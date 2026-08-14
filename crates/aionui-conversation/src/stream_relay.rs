@@ -363,12 +363,12 @@ impl StreamRelay {
         self
     }
 
-    pub fn with_output_retention(mut self, policy: OutputRetentionPolicy) -> Self {
+    pub(crate) fn with_output_retention(mut self, policy: OutputRetentionPolicy) -> Self {
         self.output_retention = Some(policy);
         self
     }
 
-    pub fn with_event_journal(mut self, journal: CanonicalEventJournal) -> Self {
+    pub(crate) fn with_event_journal(mut self, journal: CanonicalEventJournal) -> Self {
         self.event_journal = Some(journal);
         self
     }

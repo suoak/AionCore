@@ -284,6 +284,7 @@ impl CanonicalEventJournal {
         CanonicalReplayProjection::from_empty(conversation_id, &events)
     }
 
+    #[cfg(test)]
     pub async fn replay_and_compare(
         &self,
         user_id: &str,
