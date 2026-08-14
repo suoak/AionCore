@@ -659,8 +659,8 @@ fn is_visible(meta: &AgentMetadata) -> bool {
 fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementRow {
     let status = derive_management_status(&meta, reason);
     let diagnostics = derive_management_diagnostics(&meta, status, reason);
-    let handshake = meta.handshake;
     let runtime = managed_runtime_status(&meta);
+    let handshake = meta.handshake;
     AgentManagementRow {
         id: meta.id,
         icon: meta.icon,

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aionui_common::{CommandSpec, EnvVar, ProviderWithModel};
 use aionui_db::{IProviderRepository, models::Provider};
