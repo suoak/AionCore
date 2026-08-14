@@ -3422,7 +3422,7 @@ fn permission_decision_from_outcome(
 #[cfg(test)]
 mod approval_fail_closed_tests {
     use super::{PERM_ALLOW, PERM_ALLOW_ALWAYS, permission_decision_from_outcome};
-    use crate::shared_kernel::{ApprovalAskKind, ApprovalOutcome, ApprovalPolicy, resolve_approval_outcome};
+    use crate::shared_kernel::{ApprovalAskKind, ApprovalPolicy, resolve_approval_outcome};
     use aionui_session::PermissionDecision;
 
     #[test]
