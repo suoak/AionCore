@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::approval_audit::{KIND_APPROVAL_ASKED, KIND_APPROVAL_DECIDED, KIND_APPROVAL_POLICY};
 use crate::journal_compaction::{
     CompactionLock, TranscriptTokenMeasurement, compact_old_tool_results, compaction_lock, measure_model_surface,
+    tool_pairing_balanced,
 };
 use crate::stream_persistence::CanonicalJournalEvent;
 
@@ -74,6 +75,7 @@ pub(crate) struct DerivedTranscript {
     pub model_visible_sha256: String,
     pub compaction_lock: CompactionLock,
     pub tokens: TranscriptTokenMeasurement,
+    pub tool_pairing_balanced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +146,7 @@ pub(crate) fn derive_transcript(
         model_visible_sha256,
         compaction_lock: lock,
         tokens,
+        tool_pairing_balanced: tool_pairing_balanced(events),
     }
 }
 

@@ -186,6 +186,9 @@ pub struct JournalTranscriptResponse {
     pub compaction_lock: String,
     #[serde(default)]
     pub tokens: JournalTranscriptTokens,
+    /// False when a tool call is still open on the current journal surface.
+    #[serde(default)]
+    pub tool_pairing_balanced: bool,
 }
 
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.

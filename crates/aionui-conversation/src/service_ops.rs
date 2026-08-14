@@ -126,6 +126,7 @@ impl ConversationService {
                     })
                     .collect(),
             },
+            tool_pairing_balanced: transcript.tool_pairing_balanced,
         })
     }
 

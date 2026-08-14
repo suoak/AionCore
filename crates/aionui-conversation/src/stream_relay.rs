@@ -23,6 +23,8 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
+type PermissionAutoReject = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
@@ -176,7 +178,7 @@ pub struct StreamRelay {
     superseding_tips: SupersedingTipTotals,
     output_retention: Option<OutputRetentionPolicy>,
     event_journal: Option<CanonicalEventJournal>,
-    permission_auto_reject: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    permission_auto_reject: Option<PermissionAutoReject>,
 }
 
 impl StreamRelay {
@@ -259,7 +261,7 @@ impl StreamRelay {
         self
     }
 
-    pub(crate) fn with_permission_auto_reject(mut self, hook: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+    pub(crate) fn with_permission_auto_reject(mut self, hook: PermissionAutoReject) -> Self {
         self.permission_auto_reject = Some(hook);
         self
     }

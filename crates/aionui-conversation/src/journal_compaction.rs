@@ -90,6 +90,7 @@ pub(crate) fn tool_pairing_balanced(events: &[crate::stream_persistence::Canonic
     open.is_empty()
 }
 
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn tool_pairing_balanced_before(
     events: &[crate::stream_persistence::CanonicalJournalEvent],
     seq: u64,
