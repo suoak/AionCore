@@ -52,6 +52,7 @@ pub struct AgentAvailabilityService {
 }
 
 impl AgentAvailabilityService {
+    #[cfg(test)]
     pub fn new(registry: Arc<AgentRegistry>, provider_repo: Arc<dyn IProviderRepository>) -> Self {
         Self::new_with_runtime_credentials(registry, provider_repo, [0; 32], std::env::temp_dir())
     }

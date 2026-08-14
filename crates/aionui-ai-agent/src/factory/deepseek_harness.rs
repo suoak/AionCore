@@ -16,6 +16,14 @@ pub(crate) struct DeepseekHarnessLaunch {
     pub(crate) enabled_models: Vec<String>,
 }
 
+struct LaunchContext<'a> {
+    encryption_key: &'a [u8; 32],
+    data_dir: &'a Path,
+    user_id: &'a str,
+    conversation_id: &'a str,
+    workspace: &'a str,
+}
+
 pub(crate) async fn resolve_launch(
     provider_repo: &dyn IProviderRepository,
     encryption_key: &[u8; 32],
@@ -39,11 +47,13 @@ pub(crate) async fn resolve_launch(
         provider,
         model_id,
         enabled_models,
-        encryption_key,
-        data_dir,
-        user_id,
-        conversation_id,
-        workspace,
+        LaunchContext {
+            encryption_key,
+            data_dir,
+            user_id,
+            conversation_id,
+            workspace,
+        },
     )
 }
 
@@ -64,11 +74,13 @@ pub(crate) async fn resolve_probe_launch(
         provider,
         model_id,
         enabled_models,
-        encryption_key,
-        data_dir,
-        user_id,
-        "health-check",
-        &workspace,
+        LaunchContext {
+            encryption_key,
+            data_dir,
+            user_id,
+            conversation_id: "health-check",
+            workspace: &workspace,
+        },
     )
 }
 
@@ -82,6 +94,7 @@ async fn default_provider(provider_repo: &dyn IProviderRepository, user_id: &str
         .ok_or_else(|| AgentError::bad_request("No enabled DeepSeek provider is configured"))
 }
 
+#[cfg(test)]
 fn validate_model(provider: &Provider, model_id: &str) -> Result<(), AgentError> {
     validate_model_in(&enabled_models(provider)?, model_id)
 }
@@ -118,23 +131,19 @@ fn build_launch(
     provider: Provider,
     model_id: String,
     enabled_models: Vec<String>,
-    encryption_key: &[u8; 32],
-    data_dir: &Path,
-    user_id: &str,
-    conversation_id: &str,
-    workspace: &str,
+    context: LaunchContext<'_>,
 ) -> Result<DeepseekHarnessLaunch, AgentError> {
     let runtime = aionui_runtime::probe_deepseek_harness_runtime().ok_or_else(|| {
         AgentError::bad_request("DeepSeek Harness runtime is not installed; install it from Agent settings first")
     })?;
-    let api_key = aionui_common::decrypt_string(&provider.api_key_encrypted, encryption_key)
+    let api_key = aionui_common::decrypt_string(&provider.api_key_encrypted, context.encryption_key)
         .map_err(|error| AgentError::internal(format!("Failed to decrypt DeepSeek provider credential: {error}")))?;
     if api_key.trim().is_empty() {
         return Err(AgentError::bad_request("DeepSeek provider API key is empty"));
     }
 
-    let scope = scope_hash(user_id, conversation_id);
-    let runtime_data = data_dir.join("deepseek-harness");
+    let scope = scope_hash(context.user_id, context.conversation_id);
+    let runtime_data = context.data_dir.join("deepseek-harness");
     let mut env = vec![
         EnvVar {
             name: "DEEPSEEK_API_KEY".to_owned(),
@@ -148,7 +157,7 @@ fn build_launch(
             name: "AIONUI_DSH_HOME".to_owned(),
             value: runtime_data
                 .join("home")
-                .join(scope_hash(user_id, "home"))
+                .join(scope_hash(context.user_id, "home"))
                 .to_string_lossy()
                 .into_owned(),
         },
@@ -181,7 +190,7 @@ fn build_launch(
                 runtime.config_path.to_string_lossy().into_owned(),
             ],
             env,
-            cwd: Some(workspace.to_owned()),
+            cwd: Some(context.workspace.to_owned()),
         },
         provider_id: provider.id,
         model_id,
