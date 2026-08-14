@@ -469,7 +469,7 @@ mod tests {
 
 #[cfg(test)]
 mod behavior_policy_tests {
-    use super::BehaviorPolicy;
+    use super::{BehaviorPolicy, SessionLifetime};
 
     #[test]
     fn deserializes_new_capability_flags() {
