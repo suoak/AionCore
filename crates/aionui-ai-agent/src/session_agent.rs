@@ -3406,7 +3406,6 @@ fn permission_decision_from_outcome(
     picked: Option<&str>,
     always_allow: bool,
 ) -> (aionui_session::PermissionDecision, Option<String>) {
-    use crate::shared_kernel::ApprovalOutcome;
     use aionui_session::PermissionDecision;
     if !outcome.grants() {
         return (PermissionDecision::Denied, None);

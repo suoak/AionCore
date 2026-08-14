@@ -238,8 +238,7 @@ fn join_content(left: &str, right: &str) -> String {
 /// Reconstructible payload text. `None` means the event has no model-facing
 /// content of its own — callers must not invent a kind-name fallback and then
 /// claim the invariant holds.
-pub(crate) fn recorded_content(kind: &str, payload: &serde_json::Value) -> Option<String> {
-    let _ = kind;
+pub(crate) fn recorded_content(_kind: &str, payload: &serde_json::Value) -> Option<String> {
     let candidates = [
         payload.pointer("/data/content"),
         payload.pointer("/content"),
