@@ -8,13 +8,16 @@
 //! over 2000 lines.
 
 use std::path::Component;
+use std::sync::Arc;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
-    SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, RetainedOutputResponse,
+    SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
+use aionui_db::SaveRuntimeStateParams;
 use tracing::warn;
 
 use crate::ConversationError;
@@ -23,6 +26,71 @@ use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 const MAX_DIR_DEPTH: usize = 10;
 
 impl ConversationService {
+    pub async fn replay_event_projection(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<CanonicalReplayProjectionResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        if let Some(expected) = expected_sha256
+            && (expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "expected_sha256 must be a 64-character hexadecimal digest".to_owned(),
+            });
+        }
+
+        let projection = self
+            .canonical_event_journal()
+            .replay_projection(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay canonical events: {error}")))?;
+        if expected_sha256.is_some_and(|expected| !projection.journal_sha256.eq_ignore_ascii_case(expected)) {
+            return Err(ConversationError::Busy {
+                reason: "canonical event projection does not match the expected digest".to_owned(),
+            });
+        }
+
+        Ok(CanonicalReplayProjectionResponse {
+            schema_version: projection.schema_version,
+            conversation_id: projection.conversation_id,
+            event_count: projection.event_count,
+            last_sequence: projection.last_sequence,
+            last_event_id: projection.last_event_id,
+            kind_counts: projection.kind_counts,
+            journal_sha256: projection.journal_sha256,
+        })
+    }
+
+    pub async fn read_retained_output(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        reference: &str,
+    ) -> Result<RetainedOutputResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let (sha256, content) = self
+            .output_retention_policy()
+            .read(user_id, conversation_id, reference)
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => ConversationError::NotFound {
+                    id: reference.to_owned(),
+                },
+                std::io::ErrorKind::PermissionDenied => ConversationError::BadRequest {
+                    reason: "invalid retained output reference".to_owned(),
+                },
+                _ => ConversationError::internal(format!("Failed to read retained output: {error}")),
+            })?;
+        Ok(RetainedOutputResponse {
+            reference: reference.to_owned(),
+            sha256,
+            size: content.len() as u64,
+            content,
+        })
+    }
+
     // ── Config Options ──────────────────────────────────────────────
 
     pub async fn get_config_options(
@@ -56,22 +124,82 @@ impl ConversationService {
         }
         self.ensure_owned_conversation(user_id, conversation_id).await?;
         let agent = self.task(conversation_id)?;
-        let response = match agent.set_config_option(option_id, &req.value).await {
-            Ok(response) => response,
-            Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
-                warn!(
-                    conversation_id,
-                    option_id,
-                    reason = ?AgentKillReason::AgentErrorRecovery,
-                    error = %ErrorChain(&err),
-                    "ACP config option failed because protocol is disconnected; evicting task"
-                );
-                self.task_manager()
-                    .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
-                    .await;
-                return Err(ConversationError::from(err));
+        let response = if option_id == "model" && agent.backend() == Some("deepseek-harness") {
+            let snapshot = agent.get_config_options().await.map_err(ConversationError::from)?;
+            let model_option = snapshot
+                .config_options
+                .iter()
+                .find(|option| option.id == "model" || option.category.as_deref() == Some("model"));
+            if model_option.is_some_and(|option| {
+                !option.options.is_empty() && !option.options.iter().any(|item| item.value == req.value)
+            }) {
+                return Err(ConversationError::BadRequest {
+                    reason: format!("model '{}' is not enabled for the default DeepSeek provider", req.value),
+                });
             }
-            Err(err) => return Err(ConversationError::from(err)),
+
+            let current_model = self
+                .acp_session_repo()
+                .load_runtime_state_for_user(user_id, conversation_id)
+                .await
+                .map_err(|error| ConversationError::internal(format!("Failed to load DSH model: {error}")))?
+                .and_then(|state| state.current_model_id);
+            let options = if current_model.as_deref() == Some(req.value.as_str()) {
+                snapshot.config_options
+            } else {
+                // DSH's model is process configuration rather than a live ACP option.
+                // Persist the new model, drop the private vendor session anchor, then
+                // converge the whole process tree before opening a fresh session/new.
+                self.acp_session_repo()
+                    .save_runtime_state_for_user(
+                        user_id,
+                        conversation_id,
+                        &SaveRuntimeStateParams {
+                            current_model_id: Some(Some(req.value.as_str())),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| ConversationError::internal(format!("Failed to persist DSH model: {error}")))?;
+                self.acp_session_repo()
+                    .clear_session_id_for_user(user_id, conversation_id)
+                    .await
+                    .map_err(|error| ConversationError::internal(format!("Failed to clear DSH session: {error}")))?;
+                self.task_manager()
+                    .kill_and_wait(conversation_id, Some(AgentKillReason::ModelChanged))
+                    .await;
+                let task_manager = Arc::clone(self.task_manager());
+                let (replacement, _) = self
+                    .ensure_runtime_agent(user_id, conversation_id, &task_manager, "model_rebuild")
+                    .await?;
+                replacement
+                    .get_config_options()
+                    .await
+                    .map_err(ConversationError::from)?
+                    .config_options
+            };
+            SetConfigOptionResponse {
+                confirmation: ConfigOptionConfirmation::Observed,
+                config_options: Some(options),
+            }
+        } else {
+            match agent.set_config_option(option_id, &req.value).await {
+                Ok(response) => response,
+                Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
+                    warn!(
+                        conversation_id,
+                        option_id,
+                        reason = ?AgentKillReason::AgentErrorRecovery,
+                        error = %ErrorChain(&err),
+                        "ACP config option failed because protocol is disconnected; evicting task"
+                    );
+                    self.task_manager()
+                        .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+                        .await;
+                    return Err(ConversationError::from(err));
+                }
+                Err(err) => return Err(ConversationError::from(err)),
+            }
         };
 
         // Mirror runtime model/mode/thought-level switches into the persisted assistant

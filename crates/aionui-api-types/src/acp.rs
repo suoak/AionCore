@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +113,25 @@ pub struct GetConfigOptionsResponse {
 pub struct SetConfigOptionResponse {
     pub confirmation: ConfigOptionConfirmation,
     pub config_options: Option<Vec<AcpConfigOptionDto>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetainedOutputResponse {
+    pub reference: String,
+    pub sha256: String,
+    pub size: u64,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalReplayProjectionResponse {
+    pub schema_version: u32,
+    pub conversation_id: String,
+    pub event_count: u64,
+    pub last_sequence: u64,
+    pub last_event_id: Option<String>,
+    pub kind_counts: BTreeMap<String, u64>,
+    pub journal_sha256: String,
 }
 
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.

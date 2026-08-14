@@ -246,6 +246,7 @@ impl ConversationTurnOrchestrator {
             let lifecycle = runtime_state.lifecycle_for(&input.conv_id);
             let defer_clean_terminal_errors = input.defer_clean_terminal_errors
                 && agent.agent_type() == AgentType::Acp
+                && backend.as_deref() != Some("deepseek-harness")
                 && lifecycle == RuntimeLifecycleState::Active
                 && aggregate_summary.safe_to_auto_replay();
             let relay = StreamRelay::new(
@@ -262,6 +263,8 @@ impl ConversationTurnOrchestrator {
             .with_persistence(persistence.clone())
             .with_turn_completion(false)
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
+            .with_output_retention(self.service.output_retention_policy())
+            .with_event_journal(self.service.canonical_event_journal())
             // A replay spawns a fresh CLI whose own retry counter starts at one,
             // but from the user's side it is still the same stalled prompt and
             // the same card counting up — so these totals span the attempts.
