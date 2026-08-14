@@ -496,8 +496,16 @@ impl StreamRelay {
                             )
                             .await
                         {
-                            warn!(error = %error, "Failed to append canonical event before projection");
-                            continue;
+                            let terminal = matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_));
+                            warn!(
+                                error = %error,
+                                event_type = Self::event_kind(&event),
+                                terminal,
+                                "Failed to append canonical event before projection"
+                            );
+                            if !terminal {
+                                continue;
+                            }
                         }
                     }
                     let deleting = self.is_deleting();
@@ -1464,6 +1472,33 @@ mod tests {
             "needs-auth empty turn is a benign finish"
         );
         assert!(outcome.attempt.needs_auth, "needs-auth tip must set the summary flag");
+    }
+
+    #[tokio::test]
+    async fn journal_write_failure_does_not_swallow_terminal_event() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_root = temp.path().join("journal-root-is-a-file");
+        tokio::fs::write(&invalid_root, b"not a directory").await.unwrap();
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        )
+        .with_event_journal(CanonicalEventJournal::new(invalid_root));
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), relay.consume(rx))
+            .await
+            .expect("journal failure must not leave the relay waiting forever");
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
     }
 
     #[tokio::test]
