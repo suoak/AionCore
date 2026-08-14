@@ -10,7 +10,7 @@ VALUES
      'DeepSeek Harness', 'deepseek-harness', 'acp', 'builtin',
      '{"managed_runtime":{"runtime_id":"deepseek-harness","release":"2026.08.14-1"}}',
      1, 'node', '[]', '[]', '[".agents/skills",".claude/skills"]',
-     '{"supports_side_question":false,"supports_team":false,"session_lifetime":"connection_scoped"}',
+     '{"supports_side_question":false,"session_lifetime":"connection_scoped"}',
      NULL,
      '{"prompt_capabilities":{"image":false,"audio":false,"embedded_context":false}}',
      '[]', 3340,
