@@ -11,7 +11,7 @@ use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 
 /// Build the conversation-ops router (no auth layer applied — the caller is
 /// responsible for wrapping this with the auth middleware).
@@ -20,6 +20,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/side-question", post(side_question))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
+        .route("/api/usage", get(list_usage_events).delete(clear_usage_events))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
         .route("/api/conversations/{id}/transcript", get(get_event_transcript))
         .route("/api/conversations/{id}/outputs/{reference}", get(get_retained_output))
@@ -98,6 +99,39 @@ async fn set_config_option(
         state
             .service
             .set_config_option(&user.id, &id, &option_id, req)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UsageListQueryParams {
+    since: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn list_usage_events(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<UsageListQueryParams>,
+) -> Result<Json<ApiResponse<aionui_api_types::UsageListResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_usage_events(&user.id, query.since, query.limit)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn clear_usage_events(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<u64>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .clear_usage_events(&user.id)
             .await
             .map_err(ApiError::from)?,
     )))
