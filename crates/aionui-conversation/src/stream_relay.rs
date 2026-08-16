@@ -307,7 +307,7 @@ impl StreamRelay {
     }
 
     async fn consume_inner(
-        self,
+        mut self,
         mut rx: broadcast::Receiver<AgentStreamEvent>,
         mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
     ) -> RelayOutcome {
@@ -887,7 +887,7 @@ impl StreamRelay {
                 };
                 if let Err(error) = crate::usage_ledger::record_context_usage_spend(
                     repo.as_ref(),
-                    self.adapter.conversation_repo(),
+                    self.adapter.conversation_repo().as_ref(),
                     &self.user_id,
                     &self.conversation_id,
                     Some(self.turn_id.as_str()),

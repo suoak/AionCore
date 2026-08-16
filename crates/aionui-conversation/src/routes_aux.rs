@@ -11,7 +11,7 @@ use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 
 /// Build the conversation-ops router (no auth layer applied — the caller is
 /// responsible for wrapping this with the auth middleware).
