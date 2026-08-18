@@ -22,9 +22,10 @@ use aionui_api_types::{
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    PromptCapabilityView, RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SessionMcpServer, SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -295,7 +296,7 @@ fn extra_backend(row: &ConversationRow) -> Option<String> {
 }
 
 fn is_retired_preview_backend(row: &ConversationRow) -> bool {
-    extra_backend(row).as_deref() == Some("deepseek-harness")
+    extra_backend(row).as_deref() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND)
 }
 
 fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
@@ -356,6 +357,7 @@ pub struct ConversationService {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
     usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
+    input_queue_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Clone)]
@@ -431,6 +433,7 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
             usage_event_repo: Arc::new(RwLock::new(None)),
+            input_queue_locks: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -686,6 +689,13 @@ impl ConversationService {
         self.runtime_state.clone()
     }
 
+    pub(crate) fn input_queue_lock(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.input_queue_locks
+            .entry(conversation_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub fn auto_workspace_to_delete_for_row(
         &self,
         row: &aionui_db::models::ConversationRow,
@@ -762,20 +772,18 @@ impl ConversationService {
         crate::stream_persistence::CanonicalEventJournal::new(self.workspace_root.join(".event-journal"))
     }
 
-    pub(crate) async fn journal_user_prompt(&self, user_id: &str, conversation_id: &str, msg_id: &str, content: &str) {
+    pub(crate) async fn journal_user_prompt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        msg_id: &str,
+        content: &str,
+    ) -> Result<(), ConversationError> {
         let journal = self.canonical_event_journal();
-        if let Err(error) = journal
+        journal
             .append_user_prompt(user_id, conversation_id, msg_id, content)
             .await
-        {
-            warn!(
-                msg_id,
-                conversation_id,
-                error = %error,
-                "Failed to journal user prompt; DB row remains the fallback projection"
-            );
-            return;
-        }
+            .map_err(|error| ConversationError::internal(format!("Failed to journal user prompt: {error}")))?;
         match journal.replay(user_id, conversation_id).await {
             Ok(events) => {
                 if let Err(violation) = crate::model_visible::check_claimed_inputs_recorded(
@@ -801,6 +809,7 @@ impl ConversationService {
                 "Failed to replay journal after recording a user prompt"
             ),
         }
+        Ok(())
     }
 
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
@@ -868,6 +877,8 @@ impl ConversationService {
             msg_id,
             turn_id,
             runtime: self.runtime_summary_for(conversation_id).await,
+            input_id: None,
+            input_status: None,
         }
     }
 
@@ -894,6 +905,12 @@ impl ConversationService {
         }
 
         self.complete_turn(user_id, conversation_id, turn_id).await;
+        let service = self.clone();
+        let user_id = user_id.to_owned();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            service.dispatch_next_held_input(&user_id, &conversation_id).await;
+        });
     }
 }
 
@@ -3546,14 +3563,22 @@ impl ConversationService {
                 .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
+        if let Err(error) = self
+            .journal_user_prompt(user_id, conversation_id, &user_msg_id, &resolved.content)
+            .await
+        {
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                .await;
+            return Err(error);
+        }
         if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
             return Err(e.into());
         }
 
         info!(msg_id = %user_msg_id, "User message persisted");
-        self.journal_user_prompt(user_id, conversation_id, &user_msg_id, &resolved.content)
-            .await;
 
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.userCreated",
@@ -3669,6 +3694,21 @@ impl ConversationService {
                 .runtime_persistence()
                 .allows(&request.conversation_id, RuntimeWriteKind::UserMessage)
             {
+                if let Err(error) = self
+                    .journal_user_prompt(
+                        &request.user_id,
+                        &request.conversation_id,
+                        &user_msg.id,
+                        &request.content,
+                    )
+                    .await
+                {
+                    let mut turn_claim = turn_claim;
+                    let was_deleting = turn_claim.release();
+                    self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
+                        .await;
+                    return Err(error);
+                }
                 if let Err(e) = self.conversation_repo.insert_message(&request.user_id, &user_msg).await {
                     warn!(
                         msg_id = %user_msg.id,
@@ -3681,13 +3721,6 @@ impl ConversationService {
                         .await;
                     return Err(e.into());
                 }
-                self.journal_user_prompt(
-                    &request.user_id,
-                    &request.conversation_id,
-                    &user_msg.id,
-                    &request.content,
-                )
-                .await;
             }
         }
         if let Some(on_started) = request.on_started.as_ref() {
