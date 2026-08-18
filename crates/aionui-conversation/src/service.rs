@@ -889,28 +889,30 @@ impl ConversationService {
             .await;
     }
 
-    pub(crate) async fn complete_released_turn(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
+    pub(crate) fn complete_released_turn<'a>(
+        &'a self,
+        user_id: &'a str,
+        conversation_id: &'a str,
+        turn_id: &'a str,
         was_deleting: bool,
-    ) {
-        if was_deleting {
-            debug!(
-                conversation_id,
-                turn_id, "Skipping turn completion because conversation was deleting at claim release"
-            );
-            return;
-        }
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if was_deleting {
+                debug!(
+                    conversation_id,
+                    turn_id, "Skipping turn completion because conversation was deleting at claim release"
+                );
+                return;
+            }
 
-        self.complete_turn(user_id, conversation_id, turn_id).await;
-        let service = self.clone();
-        let user_id = user_id.to_owned();
-        let conversation_id = conversation_id.to_owned();
-        tokio::spawn(async move {
-            service.dispatch_next_held_input(&user_id, &conversation_id).await;
-        });
+            self.complete_turn(user_id, conversation_id, turn_id).await;
+            let service = self.clone();
+            let user_id = user_id.to_owned();
+            let conversation_id = conversation_id.to_owned();
+            tokio::spawn(async move {
+                service.dispatch_next_held_input(&user_id, &conversation_id).await;
+            });
+        })
     }
 }
 

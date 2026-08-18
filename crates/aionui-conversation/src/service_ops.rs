@@ -885,10 +885,10 @@ impl ConversationService {
     fn broadcast_input_changed(&self, user_id: &str, input: ConversationInputResponse) {
         self.broadcaster().broadcast(WebSocketMessage::new(
             "conversation.inputChanged",
-            InputChangedEvent {
+            serde_json::json!(InputChangedEvent {
                 user_id: user_id.to_owned(),
                 input,
-            },
+            }),
         ));
     }
 
