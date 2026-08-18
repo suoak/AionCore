@@ -33,6 +33,13 @@ use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
 
+struct InputStatusChange<'a> {
+    status: ConversationInputStatus,
+    turn_id: Option<&'a str>,
+    msg_id: Option<&'a str>,
+    error_code: Option<&'a str>,
+}
+
 fn input_mode_name(mode: ConversationInputMode) -> &'static str {
     match mode {
         ConversationInputMode::Followup => "followup",
@@ -663,10 +670,12 @@ impl ConversationService {
                 user_id,
                 conversation_id,
                 input_id,
-                ConversationInputStatus::Canceled,
-                None,
-                None,
-                None,
+                InputStatusChange {
+                    status: ConversationInputStatus::Canceled,
+                    turn_id: None,
+                    msg_id: None,
+                    error_code: None,
+                },
             )
             .await?;
         Ok(changed)
@@ -744,10 +753,12 @@ impl ConversationService {
                         user_id,
                         conversation_id,
                         &next.id,
-                        ConversationInputStatus::Accepted,
-                        Some(&response.turn_id),
-                        Some(&response.msg_id),
-                        None,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Accepted,
+                            turn_id: Some(&response.turn_id),
+                            msg_id: Some(&response.msg_id),
+                            error_code: None,
+                        },
                     )
                     .await
                 {
@@ -759,10 +770,12 @@ impl ConversationService {
                         user_id,
                         conversation_id,
                         &next.id,
-                        ConversationInputStatus::Applied,
-                        Some(&response.turn_id),
-                        Some(&response.msg_id),
-                        None,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Applied,
+                            turn_id: Some(&response.turn_id),
+                            msg_id: Some(&response.msg_id),
+                            error_code: None,
+                        },
                     )
                     .await
                 {
@@ -775,10 +788,12 @@ impl ConversationService {
                         user_id,
                         conversation_id,
                         &next.id,
-                        ConversationInputStatus::Held,
-                        None,
-                        None,
-                        None,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Held,
+                            turn_id: None,
+                            msg_id: None,
+                            error_code: None,
+                        },
                     )
                     .await
                 {
@@ -792,10 +807,12 @@ impl ConversationService {
                         user_id,
                         conversation_id,
                         &next.id,
-                        ConversationInputStatus::Failed,
-                        None,
-                        None,
-                        Some(error_code),
+                        InputStatusChange {
+                            status: ConversationInputStatus::Failed,
+                            turn_id: None,
+                            msg_id: None,
+                            error_code: Some(error_code),
+                        },
                     )
                     .await
                 {
@@ -810,12 +827,9 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         input_id: &str,
-        status: ConversationInputStatus,
-        turn_id: Option<&str>,
-        msg_id: Option<&str>,
-        error_code: Option<&str>,
+        change: InputStatusChange<'_>,
     ) -> Result<ConversationInputResponse, ConversationError> {
-        self.append_input_status_event(user_id, conversation_id, input_id, status, error_code)
+        self.append_input_status_event(user_id, conversation_id, input_id, change.status, change.error_code)
             .await?;
         let row = self
             .conversation_repo()
@@ -824,10 +838,10 @@ impl ConversationService {
                 conversation_id,
                 input_id,
                 &ConversationInputUpdate {
-                    status: Some(input_status_name(status)),
-                    turn_id,
-                    msg_id,
-                    error_code,
+                    status: Some(input_status_name(change.status)),
+                    turn_id: change.turn_id,
+                    msg_id: change.msg_id,
+                    error_code: change.error_code,
                     updated_at: now_ms(),
                 },
             )
