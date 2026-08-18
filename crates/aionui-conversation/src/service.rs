@@ -299,7 +299,7 @@ fn is_retired_preview_backend(row: &ConversationRow) -> bool {
     extra_backend(row).as_deref() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND)
 }
 
-fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
+pub(crate) fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
     let Some(agent_type) = parse_agent_type_from_row(row) else {
         return Ok(());
     };
@@ -4602,7 +4602,7 @@ fn strip_request_fork_spec(extra: &mut serde_json::Value) {
     }
 }
 
-fn team_id_from_extra(extra: &str) -> Option<String> {
+pub(crate) fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
 }
 

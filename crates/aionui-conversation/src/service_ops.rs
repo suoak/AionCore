@@ -29,7 +29,9 @@ use tracing::warn;
 
 use crate::ConversationError;
 use crate::journal_transcript::{RequestedVisibility, derive_transcript};
-use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
+use crate::service::{
+    AssistantRuntimePreferenceUpdate, ConversationService, reject_deprecated_runtime_row, team_id_from_extra,
+};
 
 const MAX_DIR_DEPTH: usize = 10;
 
@@ -552,6 +554,19 @@ impl ConversationService {
                 "client_key must contain between 1 and 256 bytes",
             ));
         }
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if team_id_from_extra(&row.extra).is_some() {
+            return Err(ConversationError::Forbidden {
+                reason: "Team-owned conversations must be sent through Team API".into(),
+            });
+        }
+        reject_deprecated_runtime_row(&row)?;
         let capabilities = self.conversation_capabilities(user_id, conversation_id).await?;
         let supported = match req.mode {
             ConversationInputMode::Followup => capabilities.followup,
