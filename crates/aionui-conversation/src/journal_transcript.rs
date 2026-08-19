@@ -253,6 +253,8 @@ pub(crate) fn recorded_content(_kind: &str, payload: &serde_json::Value) -> Opti
         payload.pointer("/content"),
         payload.pointer("/data/output"),
         payload.pointer("/output"),
+        payload.pointer("/data/description"),
+        payload.pointer("/description"),
         payload.pointer("/data/text"),
         payload.pointer("/text"),
         payload.pointer("/data/update/title"),
