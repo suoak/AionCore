@@ -300,11 +300,16 @@ fn is_retired_preview_backend(row: &ConversationRow) -> bool {
 }
 
 pub(crate) fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
+    if is_retired_preview_backend(row) {
+        return Err(ConversationError::RuntimeRetired {
+            backend: RETIRED_DEEPSEEK_HARNESS_BACKEND.to_owned(),
+        });
+    }
     let Some(agent_type) = parse_agent_type_from_row(row) else {
         return Ok(());
     };
 
-    if agent_type.is_deprecated_runtime() || is_retired_preview_backend(row) {
+    if agent_type.is_deprecated_runtime() {
         debug!(
             conversation_id = %row.id,
             agent_type = agent_type.serde_name(),
