@@ -15,7 +15,7 @@ use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, error, warn};
 
 use crate::runtime_completion::RuntimeCompletionPublisher;
@@ -162,6 +162,8 @@ fn ensure_contained(root: &Path, target: &Path) -> Result<(), std::io::Error> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub(crate) struct CanonicalJournalEvent {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime_epoch: String,
     pub event_id: String,
     pub conversation_id: String,
     pub sequence: u64,
@@ -226,12 +228,27 @@ pub(crate) struct CanonicalEventJournal {
 struct JournalAppendCursor {
     file_len: u64,
     last_sequence: u64,
-    events_by_id: HashMap<String, CanonicalJournalEvent>,
+    events_by_id: HashMap<String, JournalIndexEntry>,
     initialized: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JournalIndexEntry {
+    event_id: String,
+    sequence: u64,
+    start: u64,
+    end: u64,
 }
 
 static JOURNAL_APPEND_CURSORS: OnceLock<DashMap<PathBuf, Arc<tokio::sync::Mutex<JournalAppendCursor>>>> =
     OnceLock::new();
+static JOURNAL_RUNTIME_EPOCH: OnceLock<String> = OnceLock::new();
+
+fn journal_runtime_epoch() -> &'static str {
+    JOURNAL_RUNTIME_EPOCH
+        .get_or_init(|| format!("runtime_{}", uuid::Uuid::now_v7().simple()))
+        .as_str()
+}
 
 impl CanonicalEventJournal {
     pub fn new(root: PathBuf) -> Self {
@@ -260,20 +277,14 @@ impl CanonicalEventJournal {
             Err(error) => return Err(error),
         };
         if !cursor.initialized || cursor.file_len != current_len {
-            let events = self.replay_unlocked(&path).await?;
-            cursor.last_sequence = events.last().map_or(0, |event| event.sequence);
-            cursor.events_by_id = events
-                .into_iter()
-                .map(|event| (event.event_id.clone(), event))
-                .collect();
-            cursor.file_len = current_len;
-            cursor.initialized = true;
+            self.initialize_cursor(&path, current_len, &mut cursor).await?;
         }
         if let Some(existing) = cursor.events_by_id.get(&event_id) {
-            return Ok(existing.clone());
+            return self.read_indexed_event(&path, existing).await;
         }
         let event = CanonicalJournalEvent {
             schema_version: 1,
+            runtime_epoch: journal_runtime_epoch().to_owned(),
             event_id,
             conversation_id: conversation_id.to_owned(),
             sequence: cursor.last_sequence.saturating_add(1),
@@ -287,7 +298,7 @@ impl CanonicalEventJournal {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(&path)
             .await?;
         let mut encoded =
             serde_json::to_vec(&event).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -295,10 +306,191 @@ impl CanonicalEventJournal {
         file.write_all(&encoded).await?;
         file.flush().await?;
         file.sync_data().await?;
-        cursor.file_len = cursor.file_len.saturating_add(encoded.len() as u64);
+        let start = cursor.file_len;
+        let end = start.saturating_add(encoded.len() as u64);
+        let index_entry = JournalIndexEntry {
+            event_id: event.event_id.clone(),
+            sequence: event.sequence,
+            start,
+            end,
+        };
+        self.append_index_entry(&path, &index_entry).await?;
+        cursor.file_len = end;
         cursor.last_sequence = event.sequence;
-        cursor.events_by_id.insert(event.event_id.clone(), event.clone());
+        cursor.events_by_id.insert(event.event_id.clone(), index_entry);
         Ok(event)
+    }
+
+    async fn initialize_cursor(
+        &self,
+        path: &Path,
+        current_len: u64,
+        cursor: &mut JournalAppendCursor,
+    ) -> Result<(), std::io::Error> {
+        let entries = match self.load_index(path, current_len).await? {
+            Some(entries) => entries,
+            None => {
+                let events = self.replay_unlocked(path).await?;
+                self.rebuild_index(path, &events).await?
+            }
+        };
+        cursor.last_sequence = entries.last().map_or(0, |entry| entry.sequence);
+        cursor.events_by_id = entries
+            .into_iter()
+            .map(|entry| (entry.event_id.clone(), entry))
+            .collect();
+        cursor.file_len = current_len;
+        cursor.initialized = true;
+        Ok(())
+    }
+
+    async fn load_index(
+        &self,
+        journal_path: &Path,
+        current_len: u64,
+    ) -> Result<Option<Vec<JournalIndexEntry>>, std::io::Error> {
+        let bytes = match tokio::fs::read(self.index_path(journal_path)).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if bytes.is_empty() {
+            return Ok((current_len == 0).then(Vec::new));
+        }
+        if bytes.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        let raw = match std::str::from_utf8(&bytes) {
+            Ok(raw) => raw,
+            Err(_) => return Ok(None),
+        };
+        let mut entries = Vec::new();
+        let mut expected_start = 0;
+        let mut seen = std::collections::HashSet::new();
+        for (index, line) in raw.lines().filter(|line| !line.trim().is_empty()).enumerate() {
+            let entry: JournalIndexEntry = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                Err(_) => return Ok(None),
+            };
+            if entry.sequence != index as u64 + 1
+                || entry.start != expected_start
+                || entry.end <= entry.start
+                || entry.end > current_len
+                || !seen.insert(entry.event_id.clone())
+            {
+                return Ok(None);
+            }
+            expected_start = entry.end;
+            entries.push(entry);
+        }
+        if expected_start != current_len {
+            return Ok(None);
+        }
+        if let Some(last) = entries.last() {
+            let event = match self.read_indexed_event(journal_path, last).await {
+                Ok(event) => event,
+                Err(_) => return Ok(None),
+            };
+            if event.event_id != last.event_id || event.sequence != last.sequence {
+                return Ok(None);
+            }
+        }
+        Ok(Some(entries))
+    }
+
+    async fn rebuild_index(
+        &self,
+        journal_path: &Path,
+        events: &[CanonicalJournalEvent],
+    ) -> Result<Vec<JournalIndexEntry>, std::io::Error> {
+        let mut entries = Vec::with_capacity(events.len());
+        let journal_bytes = match tokio::fs::read(journal_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && events.is_empty() => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let mut offset = 0;
+        let mut encoded_index = Vec::new();
+        let committed_lines = journal_bytes.split_inclusive(|byte| *byte == b'\n');
+        for (event, line) in events.iter().zip(committed_lines) {
+            let event_len = line.len() as u64;
+            let entry = JournalIndexEntry {
+                event_id: event.event_id.clone(),
+                sequence: event.sequence,
+                start: offset,
+                end: offset.saturating_add(event_len),
+            };
+            serde_json::to_writer(&mut encoded_index, &entry)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            encoded_index.push(b'\n');
+            offset = entry.end;
+            entries.push(entry);
+        }
+        if offset != journal_bytes.len() as u64 || entries.len() != events.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical journal changed while rebuilding its cursor",
+            ));
+        }
+        self.replace_index(journal_path, &encoded_index).await?;
+        Ok(entries)
+    }
+
+    async fn append_index_entry(&self, journal_path: &Path, entry: &JournalIndexEntry) -> Result<(), std::io::Error> {
+        let index_path = self.index_path(journal_path);
+        let mut index = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(index_path)
+            .await?;
+        let mut encoded =
+            serde_json::to_vec(entry).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        encoded.push(b'\n');
+        index.write_all(&encoded).await?;
+        index.flush().await?;
+        index.sync_data().await
+    }
+
+    async fn replace_index(&self, journal_path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+        let index_path = self.index_path(journal_path);
+        if let Some(parent) = index_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let staging = index_path.with_extension(format!("cursor-{}-{}.tmp", std::process::id(), now_ms()));
+        tokio::fs::write(&staging, bytes).await?;
+        let file = tokio::fs::OpenOptions::new().write(true).open(&staging).await?;
+        file.sync_data().await?;
+        match tokio::fs::remove_file(&index_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        tokio::fs::rename(staging, index_path).await
+    }
+
+    async fn read_indexed_event(
+        &self,
+        journal_path: &Path,
+        entry: &JournalIndexEntry,
+    ) -> Result<CanonicalJournalEvent, std::io::Error> {
+        let len = entry.end.saturating_sub(entry.start);
+        let len = usize::try_from(len)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "journal event is too large"))?;
+        let mut file = tokio::fs::File::open(journal_path).await?;
+        file.seek(std::io::SeekFrom::Start(entry.start)).await?;
+        let mut bytes = vec![0; len];
+        file.read_exact(&mut bytes).await?;
+        if bytes.pop() != Some(b'\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "indexed journal event is not committed",
+            ));
+        }
+        serde_json::from_slice(&bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    fn index_path(&self, journal_path: &Path) -> PathBuf {
+        journal_path.with_extension("cursor.jsonl")
     }
 
     /// Record the user's model-visible prompt before dispatch so replay can
@@ -1126,8 +1318,34 @@ mod output_retention_tests {
             .unwrap();
         assert_eq!(first, duplicate);
         assert_eq!(second.sequence, 2);
+        assert!(!first.runtime_epoch.is_empty());
+        assert_eq!(first.runtime_epoch, second.runtime_epoch);
         assert_eq!(journal.replay("user", "conv").await.unwrap().len(), 2);
         assert!(journal.replay("other-user", "conv").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_journal_rebuilds_a_stale_persistent_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        journal
+            .append("user", "conv", "event-1".into(), "Text".into(), serde_json::json!({}))
+            .await
+            .unwrap();
+        let path = journal.path("user", "conv").unwrap();
+        let index_path = journal.index_path(&path);
+        tokio::fs::write(&index_path, br#"{"event_id":"stale"}"#).await.unwrap();
+        JOURNAL_APPEND_CURSORS.get().unwrap().remove(&path);
+
+        let second = journal
+            .append("user", "conv", "event-2".into(), "Finish".into(), serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(second.sequence, 2);
+        let index = tokio::fs::read_to_string(index_path).await.unwrap();
+        assert_eq!(index.lines().count(), 2);
+        assert_eq!(journal.replay("user", "conv").await.unwrap().len(), 2);
     }
 
     #[tokio::test]
