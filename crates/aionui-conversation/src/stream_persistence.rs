@@ -277,7 +277,8 @@ impl CanonicalEventJournal {
             Err(error) => return Err(error),
         };
         if !cursor.initialized || cursor.file_len != current_len {
-            self.initialize_cursor(&path, current_len, &mut cursor).await?;
+            self.initialize_cursor(&path, conversation_id, current_len, &mut cursor)
+                .await?;
         }
         if let Some(existing) = cursor.events_by_id.get(&event_id) {
             return self.read_indexed_event(&path, existing).await;
@@ -324,10 +325,11 @@ impl CanonicalEventJournal {
     async fn initialize_cursor(
         &self,
         path: &Path,
+        conversation_id: &str,
         current_len: u64,
         cursor: &mut JournalAppendCursor,
     ) -> Result<(), std::io::Error> {
-        let entries = match self.load_index(path, current_len).await? {
+        let entries = match self.load_index(path, conversation_id, current_len).await? {
             Some(entries) => entries,
             None => {
                 let events = self.replay_unlocked(path).await?;
@@ -347,6 +349,7 @@ impl CanonicalEventJournal {
     async fn load_index(
         &self,
         journal_path: &Path,
+        conversation_id: &str,
         current_len: u64,
     ) -> Result<Option<Vec<JournalIndexEntry>>, std::io::Error> {
         let bytes = match tokio::fs::read(self.index_path(journal_path)).await {
@@ -391,7 +394,10 @@ impl CanonicalEventJournal {
                 Ok(event) => event,
                 Err(_) => return Ok(None),
             };
-            if event.event_id != last.event_id || event.sequence != last.sequence {
+            if event.event_id != last.event_id
+                || event.sequence != last.sequence
+                || event.conversation_id != conversation_id
+            {
                 return Ok(None);
             }
         }
