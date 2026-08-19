@@ -61,7 +61,7 @@ fn input_status_name(status: ConversationInputStatus) -> &'static str {
     }
 }
 
-fn input_row_response(row: ConversationInputRow) -> Result<ConversationInputResponse, ConversationError> {
+pub(crate) fn input_row_response(row: ConversationInputRow) -> Result<ConversationInputResponse, ConversationError> {
     let mode = match row.mode.as_str() {
         "followup" => ConversationInputMode::Followup,
         "steer" => ConversationInputMode::Steer,
@@ -347,10 +347,8 @@ impl ConversationService {
         self.ensure_owned_conversation(user_id, conversation_id).await?;
         let agent = self.task(conversation_id)?;
         if agent.backend() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND) {
-            return Err(ConversationError::Archived {
-                id: conversation_id.to_owned(),
-                reason: "This historical conversation can no longer be continued. Please start a new conversation."
-                    .into(),
+            return Err(ConversationError::RuntimeRetired {
+                backend: RETIRED_DEEPSEEK_HARNESS_BACKEND.to_owned(),
             });
         }
         let response = {
@@ -531,7 +529,7 @@ impl ConversationService {
         Ok(ConversationCapabilities {
             followup: true,
             steer: false,
-            inject: false,
+            inject: row.r#type == "aionrs",
             tool_enforcement: if row.r#type == "aionrs" {
                 ToolEnforcementLevel::Native
             } else {
@@ -697,14 +695,9 @@ impl ConversationService {
     }
 
     pub(crate) async fn dispatch_next_held_input(&self, user_id: &str, conversation_id: &str) {
-        if !self.runtime_summary_for(conversation_id).await.can_send_message {
-            return;
-        }
         let lock = self.input_queue_lock(conversation_id);
         let _guard = lock.lock().await;
-        if !self.runtime_summary_for(conversation_id).await.can_send_message {
-            return;
-        }
+        let runtime = self.runtime_summary_for(conversation_id).await;
         let rows = match self
             .conversation_repo()
             .list_conversation_inputs(user_id, conversation_id)
@@ -719,6 +712,18 @@ impl ConversationService {
         let Some(next) = rows.into_iter().find(|row| row.status == "held") else {
             return;
         };
+        let can_dispatch = match next.mode.as_str() {
+            "followup" => runtime.can_send_message,
+            "inject" | "steer" => matches!(
+                runtime.state,
+                aionui_api_types::ConversationRuntimeStateKind::Running
+                    | aionui_api_types::ConversationRuntimeStateKind::WaitingConfirmation
+            ),
+            _ => true,
+        };
+        if !can_dispatch && next.mode == "followup" {
+            return;
+        }
         if let Err(error) = self
             .append_input_status_event(
                 user_id,
@@ -752,6 +757,76 @@ impl ConversationService {
             }
         };
         self.broadcast_input_changed(user_id, claimed_response.clone());
+        if claimed_response.mode == ConversationInputMode::Inject {
+            let active_turn_id = runtime.turn_id.as_deref();
+            let result = self.task(conversation_id).and_then(|task| {
+                task.inject(next.id.clone(), claimed_response.content.clone())
+                    .map_err(ConversationError::from)
+            });
+            match result {
+                Ok(()) => {
+                    if let Err(error) = self
+                        .persist_input_status(
+                            user_id,
+                            conversation_id,
+                            &next.id,
+                            InputStatusChange {
+                                status: ConversationInputStatus::Accepted,
+                                turn_id: active_turn_id,
+                                msg_id: None,
+                                error_code: None,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(conversation_id, input_id = next.id, error = %error, "Failed to project accepted injection");
+                    }
+                }
+                Err(error) => {
+                    let error_code = if matches!(&error, ConversationError::Busy { reason } if reason == "too_late") {
+                        "too_late"
+                    } else {
+                        error.error_code()
+                    };
+                    if let Err(persist_error) = self
+                        .persist_input_status(
+                            user_id,
+                            conversation_id,
+                            &next.id,
+                            InputStatusChange {
+                                status: ConversationInputStatus::Failed,
+                                turn_id: active_turn_id,
+                                msg_id: None,
+                                error_code: Some(error_code),
+                            },
+                        )
+                        .await
+                    {
+                        warn!(conversation_id, input_id = next.id, error = %persist_error, "Failed to project rejected injection");
+                    }
+                }
+            }
+            return;
+        }
+        if claimed_response.mode == ConversationInputMode::Steer {
+            if let Err(error) = self
+                .persist_input_status(
+                    user_id,
+                    conversation_id,
+                    &next.id,
+                    InputStatusChange {
+                        status: ConversationInputStatus::Failed,
+                        turn_id: runtime.turn_id.as_deref(),
+                        msg_id: None,
+                        error_code: Some("capability_unsupported"),
+                    },
+                )
+                .await
+            {
+                warn!(conversation_id, input_id = next.id, error = %error, "Failed to reject unsupported steer");
+            }
+            return;
+        }
         let request = SendMessageRequest {
             content: claimed_response.content,
             files: claimed_response.files,
@@ -867,6 +942,28 @@ impl ConversationService {
         let response = input_row_response(row)?;
         self.broadcast_input_changed(user_id, response.clone());
         Ok(response)
+    }
+
+    pub(crate) async fn recover_input_status(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+        status: ConversationInputStatus,
+        error_code: Option<&str>,
+    ) -> Result<ConversationInputResponse, ConversationError> {
+        self.persist_input_status(
+            user_id,
+            conversation_id,
+            input_id,
+            InputStatusChange {
+                status,
+                turn_id: None,
+                msg_id: None,
+                error_code,
+            },
+        )
+        .await
     }
 
     async fn append_input_status_event(
