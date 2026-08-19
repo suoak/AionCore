@@ -2579,8 +2579,8 @@ mod tests {
 
     #[tokio::test]
     async fn unfinished_inputs_are_listed_for_startup_recovery_in_fifo_order() {
-        let repo = setup_repo().await;
-        let conv = make_conversation("conv_recovery");
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
         repo.create(&conv).await.unwrap();
         for (id, status, created_at) in [
             ("held", "held", 30),
