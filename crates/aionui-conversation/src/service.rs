@@ -2816,6 +2816,18 @@ impl ConversationService {
             });
         };
 
+        let event_journal = self.canonical_event_journal();
+        let parent_journal = event_journal
+            .replay(user_id, id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay parent journal: {error}")))?;
+        let fork_journal_prefix =
+            crate::journal_fork::select_fork_prefix(&parent_journal, is_head, last_turn_id.as_deref()).map_err(
+                |reason| ConversationError::Unprocessable {
+                    reason: format!("FORK_JOURNAL_BOUNDARY_INVALID: {reason}"),
+                },
+            )?;
+
         // ── All checks passed: build the fork row ──────────────────────
         let new_id = generate_short_id();
         let now = now_ms();
@@ -2864,6 +2876,10 @@ impl ConversationService {
             project_id: parent.project_id.clone(),
             folder_id: parent.folder_id.clone(),
         };
+        let copied_journal_events = event_journal
+            .append_fork_prefix(user_id, &new_id, id, &fork_journal_prefix)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to persist fork journal: {error}")))?;
         self.conversation_repo.create(&row).await?;
 
         // Assistant snapshot: copy the parent's so rules/skills resolution is
@@ -2938,6 +2954,7 @@ impl ConversationService {
             parent_conversation_id = %id,
             fork_conversation_id = %new_id,
             copied_messages = copied,
+            copied_journal_events,
             "Conversation forked"
         );
 

@@ -521,6 +521,35 @@ impl CanonicalEventJournal {
             .await
     }
 
+    /// Copy an already-validated parent prefix into a child journal.
+    ///
+    /// Child sequences and event ids are minted independently, while payloads
+    /// remain byte-for-byte equivalent at the value level for reconstruction.
+    pub(crate) async fn append_fork_prefix(
+        &self,
+        user_id: &str,
+        child_conversation_id: &str,
+        parent_conversation_id: &str,
+        events: &[CanonicalJournalEvent],
+    ) -> Result<u64, std::io::Error> {
+        for event in events {
+            let seed = format!(
+                "fork:{parent_conversation_id}:{}:{child_conversation_id}",
+                event.event_id
+            );
+            let event_id = canonical_event_id(&seed, &event.payload);
+            self.append(
+                user_id,
+                child_conversation_id,
+                event_id,
+                event.kind.clone(),
+                event.payload.clone(),
+            )
+            .await?;
+        }
+        Ok(events.len() as u64)
+    }
+
     pub async fn replay(
         &self,
         user_id: &str,
@@ -1370,6 +1399,30 @@ mod output_retention_tests {
         assert_eq!(first.kind, "UserPrompt");
         assert_eq!(first.payload["data"]["content"], "please list files");
         assert_eq!(journal.replay("user", "conv").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fork_prefix_mints_child_scope_and_sequences() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        journal
+            .append_user_prompt("user", "parent", "msg-1", "hello")
+            .await
+            .unwrap();
+        let parent = journal.replay("user", "parent").await.unwrap();
+
+        let copied = journal
+            .append_fork_prefix("user", "child", "parent", &parent)
+            .await
+            .unwrap();
+        let child = journal.replay("user", "child").await.unwrap();
+
+        assert_eq!(copied, 1);
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].conversation_id, "child");
+        assert_eq!(child[0].sequence, 1);
+        assert_ne!(child[0].event_id, parent[0].event_id);
+        assert_eq!(child[0].payload, parent[0].payload);
     }
 
     #[tokio::test]
