@@ -392,7 +392,7 @@ impl RecordingAgent {
     fn fire_finish(&self) {
         let _ = self
             .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+            .send(AgentStreamEvent::Finish(FinishEventData::default()));
     }
 }
 
