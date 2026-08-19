@@ -621,45 +621,47 @@ impl ConversationService {
                     .await?;
                 }
             } else {
-            let payload = serde_json::json!({
-                "type": "conversation_input",
-                "visibility": "host",
-                "data": {
-                    "input_id": input_id,
-                    "mode": input_mode_name(req.mode),
-                    "status": "held",
-                    "content": req.content,
-                    "files": req.files,
-                    "inject_skills": req.inject_skills,
-                    "hidden": req.hidden,
-                    "client_key": req.client_key,
-                }
-            });
-            let event_id =
-                crate::stream_persistence::canonical_event_id(&format!("conversation_input:{input_id}:held"), &payload);
-            self.canonical_event_journal()
-                .append(user_id, conversation_id, event_id, "InputHeld".into(), payload)
-                .await
-                .map_err(|error| {
-                    ConversationError::internal(format!("Failed to journal conversation input: {error}"))
-                })?;
-            let row = self
-                .conversation_repo()
-                .insert_conversation_input(&ConversationInputInsert {
-                    id: &input_id,
-                    user_id,
-                    conversation_id,
-                    mode: input_mode_name(req.mode),
-                    status: "held",
-                    content: &req.content,
-                    files: &files,
-                    inject_skills: &inject_skills,
-                    hidden: req.hidden,
-                    client_key: req.client_key.trim(),
-                    created_at,
-                })
-                .await?;
-            self.broadcast_input_changed(user_id, input_row_response(row)?);
+                let payload = serde_json::json!({
+                    "type": "conversation_input",
+                    "visibility": "host",
+                    "data": {
+                        "input_id": input_id,
+                        "mode": input_mode_name(req.mode),
+                        "status": "held",
+                        "content": req.content,
+                        "files": req.files,
+                        "inject_skills": req.inject_skills,
+                        "hidden": req.hidden,
+                        "client_key": req.client_key,
+                    }
+                });
+                let event_id = crate::stream_persistence::canonical_event_id(
+                    &format!("conversation_input:{input_id}:held"),
+                    &payload,
+                );
+                self.canonical_event_journal()
+                    .append(user_id, conversation_id, event_id, "InputHeld".into(), payload)
+                    .await
+                    .map_err(|error| {
+                        ConversationError::internal(format!("Failed to journal conversation input: {error}"))
+                    })?;
+                let row = self
+                    .conversation_repo()
+                    .insert_conversation_input(&ConversationInputInsert {
+                        id: &input_id,
+                        user_id,
+                        conversation_id,
+                        mode: input_mode_name(req.mode),
+                        status: "held",
+                        content: &req.content,
+                        files: &files,
+                        inject_skills: &inject_skills,
+                        hidden: req.hidden,
+                        client_key: req.client_key.trim(),
+                        created_at,
+                    })
+                    .await?;
+                self.broadcast_input_changed(user_id, input_row_response(row)?);
             }
         }
 
