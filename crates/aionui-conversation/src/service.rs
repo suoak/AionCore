@@ -17,8 +17,8 @@ use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CancellationState,
-    CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CancellationChangedEvent,
+    CancellationState, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
@@ -859,8 +859,15 @@ impl ConversationService {
             )
             .await
             .map_err(|error| ConversationError::internal(format!("Failed to journal cancellation: {error}")))?;
-        self.broadcaster
-            .broadcast(WebSocketMessage::new("conversation.cancellationChanged", payload));
+        self.broadcaster().broadcast(WebSocketMessage::new(
+            "conversation.cancellationChanged",
+            serde_json::json!(CancellationChangedEvent {
+                user_id: user_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                state,
+            }),
+        ));
         Ok(())
     }
 
