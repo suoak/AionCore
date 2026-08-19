@@ -14,6 +14,7 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
+use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CancellationState,
@@ -65,6 +66,16 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
+fn cancellation_event_suffix(state: CancellationState) -> &'static str {
+    match state {
+        CancellationState::Requested => "Requested",
+        CancellationState::Cancelling => "Cancelling",
+        CancellationState::ConvergedIdle => "ConvergedIdle",
+        CancellationState::ForceTerminated => "ForceTerminated",
+        CancellationState::Failed => "Failed",
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -817,6 +828,42 @@ impl ConversationService {
         Ok(())
     }
 
+    async fn publish_cancellation_state(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        state: CancellationState,
+    ) -> Result<(), ConversationError> {
+        let payload = serde_json::json!({
+            "type": "cancellation_state",
+            "data": {
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "turn_id": turn_id,
+                "state": state,
+            }
+        });
+        let state_name = payload["data"]["state"].as_str().unwrap_or("failed");
+        let event_id = canonical_event_id(
+            &format!("cancellation:{conversation_id}:{turn_id}:{state_name}"),
+            &payload,
+        );
+        self.canonical_event_journal()
+            .append(
+                user_id,
+                conversation_id,
+                event_id,
+                format!("Cancellation{}", cancellation_event_suffix(state)),
+                payload.clone(),
+            )
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to journal cancellation: {error}")))?;
+        self.broadcaster
+            .broadcast(WebSocketMessage::new("conversation.cancellationChanged", payload));
+        Ok(())
+    }
+
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
         let agent = self.task_manager.get_task(conversation_id);
         let has_task = agent.is_some();
@@ -911,6 +958,18 @@ impl ConversationService {
             }
 
             self.complete_turn(user_id, conversation_id, turn_id).await;
+            if let Some(outcome) = self.runtime_state.take_cancellation_outcome(conversation_id, turn_id)
+                && let Err(error) = self
+                    .publish_cancellation_state(user_id, conversation_id, turn_id, outcome)
+                    .await
+            {
+                error!(
+                    conversation_id,
+                    turn_id,
+                    error = %error,
+                    "Failed to publish terminal cancellation state"
+                );
+            }
             let service = self.clone();
             let user_id = user_id.to_owned();
             let conversation_id = conversation_id.to_owned();
@@ -3972,6 +4031,8 @@ impl ConversationService {
                 active_turn_id = active_turn_id.as_deref(),
                 "cancel ignored because turn id mismatched"
             );
+            self.publish_cancellation_state(user_id, conversation_id, turn_id, CancellationState::Failed)
+                .await?;
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
                 cancellation_state: Some(CancellationState::Failed),
@@ -3989,6 +4050,8 @@ impl ConversationService {
             // Record the intent instead. The orchestrator applies it as soon as
             // the task appears, so a cancel issued during the build behaves like
             // one issued a second later.
+            self.publish_cancellation_state(user_id, conversation_id, turn_id, CancellationState::Requested)
+                .await?;
             self.runtime_state.defer_cancel(conversation_id, turn_id);
             info!(
                 conversation_id,
@@ -4000,9 +4063,15 @@ impl ConversationService {
             });
         };
 
+        self.publish_cancellation_state(user_id, conversation_id, turn_id, CancellationState::Requested)
+            .await?;
         self.runtime_state.mark_cancelling(conversation_id);
+        self.publish_cancellation_state(user_id, conversation_id, turn_id, CancellationState::Cancelling)
+            .await?;
         if let Err(e) = agent.cancel().await {
             self.runtime_state.clear_cancelling(conversation_id);
+            self.publish_cancellation_state(user_id, conversation_id, turn_id, CancellationState::Failed)
+                .await?;
             warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
             return Err(e.into());
         }
@@ -4014,8 +4083,10 @@ impl ConversationService {
         if matches!(agent.agent_type(), AgentType::Acp | AgentType::Antigravity) {
             let runtime_state = self.runtime_state();
             let task_manager = Arc::clone(task_manager);
+            let service = self.clone();
             let conv_id = conversation_id.to_owned();
             let active_turn = turn_id.to_owned();
+            let owner_user_id = user_id.to_owned();
 
             tokio::spawn(async move {
                 tokio::time::sleep(ACP_CANCEL_DRAIN_TIMEOUT).await;
@@ -4028,9 +4099,23 @@ impl ConversationService {
                         timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
                         "CLI agent cancel did not drain before timeout; killing task"
                     );
+                    runtime_state.mark_force_terminated(&conv_id, &active_turn);
                     task_manager
                         .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
                         .await;
+                    if runtime_state.active_turn_id_for(&conv_id).is_none()
+                        && let Some(outcome) = runtime_state.take_cancellation_outcome(&conv_id, &active_turn)
+                        && let Err(error) = service
+                            .publish_cancellation_state(&owner_user_id, &conv_id, &active_turn, outcome)
+                            .await
+                    {
+                        error!(
+                            conversation_id = %conv_id,
+                            turn_id = %active_turn,
+                            error = %error,
+                            "Failed to publish forced cancellation state"
+                        );
+                    }
                 }
             });
         }

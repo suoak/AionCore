@@ -181,6 +181,12 @@ pub(crate) struct CanonicalReplayProjection {
     pub journal_sha256: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredJournalReplay {
+    pub conversation_id: String,
+    pub events: Vec<CanonicalJournalEvent>,
+}
+
 impl CanonicalReplayProjection {
     fn from_empty(conversation_id: &str, events: &[CanonicalJournalEvent]) -> Result<Self, std::io::Error> {
         let mut kind_counts = BTreeMap::new();
@@ -324,6 +330,55 @@ impl CanonicalEventJournal {
     ) -> Result<Vec<CanonicalJournalEvent>, std::io::Error> {
         let path = self.path(user_id, conversation_id)?;
         self.replay_unlocked(&path).await
+    }
+
+    /// Discover and replay every canonical journal below the configured root.
+    ///
+    /// Journal paths deliberately contain hashed user/conversation scopes, so
+    /// startup repair cannot derive database ownership from filenames. The
+    /// conversation id carried by every event is returned for an ownership
+    /// lookup against the database before any projection is changed.
+    pub(crate) async fn replay_all(&self) -> Result<Vec<DiscoveredJournalReplay>, std::io::Error> {
+        let mut user_dirs = match tokio::fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut replays = Vec::new();
+        while let Some(user_dir) = user_dirs.next_entry().await? {
+            if !user_dir.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut journals = tokio::fs::read_dir(user_dir.path()).await?;
+            while let Some(journal) = journals.next_entry().await? {
+                let path = journal.path();
+                if !journal.file_type().await?.is_file()
+                    || path.extension().and_then(|value| value.to_str()) != Some("ndjson")
+                {
+                    continue;
+                }
+                self.repair_incomplete_tail(&path).await?;
+                let events = self.replay_unlocked(&path).await?;
+                let Some(first) = events.first() else {
+                    continue;
+                };
+                if events
+                    .iter()
+                    .any(|event| event.conversation_id != first.conversation_id)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "canonical event journal contains multiple conversation scopes",
+                    ));
+                }
+                replays.push(DiscoveredJournalReplay {
+                    conversation_id: first.conversation_id.clone(),
+                    events,
+                });
+            }
+        }
+        replays.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
+        Ok(replays)
     }
 
     pub async fn replay_projection(
@@ -1149,5 +1204,48 @@ mod output_retention_tests {
         let events = journal.replay("user", "conv").await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn canonical_journal_discovers_all_conversation_scopes_for_projection_rebuild() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        journal
+            .append(
+                "user-b",
+                "conv-b",
+                "b-1".into(),
+                "InputHeld".into(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                "user-a",
+                "conv-a",
+                "a-1".into(),
+                "InputHeld".into(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                "user-a",
+                "conv-a",
+                "a-2".into(),
+                "InputApplied".into(),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        let replays = journal.replay_all().await.unwrap();
+        assert_eq!(replays.len(), 2);
+        assert_eq!(replays[0].conversation_id, "conv-a");
+        assert_eq!(replays[0].events.len(), 2);
+        assert_eq!(replays[1].conversation_id, "conv-b");
+        assert_eq!(replays[1].events.len(), 1);
     }
 }
