@@ -590,6 +590,37 @@ impl ConversationService {
         let lock = self.input_queue_lock(conversation_id);
         {
             let _guard = lock.lock().await;
+            if let Some(existing) = self
+                .conversation_repo()
+                .get_conversation_input(user_id, conversation_id, &input_id)
+                .await?
+            {
+                if existing.client_key != req.client_key.trim()
+                    || existing.content != req.content
+                    || existing.mode != input_mode_name(req.mode)
+                    || existing.files != files
+                    || existing.inject_skills != inject_skills
+                    || existing.hidden != req.hidden
+                {
+                    return Err(ConversationError::bad_request(
+                        "client_key was already used for different conversation input",
+                    ));
+                }
+                if existing.status == "failed" || existing.status == "canceled" {
+                    self.persist_input_status(
+                        user_id,
+                        conversation_id,
+                        &input_id,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Held,
+                            turn_id: None,
+                            msg_id: None,
+                            error_code: None,
+                        },
+                    )
+                    .await?;
+                }
+            } else {
             let payload = serde_json::json!({
                 "type": "conversation_input",
                 "visibility": "host",
@@ -629,6 +660,7 @@ impl ConversationService {
                 })
                 .await?;
             self.broadcast_input_changed(user_id, input_row_response(row)?);
+            }
         }
 
         self.dispatch_next_held_input(user_id, conversation_id).await;
