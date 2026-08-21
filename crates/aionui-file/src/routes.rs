@@ -33,6 +33,55 @@ use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
 };
 
+impl From<FileError> for ApiError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::BadRequest(message) => ApiError::BadRequest(message),
+            FileError::Forbidden(message) => ApiError::Forbidden(message),
+            FileError::PathOutsideSandbox {
+                message,
+                field,
+                operation,
+            } => ApiError::PathOutsideSandbox {
+                message,
+                field,
+                operation,
+            },
+            FileError::NotFound(message) => ApiError::NotFound(message),
+            FileError::Internal(message) => ApiError::Internal(message),
+            // The cause was logged where it arose; it is not forwarded because it
+            // comes from the shell layer and can quote subprocess stderr or a path.
+            // The client keys off `REVEAL_FAILED` and supplies its own wording.
+            FileError::RevealFailed(_) => ApiError::coded(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "REVEAL_FAILED",
+                "Could not open the system file manager.",
+                None::<serde_json::Value>,
+            ),
+            // Identity-addressed not-found: a stable code and a path-free message,
+            // since the resolved absolute path is server-side only.
+            FileError::TargetNotFound => ApiError::coded(
+                axum::http::StatusCode::NOT_FOUND,
+                "FILE_NOT_FOUND",
+                "The requested file no longer exists.",
+                None::<serde_json::Value>,
+            ),
+            FileError::InvalidTextEncoding => ApiError::coded(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "INVALID_TEXT_ENCODING",
+                "The file is not valid UTF-8 or UTF-16 text.",
+                None::<serde_json::Value>,
+            ),
+            FileError::Busy => ApiError::coded(
+                axum::http::StatusCode::CONFLICT,
+                "FILE_BUSY",
+                "The file is in use and could not be read. Retry.",
+                None::<serde_json::Value>,
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Router state
 // ---------------------------------------------------------------------------

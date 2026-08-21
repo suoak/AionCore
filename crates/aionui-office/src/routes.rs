@@ -353,7 +353,48 @@ fn validate_office_path(
 }
 
 fn file_error_to_api_error(error: FileError) -> ApiError {
-    error.into_api_error()
+    match error {
+        FileError::BadRequest(message) => ApiError::BadRequest(message),
+        FileError::Forbidden(message) => ApiError::Forbidden(message),
+        FileError::PathOutsideSandbox {
+            message,
+            field,
+            operation,
+        } => ApiError::PathOutsideSandbox {
+            message,
+            field,
+            operation,
+        },
+        FileError::NotFound(message) => ApiError::NotFound(message),
+        FileError::Internal(message) => ApiError::Internal(message),
+        // Not reachable from office path-validation; the mapping must be total.
+        // Mirrors the file crate: the cause is logged at its origin, not forwarded.
+        FileError::RevealFailed(_) => ApiError::coded(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "REVEAL_FAILED",
+            "Could not open the system file manager.",
+            None::<serde_json::Value>,
+        ),
+        // Not reachable from office path-validation; the mapping must be total.
+        FileError::TargetNotFound => ApiError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "FILE_NOT_FOUND",
+            "The requested file no longer exists.",
+            None::<serde_json::Value>,
+        ),
+        FileError::InvalidTextEncoding => ApiError::coded(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_TEXT_ENCODING",
+            "The file is not valid UTF-8 or UTF-16 text.",
+            None::<serde_json::Value>,
+        ),
+        FileError::Busy => ApiError::coded(
+            axum::http::StatusCode::CONFLICT,
+            "FILE_BUSY",
+            "The file is in use and could not be read. Retry.",
+            None::<serde_json::Value>,
+        ),
+    }
 }
 
 fn preview_error_code(error: &OfficeError) -> &'static str {
