@@ -211,13 +211,19 @@ async fn submit_input_rejects_mismatched_csrf() {
     let id = create_conversation(&mut app, &token, &csrf, "Queue", "acp").await;
 
     let resp = app
-        .oneshot(json_with_token(
-            "POST",
-            &format!("/api/conversations/{id}/inputs"),
-            followup_body("hello", "key-1"),
-            &token,
-            "wrong-csrf",
-        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/conversations/{id}/inputs"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-csrf-token", "wrong-csrf")
+                .header("cookie", format!("aionui-csrf-token={csrf}"))
+                .body(Body::from(
+                    serde_json::to_vec(&followup_body("hello", "key-1")).unwrap(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
