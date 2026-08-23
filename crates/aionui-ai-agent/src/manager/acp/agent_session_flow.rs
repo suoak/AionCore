@@ -1664,9 +1664,11 @@ mod tests {
         let dir = std::env::temp_dir().join("aionui-acp-prompt-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("native.png");
-        let image_bytes = base64::engine::general_purpose::STANDARD
-            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL3WQAAAABJRU5ErkJggg==")
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
             .unwrap();
+        let image_bytes = image_bytes.into_inner();
         std::fs::write(&img, &image_bytes).unwrap();
         let img = img.to_string_lossy().into_owned();
         let pdf = dir.join("doc.pdf");
