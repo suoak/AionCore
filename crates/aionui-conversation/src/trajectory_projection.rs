@@ -1544,8 +1544,8 @@ mod tests {
     #[test]
     fn paging_keeps_a_folded_record_whole_across_the_cursor_boundary() {
         let events = vec![
-            event(1, "Text", json!({ "data": { "content": "first " } })),
-            event(2, "Text", json!({ "data": { "content": "answer" } })),
+            event(1, "Text", json!({ "content": "first " })),
+            event(2, "Text", json!({ "content": "answer" })),
             event(3, "ToolCall", json!({ "tool_call_id": "tool-1", "name": "search" })),
         ];
 
@@ -1579,8 +1579,8 @@ mod tests {
     #[test]
     fn incremental_cursor_returns_the_same_record_with_its_latest_folded_state() {
         let events = vec![
-            event(1, "Thinking", json!({ "data": { "content": "deep " } })),
-            event(2, "Thinking", json!({ "data": { "content": "thought" } })),
+            event(1, "Thinking", json!({ "content": "deep " })),
+            event(2, "Thinking", json!({ "content": "thought" })),
         ];
 
         let initial = derive_trajectory("conv-1", &events[..1], &TrajectoryQuery::default()).unwrap();
