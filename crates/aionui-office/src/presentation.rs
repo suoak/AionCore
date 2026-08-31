@@ -212,22 +212,14 @@ impl PresentationService {
     }
 
     pub fn get_job(&self, user_id: &str, job_id: &str) -> Option<PresentationRenderJob> {
-        if !self
-            .job_owners
-            .get(job_id)
-            .is_some_and(|owner| owner.value() == user_id)
-        {
+        if self.job_owners.get(job_id).is_none_or(|owner| owner.value() != user_id) {
             return None;
         }
         self.jobs.get(job_id).map(|entry| entry.clone())
     }
 
     pub fn cancel(&self, user_id: &str, job_id: &str) -> bool {
-        if !self
-            .job_owners
-            .get(job_id)
-            .is_some_and(|owner| owner.value() == user_id)
-        {
+        if self.job_owners.get(job_id).is_none_or(|owner| owner.value() != user_id) {
             return false;
         }
         self.cancel_job(job_id)
