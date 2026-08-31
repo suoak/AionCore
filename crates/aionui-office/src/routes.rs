@@ -790,6 +790,7 @@ mod tests {
             watch_manager: wm,
             conversion_service: conversion,
             proxy_service: proxy,
+            presentation_service: Arc::new(crate::presentation::PresentationService::new(None)),
             allowed_roots: vec![std::env::temp_dir()],
             project,
         }
