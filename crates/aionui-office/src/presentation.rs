@@ -52,7 +52,7 @@ impl PresentationService {
             return Ok(catalog);
         }
         let value = self.run_json(["deck", "catalog", "--json"]).await?;
-        let catalog = serde_json::from_value(value).map_err(OfficeError::Json)?;
+        let catalog: PresentationCatalogResponse = serde_json::from_value(value).map_err(OfficeError::Json)?;
         *self.catalog_cache.write().await = Some(catalog.clone());
         Ok(catalog)
     }
