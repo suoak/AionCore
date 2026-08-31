@@ -14,7 +14,7 @@ pub async fn is_port_listening(port: u16) -> bool {
         tokio::net::TcpStream::connect(("127.0.0.1", port)),
     )
     .await
-    .is_ok_and(Result::is_ok)
+    .is_ok_and(|result| result.is_ok())
 }
 
 #[cfg(test)]
