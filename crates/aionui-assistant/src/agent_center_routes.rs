@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 //! HTTP routes for `/api/agent-center/*` (CSBU WorkMate 智能体中心).
 
 use std::sync::Arc;
@@ -42,7 +44,7 @@ async fn list_agents(
         .service
         .list_for_user(&current_user.id, &query.scope, query.team_id.as_deref())
         .await
-        .map_err(ApiError::from)?;
+        ?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -51,12 +53,12 @@ async fn create_agent(
     Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<CreateAgentCenterRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AgentCenterDetailResponse>>), ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let Json(req) = body?;
     let created = state
         .service
         .create_for_user(&current_user.id, req)
         .await
-        .map_err(ApiError::from)?;
+        ?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
 
@@ -69,7 +71,7 @@ async fn get_agent(
         .service
         .get_detail_for_user(&current_user.id, &id, None)
         .await
-        .map_err(ApiError::from)?;
+        ?;
     Ok(Json(ApiResponse::ok(detail)))
 }
 
@@ -79,12 +81,12 @@ async fn update_agent(
     Path(id): Path<String>,
     body: Result<Json<UpdateAgentCenterRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentCenterDetailResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let Json(req) = body?;
     let updated = state
         .service
         .update_for_user(&current_user.id, &id, req)
         .await
-        .map_err(ApiError::from)?;
+        ?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
@@ -102,7 +104,7 @@ async fn publish_agent(
         .service
         .publish_for_user(&current_user.id, &id, req)
         .await
-        .map_err(ApiError::from)?;
+        ?;
     Ok(Json(ApiResponse::ok(published)))
 }
 
@@ -115,7 +117,7 @@ async fn list_versions(
         .service
         .list_versions_for_user(&current_user.id, &id)
         .await
-        .map_err(ApiError::from)?;
+        ?;
     Ok(Json(ApiResponse::ok(versions)))
 }
 
@@ -128,6 +130,6 @@ async fn run_agent(
         .service
         .run_plan_for_user(&current_user.id, &id)
         .await
-        .map_err(ApiError::from)?;
+        ?;
     Ok(Json(ApiResponse::ok(plan)))
 }
