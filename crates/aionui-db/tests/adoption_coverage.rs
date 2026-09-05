@@ -20,8 +20,16 @@ use aionui_db::init_database_memory;
 const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("acp_session", "conversation_id", "conversations"),
     // Agent Center side tables: ownership flows through assistant_definitions.user_id.
-    ("assistant_agent_center", "assistant_definition_id", "assistant_definitions"),
-    ("assistant_definition_revisions", "assistant_definition_id", "assistant_definitions"),
+    (
+        "assistant_agent_center",
+        "assistant_definition_id",
+        "assistant_definitions",
+    ),
+    (
+        "assistant_definition_revisions",
+        "assistant_definition_id",
+        "assistant_definitions",
+    ),
     ("conversation_artifacts", "conversation_id", "conversations"),
     ("conversation_assistant_snapshots", "conversation_id", "conversations"),
     // `cron_job_runs.owner_id` is the scheduler's run-lease holder, NOT a
