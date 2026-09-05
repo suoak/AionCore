@@ -43,8 +43,7 @@ async fn list_agents(
     let items = state
         .service
         .list_for_user(&current_user.id, &query.scope, query.team_id.as_deref())
-        .await
-        ?;
+        .await?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -54,11 +53,7 @@ async fn create_agent(
     body: Result<Json<CreateAgentCenterRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AgentCenterDetailResponse>>), ApiError> {
     let Json(req) = body?;
-    let created = state
-        .service
-        .create_for_user(&current_user.id, req)
-        .await
-        ?;
+    let created = state.service.create_for_user(&current_user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
 
@@ -67,11 +62,7 @@ async fn get_agent(
     Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentCenterDetailResponse>>, ApiError> {
-    let detail = state
-        .service
-        .get_detail_for_user(&current_user.id, &id, None)
-        .await
-        ?;
+    let detail = state.service.get_detail_for_user(&current_user.id, &id, None).await?;
     Ok(Json(ApiResponse::ok(detail)))
 }
 
@@ -82,11 +73,7 @@ async fn update_agent(
     body: Result<Json<UpdateAgentCenterRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentCenterDetailResponse>>, ApiError> {
     let Json(req) = body?;
-    let updated = state
-        .service
-        .update_for_user(&current_user.id, &id, req)
-        .await
-        ?;
+    let updated = state.service.update_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
@@ -100,11 +87,7 @@ async fn publish_agent(
         Ok(Json(req)) => req,
         Err(_) => PublishAgentCenterRequest::default(),
     };
-    let published = state
-        .service
-        .publish_for_user(&current_user.id, &id, req)
-        .await
-        ?;
+    let published = state.service.publish_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(published)))
 }
 
@@ -113,11 +96,7 @@ async fn list_versions(
     Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<AgentCenterRevisionResponse>>>, ApiError> {
-    let versions = state
-        .service
-        .list_versions_for_user(&current_user.id, &id)
-        .await
-        ?;
+    let versions = state.service.list_versions_for_user(&current_user.id, &id).await?;
     Ok(Json(ApiResponse::ok(versions)))
 }
 
@@ -126,10 +105,6 @@ async fn run_agent(
     Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentCenterRunPlanResponse>>, ApiError> {
-    let plan = state
-        .service
-        .run_plan_for_user(&current_user.id, &id)
-        .await
-        ?;
+    let plan = state.service.run_plan_for_user(&current_user.id, &id).await?;
     Ok(Json(ApiResponse::ok(plan)))
 }
