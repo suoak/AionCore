@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.10](https://github.com/suoak/AionCore/compare/v0.2.9...v0.2.10) (2026-09-05)
+
+### Features
+
+* **skill-evolution:** Phase 3 heuristic gate + team experience ACL (#116)
+
+
 ## [0.2.9](https://github.com/suoak/AionCore/compare/v0.2.8...v0.2.9) (2026-09-05)
 
 ### Features
