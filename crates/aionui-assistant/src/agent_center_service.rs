@@ -57,15 +57,34 @@ impl AgentCenterService {
             if matches!(assistant.source, aionui_api_types::AssistantSource::Builtin) {
                 continue;
             }
-            let Some(definition) = self
+            let definition = match self
                 .definition_repo
                 .get_by_assistant_id_for_user(user_id, &assistant.id)
                 .await
-                .map_err(|e| AssistantError::Internal(e.to_string()))?
-            else {
-                continue;
+            {
+                Ok(Some(definition)) => definition,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        assistant_id = %assistant.id,
+                        error = %err,
+                        "agent-center: skipping assistant due to definition lookup error"
+                    );
+                    continue;
+                }
             };
-            let meta = self.load_or_default_meta(&definition.id).await?;
+            let meta = match self.load_or_default_meta(&definition.id).await {
+                Ok(meta) => meta,
+                Err(err) => {
+                    tracing::warn!(
+                        assistant_id = %assistant.id,
+                        definition_id = %definition.id,
+                        error = %err,
+                        "agent-center: skipping assistant due to meta load error"
+                    );
+                    continue;
+                }
+            };
             let include = match scope {
                 "team" => {
                     meta.visibility == AgentVisibility::Team
@@ -434,16 +453,52 @@ impl AgentCenterService {
 }
 
 fn row_to_meta(row: &aionui_db::AssistantAgentCenterRow) -> Result<AgentCenterMeta, AssistantError> {
+    let visibility = match parse_visibility(&row.visibility) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                definition_id = %row.assistant_definition_id,
+                raw = %row.visibility,
+                error = %err,
+                "agent-center: bad visibility; defaulting to private"
+            );
+            AgentVisibility::Private
+        }
+    };
+    let status = match parse_status(&row.status) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                definition_id = %row.assistant_definition_id,
+                raw = %row.status,
+                error = %err,
+                "agent-center: bad status; defaulting to draft"
+            );
+            AgentPublishStatus::Draft
+        }
+    };
+    let mcp_policy = match parse_mcp_policy(&row.mcp_policy) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                definition_id = %row.assistant_definition_id,
+                raw = %row.mcp_policy,
+                error = %err,
+                "agent-center: bad mcp_policy; defaulting to allowlist"
+            );
+            AgentMcpPolicy::Allowlist
+        }
+    };
     Ok(AgentCenterMeta {
-        visibility: parse_visibility(&row.visibility)?,
+        visibility,
         team_id: row.team_id.clone(),
         enterprise_id: row.enterprise_id.clone(),
-        status: parse_status(&row.status)?,
+        status,
         version: row.version,
         published_revision_id: row.published_revision_id.clone(),
         knowledge_scopes: serde_json::from_str(&row.knowledge_scopes).unwrap_or_default(),
         skill_refs: serde_json::from_str(&row.skill_refs).unwrap_or_default(),
-        mcp_policy: parse_mcp_policy(&row.mcp_policy)?,
+        mcp_policy,
         role_bindings: serde_json::from_str(&row.role_bindings).unwrap_or_default(),
     })
 }
