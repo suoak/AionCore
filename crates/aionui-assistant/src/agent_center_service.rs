@@ -798,7 +798,7 @@ impl AgentCenterService {
                 lock
             } else {
                 let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(lock_key, Arc::downgrade(&lock));
+                locks.insert(lock_key.clone(), Arc::downgrade(&lock));
                 lock
             }
         };
