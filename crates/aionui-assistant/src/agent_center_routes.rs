@@ -141,10 +141,7 @@ async fn start_workflow_run(
     Path(id): Path<String>,
     body: Result<Json<StartAgentWorkflowRunRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AgentWorkflowRunResponse>>), ApiError> {
-    let req = match body {
-        Ok(Json(req)) => req,
-        Err(_) => StartAgentWorkflowRunRequest::default(),
-    };
+    let Json(req) = body?;
     let run = state
         .service
         .start_workflow_run_for_user(&current_user.id, &id, req)

@@ -601,6 +601,46 @@ async fn published_workflow_run_records_its_immutable_revision() {
 }
 
 #[tokio::test]
+async fn workflow_run_rejects_missing_required_input() {
+    let fx = fixture().await;
+    let response = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/agent-center/agents/bare:632f31d2/workflow-runs",
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await;
+    assert_eq!(error["error"], "workflow input is required");
+}
+
+#[tokio::test]
+async fn workflow_run_rejects_non_text_input() {
+    let fx = fixture().await;
+    let response = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/agent-center/agents/bare:632f31d2/workflow-runs",
+            json!({ "input": { "prompt": "review" } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await;
+    assert_eq!(error["error"], "workflow input must be text");
+}
+
+#[tokio::test]
 async fn published_agent_must_be_unpublished_before_editing() {
     let fx = fixture().await;
     let id = "bare:632f31d2";

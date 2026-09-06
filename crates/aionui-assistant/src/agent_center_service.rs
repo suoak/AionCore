@@ -505,6 +505,7 @@ impl AgentCenterService {
         plan.workflow
             .validate_for_publish()
             .map_err(|message| AssistantError::BadRequest(message.into()))?;
+        validate_workflow_input(&plan.workflow, &req.input)?;
 
         let now = now_ms();
         let run_id = generate_prefixed_id("awrun");
@@ -1331,6 +1332,23 @@ fn serialize_workflow_run(run: &AgentWorkflowRunResponse) -> Result<String, Assi
 
 fn parse_workflow_run(raw: &str) -> Result<AgentWorkflowRunResponse, AssistantError> {
     serde_json::from_str(raw).map_err(|e| AssistantError::Internal(format!("workflow run parse: {e}")))
+}
+
+fn validate_workflow_input(workflow: &AgentWorkflowDefinition, input: &Value) -> Result<(), AssistantError> {
+    if input.is_null() {
+        return if workflow.input.required {
+            Err(AssistantError::BadRequest("workflow input is required".into()))
+        } else {
+            Ok(())
+        };
+    }
+    let Some(text) = input.as_str() else {
+        return Err(AssistantError::BadRequest("workflow input must be text".into()));
+    };
+    if workflow.input.required && text.trim().is_empty() {
+        return Err(AssistantError::BadRequest("workflow input is required".into()));
+    }
+    Ok(())
 }
 
 fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(), AssistantError> {
