@@ -181,7 +181,6 @@ impl AgentCenterService {
         id: &str,
         req: UpdateAgentCenterRequest,
     ) -> Result<AgentCenterDetailResponse, AssistantError> {
-        let _ = self.assistants.update_for_user(user_id, id, req.assistant).await?;
         let definition = self
             .definition_repo
             .get_by_assistant_id_for_user(user_id, id)
@@ -192,6 +191,12 @@ impl AgentCenterService {
         if current.status == AgentPublishStatus::Archived {
             return Err(AssistantError::Conflict("archived agents cannot be edited".into()));
         }
+        if current.status == AgentPublishStatus::Published {
+            return Err(AssistantError::Conflict(
+                "published agents must be unpublished before editing".into(),
+            ));
+        }
+        let _ = self.assistants.update_for_user(user_id, id, req.assistant).await?;
         let meta = self.upsert_meta(&definition.id, current, &req.meta, true).await?;
         if let Some(mcp_ids) = req.meta.mcp_ids.as_ref() {
             self.apply_mcp_defaults(user_id, id, meta.mcp_policy, mcp_ids.clone())
@@ -497,7 +502,13 @@ impl AgentCenterService {
         run_id: &str,
         req: AdvanceAgentWorkflowRunRequest,
     ) -> Result<AgentWorkflowRunResponse, AssistantError> {
-        let mut run = self.get_workflow_run_for_user(user_id, run_id).await?;
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
         if run.status != AgentWorkflowRunStatus::Running {
             return Err(AssistantError::Conflict(
                 "workflow run is not awaiting node completion".into(),
@@ -527,7 +538,7 @@ impl AgentCenterService {
             run.current_node_index += 1;
             settle_workflow_run(&mut run, now)?;
         }
-        self.persist_workflow_run(user_id, run).await
+        self.persist_workflow_run(user_id, run, &row.state_json).await
     }
 
     /// Apply a conversation turn result to the active agent node.
@@ -583,7 +594,13 @@ impl AgentCenterService {
         run_id: &str,
         req: DecideAgentWorkflowApprovalRequest,
     ) -> Result<AgentWorkflowRunResponse, AssistantError> {
-        let mut run = self.get_workflow_run_for_user(user_id, run_id).await?;
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
         if run.status != AgentWorkflowRunStatus::WaitingApproval {
             return Err(AssistantError::Conflict(
                 "workflow run is not waiting for approval".into(),
@@ -622,21 +639,28 @@ impl AgentCenterService {
             }
         }
         tracing::info!(run_id, user_id, decision = ?req.decision, "agent-workflow: approval decided");
-        self.persist_workflow_run(user_id, run).await
+        self.persist_workflow_run(user_id, run, &row.state_json).await
     }
 
     async fn persist_workflow_run(
         &self,
         user_id: &str,
         mut run: AgentWorkflowRunResponse,
+        expected_state_json: &str,
     ) -> Result<AgentWorkflowRunResponse, AssistantError> {
         run.updated_at = now_ms();
         let state_json = serialize_workflow_run(&run)?;
         self.workflow_run_repo
-            .update_state(user_id, &run.id, workflow_run_status_str(run.status), &state_json)
+            .update_state_if_current(
+                user_id,
+                &run.id,
+                expected_state_json,
+                workflow_run_status_str(run.status),
+                &state_json,
+            )
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?
-            .ok_or_else(|| AssistantError::NotFound(run.id.clone()))?;
+            .ok_or_else(|| AssistantError::Conflict("workflow run changed concurrently; reload and retry".into()))?;
         tracing::info!(run_id = %run.id, user_id, status = ?run.status, node_index = run.current_node_index, "agent-workflow: run advanced");
         Ok(run)
     }
@@ -900,8 +924,9 @@ fn validate_workflow_tools(meta: &AgentCenterMeta, enabled_mcp_ids: &[String]) -
         .filter(|node| node.kind == "tool")
         .any(|node| {
             node.config
-                .get("tool_id")
-                .is_some_and(|tool_id| !enabled_mcp_ids.contains(tool_id))
+                .get("mcp_server_id")
+                .or_else(|| node.config.get("tool_id"))
+                .is_some_and(|server_id| !enabled_mcp_ids.contains(server_id))
         });
     if has_unavailable_tool {
         return Err(AssistantError::BadRequest(
@@ -936,15 +961,36 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
 
         match kind.as_str() {
             "tool" => {
-                let tool_id = config
-                    .get("tool_id")
+                let mcp_server_id = config
+                    .get("mcp_server_id")
+                    .or_else(|| config.get("tool_id"))
                     .filter(|value| !value.trim().is_empty())
                     .cloned()
-                    .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires tool_id".into()))?;
+                    .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires mcp_server_id".into()))?;
+                let tool_name = config
+                    .get("tool_name")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires tool_name".into()))?;
+                let arguments = config
+                    .get("arguments_json")
+                    .map(|raw| serde_json::from_str(raw))
+                    .transpose()
+                    .map_err(|_| AssistantError::BadRequest("workflow tool arguments must be valid JSON".into()))?
+                    .unwrap_or_else(|| json!({}));
+                if !arguments.is_object() {
+                    return Err(AssistantError::BadRequest(
+                        "workflow tool arguments must be a JSON object".into(),
+                    ));
+                }
                 node.status = AgentWorkflowNodeRunStatus::Running;
                 node.started_at = Some(now);
                 run.status = AgentWorkflowRunStatus::Running;
-                run.next_action = Some(AgentWorkflowNextAction::InvokeTool { tool_id });
+                run.next_action = Some(AgentWorkflowNextAction::InvokeTool {
+                    mcp_server_id,
+                    tool_name,
+                    arguments,
+                });
                 return Ok(());
             }
             "approval" => {

@@ -259,10 +259,14 @@ pub trait IAgentWorkflowRunRepository: Send + Sync {
         assistant_definition_id: &str,
         limit: i64,
     ) -> Result<Vec<AgentWorkflowRunRow>, DbError>;
-    async fn update_state(
+    /// Atomically updates a run only when its serialized state still matches
+    /// the state read by the caller. Returns `None` on a concurrent change or
+    /// when the scoped run does not exist.
+    async fn update_state_if_current(
         &self,
         user_id: &str,
         id: &str,
+        expected_state_json: &str,
         status: &str,
         state_json: &str,
     ) -> Result<Option<AgentWorkflowRunRow>, DbError>;

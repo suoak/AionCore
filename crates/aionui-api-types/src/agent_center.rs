@@ -288,13 +288,30 @@ impl AgentWorkflowDefinition {
         self.validate()?;
         for node in &self.nodes {
             let required_key = match node.kind.as_str() {
-                "tool" => Some("tool_id"),
+                "tool" => Some("tool_name"),
                 "approval" => Some("message"),
                 "condition" => Some("expression"),
                 _ => None,
             };
             if required_key.is_some_and(|key| node.config.get(key).is_none_or(|value| value.trim().is_empty())) {
                 return Err("workflow configurable nodes require complete configuration");
+            }
+            if node.kind == "tool" {
+                let has_server = node
+                    .config
+                    .get("mcp_server_id")
+                    .or_else(|| node.config.get("tool_id"))
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !has_server {
+                    return Err("workflow tool nodes require an MCP server");
+                }
+                if let Some(arguments) = node.config.get("arguments_json") {
+                    let parsed = serde_json::from_str::<Value>(arguments)
+                        .map_err(|_| "workflow tool arguments must be valid JSON")?;
+                    if !parsed.is_object() {
+                        return Err("workflow tool arguments must be a JSON object");
+                    }
+                }
             }
         }
 
@@ -492,12 +509,21 @@ pub enum AgentWorkflowNextAction {
         create_conversation: Box<CreateConversationRequestWire>,
     },
     InvokeTool {
-        tool_id: String,
+        #[serde(alias = "tool_id")]
+        mcp_server_id: String,
+        #[serde(default)]
+        tool_name: String,
+        #[serde(default = "default_json_object")]
+        arguments: Value,
     },
     AwaitApproval {
         node_id: String,
         message: String,
     },
+}
+
+fn default_json_object() -> Value {
+    Value::Object(Default::default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -658,7 +684,18 @@ mod tests {
         );
         workflow.nodes[2]
             .config
-            .insert("tool_id".to_owned(), "github".to_owned());
+            .insert("mcp_server_id".to_owned(), "github".to_owned());
+        workflow.nodes[2]
+            .config
+            .insert("tool_name".to_owned(), "create_issue".to_owned());
         assert_eq!(workflow.validate_for_publish(), Ok(()));
+
+        workflow.nodes[2]
+            .config
+            .insert("arguments_json".to_owned(), "[]".to_owned());
+        assert_eq!(
+            workflow.validate_for_publish(),
+            Err("workflow tool arguments must be a JSON object")
+        );
     }
 }

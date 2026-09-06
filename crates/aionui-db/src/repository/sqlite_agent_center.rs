@@ -253,24 +253,29 @@ impl IAgentWorkflowRunRepository for SqliteAgentWorkflowRunRepository {
         .await?)
     }
 
-    async fn update_state(
+    async fn update_state_if_current(
         &self,
         user_id: &str,
         id: &str,
+        expected_state_json: &str,
         status: &str,
         state_json: &str,
     ) -> Result<Option<AgentWorkflowRunRow>, DbError> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_workflow_runs SET status = ?, state_json = ?, updated_at = ?
-             WHERE id = ? AND user_id = ?",
+             WHERE id = ? AND user_id = ? AND state_json = ?",
         )
         .bind(status)
         .bind(state_json)
         .bind(now_ms())
         .bind(id)
         .bind(user_id)
+        .bind(expected_state_json)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
         self.get_for_user(user_id, id).await
     }
 }

@@ -549,6 +549,59 @@ async fn unpublish_returns_agent_to_draft_and_keeps_revision_history() {
 }
 
 #[tokio::test]
+async fn published_agent_must_be_unpublished_before_editing() {
+    let fx = fixture().await;
+    let id = "bare:632f31d2";
+    let before = fx
+        .app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/agent-center/agents/{id}"), &fx.token))
+        .await
+        .unwrap();
+    let original_name = body_json(before).await["data"]["assistant"]["profile"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let publish = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/publish"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(publish.status(), StatusCode::OK);
+
+    let edit = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{id}"),
+            json!({ "name": "must not be persisted" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(edit.status(), StatusCode::CONFLICT);
+
+    let after = fx
+        .app
+        .oneshot(get_with_token(&format!("/api/agent-center/agents/{id}"), &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(after).await["data"]["assistant"]["profile"]["name"],
+        original_name
+    );
+}
+
+#[tokio::test]
 async fn unpublish_rejects_an_agent_that_is_already_a_draft() {
     let fx = fixture().await;
     let id = "bare:632f31d2";
@@ -586,7 +639,15 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
         "nodes": [
             { "id": "start", "kind": "start" },
             { "id": "agent", "kind": "agent" },
-            { "id": "tool-1", "kind": "tool", "config": { "tool_id": "github" } },
+            {
+                "id": "tool-1",
+                "kind": "tool",
+                "config": {
+                    "mcp_server_id": "github",
+                    "tool_name": "create_issue",
+                    "arguments_json": "{\"title\":\"Review finding\"}"
+                }
+            },
             { "id": "approval-1", "kind": "approval", "config": { "message": "Approve external changes" } },
             { "id": "condition-1", "kind": "condition", "config": { "expression": "risk_score > 70" } },
             { "id": "output", "kind": "output" }
@@ -638,7 +699,14 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
         plan["data"]["create_conversation"]["extra"]["agent_workflow"]["output"]["format"],
         "json"
     );
-    assert_eq!(plan["data"]["workflow"]["nodes"][2]["config"]["tool_id"], "github");
+    assert_eq!(
+        plan["data"]["workflow"]["nodes"][2]["config"]["mcp_server_id"],
+        "github"
+    );
+    assert_eq!(
+        plan["data"]["workflow"]["nodes"][2]["config"]["tool_name"],
+        "create_issue"
+    );
 
     let invalid = fx
         .app
@@ -938,6 +1006,141 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
     assert_eq!(failed.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
     assert_eq!(failed.nodes[1].error.as_deref(), Some("agent turn failed"));
     assert!(failed.next_action.is_none());
+}
+
+#[tokio::test]
+async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{assistant_id}"),
+            json!({
+                "meta": {
+                    "workflow": {
+                        "nodes": [
+                            { "id": "start", "kind": "start" },
+                            { "id": "agent", "kind": "agent" },
+                            {
+                                "id": "tool-1",
+                                "kind": "tool",
+                                "config": {
+                                    "mcp_server_id": "github",
+                                    "tool_name": "create_issue",
+                                    "arguments_json": "{\"title\":\"Review finding\"}"
+                                }
+                            },
+                            { "id": "output", "kind": "output" }
+                        ],
+                        "edges": [
+                            { "source": "start", "target": "agent" },
+                            { "source": "agent", "target": "tool-1" },
+                            { "source": "tool-1", "target": "output" }
+                        ]
+                    }
+                }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review this" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let advance_agent = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({ "success": true, "output": { "summary": "ready" } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let invoking = body_json(advance_agent).await;
+    assert_eq!(invoking["data"]["next_action"]["kind"], "invoke_tool");
+    assert_eq!(invoking["data"]["next_action"]["mcp_server_id"], "github");
+    assert_eq!(invoking["data"]["next_action"]["tool_name"], "create_issue");
+    assert_eq!(invoking["data"]["next_action"]["arguments"]["title"], "Review finding");
+
+    let advance_tool = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({ "success": true, "output": { "issue_number": 42 } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let completed = body_json(advance_tool).await;
+    assert_eq!(completed["data"]["status"], "completed");
+    assert_eq!(completed["data"]["variables"]["tool-1"]["issue_number"], 42);
+}
+
+#[tokio::test]
+async fn workflow_run_repository_rejects_a_stale_state_update() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review this" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let repo = SqliteAgentWorkflowRunRepository::new(fx.services.database.pool().clone());
+    let original = repo
+        .get_for_user(DEFAULT_USER_ID, &run_id)
+        .await
+        .unwrap()
+        .expect("workflow run should exist");
+    let mut changed: Value = serde_json::from_str(&original.state_json).unwrap();
+    changed["updated_at"] = json!(original.updated_at + 1);
+    let changed = serde_json::to_string(&changed).unwrap();
+
+    let first = repo
+        .update_state_if_current(DEFAULT_USER_ID, &run_id, &original.state_json, "running", &changed)
+        .await
+        .unwrap();
+    let stale = repo
+        .update_state_if_current(
+            DEFAULT_USER_ID,
+            &run_id,
+            &original.state_json,
+            "failed",
+            &original.state_json,
+        )
+        .await
+        .unwrap();
+
+    assert!(first.is_some());
+    assert!(stale.is_none());
 }
 
 #[tokio::test]
