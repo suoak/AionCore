@@ -47,6 +47,7 @@ pub fn agent_center_routes(state: AgentCenterRouterState) -> Router {
             "/api/agent-center/workflow-runs/{id}/approval",
             post(decide_workflow_approval),
         )
+        .route("/api/agent-center/workflow-runs/{id}/cancel", post(cancel_workflow_run))
         .with_state(state)
 }
 
@@ -192,6 +193,18 @@ async fn decide_workflow_approval(
     let run = state
         .service
         .decide_workflow_approval_for_user(&current_user.id, &id, req)
+        .await?;
+    Ok(Json(ApiResponse::ok(run)))
+}
+
+async fn cancel_workflow_run(
+    State(state): State<AgentCenterRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AgentWorkflowRunResponse>>, ApiError> {
+    let run = state
+        .service
+        .cancel_workflow_run_for_user(&current_user.id, &id)
         .await?;
     Ok(Json(ApiResponse::ok(run)))
 }

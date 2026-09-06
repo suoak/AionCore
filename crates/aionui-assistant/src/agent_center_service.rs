@@ -21,6 +21,7 @@ use aionui_db::{
     IAssistantAgentCenterRepository, IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository,
     UpsertAssistantAgentCenterParams,
 };
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::AssistantError;
@@ -40,6 +41,12 @@ pub struct AgentWorkflowTurnResult<'a> {
     pub turn_id: &'a str,
     pub success: bool,
     pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PublishedAgentSnapshot {
+    assistant: aionui_api_types::AssistantDetailResponse,
+    meta: AgentCenterMeta,
 }
 
 impl AgentCenterService {
@@ -239,6 +246,9 @@ impl AgentCenterService {
 
         let next_revision = meta.version + 1;
         let revision_id = generate_prefixed_id("arev");
+        meta.status = AgentPublishStatus::Published;
+        meta.version = next_revision;
+        meta.published_revision_id = Some(revision_id.clone());
         let snapshot = json!({
             "assistant_id": id,
             "assistant": detail.assistant,
@@ -266,9 +276,6 @@ impl AgentCenterService {
             ..AgentCenterMetaPatch::default()
         };
         let mut base = meta;
-        base.status = AgentPublishStatus::Published;
-        base.version = next_revision;
-        base.published_revision_id = Some(revision_id);
         let _ = self.upsert_meta_full(&definition.id, &mut base, &patch).await?;
 
         self.get_detail_for_user(user_id, id, None).await
@@ -345,9 +352,43 @@ impl AgentCenterService {
         user_id: &str,
         id: &str,
     ) -> Result<AgentCenterRunPlanResponse, AssistantError> {
-        let detail = self.get_detail_for_user(user_id, id, None).await?;
+        let mut detail = self.get_detail_for_user(user_id, id, None).await?;
         if detail.meta.status == AgentPublishStatus::Archived {
             return Err(AssistantError::Conflict("archived agents cannot be run".into()));
+        }
+
+        let published_revision_id = detail.meta.published_revision_id.clone();
+        if detail.meta.status == AgentPublishStatus::Published {
+            let definition = self
+                .definition_repo
+                .get_by_assistant_id_for_user(user_id, id)
+                .await
+                .map_err(|e| AssistantError::Internal(e.to_string()))?
+                .ok_or_else(|| AssistantError::NotFound(id.to_owned()))?;
+            let revision_id = published_revision_id
+                .as_deref()
+                .ok_or_else(|| AssistantError::Internal("published agent is missing its revision id".into()))?;
+            let revision = self
+                .revision_repo
+                .get(revision_id)
+                .await
+                .map_err(|e| AssistantError::Internal(e.to_string()))?
+                .ok_or_else(|| AssistantError::Internal("published agent revision was not found".into()))?;
+            if revision.assistant_definition_id != definition.id {
+                return Err(AssistantError::Internal(
+                    "published revision does not belong to the agent".into(),
+                ));
+            }
+            let snapshot: PublishedAgentSnapshot = serde_json::from_str(&revision.snapshot_json)
+                .map_err(|e| AssistantError::Internal(format!("published snapshot parse: {e}")))?;
+            detail.assistant = snapshot.assistant;
+            detail.meta = snapshot.meta;
+            // Older snapshots were captured immediately before the published
+            // lifecycle fields were applied. The immutable revision row is the
+            // source of truth for those fields when replaying such snapshots.
+            detail.meta.status = AgentPublishStatus::Published;
+            detail.meta.version = revision.revision;
+            detail.meta.published_revision_id = Some(revision.id);
         }
 
         let skill_ids: Vec<String> = if !detail.meta.skill_refs.is_empty() {
@@ -380,7 +421,7 @@ impl AgentCenterService {
 
         Ok(AgentCenterRunPlanResponse {
             assistant_id: id.to_owned(),
-            revision_id: detail.meta.published_revision_id.clone(),
+            revision_id: published_revision_id,
             revision: detail.meta.version,
             preview_mode,
             workflow: detail.meta.workflow,
@@ -400,9 +441,24 @@ impl AgentCenterService {
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?
             .ok_or_else(|| AssistantError::NotFound(assistant_id.to_owned()))?;
-        let detail = self.get_detail_for_user(user_id, assistant_id, None).await?;
-        validate_workflow_tools(&detail.meta, &detail.assistant.defaults.mcps.value)?;
         let mut plan = self.run_plan_for_user(user_id, assistant_id).await?;
+        let plan_mcp_ids = plan
+            .create_conversation
+            .assistant
+            .as_ref()
+            .and_then(|assistant| assistant.conversation_overrides.as_ref())
+            .and_then(|overrides| overrides.mcp_ids.as_ref())
+            .cloned();
+        let validation_meta = AgentCenterMeta {
+            workflow: plan.workflow.clone(),
+            mcp_policy: if plan_mcp_ids.is_some() {
+                AgentMcpPolicy::Allowlist
+            } else {
+                AgentMcpPolicy::InheritUserEnabled
+            },
+            ..AgentCenterMeta::default()
+        };
+        validate_workflow_tools(&validation_meta, plan_mcp_ids.as_deref().unwrap_or_default())?;
         plan.workflow
             .validate_for_publish()
             .map_err(|message| AssistantError::BadRequest(message.into()))?;
@@ -514,15 +570,38 @@ impl AgentCenterService {
                 "workflow run is not awaiting node completion".into(),
             ));
         }
-        let node = run
+        let current_node = run
             .nodes
-            .get_mut(run.current_node_index)
+            .get(run.current_node_index)
             .ok_or_else(|| AssistantError::Conflict("workflow run has no current node".into()))?;
-        if node.status != AgentWorkflowNodeRunStatus::Running || !matches!(node.kind.as_str(), "agent" | "tool") {
+        if current_node.status != AgentWorkflowNodeRunStatus::Running
+            || !matches!(current_node.kind.as_str(), "agent" | "tool")
+        {
             return Err(AssistantError::Conflict(
                 "current workflow node cannot be advanced".into(),
             ));
         }
+        if current_node.kind == "tool" {
+            let Some(AgentWorkflowNextAction::InvokeTool {
+                node_id, execution_id, ..
+            }) = run.next_action.as_ref()
+            else {
+                return Err(AssistantError::Conflict(
+                    "workflow run is not awaiting a tool result".into(),
+                ));
+            };
+            if req.node_id.as_deref() != Some(node_id.as_str())
+                || req.execution_id.as_deref() != Some(execution_id.as_str())
+            {
+                return Err(AssistantError::Conflict(
+                    "tool result does not match the active workflow execution".into(),
+                ));
+            }
+        }
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no current node".into()))?;
         let now = now_ms();
         if !req.success {
             node.status = AgentWorkflowNodeRunStatus::Failed;
@@ -567,6 +646,8 @@ impl AgentCenterService {
                 user_id,
                 run_id,
                 AdvanceAgentWorkflowRunRequest {
+                    node_id: None,
+                    execution_id: None,
                     success: result.success,
                     output: json!({
                         "conversation_id": result.conversation_id,
@@ -639,6 +720,42 @@ impl AgentCenterService {
             }
         }
         tracing::info!(run_id, user_id, decision = ?req.decision, "agent-workflow: approval decided");
+        self.persist_workflow_run(user_id, run, &row.state_json).await
+    }
+
+    pub async fn cancel_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
+        if !matches!(
+            run.status,
+            AgentWorkflowRunStatus::Running | AgentWorkflowRunStatus::WaitingApproval
+        ) {
+            return Err(AssistantError::Conflict(
+                "only an active workflow run can be cancelled".into(),
+            ));
+        }
+        let now = now_ms();
+        if let Some(node) = run.nodes.get_mut(run.current_node_index) {
+            if matches!(
+                node.status,
+                AgentWorkflowNodeRunStatus::Running | AgentWorkflowNodeRunStatus::WaitingApproval
+            ) {
+                node.status = AgentWorkflowNodeRunStatus::Cancelled;
+                node.completed_at = Some(now);
+            }
+        }
+        run.status = AgentWorkflowRunStatus::Cancelled;
+        run.next_action = None;
+        tracing::info!(run_id, user_id, "agent-workflow: run cancelled");
         self.persist_workflow_run(user_id, run, &row.state_json).await
     }
 
@@ -910,6 +1027,7 @@ fn workflow_run_status_str(status: AgentWorkflowRunStatus) -> &'static str {
         AgentWorkflowRunStatus::Completed => "completed",
         AgentWorkflowRunStatus::Rejected => "rejected",
         AgentWorkflowRunStatus::Failed => "failed",
+        AgentWorkflowRunStatus::Cancelled => "cancelled",
     }
 }
 
@@ -987,6 +1105,8 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
                 node.started_at = Some(now);
                 run.status = AgentWorkflowRunStatus::Running;
                 run.next_action = Some(AgentWorkflowNextAction::InvokeTool {
+                    node_id,
+                    execution_id: generate_prefixed_id("awexec"),
                     mcp_server_id,
                     tool_name,
                     arguments,

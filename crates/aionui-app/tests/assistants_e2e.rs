@@ -516,6 +516,13 @@ async fn unpublish_returns_agent_to_draft_and_keeps_revision_history() {
     let published = body_json(publish).await;
     assert_eq!(published["data"]["meta"]["status"], "published");
     assert_eq!(published["data"]["meta"]["version"], 1);
+    let revision_id = published["data"]["meta"]["published_revision_id"].as_str().unwrap();
+    let revision_repo = SqliteAssistantDefinitionRevisionRepository::new(fx.services.database.pool().clone());
+    let revision = revision_repo.get(revision_id).await.unwrap().unwrap();
+    let snapshot: Value = serde_json::from_str(&revision.snapshot_json).unwrap();
+    assert_eq!(snapshot["meta"]["status"], "published");
+    assert_eq!(snapshot["meta"]["version"], 1);
+    assert_eq!(snapshot["meta"]["published_revision_id"], revision_id);
 
     let unpublish = fx
         .app
@@ -1081,13 +1088,43 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
     assert_eq!(invoking["data"]["next_action"]["mcp_server_id"], "github");
     assert_eq!(invoking["data"]["next_action"]["tool_name"], "create_issue");
     assert_eq!(invoking["data"]["next_action"]["arguments"]["title"], "Review finding");
+    let node_id = invoking["data"]["next_action"]["node_id"].as_str().unwrap();
+    let execution_id = invoking["data"]["next_action"]["execution_id"].as_str().unwrap();
+
+    let stale_tool = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({
+                "node_id": node_id,
+                "execution_id": "awexec_stale",
+                "success": true,
+                "output": { "issue_number": 1 }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_tool.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(stale_tool).await["message"],
+        "tool result does not match the active workflow execution"
+    );
 
     let advance_tool = fx
         .app
         .oneshot(json_with_token(
             "POST",
             &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
-            json!({ "success": true, "output": { "issue_number": 42 } }),
+            json!({
+                "node_id": node_id,
+                "execution_id": execution_id,
+                "success": true,
+                "output": { "issue_number": 42 }
+            }),
             &fx.token,
             &fx.csrf,
         ))
@@ -1096,6 +1133,74 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
     let completed = body_json(advance_tool).await;
     assert_eq!(completed["data"]["status"], "completed");
     assert_eq!(completed["data"]["variables"]["tool-1"]["issue_number"], 42);
+}
+
+#[tokio::test]
+async fn active_workflow_run_can_be_cancelled_once() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review this" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+
+    let missing_csrf = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/cancel"),
+            json!({}),
+            &fx.token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+    let cancelled = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/cancel"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    let cancelled = body_json(cancelled).await;
+    assert_eq!(cancelled["data"]["status"], "cancelled");
+    assert_eq!(cancelled["data"]["nodes"][1]["status"], "cancelled");
+    assert_eq!(cancelled["data"]["next_action"], Value::Null);
+
+    let duplicate = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/cancel"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(duplicate).await["message"],
+        "only an active workflow run can be cancelled"
+    );
 }
 
 #[tokio::test]

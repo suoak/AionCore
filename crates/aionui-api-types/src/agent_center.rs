@@ -473,6 +473,7 @@ pub enum AgentWorkflowRunStatus {
     Completed,
     Rejected,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -485,6 +486,7 @@ pub enum AgentWorkflowNodeRunStatus {
     Skipped,
     Rejected,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -509,6 +511,8 @@ pub enum AgentWorkflowNextAction {
         create_conversation: Box<CreateConversationRequestWire>,
     },
     InvokeTool {
+        node_id: String,
+        execution_id: String,
         #[serde(alias = "tool_id")]
         mcp_server_id: String,
         #[serde(default)]
@@ -552,6 +556,12 @@ pub struct StartAgentWorkflowRunRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvanceAgentWorkflowRunRequest {
+    /// Required when completing a tool action. Correlates callbacks with the
+    /// exact node and execution attempt exposed in `next_action`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     #[serde(default = "default_true")]
     pub success: bool,
     #[serde(default)]
