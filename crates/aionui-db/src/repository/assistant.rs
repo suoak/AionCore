@@ -2,10 +2,11 @@
 
 use crate::error::DbError;
 use crate::models::{
-    AssistantAgentCenterRow, AssistantDefinitionRevisionRow, AssistantDefinitionRow, AssistantOverlayRow,
-    AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CreateAssistantDefinitionRevisionParams,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertOverrideParams,
+    AgentWorkflowRunRow, AssistantAgentCenterRow, AssistantDefinitionRevisionRow, AssistantDefinitionRow,
+    AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CreateAgentWorkflowRunParams,
+    CreateAssistantDefinitionRevisionParams, CreateAssistantParams, UpdateAssistantParams,
+    UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
 
 /// CRUD access for user-authored assistant rows.
@@ -246,4 +247,23 @@ pub trait IAssistantDefinitionRevisionRepository: Send + Sync {
         &self,
         params: &CreateAssistantDefinitionRevisionParams<'_>,
     ) -> Result<AssistantDefinitionRevisionRow, DbError>;
+}
+
+#[async_trait::async_trait]
+pub trait IAgentWorkflowRunRepository: Send + Sync {
+    async fn create(&self, params: &CreateAgentWorkflowRunParams<'_>) -> Result<AgentWorkflowRunRow, DbError>;
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentWorkflowRunRow>, DbError>;
+    async fn list_for_assistant(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentWorkflowRunRow>, DbError>;
+    async fn update_state(
+        &self,
+        user_id: &str,
+        id: &str,
+        status: &str,
+        state_json: &str,
+    ) -> Result<Option<AgentWorkflowRunRow>, DbError>;
 }

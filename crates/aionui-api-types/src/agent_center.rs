@@ -448,8 +448,108 @@ pub struct AgentCenterRunPlanResponse {
     pub create_conversation: CreateConversationRequestWire,
 }
 
-/// Serde-friendly mirror of create-conversation fields (request type is Deserialize-only upstream).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkflowRunStatus {
+    Running,
+    WaitingApproval,
+    Completed,
+    Rejected,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkflowNodeRunStatus {
+    Pending,
+    Running,
+    WaitingApproval,
+    Completed,
+    Skipped,
+    Rejected,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentWorkflowNodeRun {
+    pub node_id: String,
+    pub kind: String,
+    pub status: AgentWorkflowNodeRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentWorkflowNextAction {
+    RunAgent {
+        create_conversation: CreateConversationRequestWire,
+    },
+    InvokeTool {
+        tool_id: String,
+    },
+    AwaitApproval {
+        node_id: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentWorkflowRunResponse {
+    pub id: String,
+    pub assistant_id: String,
+    pub status: AgentWorkflowRunStatus,
+    pub current_node_index: usize,
+    pub workflow: AgentWorkflowDefinition,
+    pub nodes: Vec<AgentWorkflowNodeRun>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variables: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<AgentWorkflowNextAction>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StartAgentWorkflowRunRequest {
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub variables: BTreeMap<String, Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvanceAgentWorkflowRunRequest {
+    #[serde(default = "default_true")]
+    pub success: bool,
+    #[serde(default)]
+    pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkflowApprovalDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideAgentWorkflowApprovalRequest {
+    pub decision: AgentWorkflowApprovalDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// Serde-friendly mirror of create-conversation fields (request type is Deserialize-only upstream).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateConversationRequestWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

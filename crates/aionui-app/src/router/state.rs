@@ -494,12 +494,14 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
     let pool = services.database.pool().clone();
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
     let center_repo = Arc::new(SqliteAssistantAgentCenterRepository::new(pool.clone()));
-    let revision_repo = Arc::new(SqliteAssistantDefinitionRevisionRepository::new(pool));
+    let revision_repo = Arc::new(SqliteAssistantDefinitionRevisionRepository::new(pool.clone()));
+    let workflow_run_repo = Arc::new(aionui_db::SqliteAgentWorkflowRunRepository::new(pool));
     let service = Arc::new(AgentCenterService::new(
         assistant.service.clone(),
         definition_repo,
         center_repo,
         revision_repo,
+        workflow_run_repo,
     ));
     AgentCenterRouterState { service }
 }

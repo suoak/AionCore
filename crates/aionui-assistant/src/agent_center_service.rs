@@ -6,16 +6,20 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta, AgentCenterMetaPatch, AgentCenterPreviewMode,
-    AgentCenterRevisionResponse, AgentCenterRunPlanResponse, AgentMcpPolicy, AgentPublishStatus, AgentSkillRef,
-    AgentVisibility, AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
-    CreateAgentCenterRequest, CreateConversationRequestWire, PublishAgentCenterRequest, SkillVersionPolicy,
+    AdvanceAgentWorkflowRunRequest, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta,
+    AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
+    AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowApprovalDecision,
+    AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunStatus, AgentWorkflowRunResponse,
+    AgentWorkflowRunStatus, AssistantConversationOverridesRequest, AssistantDefaultListRequest,
+    AssistantDefaultsRequest, CreateAgentCenterRequest, CreateConversationRequestWire,
+    DecideAgentWorkflowApprovalRequest, PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest,
     UpdateAgentCenterRequest, UpdateAssistantRequest,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
-    CreateAssistantDefinitionRevisionParams, IAssistantAgentCenterRepository, IAssistantDefinitionRepository,
-    IAssistantDefinitionRevisionRepository, UpsertAssistantAgentCenterParams,
+    CreateAgentWorkflowRunParams, CreateAssistantDefinitionRevisionParams, IAgentWorkflowRunRepository,
+    IAssistantAgentCenterRepository, IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository,
+    UpsertAssistantAgentCenterParams,
 };
 use serde_json::json;
 
@@ -27,6 +31,7 @@ pub struct AgentCenterService {
     definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     center_repo: Arc<dyn IAssistantAgentCenterRepository>,
     revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository>,
+    workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
 }
 
 impl AgentCenterService {
@@ -35,12 +40,14 @@ impl AgentCenterService {
         definition_repo: Arc<dyn IAssistantDefinitionRepository>,
         center_repo: Arc<dyn IAssistantAgentCenterRepository>,
         revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository>,
+        workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
     ) -> Self {
         Self {
             assistants,
             definition_repo,
             center_repo,
             revision_repo,
+            workflow_run_repo,
         }
     }
 
@@ -215,24 +222,7 @@ impl AgentCenterService {
         meta.workflow
             .validate_for_publish()
             .map_err(|message| AssistantError::BadRequest(message.into()))?;
-        if meta.mcp_policy == AgentMcpPolicy::Allowlist {
-            let enabled_mcp_ids = &detail.assistant.defaults.mcps.value;
-            let has_unavailable_tool = meta
-                .workflow
-                .nodes
-                .iter()
-                .filter(|node| node.kind == "tool")
-                .any(|node| {
-                    node.config
-                        .get("tool_id")
-                        .is_some_and(|tool_id| !enabled_mcp_ids.contains(tool_id))
-                });
-            if has_unavailable_tool {
-                return Err(AssistantError::BadRequest(
-                    "workflow tool nodes must reference an enabled MCP server".into(),
-                ));
-            }
-        }
+        validate_workflow_tools(&meta, &detail.assistant.defaults.mcps.value)?;
 
         let next_revision = meta.version + 1;
         let revision_id = generate_prefixed_id("arev");
@@ -383,6 +373,217 @@ impl AgentCenterService {
             workflow: detail.meta.workflow,
             create_conversation,
         })
+    }
+
+    pub async fn start_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        req: StartAgentWorkflowRunRequest,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(assistant_id.to_owned()))?;
+        let detail = self.get_detail_for_user(user_id, assistant_id, None).await?;
+        validate_workflow_tools(&detail.meta, &detail.assistant.defaults.mcps.value)?;
+        let mut plan = self.run_plan_for_user(user_id, assistant_id).await?;
+        plan.workflow
+            .validate_for_publish()
+            .map_err(|message| AssistantError::BadRequest(message.into()))?;
+
+        let now = now_ms();
+        let run_id = generate_prefixed_id("awrun");
+        plan.create_conversation.extra["agent_workflow_run_id"] = json!(run_id.clone());
+        let mut variables = req.variables;
+        variables.insert("input".to_owned(), req.input);
+        let mut run = AgentWorkflowRunResponse {
+            id: run_id,
+            assistant_id: assistant_id.to_owned(),
+            status: AgentWorkflowRunStatus::Running,
+            current_node_index: 1,
+            workflow: plan.workflow,
+            nodes: Vec::new(),
+            variables,
+            next_action: Some(AgentWorkflowNextAction::RunAgent {
+                create_conversation: plan.create_conversation,
+            }),
+            created_at: now,
+            updated_at: now,
+        };
+        run.nodes = run
+            .workflow
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| AgentWorkflowNodeRun {
+                node_id: node.id.clone(),
+                kind: node.kind.clone(),
+                status: if index == 0 {
+                    AgentWorkflowNodeRunStatus::Completed
+                } else if index == 1 {
+                    AgentWorkflowNodeRunStatus::Running
+                } else {
+                    AgentWorkflowNodeRunStatus::Pending
+                },
+                output: None,
+                error: None,
+                started_at: (index <= 1).then_some(now),
+                completed_at: (index == 0).then_some(now),
+            })
+            .collect();
+        let state_json = serialize_workflow_run(&run)?;
+        self.workflow_run_repo
+            .create(&CreateAgentWorkflowRunParams {
+                id: &run.id,
+                assistant_definition_id: &definition.id,
+                user_id,
+                status: workflow_run_status_str(run.status),
+                state_json: &state_json,
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?;
+        tracing::info!(run_id = %run.id, assistant_id, user_id, "agent-workflow: run started");
+        Ok(run)
+    }
+
+    pub async fn get_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        parse_workflow_run(&row.state_json)
+    }
+
+    pub async fn list_workflow_runs_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Vec<AgentWorkflowRunResponse>, AssistantError> {
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(assistant_id.to_owned()))?;
+        self.workflow_run_repo
+            .list_for_assistant(user_id, &definition.id, 50)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .into_iter()
+            .map(|row| parse_workflow_run(&row.state_json))
+            .collect()
+    }
+
+    pub async fn advance_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        req: AdvanceAgentWorkflowRunRequest,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let mut run = self.get_workflow_run_for_user(user_id, run_id).await?;
+        if run.status != AgentWorkflowRunStatus::Running {
+            return Err(AssistantError::Conflict(
+                "workflow run is not awaiting node completion".into(),
+            ));
+        }
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no current node".into()))?;
+        if node.status != AgentWorkflowNodeRunStatus::Running || !matches!(node.kind.as_str(), "agent" | "tool") {
+            return Err(AssistantError::Conflict(
+                "current workflow node cannot be advanced".into(),
+            ));
+        }
+        let now = now_ms();
+        if !req.success {
+            node.status = AgentWorkflowNodeRunStatus::Failed;
+            node.error = req.error.or_else(|| Some("node execution failed".into()));
+            node.completed_at = Some(now);
+            run.status = AgentWorkflowRunStatus::Failed;
+            run.next_action = None;
+        } else {
+            node.status = AgentWorkflowNodeRunStatus::Completed;
+            node.output = Some(req.output.clone());
+            node.completed_at = Some(now);
+            run.variables.insert(node.node_id.clone(), req.output);
+            run.current_node_index += 1;
+            settle_workflow_run(&mut run, now)?;
+        }
+        self.persist_workflow_run(user_id, run).await
+    }
+
+    pub async fn decide_workflow_approval_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        req: DecideAgentWorkflowApprovalRequest,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let mut run = self.get_workflow_run_for_user(user_id, run_id).await?;
+        if run.status != AgentWorkflowRunStatus::WaitingApproval {
+            return Err(AssistantError::Conflict(
+                "workflow run is not waiting for approval".into(),
+            ));
+        }
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no approval node".into()))?;
+        if node.kind != "approval" || node.status != AgentWorkflowNodeRunStatus::WaitingApproval {
+            return Err(AssistantError::Conflict(
+                "current workflow node is not an approval".into(),
+            ));
+        }
+        let now = now_ms();
+        node.output = Some(json!({
+            "decision": match req.decision {
+                AgentWorkflowApprovalDecision::Approve => "approve",
+                AgentWorkflowApprovalDecision::Reject => "reject",
+            },
+            "comment": req.comment,
+        }));
+        match req.decision {
+            AgentWorkflowApprovalDecision::Reject => {
+                node.status = AgentWorkflowNodeRunStatus::Rejected;
+                node.completed_at = Some(now);
+                run.status = AgentWorkflowRunStatus::Rejected;
+                run.next_action = None;
+            }
+            AgentWorkflowApprovalDecision::Approve => {
+                node.status = AgentWorkflowNodeRunStatus::Completed;
+                node.completed_at = Some(now);
+                run.current_node_index += 1;
+                run.status = AgentWorkflowRunStatus::Running;
+                settle_workflow_run(&mut run, now)?;
+            }
+        }
+        tracing::info!(run_id, user_id, decision = ?req.decision, "agent-workflow: approval decided");
+        self.persist_workflow_run(user_id, run).await
+    }
+
+    async fn persist_workflow_run(
+        &self,
+        user_id: &str,
+        mut run: AgentWorkflowRunResponse,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        run.updated_at = now_ms();
+        let state_json = serialize_workflow_run(&run)?;
+        self.workflow_run_repo
+            .update_state(user_id, &run.id, workflow_run_status_str(run.status), &state_json)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run.id.clone()))?;
+        tracing::info!(run_id = %run.id, user_id, status = ?run.status, node_index = run.current_node_index, "agent-workflow: run advanced");
+        Ok(run)
     }
 
     async fn load_or_default_meta(&self, definition_id: &str) -> Result<AgentCenterMeta, AssistantError> {
@@ -620,5 +821,216 @@ fn mcp_policy_str(p: AgentMcpPolicy) -> &'static str {
     match p {
         AgentMcpPolicy::Allowlist => "allowlist",
         AgentMcpPolicy::InheritUserEnabled => "inherit_user_enabled",
+    }
+}
+
+fn workflow_run_status_str(status: AgentWorkflowRunStatus) -> &'static str {
+    match status {
+        AgentWorkflowRunStatus::Running => "running",
+        AgentWorkflowRunStatus::WaitingApproval => "waiting_approval",
+        AgentWorkflowRunStatus::Completed => "completed",
+        AgentWorkflowRunStatus::Rejected => "rejected",
+        AgentWorkflowRunStatus::Failed => "failed",
+    }
+}
+
+fn validate_workflow_tools(meta: &AgentCenterMeta, enabled_mcp_ids: &[String]) -> Result<(), AssistantError> {
+    if meta.mcp_policy != AgentMcpPolicy::Allowlist {
+        return Ok(());
+    }
+    let has_unavailable_tool = meta
+        .workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "tool")
+        .any(|node| {
+            node.config
+                .get("tool_id")
+                .is_some_and(|tool_id| !enabled_mcp_ids.contains(tool_id))
+        });
+    if has_unavailable_tool {
+        return Err(AssistantError::BadRequest(
+            "workflow tool nodes must reference an enabled MCP server".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn serialize_workflow_run(run: &AgentWorkflowRunResponse) -> Result<String, AssistantError> {
+    serde_json::to_string(run).map_err(|e| AssistantError::Internal(format!("workflow run serialize: {e}")))
+}
+
+fn parse_workflow_run(raw: &str) -> Result<AgentWorkflowRunResponse, AssistantError> {
+    serde_json::from_str(raw).map_err(|e| AssistantError::Internal(format!("workflow run parse: {e}")))
+}
+
+fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(), AssistantError> {
+    loop {
+        let Some(definition) = run.workflow.nodes.get(run.current_node_index) else {
+            run.status = AgentWorkflowRunStatus::Completed;
+            run.next_action = None;
+            return Ok(());
+        };
+        let node_id = definition.id.clone();
+        let kind = definition.kind.clone();
+        let config = definition.config.clone();
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Internal("workflow run node state is incomplete".into()))?;
+
+        match kind.as_str() {
+            "tool" => {
+                let tool_id = config
+                    .get("tool_id")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires tool_id".into()))?;
+                node.status = AgentWorkflowNodeRunStatus::Running;
+                node.started_at = Some(now);
+                run.status = AgentWorkflowRunStatus::Running;
+                run.next_action = Some(AgentWorkflowNextAction::InvokeTool { tool_id });
+                return Ok(());
+            }
+            "approval" => {
+                let message = config
+                    .get("message")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .ok_or_else(|| AssistantError::BadRequest("workflow approval node requires message".into()))?;
+                node.status = AgentWorkflowNodeRunStatus::WaitingApproval;
+                node.started_at = Some(now);
+                run.status = AgentWorkflowRunStatus::WaitingApproval;
+                run.next_action = Some(AgentWorkflowNextAction::AwaitApproval { node_id, message });
+                return Ok(());
+            }
+            "condition" => {
+                let expression = config
+                    .get("expression")
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| AssistantError::BadRequest("workflow condition node requires expression".into()))?;
+                let passed = evaluate_guard_expression(expression, &run.variables)?;
+                node.status = AgentWorkflowNodeRunStatus::Completed;
+                node.started_at = Some(now);
+                node.completed_at = Some(now);
+                node.output = Some(serde_json::Value::Bool(passed));
+                if passed {
+                    run.current_node_index += 1;
+                    continue;
+                }
+                for remaining in run.nodes.iter_mut().skip(run.current_node_index + 1) {
+                    if remaining.kind == "output" {
+                        remaining.status = AgentWorkflowNodeRunStatus::Completed;
+                    } else {
+                        remaining.status = AgentWorkflowNodeRunStatus::Skipped;
+                    }
+                    remaining.completed_at = Some(now);
+                }
+                run.current_node_index = run.nodes.len().saturating_sub(1);
+                run.status = AgentWorkflowRunStatus::Completed;
+                run.next_action = None;
+                return Ok(());
+            }
+            "output" => {
+                node.status = AgentWorkflowNodeRunStatus::Completed;
+                node.started_at = Some(now);
+                node.completed_at = Some(now);
+                run.status = AgentWorkflowRunStatus::Completed;
+                run.next_action = None;
+                return Ok(());
+            }
+            _ => {
+                return Err(AssistantError::Internal(format!(
+                    "workflow cannot automatically settle node kind {kind}"
+                )));
+            }
+        }
+    }
+}
+
+fn evaluate_guard_expression(
+    expression: &str,
+    variables: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<bool, AssistantError> {
+    let expression = expression.trim();
+    if expression.eq_ignore_ascii_case("true") {
+        return Ok(true);
+    }
+    if expression.eq_ignore_ascii_case("false") {
+        return Ok(false);
+    }
+    for operator in [">=", "<=", "!=", "==", ">", "<"] {
+        if let Some((left, right)) = expression.split_once(operator) {
+            let actual = variables.get(left.trim()).ok_or_else(|| {
+                AssistantError::BadRequest(format!("workflow condition variable is missing: {}", left.trim()))
+            })?;
+            let expected = parse_guard_literal(right.trim());
+            return compare_guard_values(actual, &expected, operator);
+        }
+    }
+    Err(AssistantError::BadRequest(
+        "workflow condition must be true, false, or a simple variable comparison".into(),
+    ))
+}
+
+fn parse_guard_literal(raw: &str) -> serde_json::Value {
+    let unquoted = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| raw.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')));
+    if let Some(value) = unquoted {
+        return serde_json::Value::String(value.to_owned());
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+}
+
+fn compare_guard_values(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    operator: &str,
+) -> Result<bool, AssistantError> {
+    match operator {
+        "==" => Ok(actual == expected),
+        "!=" => Ok(actual != expected),
+        ">" | ">=" | "<" | "<=" => {
+            let left = actual
+                .as_f64()
+                .ok_or_else(|| AssistantError::BadRequest("workflow numeric comparison requires numbers".into()))?;
+            let right = expected
+                .as_f64()
+                .ok_or_else(|| AssistantError::BadRequest("workflow numeric comparison requires numbers".into()))?;
+            Ok(match operator {
+                ">" => left > right,
+                ">=" => left >= right,
+                "<" => left < right,
+                "<=" => left <= right,
+                _ => false,
+            })
+        }
+        _ => Err(AssistantError::BadRequest(
+            "unsupported workflow condition operator".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod workflow_run_tests {
+    use super::*;
+
+    #[test]
+    fn guard_evaluator_supports_boolean_numeric_and_string_comparisons() {
+        let variables = std::collections::BTreeMap::from([
+            ("risk_score".to_owned(), json!(75)),
+            ("region".to_owned(), json!("cn")),
+        ]);
+        assert!(evaluate_guard_expression("true", &variables).unwrap());
+        assert!(evaluate_guard_expression("risk_score > 70", &variables).unwrap());
+        assert!(evaluate_guard_expression("region == \"cn\"", &variables).unwrap());
+    }
+
+    #[test]
+    fn guard_evaluator_rejects_arbitrary_expressions() {
+        let error = evaluate_guard_expression("process.exit()", &Default::default()).unwrap_err();
+        assert!(matches!(error, AssistantError::BadRequest(_)));
     }
 }

@@ -23,9 +23,10 @@ use aionui_assistant::{
 };
 use aionui_common::AgentType;
 use aionui_db::{
-    IAssistantAgentCenterRepository, IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository,
-    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
-    IProviderRepository, SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRepository,
+    IAgentWorkflowRunRepository, IAssistantAgentCenterRepository, IAssistantDefinitionRepository,
+    IAssistantDefinitionRevisionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository, SqliteAgentWorkflowRunRepository,
+    SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteProviderRepository,
     UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
@@ -40,7 +41,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use common::{body_json, delete_with_token, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login};
 
 const DEFAULT_USER_ID: &str = "system_default_user";
 
@@ -352,12 +353,15 @@ async fn fixture() -> Fixture {
     let revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository> = Arc::new(
         SqliteAssistantDefinitionRevisionRepository::new(services.database.pool().clone()),
     );
+    let workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository> =
+        Arc::new(SqliteAgentWorkflowRunRepository::new(services.database.pool().clone()));
     states.agent_center = AgentCenterRouterState {
         service: Arc::new(AgentCenterService::new(
             service.clone(),
             definition_repo,
             center_repo,
             revision_repo,
+            workflow_run_repo,
         )),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
@@ -687,6 +691,136 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
         .await
         .unwrap();
     assert_eq!(publish.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn workflow_run_pauses_for_approval_and_resumes_through_a_true_condition() {
+    let fx = fixture().await;
+    let id = "bare:632f31d2";
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{id}"),
+            json!({
+                "meta": {
+                    "workflow": {
+                        "nodes": [
+                            { "id": "start", "kind": "start" },
+                            { "id": "agent", "kind": "agent" },
+                            { "id": "approval-1", "kind": "approval", "config": { "message": "Approve result" } },
+                            { "id": "condition-1", "kind": "condition", "config": { "expression": "risk_score >= 70" } },
+                            { "id": "output", "kind": "output" }
+                        ],
+                        "edges": [
+                            { "source": "start", "target": "agent" },
+                            { "source": "agent", "target": "approval-1" },
+                            { "source": "approval-1", "target": "condition-1" },
+                            { "source": "condition-1", "target": "output" }
+                        ]
+                    }
+                }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/workflow-runs"),
+            json!({ "input": "review this", "variables": { "risk_score": 75 } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::CREATED);
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap();
+    assert_eq!(started["data"]["next_action"]["kind"], "run_agent");
+    assert_eq!(
+        started["data"]["next_action"]["create_conversation"]["extra"]["agent_workflow_run_id"],
+        run_id,
+    );
+
+    let unauthenticated = fx
+        .app
+        .clone()
+        .oneshot(get_request(&format!("/api/agent-center/workflow-runs/{run_id}")))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_csrf = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({ "success": true }),
+            &fx.token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+    let advance = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({ "success": true, "output": { "summary": "ready" } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(advance.status(), StatusCode::OK);
+    let waiting = body_json(advance).await;
+    assert_eq!(waiting["data"]["status"], "waiting_approval");
+    assert_eq!(waiting["data"]["next_action"]["kind"], "await_approval");
+
+    let approve = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/approval"),
+            json!({ "decision": "approve", "comment": "Reviewed by operator" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK);
+    let completed = body_json(approve).await;
+    assert_eq!(completed["data"]["status"], "completed");
+    assert_eq!(completed["data"]["nodes"][2]["output"]["decision"], "approve");
+    assert_eq!(
+        completed["data"]["nodes"][2]["output"]["comment"],
+        "Reviewed by operator",
+    );
+    assert_eq!(completed["data"]["nodes"][3]["output"], true);
+
+    let persisted = fx
+        .app
+        .oneshot(get_with_token(
+            &format!("/api/agent-center/workflow-runs/{run_id}"),
+            &fx.token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(persisted.status(), StatusCode::OK);
+    assert_eq!(body_json(persisted).await["data"]["status"], "completed");
 }
 
 #[tokio::test]

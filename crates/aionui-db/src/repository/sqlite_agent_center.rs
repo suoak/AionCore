@@ -2,11 +2,13 @@
 
 use sqlx::SqlitePool;
 
-use super::assistant::{IAssistantAgentCenterRepository, IAssistantDefinitionRevisionRepository};
+use super::assistant::{
+    IAgentWorkflowRunRepository, IAssistantAgentCenterRepository, IAssistantDefinitionRevisionRepository,
+};
 use crate::error::DbError;
 use crate::models::{
-    AssistantAgentCenterRow, AssistantDefinitionRevisionRow, CreateAssistantDefinitionRevisionParams,
-    UpsertAssistantAgentCenterParams,
+    AgentWorkflowRunRow, AssistantAgentCenterRow, AssistantDefinitionRevisionRow, CreateAgentWorkflowRunParams,
+    CreateAssistantDefinitionRevisionParams, UpsertAssistantAgentCenterParams,
 };
 
 fn now_ms() -> i64 {
@@ -187,5 +189,88 @@ impl IAssistantDefinitionRevisionRepository for SqliteAssistantDefinitionRevisio
         self.get(params.id)
             .await?
             .ok_or_else(|| DbError::Init("assistant_definition_revisions insert missing row".into()))
+    }
+}
+
+pub struct SqliteAgentWorkflowRunRepository {
+    pool: SqlitePool,
+}
+
+impl SqliteAgentWorkflowRunRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl IAgentWorkflowRunRepository for SqliteAgentWorkflowRunRepository {
+    async fn create(&self, params: &CreateAgentWorkflowRunParams<'_>) -> Result<AgentWorkflowRunRow, DbError> {
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO agent_workflow_runs
+             (id, assistant_definition_id, user_id, status, state_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(params.id)
+        .bind(params.assistant_definition_id)
+        .bind(params.user_id)
+        .bind(params.status)
+        .bind(params.state_json)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        self.get_for_user(params.user_id, params.id)
+            .await?
+            .ok_or_else(|| DbError::Init("agent_workflow_runs insert missing row".into()))
+    }
+
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentWorkflowRunRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, AgentWorkflowRunRow>("SELECT * FROM agent_workflow_runs WHERE id = ? AND user_id = ?")
+                .bind(id)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn list_for_assistant(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentWorkflowRunRow>, DbError> {
+        Ok(sqlx::query_as::<_, AgentWorkflowRunRow>(
+            "SELECT * FROM agent_workflow_runs
+             WHERE user_id = ? AND assistant_definition_id = ?
+             ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(assistant_definition_id)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn update_state(
+        &self,
+        user_id: &str,
+        id: &str,
+        status: &str,
+        state_json: &str,
+    ) -> Result<Option<AgentWorkflowRunRow>, DbError> {
+        sqlx::query(
+            "UPDATE agent_workflow_runs SET status = ?, state_json = ?, updated_at = ?
+             WHERE id = ? AND user_id = ?",
+        )
+        .bind(status)
+        .bind(state_json)
+        .bind(now_ms())
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        self.get_for_user(user_id, id).await
     }
 }

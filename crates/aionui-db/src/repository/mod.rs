@@ -46,8 +46,9 @@ pub mod user_order;
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
 pub use assistant::{
-    IAssistantAgentCenterRepository, IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository,
-    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IAgentWorkflowRunRepository, IAssistantAgentCenterRepository, IAssistantDefinitionRepository,
+    IAssistantDefinitionRevisionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
+    IAssistantPreferenceRepository, IAssistantRepository,
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
@@ -69,7 +70,9 @@ pub use skill_evolution::{
     IExperienceArticleRepository, ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository,
 };
 pub use sqlite_acp_session::SqliteAcpSessionRepository;
-pub use sqlite_agent_center::{SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRevisionRepository};
+pub use sqlite_agent_center::{
+    SqliteAgentWorkflowRunRepository, SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRevisionRepository,
+};
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
 pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,

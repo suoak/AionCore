@@ -238,6 +238,25 @@ pub struct UpsertAssistantAgentCenterParams<'a> {
     pub workflow_definition: &'a str,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AgentWorkflowRunRow {
+    pub id: String,
+    pub assistant_definition_id: String,
+    pub user_id: String,
+    pub status: String,
+    pub state_json: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+pub struct CreateAgentWorkflowRunParams<'a> {
+    pub id: &'a str,
+    pub assistant_definition_id: &'a str,
+    pub user_id: &'a str,
+    pub status: &'a str,
+    pub state_json: &'a str,
+}
+
 /// Row mapping for `assistant_definition_revisions`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AssistantDefinitionRevisionRow {
