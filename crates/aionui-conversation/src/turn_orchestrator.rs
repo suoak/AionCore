@@ -670,6 +670,22 @@ impl ConversationTurnOrchestrator {
             .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
 
+        if !was_deleting {
+            self.service
+                .notify_turn_settled(
+                    &input.user_id,
+                    &conv_id,
+                    &turn_id,
+                    if final_failed {
+                        aionui_common::ConversationTurnSettlement::Failed
+                    } else {
+                        aionui_common::ConversationTurnSettlement::Completed
+                    },
+                    final_error_message.as_deref(),
+                )
+                .await;
+        }
+
         ConversationTurnResult {
             status: if final_failed {
                 ConversationTurnStatus::Failed

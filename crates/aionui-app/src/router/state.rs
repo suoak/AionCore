@@ -13,7 +13,7 @@ use aionui_assistant::{
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
-use aionui_common::AgentKillReason;
+use aionui_common::{AgentKillReason, ConversationTurnSettlement, OnConversationTurnSettled};
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
@@ -308,6 +308,12 @@ pub async fn build_module_states(
     let system = build_module_state_phase(&boot, "system", || build_system_state(services));
     let agent_center =
         build_module_state_phase(&boot, "agent_center", || build_agent_center_state(services, &assistant));
+    services
+        .conversation_service
+        .with_turn_settled_hook(Arc::new(AgentWorkflowTurnSettlementAdapter {
+            conversations: services.conversation_repo.clone(),
+            agent_center: agent_center.service.clone(),
+        }));
     let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
         build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
     });
@@ -384,6 +390,88 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+struct AgentWorkflowTurnSettlementAdapter {
+    conversations: Arc<dyn IConversationRepository>,
+    agent_center: Arc<AgentCenterService>,
+}
+
+#[async_trait::async_trait]
+impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
+    async fn on_turn_settled(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        settlement: ConversationTurnSettlement,
+        error_message: Option<&str>,
+    ) {
+        let conversation = match self.conversations.get(user_id, conversation_id).await {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    "agent-workflow: failed to load settled conversation"
+                );
+                return;
+            }
+        };
+        let run_id = serde_json::from_str::<serde_json::Value>(&conversation.extra)
+            .ok()
+            .and_then(|extra| {
+                extra
+                    .get("agent_workflow_run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let Some(run_id) = run_id else {
+            return;
+        };
+        let assistant_id = match self
+            .conversations
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot.assistant_id,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    run_id,
+                    "agent-workflow: failed to load conversation assistant snapshot"
+                );
+                return;
+            }
+        };
+
+        let result = self
+            .agent_center
+            .settle_agent_turn_for_user(
+                user_id,
+                &run_id,
+                &assistant_id,
+                conversation_id,
+                turn_id,
+                settlement == ConversationTurnSettlement::Completed,
+                error_message.map(str::to_owned),
+            )
+            .await;
+        if result.is_err() {
+            tracing::warn!(
+                user_id,
+                conversation_id,
+                turn_id,
+                run_id,
+                "agent-workflow: failed to settle agent turn"
+            );
+        }
+    }
 }
 
 /// Cross-session messaging state, plus the process's single drainer.

@@ -28,8 +28,8 @@ use aionui_api_types::{
     SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
-    AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
-    ProviderWithModel, TimestampMs,
+    AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, ConversationTurnSettlement,
+    OnConversationTurnSettled, PaginatedResult, ProviderWithModel, TimestampMs,
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
@@ -4353,6 +4353,68 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn run_agent_turn_notifies_settlement_hooks_once_after_completion() {
+    struct RecordingSettlementHook(Arc<Mutex<Vec<(String, String, String, ConversationTurnSettlement)>>>);
+
+    #[async_trait::async_trait]
+    impl OnConversationTurnSettled for RecordingSettlementHook {
+        async fn on_turn_settled(
+            &self,
+            user_id: &str,
+            conversation_id: &str,
+            turn_id: &str,
+            settlement: ConversationTurnSettlement,
+            _error_message: Option<&str>,
+        ) {
+            self.0.lock().unwrap().push((
+                user_id.to_owned(),
+                conversation_id.to_owned(),
+                turn_id.to_owned(),
+                settlement,
+            ));
+        }
+    }
+
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new("placeholder"),
+    ))]));
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr,
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let settlements = Arc::new(Mutex::new(Vec::new()));
+    service.with_turn_settled_hook(Arc::new(RecordingSettlementHook(settlements.clone())));
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "complete workflow agent node".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: None,
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    let recorded = settlements.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, "user_1");
+    assert_eq!(recorded[0].1, conv.id);
+    assert_eq!(recorded[0].2, outcome.turn_id);
+    assert_eq!(recorded[0].3, ConversationTurnSettlement::Completed);
 }
 
 #[tokio::test]

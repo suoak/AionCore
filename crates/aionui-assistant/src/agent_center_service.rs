@@ -522,6 +522,57 @@ impl AgentCenterService {
         self.persist_workflow_run(user_id, run).await
     }
 
+    /// Apply a conversation turn result to the active agent node.
+    ///
+    /// Returns `None` when the event is unrelated or stale. This makes the
+    /// lifecycle adapter idempotent while retaining strict conflict responses
+    /// for the user-facing manual advance endpoint.
+    pub async fn settle_agent_turn_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        assistant_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        success: bool,
+        error: Option<String>,
+    ) -> Result<Option<AgentWorkflowRunResponse>, AssistantError> {
+        let run = self.get_workflow_run_for_user(user_id, run_id).await?;
+        let current_node = run.nodes.get(run.current_node_index);
+        if run.assistant_id != assistant_id
+            || run.status != AgentWorkflowRunStatus::Running
+            || !matches!(run.next_action, Some(AgentWorkflowNextAction::RunAgent { .. }))
+            || !matches!(current_node, Some(node) if node.kind == "agent" && node.status == AgentWorkflowNodeRunStatus::Running)
+        {
+            return Ok(None);
+        }
+
+        let updated = self
+            .advance_workflow_run_for_user(
+                user_id,
+                run_id,
+                AdvanceAgentWorkflowRunRequest {
+                    success,
+                    output: json!({
+                        "conversation_id": conversation_id,
+                        "turn_id": turn_id,
+                    }),
+                    error,
+                },
+            )
+            .await?;
+        tracing::info!(
+            run_id,
+            user_id,
+            assistant_id,
+            conversation_id,
+            turn_id,
+            success,
+            "agent-workflow: agent turn settled"
+        );
+        Ok(Some(updated))
+    }
+
     pub async fn decide_workflow_approval_for_user(
         &self,
         user_id: &str,

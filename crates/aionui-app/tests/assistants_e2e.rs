@@ -55,6 +55,7 @@ const DEFAULT_USER_ID: &str = "system_default_user";
 struct Fixture {
     app: axum::Router,
     services: AppServices,
+    agent_center: Arc<AgentCenterService>,
     token: String,
     csrf: String,
     // user-data root containing assistant-rules / assistant-skills / assistant-avatars
@@ -355,14 +356,15 @@ async fn fixture() -> Fixture {
     );
     let workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository> =
         Arc::new(SqliteAgentWorkflowRunRepository::new(services.database.pool().clone()));
+    let agent_center = Arc::new(AgentCenterService::new(
+        service.clone(),
+        definition_repo,
+        center_repo,
+        revision_repo,
+        workflow_run_repo,
+    ));
     states.agent_center = AgentCenterRouterState {
-        service: Arc::new(AgentCenterService::new(
-            service.clone(),
-            definition_repo,
-            center_repo,
-            revision_repo,
-            workflow_run_repo,
-        )),
+        service: agent_center.clone(),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
     // endpoints route through the test-configured service.
@@ -375,6 +377,7 @@ async fn fixture() -> Fixture {
     Fixture {
         app,
         services,
+        agent_center,
         token,
         csrf,
         user_data_dir,
@@ -823,6 +826,110 @@ async fn workflow_run_pauses_for_approval_and_resumes_through_a_true_condition()
         .unwrap();
     assert_eq!(persisted.status(), StatusCode::OK);
     assert_eq!(body_json(persisted).await["data"]["status"], "completed");
+}
+
+#[tokio::test]
+async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review this" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::CREATED);
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap();
+
+    let mismatch = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            run_id,
+            "bare:another-agent",
+            "conversation-1",
+            "turn-1",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(mismatch.is_none());
+
+    let settled = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            run_id,
+            assistant_id,
+            "conversation-1",
+            "turn-1",
+            true,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("matching turn should settle the agent node");
+    assert_eq!(settled.status, aionui_api_types::AgentWorkflowRunStatus::Completed);
+    assert_eq!(
+        settled.nodes[1].output.as_ref().unwrap()["conversation_id"],
+        "conversation-1"
+    );
+    assert_eq!(settled.nodes[1].output.as_ref().unwrap()["turn_id"], "turn-1");
+
+    let duplicate = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            run_id,
+            assistant_id,
+            "conversation-1",
+            "turn-1",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(duplicate.is_none());
+
+    let failed_start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review another item" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let failed_started = body_json(failed_start).await;
+    let failed_run_id = failed_started["data"]["id"].as_str().unwrap();
+    let failed = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            failed_run_id,
+            assistant_id,
+            "conversation-2",
+            "turn-2",
+            false,
+            Some("agent turn failed".to_owned()),
+        )
+        .await
+        .unwrap()
+        .expect("matching failed turn should settle the agent node");
+    assert_eq!(failed.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
+    assert_eq!(failed.nodes[1].error.as_deref(), Some("agent turn failed"));
+    assert!(failed.next_action.is_none());
 }
 
 #[tokio::test]
