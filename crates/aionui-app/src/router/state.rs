@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AssistantAgentCatalogPort, AssistantError, AssistantRouterState,
-    AssistantService, BuiltinAssistantRegistry, SkillEvolutionRouterState, SkillEvolutionService,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowTurnResult, AssistantAgentCatalogPort, AssistantError,
+    AssistantRouterState, AssistantService, BuiltinAssistantRegistry, SkillEvolutionRouterState, SkillEvolutionService,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
@@ -455,11 +455,13 @@ impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
             .settle_agent_turn_for_user(
                 user_id,
                 &run_id,
-                &assistant_id,
-                conversation_id,
-                turn_id,
-                settlement == ConversationTurnSettlement::Completed,
-                error_message.map(str::to_owned),
+                AgentWorkflowTurnResult {
+                    assistant_id: &assistant_id,
+                    conversation_id,
+                    turn_id,
+                    success: settlement == ConversationTurnSettlement::Completed,
+                    error: error_message.map(str::to_owned),
+                },
             )
             .await;
         if result.is_err() {

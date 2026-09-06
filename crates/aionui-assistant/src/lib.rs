@@ -22,7 +22,7 @@ pub mod state;
 
 pub use agent_catalog::AssistantAgentCatalogPort;
 pub use agent_center_routes::{AgentCenterRouterState, agent_center_routes};
-pub use agent_center_service::AgentCenterService;
+pub use agent_center_service::{AgentCenterService, AgentWorkflowTurnResult};
 pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};
 pub use error::AssistantError;
 pub use routes::{AssistantRouterState, assistant_routes};

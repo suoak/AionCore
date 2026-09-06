@@ -18,8 +18,8 @@ use aionui_api_types::{
 };
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AssistantAgentCatalogPort, AssistantRouterState, AssistantService,
-    BuiltinAssistantRegistry,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowTurnResult, AssistantAgentCatalogPort,
+    AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_common::AgentType;
 use aionui_db::{
@@ -853,11 +853,13 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
         .settle_agent_turn_for_user(
             DEFAULT_USER_ID,
             run_id,
-            "bare:another-agent",
-            "conversation-1",
-            "turn-1",
-            true,
-            None,
+            AgentWorkflowTurnResult {
+                assistant_id: "bare:another-agent",
+                conversation_id: "conversation-1",
+                turn_id: "turn-1",
+                success: true,
+                error: None,
+            },
         )
         .await
         .unwrap();
@@ -868,11 +870,13 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
         .settle_agent_turn_for_user(
             DEFAULT_USER_ID,
             run_id,
-            assistant_id,
-            "conversation-1",
-            "turn-1",
-            true,
-            None,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-1",
+                turn_id: "turn-1",
+                success: true,
+                error: None,
+            },
         )
         .await
         .unwrap()
@@ -889,11 +893,13 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
         .settle_agent_turn_for_user(
             DEFAULT_USER_ID,
             run_id,
-            assistant_id,
-            "conversation-1",
-            "turn-1",
-            true,
-            None,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-1",
+                turn_id: "turn-1",
+                success: true,
+                error: None,
+            },
         )
         .await
         .unwrap();
@@ -918,11 +924,13 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
         .settle_agent_turn_for_user(
             DEFAULT_USER_ID,
             failed_run_id,
-            assistant_id,
-            "conversation-2",
-            "turn-2",
-            false,
-            Some("agent turn failed".to_owned()),
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-2",
+                turn_id: "turn-2",
+                success: false,
+                error: Some("agent turn failed".to_owned()),
+            },
         )
         .await
         .unwrap()

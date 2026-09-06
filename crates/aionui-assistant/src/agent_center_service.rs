@@ -34,6 +34,14 @@ pub struct AgentCenterService {
     workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
 }
 
+pub struct AgentWorkflowTurnResult<'a> {
+    pub assistant_id: &'a str,
+    pub conversation_id: &'a str,
+    pub turn_id: &'a str,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
 impl AgentCenterService {
     pub fn new(
         assistants: Arc<AssistantService>,
@@ -531,15 +539,11 @@ impl AgentCenterService {
         &self,
         user_id: &str,
         run_id: &str,
-        assistant_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
-        success: bool,
-        error: Option<String>,
+        result: AgentWorkflowTurnResult<'_>,
     ) -> Result<Option<AgentWorkflowRunResponse>, AssistantError> {
         let run = self.get_workflow_run_for_user(user_id, run_id).await?;
         let current_node = run.nodes.get(run.current_node_index);
-        if run.assistant_id != assistant_id
+        if run.assistant_id != result.assistant_id
             || run.status != AgentWorkflowRunStatus::Running
             || !matches!(run.next_action, Some(AgentWorkflowNextAction::RunAgent { .. }))
             || !matches!(current_node, Some(node) if node.kind == "agent" && node.status == AgentWorkflowNodeRunStatus::Running)
@@ -552,22 +556,22 @@ impl AgentCenterService {
                 user_id,
                 run_id,
                 AdvanceAgentWorkflowRunRequest {
-                    success,
+                    success: result.success,
                     output: json!({
-                        "conversation_id": conversation_id,
-                        "turn_id": turn_id,
+                        "conversation_id": result.conversation_id,
+                        "turn_id": result.turn_id,
                     }),
-                    error,
+                    error: result.error,
                 },
             )
             .await?;
         tracing::info!(
             run_id,
             user_id,
-            assistant_id,
-            conversation_id,
-            turn_id,
-            success,
+            assistant_id = result.assistant_id,
+            conversation_id = result.conversation_id,
+            turn_id = result.turn_id,
+            success = result.success,
             "agent-workflow: agent turn settled"
         );
         Ok(Some(updated))
