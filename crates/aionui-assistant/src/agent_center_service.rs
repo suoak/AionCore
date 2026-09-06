@@ -250,6 +250,42 @@ impl AgentCenterService {
         self.get_detail_for_user(user_id, id, None).await
     }
 
+    /// Withdraw a published agent while retaining its immutable revision history.
+    ///
+    /// The editable assistant definition remains intact and becomes a draft again.
+    /// A later publish creates the next revision rather than overwriting history.
+    pub async fn unpublish_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<AgentCenterDetailResponse, AssistantError> {
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(id.to_owned()))?;
+        let mut meta = self.load_or_default_meta(&definition.id).await?;
+        if meta.status != AgentPublishStatus::Published {
+            return Err(AssistantError::Conflict(
+                "only published agents can be unpublished".into(),
+            ));
+        }
+
+        meta.status = AgentPublishStatus::Draft;
+        meta.published_revision_id = None;
+        let patch = AgentCenterMetaPatch::default();
+        let _ = self.upsert_meta_full(&definition.id, &mut meta, &patch).await?;
+        tracing::info!(
+            assistant_id = %id,
+            user_id = %user_id,
+            version = meta.version,
+            "agent-center: unpublished agent"
+        );
+
+        self.get_detail_for_user(user_id, id, None).await
+    }
+
     pub async fn list_versions_for_user(
         &self,
         user_id: &str,

@@ -17,14 +17,19 @@ use aionui_api_types::{
     AgentSourceInfo, BehaviorPolicy,
 };
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
-use aionui_assistant::{AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
+use aionui_assistant::{
+    AgentCenterRouterState, AgentCenterService, AssistantAgentCatalogPort, AssistantRouterState, AssistantService,
+    BuiltinAssistantRegistry,
+};
 use aionui_common::AgentType;
 use aionui_db::{
-    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteProviderRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, init_database_memory,
+    IAssistantAgentCenterRepository, IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository,
+    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IProviderRepository, SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteProviderRepository,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+    init_database_memory,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionSource, ExtensionStateStore,
@@ -320,7 +325,7 @@ async fn fixture() -> Fixture {
     let service = Arc::new(AssistantService::new(
         pool,
         aionui_assistant::service::AssistantServiceDeps {
-            definition_repo,
+            definition_repo: definition_repo.clone(),
             state_repo,
             preference_repo,
             repo,
@@ -340,6 +345,20 @@ async fn fixture() -> Fixture {
     service.bootstrap_assistant_storage().await.unwrap();
     states.assistant = AssistantRouterState {
         service: service.clone(),
+    };
+    let center_repo: Arc<dyn IAssistantAgentCenterRepository> = Arc::new(SqliteAssistantAgentCenterRepository::new(
+        services.database.pool().clone(),
+    ));
+    let revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository> = Arc::new(
+        SqliteAssistantDefinitionRevisionRepository::new(services.database.pool().clone()),
+    );
+    states.agent_center = AgentCenterRouterState {
+        service: Arc::new(AgentCenterService::new(
+            service.clone(),
+            definition_repo,
+            center_repo,
+            revision_repo,
+        )),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
     // endpoints route through the test-configured service.
@@ -467,6 +486,85 @@ async fn list_requires_auth() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn unpublish_returns_agent_to_draft_and_keeps_revision_history() {
+    let fx = fixture().await;
+    let id = "bare:632f31d2";
+
+    let publish = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/publish"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(publish.status(), StatusCode::OK);
+    let published = body_json(publish).await;
+    assert_eq!(published["data"]["meta"]["status"], "published");
+    assert_eq!(published["data"]["meta"]["version"], 1);
+
+    let unpublish = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/unpublish"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unpublish.status(), StatusCode::OK);
+    let draft = body_json(unpublish).await;
+    assert_eq!(draft["data"]["meta"]["status"], "draft");
+    assert_eq!(draft["data"]["meta"]["version"], 1);
+    assert_eq!(draft["data"]["meta"]["published_revision_id"], Value::Null);
+
+    let versions = fx
+        .app
+        .oneshot(get_with_token(
+            &format!("/api/agent-center/agents/{id}/versions"),
+            &fx.token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(versions.status(), StatusCode::OK);
+    let versions = body_json(versions).await;
+    assert_eq!(versions["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unpublish_rejects_an_agent_that_is_already_a_draft() {
+    let fx = fixture().await;
+    let id = "bare:632f31d2";
+
+    let response = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/unpublish"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_json(response).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("only published agents can be unpublished")),
+        "body = {body}"
+    );
 }
 
 #[tokio::test]

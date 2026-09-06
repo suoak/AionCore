@@ -30,6 +30,7 @@ pub fn agent_center_routes(state: AgentCenterRouterState) -> Router {
         .route("/api/agent-center/agents", get(list_agents).post(create_agent))
         .route("/api/agent-center/agents/{id}", get(get_agent).put(update_agent))
         .route("/api/agent-center/agents/{id}/publish", post(publish_agent))
+        .route("/api/agent-center/agents/{id}/unpublish", post(unpublish_agent))
         .route("/api/agent-center/agents/{id}/versions", get(list_versions))
         .route("/api/agent-center/agents/{id}/run", post(run_agent))
         .with_state(state)
@@ -89,6 +90,15 @@ async fn publish_agent(
     };
     let published = state.service.publish_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(published)))
+}
+
+async fn unpublish_agent(
+    State(state): State<AgentCenterRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AgentCenterDetailResponse>>, ApiError> {
+    let draft = state.service.unpublish_for_user(&current_user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(draft)))
 }
 
 async fn list_versions(
