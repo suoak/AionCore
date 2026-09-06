@@ -1110,7 +1110,7 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
         .unwrap();
     assert_eq!(stale_tool.status(), StatusCode::CONFLICT);
     assert_eq!(
-        body_json(stale_tool).await["message"],
+        body_json(stale_tool).await["error"],
         "tool result does not match the active workflow execution"
     );
 
@@ -1198,7 +1198,7 @@ async fn active_workflow_run_can_be_cancelled_once() {
         .unwrap();
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
     assert_eq!(
-        body_json(duplicate).await["message"],
+        body_json(duplicate).await["error"],
         "only an active workflow run can be cancelled"
     );
 }
