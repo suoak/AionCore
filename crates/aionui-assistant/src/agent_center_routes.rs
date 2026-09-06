@@ -195,6 +195,7 @@ async fn decide_workflow_approval(
         .service
         .decide_workflow_approval_for_user(&current_user.id, &id, req)
         .await?;
+    dispatch_pending_tool_execution(&state.service, &current_user.id, &run);
     Ok(Json(ApiResponse::ok(run)))
 }
 
@@ -216,5 +217,23 @@ async fn retry_workflow_run(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentWorkflowRunResponse>>, ApiError> {
     let run = state.service.retry_workflow_run_for_user(&current_user.id, &id).await?;
+    dispatch_pending_tool_execution(&state.service, &current_user.id, &run);
     Ok(Json(ApiResponse::ok(run)))
+}
+
+fn dispatch_pending_tool_execution(service: &Arc<AgentCenterService>, user_id: &str, run: &AgentWorkflowRunResponse) {
+    if !matches!(
+        run.next_action.as_ref(),
+        Some(aionui_api_types::AgentWorkflowNextAction::InvokeTool { .. })
+    ) {
+        return;
+    }
+    let service = service.clone();
+    let user_id = user_id.to_owned();
+    let run_id = run.id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = service.execute_pending_tools_for_user(&user_id, &run_id).await {
+            tracing::warn!(user_id, run_id, error = %error, "agent-workflow: background MCP tool execution failed");
+        }
+    });
 }

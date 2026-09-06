@@ -919,7 +919,6 @@ impl AgentCenterService {
             },
             "comment": req.comment,
         }));
-        let approved = req.decision == AgentWorkflowApprovalDecision::Approve;
         match req.decision {
             AgentWorkflowApprovalDecision::Reject => {
                 node.status = AgentWorkflowNodeRunStatus::Rejected;
@@ -936,12 +935,7 @@ impl AgentCenterService {
             }
         }
         tracing::info!(run_id, user_id, decision = ?req.decision, "agent-workflow: approval decided");
-        let decided = self.persist_workflow_run(user_id, run, &row.state_json).await?;
-        if approved && self.tool_executor.is_some() {
-            self.execute_pending_tools_for_user(user_id, run_id).await
-        } else {
-            Ok(decided)
-        }
+        self.persist_workflow_run(user_id, run, &row.state_json).await
     }
 
     pub async fn cancel_workflow_run_for_user(
@@ -1030,11 +1024,7 @@ impl AgentCenterService {
         run.next_action = Some(next_action);
         let retried = self.persist_workflow_run(user_id, run, &row.state_json).await?;
         tracing::info!(run_id, user_id, "agent-workflow: failed tool node retried");
-        if self.tool_executor.is_some() {
-            self.execute_pending_tools_for_user(user_id, run_id).await
-        } else {
-            Ok(retried)
-        }
+        Ok(retried)
     }
 
     async fn persist_workflow_run(

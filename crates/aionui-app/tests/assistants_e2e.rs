@@ -1271,6 +1271,122 @@ async fn cancelling_a_run_interrupts_its_in_flight_tool_execution() {
 }
 
 #[tokio::test]
+async fn approval_returns_before_its_tool_finishes_and_keeps_cancel_available() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(BlockingToolExecutor {
+        started: tokio::sync::Notify::new(),
+        dropped: dropped.clone(),
+    });
+    let fx = fixture_with_tool_executor(Some(executor.clone())).await;
+    let assistant_id = "bare:632f31d2";
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{assistant_id}"),
+            json!({
+                "meta": {
+                    "mcp_policy": "inherit_user_enabled",
+                    "workflow": {
+                        "nodes": [
+                            { "id": "start", "kind": "start" },
+                            { "id": "agent", "kind": "agent" },
+                            { "id": "approval-1", "kind": "approval", "config": { "message": "Approve changes" } },
+                            {
+                                "id": "tool-1",
+                                "kind": "tool",
+                                "config": {
+                                    "mcp_server_id": "mcp-1",
+                                    "tool_name": "create_issue"
+                                }
+                            },
+                            { "id": "output", "kind": "output" }
+                        ],
+                        "edges": [
+                            { "source": "start", "target": "agent" },
+                            { "source": "agent", "target": "approval-1" },
+                            { "source": "approval-1", "target": "tool-1" },
+                            { "source": "tool-1", "target": "output" }
+                        ]
+                    }
+                }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let waiting = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({ "success": true, "output": { "summary": "ready" } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(waiting).await["data"]["status"], "waiting_approval");
+
+    let approval = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        fx.app.clone().oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/approval"),
+            json!({ "decision": "approve" }),
+            &fx.token,
+            &fx.csrf,
+        )),
+    )
+    .await
+    .expect("approval should not wait for MCP tool completion")
+    .unwrap();
+    let approved = body_json(approval).await;
+    assert_eq!(approved["data"]["status"], "running");
+    assert_eq!(approved["data"]["next_action"]["kind"], "invoke_tool");
+    tokio::time::timeout(std::time::Duration::from_secs(1), executor.started.notified())
+        .await
+        .expect("background tool execution should start");
+
+    let cancel = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/cancel"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(cancel).await["data"]["status"], "cancelled");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !dropped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancel should drop the background tool future");
+}
+
+#[tokio::test]
 async fn interrupted_tool_is_failed_without_automatic_replay() {
     let fx = fixture().await;
     let assistant_id = "bare:632f31d2";
