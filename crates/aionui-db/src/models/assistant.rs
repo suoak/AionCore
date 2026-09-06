@@ -216,6 +216,7 @@ pub struct AssistantAgentCenterRow {
     pub skill_refs: String,
     pub mcp_policy: String,
     pub role_bindings: String,
+    pub workflow_definition: String,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -234,6 +235,7 @@ pub struct UpsertAssistantAgentCenterParams<'a> {
     pub skill_refs: &'a str,
     pub mcp_policy: &'a str,
     pub role_bindings: &'a str,
+    pub workflow_definition: &'a str,
 }
 
 /// Row mapping for `assistant_definition_revisions`.

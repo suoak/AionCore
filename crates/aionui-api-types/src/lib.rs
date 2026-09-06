@@ -61,9 +61,10 @@ pub use agent_build_extra::{
 pub use agent_center::{
     AgentAclRole, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterListQuery, AgentCenterMeta,
     AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
-    AgentMcpPolicy, AgentPublishStatus, AgentRoleBinding, AgentSkillRef, AgentVisibility, CreateAgentCenterRequest,
-    CreateConversationRequestWire, KnowledgeScopeRef, PublishAgentCenterRequest, SkillVersionPolicy,
-    UpdateAgentCenterRequest,
+    AgentMcpPolicy, AgentPublishStatus, AgentRoleBinding, AgentSkillRef, AgentVisibility, AgentWorkflowDefinition,
+    AgentWorkflowEdgeDefinition, AgentWorkflowInputDefinition, AgentWorkflowNodeDefinition,
+    AgentWorkflowOutputDefinition, AgentWorkflowOutputFormat, CreateAgentCenterRequest, CreateConversationRequestWire,
+    KnowledgeScopeRef, PublishAgentCenterRequest, SkillVersionPolicy, UpdateAgentCenterRequest,
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,

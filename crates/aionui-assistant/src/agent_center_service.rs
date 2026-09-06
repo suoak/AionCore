@@ -351,12 +351,16 @@ impl AgentCenterService {
             _ => AgentCenterPreviewMode::Draft,
         };
 
+        let mut create_conversation = CreateConversationRequestWire::for_assistant(id, Some(overrides));
+        create_conversation.extra = json!({ "agent_workflow": detail.meta.workflow.clone() });
+
         Ok(AgentCenterRunPlanResponse {
             assistant_id: id.to_owned(),
             revision_id: detail.meta.published_revision_id.clone(),
             revision: detail.meta.version,
             preview_mode,
-            create_conversation: CreateConversationRequestWire::for_assistant(id, Some(overrides)),
+            workflow: detail.meta.workflow,
+            create_conversation,
         })
     }
 
@@ -409,6 +413,12 @@ impl AgentCenterService {
         if let Some(ref roles) = patch.role_bindings {
             base.role_bindings = roles.clone();
         }
+        if let Some(ref workflow) = patch.workflow {
+            workflow
+                .validate()
+                .map_err(|message| AssistantError::BadRequest(message.into()))?;
+            base.workflow = workflow.clone();
+        }
 
         let knowledge_scopes =
             serde_json::to_string(&base.knowledge_scopes).map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -416,6 +426,8 @@ impl AgentCenterService {
             serde_json::to_string(&base.skill_refs).map_err(|e| AssistantError::Internal(e.to_string()))?;
         let role_bindings =
             serde_json::to_string(&base.role_bindings).map_err(|e| AssistantError::Internal(e.to_string()))?;
+        let workflow_definition =
+            serde_json::to_string(&base.workflow).map_err(|e| AssistantError::Internal(e.to_string()))?;
         let visibility = visibility_str(base.visibility);
         let status = status_str(base.status);
         let mcp_policy = mcp_policy_str(base.mcp_policy);
@@ -434,6 +446,7 @@ impl AgentCenterService {
                 skill_refs: &skill_refs,
                 mcp_policy,
                 role_bindings: &role_bindings,
+                workflow_definition: &workflow_definition,
             })
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -536,6 +549,7 @@ fn row_to_meta(row: &aionui_db::AssistantAgentCenterRow) -> Result<AgentCenterMe
         skill_refs: serde_json::from_str(&row.skill_refs).unwrap_or_default(),
         mcp_policy,
         role_bindings: serde_json::from_str(&row.role_bindings).unwrap_or_default(),
+        workflow: serde_json::from_str(&row.workflow_definition).unwrap_or_default(),
     })
 }
 

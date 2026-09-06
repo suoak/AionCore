@@ -568,6 +568,78 @@ async fn unpublish_rejects_an_agent_that_is_already_a_draft() {
 }
 
 #[tokio::test]
+async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
+    let fx = fixture().await;
+    let id = "bare:632f31d2";
+    let workflow = json!({
+        "schema_version": 1,
+        "trigger": "manual",
+        "input": { "kind": "text", "required": true, "placeholder": "Paste a pull request diff" },
+        "output": { "format": "json" },
+        "nodes": [
+            { "id": "start", "kind": "start" },
+            { "id": "agent", "kind": "agent" },
+            { "id": "output", "kind": "output" }
+        ],
+        "edges": [
+            { "source": "start", "target": "agent" },
+            { "source": "agent", "target": "output" }
+        ]
+    });
+
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{id}"),
+            json!({ "meta": { "workflow": workflow } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let updated = body_json(update).await;
+    assert_eq!(updated["data"]["meta"]["workflow"]["output"]["format"], "json");
+
+    let run = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/run"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(run.status(), StatusCode::OK);
+    let plan = body_json(run).await;
+    assert_eq!(
+        plan["data"]["workflow"]["input"]["placeholder"],
+        "Paste a pull request diff"
+    );
+    assert_eq!(
+        plan["data"]["create_conversation"]["extra"]["agent_workflow"]["output"]["format"],
+        "json"
+    );
+
+    let invalid = fx
+        .app
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{id}"),
+            json!({ "meta": { "workflow": { "schema_version": 2 } } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn get_detail_returns_definition_state_preferences_and_rules() {
     let fx = fixture().await;
 

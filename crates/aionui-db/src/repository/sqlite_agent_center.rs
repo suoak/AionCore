@@ -67,8 +67,8 @@ impl IAssistantAgentCenterRepository for SqliteAssistantAgentCenterRepository {
             "INSERT INTO assistant_agent_center (
                 assistant_definition_id, visibility, team_id, enterprise_id, status, version,
                 published_revision_id, knowledge_scopes, skill_refs, mcp_policy, role_bindings,
-                created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                workflow_definition, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(assistant_definition_id) DO UPDATE SET
                 visibility = excluded.visibility,
                 team_id = excluded.team_id,
@@ -80,6 +80,7 @@ impl IAssistantAgentCenterRepository for SqliteAssistantAgentCenterRepository {
                 skill_refs = excluded.skill_refs,
                 mcp_policy = excluded.mcp_policy,
                 role_bindings = excluded.role_bindings,
+                workflow_definition = excluded.workflow_definition,
                 updated_at = excluded.updated_at",
         )
         .bind(params.assistant_definition_id)
@@ -93,6 +94,7 @@ impl IAssistantAgentCenterRepository for SqliteAssistantAgentCenterRepository {
         .bind(params.skill_refs)
         .bind(params.mcp_policy)
         .bind(params.role_bindings)
+        .bind(params.workflow_definition)
         .bind(now)
         .bind(now)
         .execute(&self.pool)

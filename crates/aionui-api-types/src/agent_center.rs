@@ -87,6 +87,185 @@ pub struct AgentRoleBinding {
     pub role: AgentAclRole,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkflowOutputFormat {
+    Markdown,
+    PlainText,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkflowInputDefinition {
+    #[serde(default = "default_text_input_kind")]
+    pub kind: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+}
+
+fn default_text_input_kind() -> String {
+    "text".to_owned()
+}
+
+impl Default for AgentWorkflowInputDefinition {
+    fn default() -> Self {
+        Self {
+            kind: default_text_input_kind(),
+            required: true,
+            placeholder: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkflowOutputDefinition {
+    #[serde(default = "default_markdown_output")]
+    pub format: AgentWorkflowOutputFormat,
+}
+
+fn default_markdown_output() -> AgentWorkflowOutputFormat {
+    AgentWorkflowOutputFormat::Markdown
+}
+
+impl Default for AgentWorkflowOutputDefinition {
+    fn default() -> Self {
+        Self {
+            format: default_markdown_output(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkflowNodeDefinition {
+    pub id: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkflowEdgeDefinition {
+    pub source: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkflowDefinition {
+    #[serde(default = "default_workflow_schema_version")]
+    pub schema_version: u32,
+    #[serde(default = "default_manual_trigger")]
+    pub trigger: String,
+    #[serde(default)]
+    pub input: AgentWorkflowInputDefinition,
+    #[serde(default)]
+    pub output: AgentWorkflowOutputDefinition,
+    #[serde(default = "default_workflow_nodes")]
+    pub nodes: Vec<AgentWorkflowNodeDefinition>,
+    #[serde(default = "default_workflow_edges")]
+    pub edges: Vec<AgentWorkflowEdgeDefinition>,
+}
+
+fn default_workflow_schema_version() -> u32 {
+    1
+}
+
+fn default_manual_trigger() -> String {
+    "manual".to_owned()
+}
+
+fn default_workflow_nodes() -> Vec<AgentWorkflowNodeDefinition> {
+    vec![
+        AgentWorkflowNodeDefinition {
+            id: "start".to_owned(),
+            kind: "start".to_owned(),
+        },
+        AgentWorkflowNodeDefinition {
+            id: "agent".to_owned(),
+            kind: "agent".to_owned(),
+        },
+        AgentWorkflowNodeDefinition {
+            id: "output".to_owned(),
+            kind: "output".to_owned(),
+        },
+    ]
+}
+
+fn default_workflow_edges() -> Vec<AgentWorkflowEdgeDefinition> {
+    vec![
+        AgentWorkflowEdgeDefinition {
+            source: "start".to_owned(),
+            target: "agent".to_owned(),
+        },
+        AgentWorkflowEdgeDefinition {
+            source: "agent".to_owned(),
+            target: "output".to_owned(),
+        },
+    ]
+}
+
+impl Default for AgentWorkflowDefinition {
+    fn default() -> Self {
+        Self {
+            schema_version: default_workflow_schema_version(),
+            trigger: default_manual_trigger(),
+            input: AgentWorkflowInputDefinition::default(),
+            output: AgentWorkflowOutputDefinition::default(),
+            nodes: default_workflow_nodes(),
+            edges: default_workflow_edges(),
+        }
+    }
+}
+
+impl AgentWorkflowDefinition {
+    /// Validates the executable subset supported by workflow schema v1.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1 {
+            return Err("workflow.schema_version must be 1");
+        }
+        if self.trigger != "manual" {
+            return Err("workflow.trigger must be manual");
+        }
+        if self.input.kind != "text" {
+            return Err("workflow.input.kind must be text");
+        }
+
+        let mut node_ids = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if node.id.trim().is_empty() || node.kind.trim().is_empty() {
+                return Err("workflow nodes require non-empty id and kind");
+            }
+            if !node_ids.insert(node.id.as_str()) {
+                return Err("workflow node ids must be unique");
+            }
+        }
+        for required_id in ["start", "agent", "output"] {
+            if !node_ids.contains(required_id) {
+                return Err("workflow requires start, agent, and output nodes");
+            }
+        }
+        if self
+            .edges
+            .iter()
+            .any(|edge| !node_ids.contains(edge.source.as_str()) || !node_ids.contains(edge.target.as_str()))
+        {
+            return Err("workflow edges must reference existing nodes");
+        }
+        if !self
+            .edges
+            .iter()
+            .any(|edge| edge.source == "start" && edge.target == "agent")
+            || !self
+                .edges
+                .iter()
+                .any(|edge| edge.source == "agent" && edge.target == "output")
+        {
+            return Err("workflow requires start -> agent -> output edges");
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCenterMeta {
     pub visibility: AgentVisibility,
@@ -105,6 +284,8 @@ pub struct AgentCenterMeta {
     pub mcp_policy: AgentMcpPolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub role_bindings: Vec<AgentRoleBinding>,
+    #[serde(default)]
+    pub workflow: AgentWorkflowDefinition,
 }
 
 impl Default for AgentCenterMeta {
@@ -120,6 +301,7 @@ impl Default for AgentCenterMeta {
             skill_refs: Vec::new(),
             mcp_policy: AgentMcpPolicy::Allowlist,
             role_bindings: Vec::new(),
+            workflow: AgentWorkflowDefinition::default(),
         }
     }
 }
@@ -152,6 +334,8 @@ pub struct AgentCenterMetaPatch {
     pub mcp_policy: Option<AgentMcpPolicy>,
     #[serde(default)]
     pub role_bindings: Option<Vec<AgentRoleBinding>>,
+    #[serde(default)]
+    pub workflow: Option<AgentWorkflowDefinition>,
     /// When set with `mcp_policy=allowlist`, written to assistant defaults as fixed mcp ids.
     #[serde(default)]
     pub mcp_ids: Option<Vec<String>>,
@@ -223,6 +407,7 @@ pub struct AgentCenterRunPlanResponse {
     pub revision: i64,
     /// Clarifies whether this try-run uses draft or published agent config.
     pub preview_mode: AgentCenterPreviewMode,
+    pub workflow: AgentWorkflowDefinition,
     /// Ready-to-POST body for `POST /api/conversations` (existing runtime path).
     pub create_conversation: CreateConversationRequestWire,
 }
@@ -282,5 +467,22 @@ mod tests {
         assert_eq!(meta.mcp_policy, AgentMcpPolicy::Allowlist);
         let v = serde_json::to_value(&meta).unwrap();
         assert_eq!(v["mcp_policy"], "allowlist");
+    }
+
+    #[test]
+    fn workflow_defaults_to_single_agent_manual_flow() {
+        let workflow = AgentWorkflowDefinition::default();
+        assert_eq!(workflow.trigger, "manual");
+        assert_eq!(workflow.nodes.len(), 3);
+        assert_eq!(workflow.edges.len(), 2);
+        assert_eq!(workflow.output.format, AgentWorkflowOutputFormat::Markdown);
+        assert_eq!(workflow.validate(), Ok(()));
+    }
+
+    #[test]
+    fn workflow_rejects_edges_to_unknown_nodes() {
+        let mut workflow = AgentWorkflowDefinition::default();
+        workflow.edges[0].target = "missing".to_owned();
+        assert_eq!(workflow.validate(), Err("workflow edges must reference existing nodes"));
     }
 }
