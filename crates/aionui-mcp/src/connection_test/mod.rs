@@ -737,6 +737,13 @@ mod tests {
     use aionui_realtime::BroadcastEventBus;
     use aionui_realtime::EventBroadcaster;
     use aionui_runtime::{NodeRuntimeProgress, NodeRuntimeProgressPhase};
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+    };
     use std::io::Write;
     use std::sync::Mutex;
     use tracing::Level;
@@ -758,6 +765,70 @@ mod tests {
 
     struct RecordingBroadcaster {
         events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct HttpMcpFixture {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        fail_tool_call: bool,
+    }
+
+    async fn http_mcp_handler(
+        State(state): State<HttpMcpFixture>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        state.requests.lock().unwrap().push(serde_json::json!({
+            "method": method,
+            "params": body.get("params"),
+            "session_id": headers.get("mcp-session-id").and_then(|value| value.to_str().ok()),
+        }));
+        if method == "notifications/initialized" {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let response = if method == "tools/call" && state.fail_tool_call {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32602, "message": "invalid arguments" },
+            })
+        } else if method == "tools/call" {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": [{ "type": "text", "text": "created" }] },
+            })
+        } else {
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+        };
+        let mut response = Json(response).into_response();
+        if method == "initialize" {
+            response
+                .headers_mut()
+                .insert("mcp-session-id", HeaderValue::from_static("session-1"));
+        }
+        response
+    }
+
+    async fn start_http_mcp_fixture(fail_tool_call: bool) -> (String, HttpMcpFixture, tokio::task::JoinHandle<()>) {
+        let state = HttpMcpFixture {
+            fail_tool_call,
+            ..HttpMcpFixture::default()
+        };
+        let app = Router::new()
+            .route("/mcp", post(http_mcp_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/mcp"), state, handle)
     }
 
     impl RecordingBroadcaster {
@@ -805,6 +876,67 @@ mod tests {
         let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
             .with_timeout(Duration::from_secs(5));
         assert_eq!(svc.timeout, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn http_tool_execution_uses_handshake_session_and_configured_arguments() {
+        let (url, fixture, server) = start_http_mcp_fixture(false).await;
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+        let transport = McpServerTransport::Http {
+            url,
+            headers: HashMap::new(),
+        };
+
+        let output = svc
+            .execute_tool(
+                &transport,
+                "create_issue",
+                serde_json::json!({ "title": "Finding" }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        let requests = fixture.requests.lock().unwrap();
+
+        assert_eq!(output["content"][0]["text"], "created");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "notifications/initialized", "tools/call"]
+        );
+        assert_eq!(
+            requests[2],
+            serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "create_issue",
+                    "arguments": { "title": "Finding" },
+                },
+                "session_id": "session-1",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn http_tool_execution_surfaces_rpc_errors() {
+        let (url, _fixture, server) = start_http_mcp_fixture(true).await;
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+        let transport = McpServerTransport::Http {
+            url,
+            headers: HashMap::new(),
+        };
+
+        let error = svc
+            .execute_tool(&transport, "create_issue", serde_json::json!({}), None, None)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert_eq!(error, "tools/call error: invalid arguments (code -32602)");
     }
 
     #[test]
