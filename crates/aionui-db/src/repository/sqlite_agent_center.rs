@@ -235,6 +235,15 @@ impl IAgentWorkflowRunRepository for SqliteAgentWorkflowRunRepository {
         )
     }
 
+    async fn list_by_status(&self, status: &str) -> Result<Vec<AgentWorkflowRunRow>, DbError> {
+        Ok(sqlx::query_as::<_, AgentWorkflowRunRow>(
+            "SELECT * FROM agent_workflow_runs WHERE status = ? ORDER BY created_at ASC",
+        )
+        .bind(status)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn list_for_assistant(
         &self,
         user_id: &str,

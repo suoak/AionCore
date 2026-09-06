@@ -1139,6 +1139,118 @@ async fn pending_tool_is_executed_and_settled_with_the_configured_contract() {
 }
 
 #[tokio::test]
+async fn interrupted_tool_is_failed_without_automatic_replay() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{assistant_id}"),
+            json!({
+                "meta": {
+                    "mcp_policy": "inherit_user_enabled",
+                    "workflow": {
+                        "nodes": [
+                            { "id": "start", "kind": "start" },
+                            { "id": "agent", "kind": "agent" },
+                            {
+                                "id": "tool-1",
+                                "kind": "tool",
+                                "config": {
+                                    "mcp_server_id": "mcp-1",
+                                    "tool_name": "create_issue"
+                                }
+                            },
+                            { "id": "output", "kind": "output" }
+                        ],
+                        "edges": [
+                            { "source": "start", "target": "agent" },
+                            { "source": "agent", "target": "tool-1" },
+                            { "source": "tool-1", "target": "output" }
+                        ]
+                    }
+                }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    fx.agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            &run_id,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-1",
+                turn_id: "turn-1",
+                success: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fx.agent_center.recover_interrupted_tool_runs().await.unwrap(), 1);
+    let recovered = fx
+        .agent_center
+        .get_workflow_run_for_user(DEFAULT_USER_ID, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(recovered.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
+    assert!(
+        recovered.nodes[2]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Verify external side effects")
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_leaves_agent_turns_running() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+
+    assert_eq!(fx.agent_center.recover_interrupted_tool_runs().await.unwrap(), 0);
+    let unchanged = fx
+        .agent_center
+        .get_workflow_run_for_user(DEFAULT_USER_ID, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status, aionui_api_types::AgentWorkflowRunStatus::Running);
+}
+
+#[tokio::test]
 async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result() {
     let fx = fixture().await;
     let assistant_id = "bare:632f31d2";

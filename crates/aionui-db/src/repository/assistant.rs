@@ -253,6 +253,7 @@ pub trait IAssistantDefinitionRevisionRepository: Send + Sync {
 pub trait IAgentWorkflowRunRepository: Send + Sync {
     async fn create(&self, params: &CreateAgentWorkflowRunParams<'_>) -> Result<AgentWorkflowRunRow, DbError>;
     async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentWorkflowRunRow>, DbError>;
+    async fn list_by_status(&self, status: &str) -> Result<Vec<AgentWorkflowRunRow>, DbError>;
     async fn list_for_assistant(
         &self,
         user_id: &str,

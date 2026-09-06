@@ -571,6 +571,75 @@ impl AgentCenterService {
             .collect()
     }
 
+    /// Mark tool executions left in-flight by a previous process as failed.
+    ///
+    /// Tool calls can have external side effects, so startup recovery must not
+    /// replay them automatically. A user can inspect the external system and
+    /// explicitly retry, which creates a fresh execution id.
+    pub async fn recover_interrupted_tool_runs(&self) -> Result<usize, AssistantError> {
+        let rows = self
+            .workflow_run_repo
+            .list_by_status("running")
+            .await
+            .map_err(|error| AssistantError::Internal(error.to_string()))?;
+        let mut recovered = 0;
+        for row in rows {
+            let mut run = match parse_workflow_run(&row.state_json) {
+                Ok(run) => run,
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = row.id,
+                        user_id = row.user_id,
+                        error = %error,
+                        "agent-workflow: skipped malformed run during startup recovery"
+                    );
+                    continue;
+                }
+            };
+            let Some(AgentWorkflowNextAction::InvokeTool {
+                node_id, execution_id, ..
+            }) = run.next_action.as_ref()
+            else {
+                continue;
+            };
+            let Some(node) = run.nodes.get_mut(run.current_node_index) else {
+                continue;
+            };
+            if node.kind != "tool" || node.status != AgentWorkflowNodeRunStatus::Running {
+                continue;
+            }
+            let node_id = node_id.clone();
+            let execution_id = execution_id.clone();
+            let now = now_ms();
+            node.status = AgentWorkflowNodeRunStatus::Failed;
+            node.error = Some(
+                "Tool execution was interrupted by an application restart. Verify external side effects before retrying."
+                    .into(),
+            );
+            node.completed_at = Some(now);
+            run.status = AgentWorkflowRunStatus::Failed;
+            run.next_action = None;
+            run.updated_at = now;
+            let state_json = serialize_workflow_run(&run)?;
+            let updated = self
+                .workflow_run_repo
+                .update_state_if_current(&row.user_id, &row.id, &row.state_json, "failed", &state_json)
+                .await
+                .map_err(|error| AssistantError::Internal(error.to_string()))?;
+            if updated.is_some() {
+                recovered += 1;
+                tracing::warn!(
+                    run_id = row.id,
+                    user_id = row.user_id,
+                    node_id,
+                    execution_id,
+                    "agent-workflow: interrupted tool execution recovered as failed"
+                );
+            }
+        }
+        Ok(recovered)
+    }
+
     pub async fn advance_workflow_run_for_user(
         &self,
         user_id: &str,
