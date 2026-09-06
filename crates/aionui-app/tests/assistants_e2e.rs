@@ -1020,6 +1020,7 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
             &format!("/api/agent-center/agents/{assistant_id}"),
             json!({
                 "meta": {
+                    "mcp_policy": "inherit_user_enabled",
                     "workflow": {
                         "nodes": [
                             { "id": "start", "kind": "start" },
