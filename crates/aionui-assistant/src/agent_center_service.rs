@@ -15,8 +15,8 @@ use aionui_api_types::{
     AdvanceAgentWorkflowRunRequest, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta,
     AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
     AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowApprovalDecision,
-    AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunStatus, AgentWorkflowRunResponse,
-    AgentWorkflowRunStatus, AssistantConversationOverridesRequest, AssistantDefaultListRequest,
+    AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunStatus,
+    AgentWorkflowRunResponse, AgentWorkflowRunStatus, AssistantConversationOverridesRequest, AssistantDefaultListRequest,
     AssistantDefaultsRequest, CreateAgentCenterRequest, CreateConversationRequestWire,
     DecideAgentWorkflowApprovalRequest, PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest,
     UpdateAgentCenterRequest, UpdateAssistantRequest,
@@ -28,7 +28,7 @@ use aionui_db::{
     UpsertAssistantAgentCenterParams,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::error::AssistantError;
 use crate::service::AssistantService;
