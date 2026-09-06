@@ -34,6 +34,13 @@ use protocol::{
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+struct ToolExecution<'a> {
+    name: &'a str,
+    arguments: serde_json::Value,
+    user_id: Option<&'a str>,
+    runtime_scope_id: Option<&'a str>,
+}
+
 // ---------------------------------------------------------------------------
 // McpConnectionTestService
 // ---------------------------------------------------------------------------
@@ -110,8 +117,18 @@ impl McpConnectionTestService {
         }
         match transport {
             McpServerTransport::Stdio { command, args, env } => {
-                self.execute_stdio_tool(command, args, env, tool_name, arguments, user_id, runtime_scope_id)
-                    .await
+                self.execute_stdio_tool(
+                    command,
+                    args,
+                    env,
+                    ToolExecution {
+                        name: tool_name,
+                        arguments,
+                        user_id,
+                        runtime_scope_id,
+                    },
+                )
+                .await
             }
             McpServerTransport::Http { url, headers } => {
                 tokio::time::timeout(self.timeout, self.execute_http_tool(url, headers, tool_name, arguments))
@@ -131,13 +148,11 @@ impl McpConnectionTestService {
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
-        tool_name: &str,
-        arguments: serde_json::Value,
-        user_id: Option<&str>,
-        runtime_scope_id: Option<&str>,
+        execution: ToolExecution<'_>,
     ) -> Result<serde_json::Value, String> {
-        let reporter =
-            runtime_scope_id.map(|scope_id| self.runtime_reporter(user_id.map(str::to_owned), scope_id.to_owned()));
+        let reporter = execution
+            .runtime_scope_id
+            .map(|scope_id| self.runtime_reporter(execution.user_id.map(str::to_owned), scope_id.to_owned()));
         let mut cmd = match probe_runtime_command(command) {
             RuntimeCommandProbe::NodeTool { .. } => {
                 let resolved = ensure_runtime_command_with_reporter(command, reporter.as_deref())
@@ -160,11 +175,15 @@ impl McpConnectionTestService {
             .map_err(|error| format!("failed to start MCP server: {error}"))?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
-        let result =
-            match tokio::time::timeout(self.timeout, run_stdio_tool_call(stdin, stdout, tool_name, arguments)).await {
-                Ok(result) => result,
-                Err(_) => Err(format!("tool execution timed out after {}s", self.timeout.as_secs())),
-            };
+        let result = match tokio::time::timeout(
+            self.timeout,
+            run_stdio_tool_call(stdin, stdout, execution.name, execution.arguments),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!("tool execution timed out after {}s", self.timeout.as_secs())),
+        };
         if let Err(error) = kill_process_tree(&mut child).await {
             warn!(%error, "failed to clean up MCP tool execution process tree");
         }
