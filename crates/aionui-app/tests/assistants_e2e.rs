@@ -10,7 +10,10 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use aionui_api_types::{
     AgentManagementRow, AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
@@ -1025,6 +1028,34 @@ struct RecordingToolExecutor {
     result: Value,
 }
 
+struct BlockingToolExecutor {
+    started: tokio::sync::Notify,
+    dropped: Arc<AtomicBool>,
+}
+
+struct ExecutionDropGuard(Arc<AtomicBool>);
+
+impl Drop for ExecutionDropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentWorkflowToolExecutionPort for BlockingToolExecutor {
+    async fn execute(
+        &self,
+        _user_id: &str,
+        _mcp_server_id: &str,
+        _tool_name: &str,
+        _arguments: Value,
+    ) -> Result<Value, String> {
+        let _guard = ExecutionDropGuard(self.dropped.clone());
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentWorkflowToolExecutionPort for RecordingToolExecutor {
     async fn execute(
@@ -1136,6 +1167,107 @@ async fn pending_tool_is_executed_and_settled_with_the_configured_contract() {
     assert_eq!(calls[0].0, "mcp-1");
     assert_eq!(calls[0].1, "create_issue");
     assert_eq!(calls[0].2["title"], "Finding");
+}
+
+#[tokio::test]
+async fn cancelling_a_run_interrupts_its_in_flight_tool_execution() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(BlockingToolExecutor {
+        started: tokio::sync::Notify::new(),
+        dropped: dropped.clone(),
+    });
+    let fx = fixture_with_tool_executor(Some(executor.clone())).await;
+    let assistant_id = "bare:632f31d2";
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{assistant_id}"),
+            json!({
+                "meta": {
+                    "mcp_policy": "inherit_user_enabled",
+                    "workflow": {
+                        "nodes": [
+                            { "id": "start", "kind": "start" },
+                            { "id": "agent", "kind": "agent" },
+                            {
+                                "id": "tool-1",
+                                "kind": "tool",
+                                "config": {
+                                    "mcp_server_id": "mcp-1",
+                                    "tool_name": "create_issue"
+                                }
+                            },
+                            { "id": "output", "kind": "output" }
+                        ],
+                        "edges": [
+                            { "source": "start", "target": "agent" },
+                            { "source": "agent", "target": "tool-1" },
+                            { "source": "tool-1", "target": "output" }
+                        ]
+                    }
+                }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    fx.agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            &run_id,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-1",
+                turn_id: "turn-1",
+                success: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let service = fx.agent_center.clone();
+    let executing_run_id = run_id.clone();
+    let execution = tokio::spawn(async move {
+        service
+            .execute_pending_tools_for_user(DEFAULT_USER_ID, &executing_run_id)
+            .await
+    });
+    executor.started.notified().await;
+
+    let cancelled = fx
+        .agent_center
+        .cancel_workflow_run_for_user(DEFAULT_USER_ID, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, aionui_api_types::AgentWorkflowRunStatus::Cancelled);
+    let execution_result = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+        .await
+        .expect("cancelled tool execution should return promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        execution_result.status,
+        aionui_api_types::AgentWorkflowRunStatus::Cancelled
+    );
+    assert!(dropped.load(Ordering::Acquire), "tool execution future must be dropped");
 }
 
 #[tokio::test]

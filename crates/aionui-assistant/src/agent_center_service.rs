@@ -5,7 +5,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use aionui_api_types::{
@@ -38,6 +41,26 @@ pub struct AgentCenterService {
     workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
     tool_executor: Option<Arc<dyn AgentWorkflowToolExecutionPort>>,
     tool_execution_locks: tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    tool_execution_cancellations: tokio::sync::Mutex<HashMap<String, Weak<WorkflowExecutionCancellation>>>,
+}
+
+#[derive(Default)]
+struct WorkflowExecutionCancellation {
+    cancelled: AtomicBool,
+    notification: tokio::sync::Notify,
+}
+
+impl WorkflowExecutionCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notification.notify_one();
+    }
+
+    async fn cancelled(&self) {
+        while !self.cancelled.load(Ordering::Acquire) {
+            self.notification.notified().await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -82,6 +105,7 @@ impl AgentCenterService {
             workflow_run_repo,
             tool_executor,
             tool_execution_locks: tokio::sync::Mutex::new(HashMap::new()),
+            tool_execution_cancellations: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -779,6 +803,13 @@ impl AgentCenterService {
             }
         };
         let _execution_guard = execution_lock.lock().await;
+        let cancellation = {
+            let mut cancellations = self.tool_execution_cancellations.lock().await;
+            cancellations.retain(|_, cancellation| cancellation.strong_count() > 0);
+            let cancellation = Arc::new(WorkflowExecutionCancellation::default());
+            cancellations.insert(lock_key.clone(), Arc::downgrade(&cancellation));
+            cancellation
+        };
         loop {
             let run = self.get_workflow_run_for_user(user_id, run_id).await?;
             let Some(AgentWorkflowNextAction::InvokeTool {
@@ -800,7 +831,13 @@ impl AgentCenterService {
                 tool_name,
                 "agent-workflow: MCP tool execution started"
             );
-            let result = executor.execute(user_id, &mcp_server_id, &tool_name, arguments).await;
+            let result = tokio::select! {
+                result = executor.execute(user_id, &mcp_server_id, &tool_name, arguments) => result,
+                () = cancellation.cancelled() => {
+                    tracing::info!(run_id, user_id, node_id, execution_id, "agent-workflow: MCP tool execution interrupted");
+                    return self.get_workflow_run_for_user(user_id, run_id).await;
+                }
+            };
             let (success, output, error) = match result {
                 Ok(output) if output.get("isError").and_then(serde_json::Value::as_bool) != Some(true) => {
                     if serde_json::to_vec(&output).is_ok_and(|encoded| encoded.len() <= 1_048_576) {
@@ -816,7 +853,7 @@ impl AgentCenterService {
                 Ok(output) => (false, output, Some("MCP tool reported an execution error".into())),
                 Err(error) => (false, serde_json::Value::Null, Some(error)),
             };
-            let updated = self
+            let update_result = self
                 .advance_workflow_run_for_user(
                     user_id,
                     run_id,
@@ -828,7 +865,18 @@ impl AgentCenterService {
                         error,
                     },
                 )
-                .await?;
+                .await;
+            let updated = match update_result {
+                Ok(updated) => updated,
+                Err(error @ AssistantError::Conflict(_)) => {
+                    let current = self.get_workflow_run_for_user(user_id, run_id).await?;
+                    if current.status == AgentWorkflowRunStatus::Cancelled {
+                        return Ok(current);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             tracing::info!(run_id, user_id, success, "agent-workflow: MCP tool execution settled");
             if !success {
                 return Ok(updated);
@@ -928,8 +976,18 @@ impl AgentCenterService {
         }
         run.status = AgentWorkflowRunStatus::Cancelled;
         run.next_action = None;
+        let cancelled = self.persist_workflow_run(user_id, run, &row.state_json).await?;
+        let lock_key = format!("{user_id}:{run_id}");
+        let cancellation = {
+            let mut cancellations = self.tool_execution_cancellations.lock().await;
+            cancellations.retain(|_, cancellation| cancellation.strong_count() > 0);
+            cancellations.get(&lock_key).and_then(Weak::upgrade)
+        };
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
         tracing::info!(run_id, user_id, "agent-workflow: run cancelled");
-        self.persist_workflow_run(user_id, run, &row.state_json).await
+        Ok(cancelled)
     }
 
     pub async fn retry_workflow_run_for_user(

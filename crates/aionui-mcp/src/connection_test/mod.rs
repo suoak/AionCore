@@ -739,11 +739,13 @@ mod tests {
     use aionui_runtime::{NodeRuntimeProgress, NodeRuntimeProgressPhase};
     use axum::{
         Json, Router,
+        body::{Body, Bytes},
         extract::State,
-        http::{HeaderMap, HeaderValue, StatusCode},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
         response::{IntoResponse, Response},
-        routing::post,
+        routing::{get, post},
     };
+    use std::convert::Infallible;
     use std::io::Write;
     use std::sync::Mutex;
     use tracing::Level;
@@ -771,6 +773,55 @@ mod tests {
     struct HttpMcpFixture {
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
         fail_tool_call: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct SseMcpFixture {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        events: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
+    }
+
+    async fn sse_stream_handler(State(state): State<SseMcpFixture>) -> Response {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Bytes::from_static(b"event: endpoint\ndata: /messages\n\n"))
+            .unwrap();
+        *state.events.lock().unwrap() = Some(tx);
+        let stream = futures_util::stream::unfold(rx, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|bytes| (Ok::<Bytes, Infallible>(bytes), receiver))
+        });
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    async fn sse_message_handler(
+        State(state): State<SseMcpFixture>,
+        Json(body): Json<serde_json::Value>,
+    ) -> StatusCode {
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        state.requests.lock().unwrap().push(body.clone());
+        if let Some(id) = body.get("id") {
+            let result = if method == "tools/call" {
+                serde_json::json!({ "content": [{ "type": "text", "text": "sent" }] })
+            } else {
+                serde_json::json!({})
+            };
+            let event = format!(
+                "event: message\ndata: {}\n\n",
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+            );
+            if let Some(sender) = state.events.lock().unwrap().as_ref() {
+                let _ = sender.send(Bytes::from(event));
+            }
+        }
+        StatusCode::ACCEPTED
     }
 
     async fn http_mcp_handler(
@@ -829,6 +880,20 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}/mcp"), state, handle)
+    }
+
+    async fn start_sse_mcp_fixture() -> (String, SseMcpFixture, tokio::task::JoinHandle<()>) {
+        let state = SseMcpFixture::default();
+        let app = Router::new()
+            .route("/sse", get(sse_stream_handler))
+            .route("/messages", post(sse_message_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/sse"), state, handle)
     }
 
     impl RecordingBroadcaster {
@@ -937,6 +1002,66 @@ mod tests {
         server.abort();
 
         assert_eq!(error, "tools/call error: invalid arguments (code -32602)");
+    }
+
+    #[tokio::test]
+    async fn sse_tool_execution_uses_endpoint_events_and_returns_result() {
+        let (url, fixture, server) = start_sse_mcp_fixture().await;
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+        let transport = McpServerTransport::Sse {
+            url,
+            headers: HashMap::new(),
+        };
+
+        let output = svc
+            .execute_tool(
+                &transport,
+                "send_message",
+                serde_json::json!({ "channel": "ops" }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        let requests = fixture.requests.lock().unwrap();
+
+        assert_eq!(output["content"][0]["text"], "sent");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "notifications/initialized", "tools/call"]
+        );
+        assert_eq!(requests[2]["params"]["arguments"]["channel"], "ops");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_tool_execution_performs_handshake_and_returns_result() {
+        let transport = McpServerTransport::Stdio {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                concat!(
+                    "read init; ",
+                    "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; ",
+                    "read initialized; read call; ",
+                    "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"stored\"}]}}'",
+                )
+                .into(),
+            ],
+            env: HashMap::new(),
+        };
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+
+        let output = svc
+            .execute_tool(&transport, "store_record", serde_json::json!({ "id": 7 }), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(output["content"][0]["text"], "stored");
     }
 
     #[test]
