@@ -417,6 +417,7 @@ impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
         turn_id: &str,
         settlement: ConversationTurnSettlement,
         error_message: Option<&str>,
+        assistant_output: Option<&str>,
     ) {
         let conversation = match self.conversations.get(user_id, conversation_id).await {
             Ok(Some(conversation)) => conversation,
@@ -472,6 +473,7 @@ impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
                     turn_id,
                     success: settlement == ConversationTurnSettlement::Completed,
                     error: error_message.map(str::to_owned),
+                    output: assistant_output,
                 },
             )
             .await;

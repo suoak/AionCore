@@ -4357,7 +4357,9 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
 
 #[tokio::test]
 async fn run_agent_turn_notifies_settlement_hooks_once_after_completion() {
-    struct RecordingSettlementHook(Arc<Mutex<Vec<(String, String, String, ConversationTurnSettlement)>>>);
+    struct RecordingSettlementHook(
+        Arc<Mutex<Vec<(String, String, String, ConversationTurnSettlement, Option<String>)>>>,
+    );
 
     #[async_trait::async_trait]
     impl OnConversationTurnSettled for RecordingSettlementHook {
@@ -4368,18 +4370,28 @@ async fn run_agent_turn_notifies_settlement_hooks_once_after_completion() {
             turn_id: &str,
             settlement: ConversationTurnSettlement,
             _error_message: Option<&str>,
+            assistant_output: Option<&str>,
         ) {
             self.0.lock().unwrap().push((
                 user_id.to_owned(),
                 conversation_id.to_owned(),
                 turn_id.to_owned(),
                 settlement,
+                assistant_output.map(str::to_owned),
             ));
         }
     }
 
     let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
-        MockAgent::new("placeholder"),
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "workflow result".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ]],
+        ),
     ))]));
     let service = ConversationService::new(
         std::env::temp_dir(),
@@ -4415,6 +4427,7 @@ async fn run_agent_turn_notifies_settlement_hooks_once_after_completion() {
     assert_eq!(recorded[0].1, conv.id);
     assert_eq!(recorded[0].2, outcome.turn_id);
     assert_eq!(recorded[0].3, ConversationTurnSettlement::Completed);
+    assert_eq!(recorded[0].4.as_deref(), Some("workflow result"));
 }
 
 #[tokio::test]
@@ -9703,6 +9716,7 @@ async fn session_not_found_clears_the_persisted_session_id() {
             retryable: Some(true),
         },
         attempt: Default::default(),
+        assistant_output: None,
     };
 
     let evicted = svc
@@ -9738,6 +9752,7 @@ async fn other_terminal_errors_keep_the_session_id_for_replay() {
                 retryable: Some(true),
             },
             attempt: Default::default(),
+            assistant_output: None,
         };
         svc.evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
             .await;
@@ -9763,6 +9778,7 @@ async fn a_clean_finish_leaves_the_session_id_alone() {
         system_responses: Vec::new(),
         terminal: crate::stream_relay::RelayTerminal::Finish,
         attempt: Default::default(),
+        assistant_output: None,
     };
 
     let evicted = svc

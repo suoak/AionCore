@@ -128,6 +128,8 @@ pub struct RelayOutcome {
     pub system_responses: Vec<String>,
     pub terminal: RelayTerminal,
     pub attempt: TurnAttemptSummary,
+    /// Final middleware-processed assistant text for successful consumers.
+    pub assistant_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -634,6 +636,7 @@ impl StreamRelay {
                                     system_responses: Vec::new(),
                                     terminal,
                                     attempt,
+                                    assistant_output: None,
                                 };
                             }
 
@@ -661,6 +664,7 @@ impl StreamRelay {
                                     system_responses: Vec::new(),
                                     terminal,
                                     attempt: attempt.clone(),
+                                    assistant_output: None,
                                 }
                             } else {
                                 self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
@@ -878,6 +882,7 @@ impl StreamRelay {
                             system_responses: Vec::new(),
                             terminal: RelayTerminal::ChannelClosed,
                             attempt: attempt.clone(),
+                            assistant_output: None,
                         }
                     } else {
                         self.finalize(
@@ -1209,6 +1214,7 @@ impl StreamRelay {
             system_responses: Vec::new(),
             terminal,
             attempt: TurnAttemptSummary::default(),
+            assistant_output: None,
         };
         let status = match event {
             AgentStreamEvent::Error(_) => "error",
@@ -1219,6 +1225,7 @@ impl StreamRelay {
             let processed = self.process_final_text(text).await;
             let final_text = processed.message.trim().to_owned();
             let hidden = final_text.is_empty();
+            outcome.assistant_output = (!hidden).then(|| final_text.clone());
 
             let rewrite_segments = processed.message != text || hidden;
             let overrides = self

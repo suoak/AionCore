@@ -80,6 +80,7 @@ pub struct AgentWorkflowTurnResult<'a> {
     pub turn_id: &'a str,
     pub success: bool,
     pub error: Option<String>,
+    pub output: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -523,6 +524,7 @@ impl AgentCenterService {
             workflow: plan.workflow,
             nodes: Vec::new(),
             variables,
+            output: None,
             next_action: Some(AgentWorkflowNextAction::RunAgent {
                 create_conversation: Box::new(plan.create_conversation),
             }),
@@ -758,6 +760,13 @@ impl AgentCenterService {
             return Ok(None);
         }
 
+        let mut output = json!({
+            "conversation_id": result.conversation_id,
+            "turn_id": result.turn_id,
+        });
+        if let Some(content) = result.output.filter(|content| !content.trim().is_empty()) {
+            output["content"] = json!(content);
+        }
         let updated = self
             .advance_workflow_run_for_user(
                 user_id,
@@ -766,10 +775,7 @@ impl AgentCenterService {
                     node_id: None,
                     execution_id: None,
                     success: result.success,
-                    output: json!({
-                        "conversation_id": result.conversation_id,
-                        "turn_id": result.turn_id,
-                    }),
+                    output,
                     error: result.error,
                 },
             )
@@ -1025,6 +1031,7 @@ impl AgentCenterService {
         node.started_at = Some(now);
         node.completed_at = None;
         run.status = AgentWorkflowRunStatus::Running;
+        run.output = None;
         run.next_action = Some(next_action);
         let retried = self.persist_workflow_run(user_id, run, &row.state_json).await?;
         tracing::info!(run_id, user_id, "agent-workflow: failed tool node retried");
@@ -1354,6 +1361,9 @@ fn validate_workflow_input(workflow: &AgentWorkflowDefinition, input: &Value) ->
 fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(), AssistantError> {
     loop {
         let Some(definition) = run.workflow.nodes.get(run.current_node_index) else {
+            if run.output.is_none() {
+                run.output = resolve_workflow_output(run);
+            }
             run.status = AgentWorkflowRunStatus::Completed;
             run.next_action = None;
             return Ok(());
@@ -1361,6 +1371,9 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
         let node_id = definition.id.clone();
         let kind = definition.kind.clone();
         let config = definition.config.clone();
+        let resolved_output = matches!(kind.as_str(), "condition" | "output")
+            .then(|| resolve_workflow_output(run))
+            .flatten();
         let node = run
             .nodes
             .get_mut(run.current_node_index)
@@ -1403,6 +1416,7 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
                 for remaining in run.nodes.iter_mut().skip(run.current_node_index + 1) {
                     if remaining.kind == "output" {
                         remaining.status = AgentWorkflowNodeRunStatus::Completed;
+                        remaining.output = resolved_output.clone();
                     } else {
                         remaining.status = AgentWorkflowNodeRunStatus::Skipped;
                     }
@@ -1410,6 +1424,7 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
                 }
                 run.current_node_index = run.nodes.len().saturating_sub(1);
                 run.status = AgentWorkflowRunStatus::Completed;
+                run.output = resolved_output;
                 run.next_action = None;
                 return Ok(());
             }
@@ -1417,7 +1432,9 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
                 node.status = AgentWorkflowNodeRunStatus::Completed;
                 node.started_at = Some(now);
                 node.completed_at = Some(now);
+                node.output = resolved_output.clone();
                 run.status = AgentWorkflowRunStatus::Completed;
+                run.output = resolved_output;
                 run.next_action = None;
                 return Ok(());
             }
@@ -1428,6 +1445,24 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
             }
         }
     }
+}
+
+fn resolve_workflow_output(run: &AgentWorkflowRunResponse) -> Option<Value> {
+    run.workflow
+        .nodes
+        .iter()
+        .zip(run.nodes.iter())
+        .rev()
+        .find_map(|(definition, node)| {
+            if node.status != AgentWorkflowNodeRunStatus::Completed {
+                return None;
+            }
+            match definition.kind.as_str() {
+                "tool" => node.output.clone(),
+                "agent" => node.output.as_ref().and_then(|output| output.get("content").cloned()),
+                _ => None,
+            }
+        })
 }
 
 fn build_tool_action(

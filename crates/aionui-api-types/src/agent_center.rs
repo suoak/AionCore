@@ -548,6 +548,8 @@ pub struct AgentWorkflowRunResponse {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub variables: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_action: Option<AgentWorkflowNextAction>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -735,5 +737,6 @@ mod tests {
         assert_eq!(run.revision_id, None);
         assert_eq!(run.revision, 0);
         assert_eq!(run.preview_mode, AgentCenterPreviewMode::Draft);
+        assert_eq!(run.output, None);
     }
 }

@@ -81,5 +81,6 @@ pub trait OnConversationTurnSettled: Send + Sync {
         turn_id: &str,
         settlement: ConversationTurnSettlement,
         error_message: Option<&str>,
+        assistant_output: Option<&str>,
     );
 }

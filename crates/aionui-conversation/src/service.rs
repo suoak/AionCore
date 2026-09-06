@@ -706,6 +706,7 @@ impl ConversationService {
         turn_id: &str,
         settlement: ConversationTurnSettlement,
         error_message: Option<&str>,
+        assistant_output: Option<&str>,
     ) {
         let hooks: Vec<Arc<dyn OnConversationTurnSettled>> = self
             .turn_settled_hooks
@@ -713,8 +714,15 @@ impl ConversationService {
             .map(|guard| guard.clone())
             .unwrap_or_default();
         for hook in hooks {
-            hook.on_turn_settled(user_id, conversation_id, turn_id, settlement, error_message)
-                .await;
+            hook.on_turn_settled(
+                user_id,
+                conversation_id,
+                turn_id,
+                settlement,
+                error_message,
+                assistant_output,
+            )
+            .await;
         }
     }
 

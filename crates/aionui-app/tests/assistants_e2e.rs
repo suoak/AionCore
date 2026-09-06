@@ -1019,6 +1019,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
+                output: None,
             },
         )
         .await
@@ -1036,6 +1037,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
+                output: Some("# Review complete"),
             },
         )
         .await
@@ -1047,6 +1049,12 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
         "conversation-1"
     );
     assert_eq!(settled.nodes[1].output.as_ref().unwrap()["turn_id"], "turn-1");
+    assert_eq!(
+        settled.nodes[1].output.as_ref().unwrap()["content"],
+        "# Review complete"
+    );
+    assert_eq!(settled.nodes[2].output.as_ref().unwrap(), "# Review complete");
+    assert_eq!(settled.output.as_ref().unwrap(), "# Review complete");
 
     let duplicate = fx
         .agent_center
@@ -1059,6 +1067,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
+                output: None,
             },
         )
         .await
@@ -1090,6 +1099,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
                 turn_id: "turn-2",
                 success: false,
                 error: Some("agent turn failed".to_owned()),
+                output: None,
             },
         )
         .await
@@ -1220,6 +1230,7 @@ async fn pending_tool_is_executed_and_settled_with_the_configured_contract() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
+                output: None,
             },
         )
         .await
@@ -1239,6 +1250,7 @@ async fn pending_tool_is_executed_and_settled_with_the_configured_contract() {
         completed.nodes[2].output.as_ref().unwrap()["content"][0]["text"],
         "created"
     );
+    assert_eq!(completed.output, completed.nodes[2].output);
     let calls = executor.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "mcp-1");
@@ -1315,6 +1327,7 @@ async fn cancelling_a_run_interrupts_its_in_flight_tool_execution() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
+                output: None,
             },
         )
         .await
@@ -1527,6 +1540,7 @@ async fn interrupted_tool_is_failed_without_automatic_replay() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
+                output: None,
             },
         )
         .await
