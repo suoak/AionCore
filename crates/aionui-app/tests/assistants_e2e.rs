@@ -579,11 +579,17 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
         "nodes": [
             { "id": "start", "kind": "start" },
             { "id": "agent", "kind": "agent" },
+            { "id": "tool-1", "kind": "tool", "config": { "tool_id": "github" } },
+            { "id": "approval-1", "kind": "approval", "config": { "message": "Approve external changes" } },
+            { "id": "condition-1", "kind": "condition", "config": { "expression": "risk_score > 70" } },
             { "id": "output", "kind": "output" }
         ],
         "edges": [
             { "source": "start", "target": "agent" },
-            { "source": "agent", "target": "output" }
+            { "source": "agent", "target": "tool-1" },
+            { "source": "tool-1", "target": "approval-1" },
+            { "source": "approval-1", "target": "condition-1" },
+            { "source": "condition-1", "target": "output" }
         ]
     });
 
@@ -624,6 +630,7 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
         plan["data"]["create_conversation"]["extra"]["agent_workflow"]["output"]["format"],
         "json"
     );
+    assert_eq!(plan["data"]["workflow"]["nodes"][2]["config"]["tool_id"], "github");
 
     let invalid = fx
         .app
@@ -637,6 +644,49 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let incomplete = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{id}"),
+            json!({
+                "meta": {
+                    "workflow": {
+                        "nodes": [
+                            { "id": "start", "kind": "start" },
+                            { "id": "agent", "kind": "agent" },
+                            { "id": "tool-2", "kind": "tool" },
+                            { "id": "output", "kind": "output" }
+                        ],
+                        "edges": [
+                            { "source": "start", "target": "agent" },
+                            { "source": "agent", "target": "tool-2" },
+                            { "source": "tool-2", "target": "output" }
+                        ]
+                    }
+                }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(incomplete.status(), StatusCode::OK);
+
+    let publish = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/publish"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(publish.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

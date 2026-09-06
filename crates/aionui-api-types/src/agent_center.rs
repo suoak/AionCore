@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::{
     AssistantConversationOverridesRequest, AssistantConversationRequest, AssistantDetailResponse, AssistantResponse,
@@ -141,6 +142,10 @@ impl Default for AgentWorkflowOutputDefinition {
 pub struct AgentWorkflowNodeDefinition {
     pub id: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,14 +183,20 @@ fn default_workflow_nodes() -> Vec<AgentWorkflowNodeDefinition> {
         AgentWorkflowNodeDefinition {
             id: "start".to_owned(),
             kind: "start".to_owned(),
+            label: None,
+            config: BTreeMap::new(),
         },
         AgentWorkflowNodeDefinition {
             id: "agent".to_owned(),
             kind: "agent".to_owned(),
+            label: None,
+            config: BTreeMap::new(),
         },
         AgentWorkflowNodeDefinition {
             id: "output".to_owned(),
             kind: "output".to_owned(),
+            label: None,
+            config: BTreeMap::new(),
         },
     ]
 }
@@ -229,7 +240,10 @@ impl AgentWorkflowDefinition {
             return Err("workflow.input.kind must be text");
         }
 
-        let mut node_ids = std::collections::HashSet::new();
+        if self.nodes.len() < 3 || self.nodes.len() > 20 {
+            return Err("workflow must contain between 3 and 20 nodes");
+        }
+        let mut node_ids = HashSet::new();
         for node in &self.nodes {
             if node.id.trim().is_empty() || node.kind.trim().is_empty() {
                 return Err("workflow nodes require non-empty id and kind");
@@ -237,29 +251,51 @@ impl AgentWorkflowDefinition {
             if !node_ids.insert(node.id.as_str()) {
                 return Err("workflow node ids must be unique");
             }
-        }
-        for required_id in ["start", "agent", "output"] {
-            if !node_ids.contains(required_id) {
-                return Err("workflow requires start, agent, and output nodes");
+            if !matches!(
+                node.kind.as_str(),
+                "start" | "agent" | "tool" | "approval" | "condition" | "output"
+            ) {
+                return Err("workflow contains an unsupported node kind");
             }
         }
-        if self
-            .edges
-            .iter()
-            .any(|edge| !node_ids.contains(edge.source.as_str()) || !node_ids.contains(edge.target.as_str()))
+        if self.nodes.first().map(|node| node.kind.as_str()) != Some("start")
+            || self.nodes.get(1).map(|node| node.kind.as_str()) != Some("agent")
+            || self.nodes.last().map(|node| node.kind.as_str()) != Some("output")
         {
-            return Err("workflow edges must reference existing nodes");
+            return Err("workflow must start with start -> agent and end with output");
         }
-        if !self
-            .edges
-            .iter()
-            .any(|edge| edge.source == "start" && edge.target == "agent")
-            || !self
-                .edges
-                .iter()
-                .any(|edge| edge.source == "agent" && edge.target == "output")
+        if self.nodes.iter().filter(|node| node.kind == "start").count() != 1
+            || self.nodes.iter().filter(|node| node.kind == "agent").count() != 1
+            || self.nodes.iter().filter(|node| node.kind == "output").count() != 1
         {
-            return Err("workflow requires start -> agent -> output edges");
+            return Err("workflow requires exactly one start, agent, and output node");
+        }
+        if self.edges.len() != self.nodes.len() - 1
+            || self
+                .nodes
+                .windows(2)
+                .zip(&self.edges)
+                .any(|(nodes, edge)| edge.source != nodes[0].id || edge.target != nodes[1].id)
+        {
+            return Err("workflow edges must form the declared linear node order");
+        }
+
+        Ok(())
+    }
+
+    /// Validates configuration required before creating an immutable published revision.
+    pub fn validate_for_publish(&self) -> Result<(), &'static str> {
+        self.validate()?;
+        for node in &self.nodes {
+            let required_key = match node.kind.as_str() {
+                "tool" => Some("tool_id"),
+                "approval" => Some("message"),
+                "condition" => Some("expression"),
+                _ => None,
+            };
+            if required_key.is_some_and(|key| node.config.get(key).is_none_or(|value| value.trim().is_empty())) {
+                return Err("workflow configurable nodes require complete configuration");
+            }
         }
 
         Ok(())
@@ -483,6 +519,46 @@ mod tests {
     fn workflow_rejects_edges_to_unknown_nodes() {
         let mut workflow = AgentWorkflowDefinition::default();
         workflow.edges[0].target = "missing".to_owned();
-        assert_eq!(workflow.validate(), Err("workflow edges must reference existing nodes"));
+        assert_eq!(
+            workflow.validate(),
+            Err("workflow edges must form the declared linear node order")
+        );
+    }
+
+    #[test]
+    fn workflow_requires_tool_configuration_only_for_publish() {
+        let mut workflow = AgentWorkflowDefinition::default();
+        workflow.nodes.insert(
+            2,
+            AgentWorkflowNodeDefinition {
+                id: "tool-1".to_owned(),
+                kind: "tool".to_owned(),
+                label: None,
+                config: BTreeMap::new(),
+            },
+        );
+        workflow.edges = vec![
+            AgentWorkflowEdgeDefinition {
+                source: "start".to_owned(),
+                target: "agent".to_owned(),
+            },
+            AgentWorkflowEdgeDefinition {
+                source: "agent".to_owned(),
+                target: "tool-1".to_owned(),
+            },
+            AgentWorkflowEdgeDefinition {
+                source: "tool-1".to_owned(),
+                target: "output".to_owned(),
+            },
+        ];
+        assert_eq!(workflow.validate(), Ok(()));
+        assert_eq!(
+            workflow.validate_for_publish(),
+            Err("workflow configurable nodes require complete configuration")
+        );
+        workflow.nodes[2]
+            .config
+            .insert("tool_id".to_owned(), "github".to_owned());
+        assert_eq!(workflow.validate_for_publish(), Ok(()));
     }
 }

@@ -212,6 +212,27 @@ impl AgentCenterService {
                 }
             }
         }
+        meta.workflow
+            .validate_for_publish()
+            .map_err(|message| AssistantError::BadRequest(message.into()))?;
+        if meta.mcp_policy == AgentMcpPolicy::Allowlist {
+            let enabled_mcp_ids = &detail.assistant.defaults.mcps.value;
+            let has_unavailable_tool = meta
+                .workflow
+                .nodes
+                .iter()
+                .filter(|node| node.kind == "tool")
+                .any(|node| {
+                    node.config
+                        .get("tool_id")
+                        .is_some_and(|tool_id| !enabled_mcp_ids.contains(tool_id))
+                });
+            if has_unavailable_tool {
+                return Err(AssistantError::BadRequest(
+                    "workflow tool nodes must reference an enabled MCP server".into(),
+                ));
+            }
+        }
 
         let next_revision = meta.version + 1;
         let revision_id = generate_prefixed_id("arev");
