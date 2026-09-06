@@ -3,7 +3,10 @@
 //! Reuses [`AssistantService`] for identity/rules/defaults; stores Agent Center
 //! fields in side tables so existing `/api/assistants` CRUD stays intact.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use aionui_api_types::{
     AdvanceAgentWorkflowRunRequest, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta,
@@ -33,6 +36,19 @@ pub struct AgentCenterService {
     center_repo: Arc<dyn IAssistantAgentCenterRepository>,
     revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository>,
     workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
+    tool_executor: Option<Arc<dyn AgentWorkflowToolExecutionPort>>,
+    tool_execution_locks: tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+#[async_trait::async_trait]
+pub trait AgentWorkflowToolExecutionPort: Send + Sync {
+    async fn execute(
+        &self,
+        user_id: &str,
+        mcp_server_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
 }
 
 pub struct AgentWorkflowTurnResult<'a> {
@@ -56,6 +72,7 @@ impl AgentCenterService {
         center_repo: Arc<dyn IAssistantAgentCenterRepository>,
         revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository>,
         workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
+        tool_executor: Option<Arc<dyn AgentWorkflowToolExecutionPort>>,
     ) -> Self {
         Self {
             assistants,
@@ -63,6 +80,8 @@ impl AgentCenterService {
             center_repo,
             revision_repo,
             workflow_run_repo,
+            tool_executor,
+            tool_execution_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -605,6 +624,7 @@ impl AgentCenterService {
         let now = now_ms();
         if !req.success {
             node.status = AgentWorkflowNodeRunStatus::Failed;
+            node.output = (!req.output.is_null()).then_some(req.output);
             node.error = req.error.or_else(|| Some("node execution failed".into()));
             node.completed_at = Some(now);
             run.status = AgentWorkflowRunStatus::Failed;
@@ -669,6 +689,84 @@ impl AgentCenterService {
         Ok(Some(updated))
     }
 
+    pub async fn execute_pending_tools_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let Some(executor) = self.tool_executor.as_ref() else {
+            return self.get_workflow_run_for_user(user_id, run_id).await;
+        };
+        let lock_key = format!("{user_id}:{run_id}");
+        let execution_lock = {
+            let mut locks = self.tool_execution_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&lock_key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(lock_key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _execution_guard = execution_lock.lock().await;
+        loop {
+            let run = self.get_workflow_run_for_user(user_id, run_id).await?;
+            let Some(AgentWorkflowNextAction::InvokeTool {
+                node_id,
+                execution_id,
+                mcp_server_id,
+                tool_name,
+                arguments,
+            }) = run.next_action.clone()
+            else {
+                return Ok(run);
+            };
+            tracing::info!(
+                run_id,
+                user_id,
+                node_id,
+                execution_id,
+                mcp_server_id,
+                tool_name,
+                "agent-workflow: MCP tool execution started"
+            );
+            let result = executor.execute(user_id, &mcp_server_id, &tool_name, arguments).await;
+            let (success, output, error) = match result {
+                Ok(output) if output.get("isError").and_then(serde_json::Value::as_bool) != Some(true) => {
+                    if serde_json::to_vec(&output).is_ok_and(|encoded| encoded.len() <= 1_048_576) {
+                        (true, output, None)
+                    } else {
+                        (
+                            false,
+                            serde_json::Value::Null,
+                            Some("MCP tool result exceeded the 1 MiB workflow limit".into()),
+                        )
+                    }
+                }
+                Ok(output) => (false, output, Some("MCP tool reported an execution error".into())),
+                Err(error) => (false, serde_json::Value::Null, Some(error)),
+            };
+            let updated = self
+                .advance_workflow_run_for_user(
+                    user_id,
+                    run_id,
+                    AdvanceAgentWorkflowRunRequest {
+                        node_id: Some(node_id),
+                        execution_id: Some(execution_id),
+                        success,
+                        output,
+                        error,
+                    },
+                )
+                .await?;
+            tracing::info!(run_id, user_id, success, "agent-workflow: MCP tool execution settled");
+            if !success {
+                return Ok(updated);
+            }
+        }
+    }
+
     pub async fn decide_workflow_approval_for_user(
         &self,
         user_id: &str,
@@ -704,6 +802,7 @@ impl AgentCenterService {
             },
             "comment": req.comment,
         }));
+        let approved = req.decision == AgentWorkflowApprovalDecision::Approve;
         match req.decision {
             AgentWorkflowApprovalDecision::Reject => {
                 node.status = AgentWorkflowNodeRunStatus::Rejected;
@@ -720,7 +819,12 @@ impl AgentCenterService {
             }
         }
         tracing::info!(run_id, user_id, decision = ?req.decision, "agent-workflow: approval decided");
-        self.persist_workflow_run(user_id, run, &row.state_json).await
+        let decided = self.persist_workflow_run(user_id, run, &row.state_json).await?;
+        if approved && self.tool_executor.is_some() {
+            self.execute_pending_tools_for_user(user_id, run_id).await
+        } else {
+            Ok(decided)
+        }
     }
 
     pub async fn cancel_workflow_run_for_user(
@@ -757,6 +861,53 @@ impl AgentCenterService {
         run.next_action = None;
         tracing::info!(run_id, user_id, "agent-workflow: run cancelled");
         self.persist_workflow_run(user_id, run, &row.state_json).await
+    }
+
+    pub async fn retry_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
+        let definition = run
+            .workflow
+            .nodes
+            .get(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no failed node".into()))?;
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no failed node".into()))?;
+        if run.status != AgentWorkflowRunStatus::Failed
+            || node.kind != "tool"
+            || node.status != AgentWorkflowNodeRunStatus::Failed
+        {
+            return Err(AssistantError::Conflict(
+                "only a failed tool node can be retried".into(),
+            ));
+        }
+        let next_action = build_tool_action(definition)?;
+        let now = now_ms();
+        node.status = AgentWorkflowNodeRunStatus::Running;
+        node.output = None;
+        node.error = None;
+        node.started_at = Some(now);
+        node.completed_at = None;
+        run.status = AgentWorkflowRunStatus::Running;
+        run.next_action = Some(next_action);
+        let retried = self.persist_workflow_run(user_id, run, &row.state_json).await?;
+        tracing::info!(run_id, user_id, "agent-workflow: failed tool node retried");
+        if self.tool_executor.is_some() {
+            self.execute_pending_tools_for_user(user_id, run_id).await
+        } else {
+            Ok(retried)
+        }
     }
 
     async fn persist_workflow_run(
@@ -1079,38 +1230,10 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
 
         match kind.as_str() {
             "tool" => {
-                let mcp_server_id = config
-                    .get("mcp_server_id")
-                    .or_else(|| config.get("tool_id"))
-                    .filter(|value| !value.trim().is_empty())
-                    .cloned()
-                    .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires mcp_server_id".into()))?;
-                let tool_name = config
-                    .get("tool_name")
-                    .filter(|value| !value.trim().is_empty())
-                    .cloned()
-                    .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires tool_name".into()))?;
-                let arguments = config
-                    .get("arguments_json")
-                    .map(|raw| serde_json::from_str(raw))
-                    .transpose()
-                    .map_err(|_| AssistantError::BadRequest("workflow tool arguments must be valid JSON".into()))?
-                    .unwrap_or_else(|| json!({}));
-                if !arguments.is_object() {
-                    return Err(AssistantError::BadRequest(
-                        "workflow tool arguments must be a JSON object".into(),
-                    ));
-                }
                 node.status = AgentWorkflowNodeRunStatus::Running;
                 node.started_at = Some(now);
                 run.status = AgentWorkflowRunStatus::Running;
-                run.next_action = Some(AgentWorkflowNextAction::InvokeTool {
-                    node_id,
-                    execution_id: generate_prefixed_id("awexec"),
-                    mcp_server_id,
-                    tool_name,
-                    arguments,
-                });
+                run.next_action = Some(build_tool_action(definition)?);
                 return Ok(());
             }
             "approval" => {
@@ -1167,6 +1290,43 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
             }
         }
     }
+}
+
+fn build_tool_action(
+    definition: &aionui_api_types::AgentWorkflowNodeDefinition,
+) -> Result<AgentWorkflowNextAction, AssistantError> {
+    let mcp_server_id = definition
+        .config
+        .get("mcp_server_id")
+        .or_else(|| definition.config.get("tool_id"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires mcp_server_id".into()))?;
+    let tool_name = definition
+        .config
+        .get("tool_name")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires tool_name".into()))?;
+    let arguments = definition
+        .config
+        .get("arguments_json")
+        .map(|raw| serde_json::from_str(raw))
+        .transpose()
+        .map_err(|_| AssistantError::BadRequest("workflow tool arguments must be valid JSON".into()))?
+        .unwrap_or_else(|| json!({}));
+    if !arguments.is_object() {
+        return Err(AssistantError::BadRequest(
+            "workflow tool arguments must be a JSON object".into(),
+        ));
+    }
+    Ok(AgentWorkflowNextAction::InvokeTool {
+        node_id: definition.id.clone(),
+        execution_id: generate_prefixed_id("awexec"),
+        mcp_server_id,
+        tool_name,
+        arguments,
+    })
 }
 
 fn evaluate_guard_expression(

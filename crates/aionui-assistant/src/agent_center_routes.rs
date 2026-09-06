@@ -48,6 +48,7 @@ pub fn agent_center_routes(state: AgentCenterRouterState) -> Router {
             post(decide_workflow_approval),
         )
         .route("/api/agent-center/workflow-runs/{id}/cancel", post(cancel_workflow_run))
+        .route("/api/agent-center/workflow-runs/{id}/retry", post(retry_workflow_run))
         .with_state(state)
 }
 
@@ -206,5 +207,14 @@ async fn cancel_workflow_run(
         .service
         .cancel_workflow_run_for_user(&current_user.id, &id)
         .await?;
+    Ok(Json(ApiResponse::ok(run)))
+}
+
+async fn retry_workflow_run(
+    State(state): State<AgentCenterRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<AgentWorkflowRunResponse>>, ApiError> {
+    let run = state.service.retry_workflow_run_for_user(&current_user.id, &id).await?;
     Ok(Json(ApiResponse::ok(run)))
 }

@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{
     AgentManagementRow, AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
@@ -18,8 +18,8 @@ use aionui_api_types::{
 };
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AgentWorkflowTurnResult, AssistantAgentCatalogPort,
-    AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
+    AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_common::AgentType;
 use aionui_db::{
@@ -160,6 +160,10 @@ fn assert_versioned_avatar_value(value: Option<&str>, expected_path: &str) {
 /// Also logs in `admin` and hands back the session + CSRF tokens so tests
 /// can issue authenticated mutating requests.
 async fn fixture() -> Fixture {
+    fixture_with_tool_executor(None).await
+}
+
+async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowToolExecutionPort>>) -> Fixture {
     let user_tmp = TempDir::new().unwrap();
     let builtin_tmp = TempDir::new().unwrap();
     let ext_tmp = TempDir::new().unwrap();
@@ -362,6 +366,7 @@ async fn fixture() -> Fixture {
         center_repo,
         revision_repo,
         workflow_run_repo,
+        tool_executor,
     ));
     states.agent_center = AgentCenterRouterState {
         service: agent_center.clone(),
@@ -1015,6 +1020,124 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
     assert!(failed.next_action.is_none());
 }
 
+struct RecordingToolExecutor {
+    calls: Mutex<Vec<(String, String, Value)>>,
+    result: Value,
+}
+
+#[async_trait::async_trait]
+impl AgentWorkflowToolExecutionPort for RecordingToolExecutor {
+    async fn execute(
+        &self,
+        _user_id: &str,
+        mcp_server_id: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((mcp_server_id.to_owned(), tool_name.to_owned(), arguments));
+        tokio::task::yield_now().await;
+        Ok(self.result.clone())
+    }
+}
+
+#[tokio::test]
+async fn pending_tool_is_executed_and_settled_with_the_configured_contract() {
+    let executor = Arc::new(RecordingToolExecutor {
+        calls: Mutex::new(Vec::new()),
+        result: json!({ "content": [{ "type": "text", "text": "created" }] }),
+    });
+    let fx = fixture_with_tool_executor(Some(executor.clone())).await;
+    let assistant_id = "bare:632f31d2";
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{assistant_id}"),
+            json!({
+                "meta": {
+                    "mcp_policy": "inherit_user_enabled",
+                    "workflow": {
+                        "nodes": [
+                            { "id": "start", "kind": "start" },
+                            { "id": "agent", "kind": "agent" },
+                            {
+                                "id": "tool-1",
+                                "kind": "tool",
+                                "config": {
+                                    "mcp_server_id": "mcp-1",
+                                    "tool_name": "create_issue",
+                                    "arguments_json": "{\"title\":\"Finding\"}"
+                                }
+                            },
+                            { "id": "output", "kind": "output" }
+                        ],
+                        "edges": [
+                            { "source": "start", "target": "agent" },
+                            { "source": "agent", "target": "tool-1" },
+                            { "source": "tool-1", "target": "output" }
+                        ]
+                    }
+                }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    fx.agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            &run_id,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-1",
+                turn_id: "turn-1",
+                success: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (first, second) = tokio::join!(
+        fx.agent_center.execute_pending_tools_for_user(DEFAULT_USER_ID, &run_id),
+        fx.agent_center.execute_pending_tools_for_user(DEFAULT_USER_ID, &run_id),
+    );
+    let completed = first.unwrap();
+    assert_eq!(
+        second.unwrap().status,
+        aionui_api_types::AgentWorkflowRunStatus::Completed
+    );
+    assert_eq!(completed.status, aionui_api_types::AgentWorkflowRunStatus::Completed);
+    assert_eq!(
+        completed.nodes[2].output.as_ref().unwrap()["content"][0]["text"],
+        "created"
+    );
+    let calls = executor.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "mcp-1");
+    assert_eq!(calls[0].1, "create_issue");
+    assert_eq!(calls[0].2["title"], "Finding");
+}
+
 #[tokio::test]
 async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result() {
     let fx = fixture().await;
@@ -1114,6 +1237,60 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
         "tool result does not match the active workflow execution"
     );
 
+    let fail_tool = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({
+                "node_id": node_id,
+                "execution_id": execution_id,
+                "success": false,
+                "output": { "isError": true },
+                "error": "remote tool failed"
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let failed = body_json(fail_tool).await;
+    assert_eq!(failed["data"]["status"], "failed");
+    assert_eq!(failed["data"]["nodes"][2]["output"]["isError"], true);
+
+    let retry_without_csrf = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/retry"),
+            json!({}),
+            &fx.token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry_without_csrf.status(), StatusCode::FORBIDDEN);
+
+    let retry = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/retry"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retried = body_json(retry).await;
+    assert_eq!(retried["data"]["status"], "running");
+    let retry_execution_id = retried["data"]["next_action"]["execution_id"].as_str().unwrap();
+    assert_ne!(retry_execution_id, execution_id);
+
     let advance_tool = fx
         .app
         .oneshot(json_with_token(
@@ -1121,7 +1298,7 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
             &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
             json!({
                 "node_id": node_id,
-                "execution_id": execution_id,
+                "execution_id": retry_execution_id,
                 "success": true,
                 "output": { "issue_number": 42 }
             }),

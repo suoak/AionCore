@@ -8,8 +8,9 @@ use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AgentWorkflowTurnResult, AssistantAgentCatalogPort, AssistantError,
-    AssistantRouterState, AssistantService, BuiltinAssistantRegistry, SkillEvolutionRouterState, SkillEvolutionService,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
+    AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+    SkillEvolutionRouterState, SkillEvolutionService,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
@@ -19,7 +20,7 @@ use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
-    IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantAgentCenterRepository,
+    IMcpServerRepository, IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantAgentCenterRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteExperienceArticleRepository,
@@ -35,7 +36,8 @@ use aionui_extension::{
 use aionui_file::{FileRouterState, FileService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
-    McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
+    McpConfigService, McpConnectionTestService, McpRouterState, McpServer, McpSyncService, OpencodeAdapter,
+    QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
@@ -464,15 +466,66 @@ impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
                 },
             )
             .await;
-        if result.is_err() {
-            tracing::warn!(
-                user_id,
-                conversation_id,
-                turn_id,
-                run_id,
-                "agent-workflow: failed to settle agent turn"
-            );
+        match result {
+            Ok(Some(run)) => {
+                if let Err(error) = self.agent_center.execute_pending_tools_for_user(user_id, &run.id).await {
+                    tracing::warn!(
+                        user_id,
+                        conversation_id,
+                        turn_id,
+                        run_id,
+                        error = %error,
+                        "agent-workflow: failed to execute pending MCP tool"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    run_id,
+                    "agent-workflow: failed to settle agent turn"
+                );
+            }
         }
+    }
+}
+
+struct AgentWorkflowMcpToolAdapter {
+    repo: Arc<dyn IMcpServerRepository>,
+    client: McpConnectionTestService,
+}
+
+#[async_trait::async_trait]
+impl AgentWorkflowToolExecutionPort for AgentWorkflowMcpToolAdapter {
+    async fn execute(
+        &self,
+        user_id: &str,
+        mcp_server_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let row = self
+            .repo
+            .find_by_id(user_id, mcp_server_id)
+            .await
+            .map_err(|_| "failed to load MCP server".to_owned())?
+            .ok_or_else(|| "MCP server was not found".to_owned())?;
+        if !row.enabled {
+            return Err("MCP server is disabled".into());
+        }
+        let server = McpServer::from_row(row).map_err(|_| "MCP server configuration is invalid".to_owned())?;
+        self.client
+            .execute_tool(
+                &server.transport,
+                tool_name,
+                arguments,
+                Some(user_id),
+                Some(mcp_server_id),
+            )
+            .await
     }
 }
 
@@ -585,13 +638,19 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
     let center_repo = Arc::new(SqliteAssistantAgentCenterRepository::new(pool.clone()));
     let revision_repo = Arc::new(SqliteAssistantDefinitionRevisionRepository::new(pool.clone()));
-    let workflow_run_repo = Arc::new(aionui_db::SqliteAgentWorkflowRunRepository::new(pool));
+    let workflow_run_repo = Arc::new(aionui_db::SqliteAgentWorkflowRunRepository::new(pool.clone()));
+    let mcp_repo: Arc<dyn IMcpServerRepository> = Arc::new(aionui_db::SqliteMcpServerRepository::new(pool));
+    let tool_executor: Arc<dyn AgentWorkflowToolExecutionPort> = Arc::new(AgentWorkflowMcpToolAdapter {
+        repo: mcp_repo,
+        client: McpConnectionTestService::new(reqwest::Client::new(), services.event_bus.clone()),
+    });
     let service = Arc::new(AgentCenterService::new(
         assistant.service.clone(),
         definition_repo,
         center_repo,
         revision_repo,
         workflow_run_repo,
+        Some(tool_executor),
     ));
     AgentCenterRouterState { service }
 }
