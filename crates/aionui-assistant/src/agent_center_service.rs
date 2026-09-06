@@ -744,14 +744,14 @@ impl AgentCenterService {
             ));
         }
         let now = now_ms();
-        if let Some(node) = run.nodes.get_mut(run.current_node_index) {
-            if matches!(
+        if let Some(node) = run.nodes.get_mut(run.current_node_index)
+            && matches!(
                 node.status,
                 AgentWorkflowNodeRunStatus::Running | AgentWorkflowNodeRunStatus::WaitingApproval
-            ) {
-                node.status = AgentWorkflowNodeRunStatus::Cancelled;
-                node.completed_at = Some(now);
-            }
+            )
+        {
+            node.status = AgentWorkflowNodeRunStatus::Cancelled;
+            node.completed_at = Some(now);
         }
         run.status = AgentWorkflowRunStatus::Cancelled;
         run.next_action = None;
