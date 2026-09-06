@@ -564,6 +564,43 @@ async fn unpublish_returns_agent_to_draft_and_keeps_revision_history() {
 }
 
 #[tokio::test]
+async fn published_workflow_run_records_its_immutable_revision() {
+    let fx = fixture().await;
+    let id = "bare:632f31d2";
+    let publish = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/publish"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let published = body_json(publish).await;
+    let revision_id = published["data"]["meta"]["published_revision_id"].as_str().unwrap();
+
+    let start = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{id}/workflow-runs"),
+            json!({ "input": "review" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let run = body_json(start).await;
+
+    assert_eq!(run["data"]["revision_id"], revision_id);
+    assert_eq!(run["data"]["revision"], 1);
+    assert_eq!(run["data"]["preview_mode"], "published");
+}
+
+#[tokio::test]
 async fn published_agent_must_be_unpublished_before_editing() {
     let fx = fixture().await;
     let id = "bare:632f31d2";

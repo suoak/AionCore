@@ -443,10 +443,11 @@ pub struct AgentCenterRevisionResponse {
     pub snapshot: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentCenterPreviewMode {
     /// Live draft config (unpublished or edits after last publish).
+    #[default]
     Draft,
     /// Running against the last published revision metadata.
     Published,
@@ -534,6 +535,12 @@ fn default_json_object() -> Value {
 pub struct AgentWorkflowRunResponse {
     pub id: String,
     pub assistant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default)]
+    pub preview_mode: AgentCenterPreviewMode,
     pub status: AgentWorkflowRunStatus,
     pub current_node_index: usize,
     pub workflow: AgentWorkflowDefinition,
@@ -707,5 +714,26 @@ mod tests {
             workflow.validate_for_publish(),
             Err("workflow tool arguments must be a JSON object")
         );
+    }
+
+    #[test]
+    fn workflow_run_provenance_defaults_for_legacy_state() {
+        let legacy = serde_json::json!({
+            "id": "awrun-legacy",
+            "assistant_id": "assistant-1",
+            "status": "running",
+            "current_node_index": 1,
+            "workflow": AgentWorkflowDefinition::default(),
+            "nodes": [],
+            "variables": {},
+            "created_at": 1,
+            "updated_at": 1
+        });
+
+        let run: AgentWorkflowRunResponse = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(run.revision_id, None);
+        assert_eq!(run.revision, 0);
+        assert_eq!(run.preview_mode, AgentCenterPreviewMode::Draft);
     }
 }

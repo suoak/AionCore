@@ -514,6 +514,9 @@ impl AgentCenterService {
         let mut run = AgentWorkflowRunResponse {
             id: run_id,
             assistant_id: assistant_id.to_owned(),
+            revision_id: plan.revision_id,
+            revision: plan.revision,
+            preview_mode: plan.preview_mode,
             status: AgentWorkflowRunStatus::Running,
             current_node_index: 1,
             workflow: plan.workflow,
