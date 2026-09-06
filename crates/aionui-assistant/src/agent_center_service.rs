@@ -408,7 +408,7 @@ impl AgentCenterService {
             nodes: Vec::new(),
             variables,
             next_action: Some(AgentWorkflowNextAction::RunAgent {
-                create_conversation: plan.create_conversation,
+                create_conversation: Box::new(plan.create_conversation),
             }),
             created_at: now,
             updated_at: now,

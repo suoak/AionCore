@@ -615,6 +615,7 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
 
     let run = fx
         .app
+        .clone()
         .oneshot(json_with_token(
             "POST",
             &format!("/api/agent-center/agents/{id}/run"),
@@ -638,6 +639,7 @@ async fn workflow_contract_roundtrips_and_is_attached_to_run_plan() {
 
     let invalid = fx
         .app
+        .clone()
         .oneshot(json_with_token(
             "PUT",
             &format!("/api/agent-center/agents/{id}"),

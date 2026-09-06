@@ -489,7 +489,7 @@ pub struct AgentWorkflowNodeRun {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentWorkflowNextAction {
     RunAgent {
-        create_conversation: CreateConversationRequestWire,
+        create_conversation: Box<CreateConversationRequestWire>,
     },
     InvokeTool {
         tool_id: String,
