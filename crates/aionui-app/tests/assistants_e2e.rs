@@ -943,7 +943,7 @@ async fn workflow_run_pauses_for_approval_and_resumes_through_a_true_condition()
         .oneshot(json_with_token(
             "POST",
             &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
-            json!({ "success": true, "output": { "summary": "ready" } }),
+            json!({ "success": true, "output": "ready" }),
             &fx.token,
             &fx.csrf,
         ))
@@ -975,6 +975,7 @@ async fn workflow_run_pauses_for_approval_and_resumes_through_a_true_condition()
         "Reviewed by operator",
     );
     assert_eq!(completed["data"]["nodes"][3]["output"], true);
+    assert_eq!(completed["data"]["output"], "ready");
 
     let persisted = fx
         .app
@@ -1019,7 +1020,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
-                output: None,
+                output: Some("agent result"),
             },
         )
         .await
@@ -1067,7 +1068,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
-                output: None,
+                output: Some("agent result"),
             },
         )
         .await
@@ -1108,6 +1109,108 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
     assert_eq!(failed.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
     assert_eq!(failed.nodes[1].error.as_deref(), Some("agent turn failed"));
     assert!(failed.next_action.is_none());
+}
+
+#[tokio::test]
+async fn json_workflow_contract_guides_and_validates_agent_output() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let update = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/agent-center/agents/{assistant_id}"),
+            json!({ "meta": { "workflow": { "output": { "format": "json" } } } }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "classify this defect" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::CREATED);
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap();
+    assert!(
+        started["data"]["next_action"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Return only one valid JSON value")
+    );
+
+    let completed = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            run_id,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-json",
+                turn_id: "turn-json",
+                success: true,
+                error: None,
+                output: Some(r#"{"severity":"high"}"#),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, aionui_api_types::AgentWorkflowRunStatus::Completed);
+    assert_eq!(completed.output, Some(json!({ "severity": "high" })));
+
+    let invalid_start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "classify another defect" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_start.status(), StatusCode::CREATED);
+    let invalid_run_id = body_json(invalid_start).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let failed = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            &invalid_run_id,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                conversation_id: "conversation-invalid-json",
+                turn_id: "turn-invalid-json",
+                success: true,
+                error: None,
+                output: Some("```json\n{}\n```"),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
+    assert_eq!(
+        failed.nodes[1].error.as_deref(),
+        Some("workflow agent output must be valid JSON without Markdown code fences")
+    );
+    assert!(failed.output.is_none());
 }
 
 struct RecordingToolExecutor {
@@ -1230,7 +1333,7 @@ async fn pending_tool_is_executed_and_settled_with_the_configured_contract() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
-                output: None,
+                output: Some("agent result"),
             },
         )
         .await
@@ -1327,7 +1430,7 @@ async fn cancelling_a_run_interrupts_its_in_flight_tool_execution() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
-                output: None,
+                output: Some("agent result"),
             },
         )
         .await
@@ -1540,7 +1643,7 @@ async fn interrupted_tool_is_failed_without_automatic_replay() {
                 turn_id: "turn-1",
                 success: true,
                 error: None,
-                output: None,
+                output: Some("agent result"),
             },
         )
         .await

@@ -507,6 +507,11 @@ impl AgentCenterService {
             .validate_for_publish()
             .map_err(|message| AssistantError::BadRequest(message.into()))?;
         validate_workflow_input(&plan.workflow, &req.input)?;
+        let input = req
+            .input
+            .as_str()
+            .ok_or_else(|| AssistantError::BadRequest("workflow input must be text".into()))?;
+        let agent_message = build_agent_message(input, plan.workflow.output.format);
 
         let now = now_ms();
         let run_id = generate_prefixed_id("awrun");
@@ -527,6 +532,7 @@ impl AgentCenterService {
             output: None,
             next_action: Some(AgentWorkflowNextAction::RunAgent {
                 create_conversation: Box::new(plan.create_conversation),
+                message: agent_message,
             }),
             created_at: now,
             updated_at: now,
@@ -674,7 +680,7 @@ impl AgentCenterService {
         &self,
         user_id: &str,
         run_id: &str,
-        req: AdvanceAgentWorkflowRunRequest,
+        mut req: AdvanceAgentWorkflowRunRequest,
     ) -> Result<AgentWorkflowRunResponse, AssistantError> {
         let row = self
             .workflow_run_repo
@@ -715,6 +721,9 @@ impl AgentCenterService {
                     "tool result does not match the active workflow execution".into(),
                 ));
             }
+        } else if req.success {
+            req.output = normalize_manual_agent_output(req.output, run.workflow.output.format)
+                .map_err(AssistantError::BadRequest)?;
         }
         let node = run
             .nodes
@@ -760,12 +769,34 @@ impl AgentCenterService {
             return Ok(None);
         }
 
-        let mut output = json!({
+        let mut node_output = json!({
             "conversation_id": result.conversation_id,
             "turn_id": result.turn_id,
         });
-        if let Some(content) = result.output.filter(|content| !content.trim().is_empty()) {
-            output["content"] = json!(content);
+        let (success, error) = if result.success {
+            match normalize_agent_output(result.output, run.workflow.output.format) {
+                Ok(content) => {
+                    node_output["content"] = content;
+                    (true, None)
+                }
+                Err(error) => (false, Some(error)),
+            }
+        } else {
+            if let Some(content) = result.output.filter(|content| !content.trim().is_empty()) {
+                node_output["content"] = json!(content);
+            }
+            (false, result.error)
+        };
+        if result.success && !success {
+            tracing::warn!(
+                run_id,
+                user_id,
+                assistant_id = result.assistant_id,
+                conversation_id = result.conversation_id,
+                turn_id = result.turn_id,
+                output_format = ?run.workflow.output.format,
+                "agent-workflow: agent output contract validation failed"
+            );
         }
         let updated = self
             .advance_workflow_run_for_user(
@@ -774,9 +805,9 @@ impl AgentCenterService {
                 AdvanceAgentWorkflowRunRequest {
                     node_id: None,
                     execution_id: None,
-                    success: result.success,
-                    output,
-                    error: result.error,
+                    success,
+                    output: node_output,
+                    error,
                 },
             )
             .await?;
@@ -786,7 +817,7 @@ impl AgentCenterService {
             assistant_id = result.assistant_id,
             conversation_id = result.conversation_id,
             turn_id = result.turn_id,
-            success = result.success,
+            success,
             "agent-workflow: agent turn settled"
         );
         Ok(Some(updated))
@@ -1358,6 +1389,66 @@ fn validate_workflow_input(workflow: &AgentWorkflowDefinition, input: &Value) ->
     Ok(())
 }
 
+fn build_agent_message(input: &str, format: aionui_api_types::AgentWorkflowOutputFormat) -> String {
+    use aionui_api_types::AgentWorkflowOutputFormat;
+
+    match format {
+        AgentWorkflowOutputFormat::Markdown => input.to_owned(),
+        AgentWorkflowOutputFormat::PlainText => format!(
+            "{input}\n\n---\nWorkflow output contract: Return plain text only. Do not use Markdown formatting or code fences."
+        ),
+        AgentWorkflowOutputFormat::Json => format!(
+            "{input}\n\n---\nWorkflow output contract: Return only one valid JSON value. Do not use Markdown or code fences."
+        ),
+    }
+}
+
+fn normalize_agent_output(
+    output: Option<&str>,
+    format: aionui_api_types::AgentWorkflowOutputFormat,
+) -> Result<Value, String> {
+    use aionui_api_types::AgentWorkflowOutputFormat;
+
+    let output = output
+        .map(str::trim)
+        .filter(|output| !output.is_empty())
+        .ok_or_else(|| "workflow agent returned no output".to_owned())?;
+    match format {
+        AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText => Ok(json!(output)),
+        AgentWorkflowOutputFormat::Json => serde_json::from_str(output)
+            .map_err(|_| "workflow agent output must be valid JSON without Markdown code fences".to_owned()),
+    }
+}
+
+fn normalize_manual_agent_output(
+    output: Value,
+    format: aionui_api_types::AgentWorkflowOutputFormat,
+) -> Result<Value, String> {
+    use aionui_api_types::AgentWorkflowOutputFormat;
+
+    let is_internal_result = output.get("conversation_id").is_some_and(Value::is_string)
+        && output.get("turn_id").is_some_and(Value::is_string)
+        && output.get("content").is_some();
+    if is_internal_result {
+        return Ok(output);
+    }
+    let content = match format {
+        AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText => {
+            let text = output
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| "workflow agent output must be non-empty text".to_owned())?;
+            json!(text)
+        }
+        AgentWorkflowOutputFormat::Json if output.is_null() => {
+            return Err("workflow agent output must be a non-null JSON value".to_owned());
+        }
+        AgentWorkflowOutputFormat::Json => output,
+    };
+    Ok(json!({ "content": content }))
+}
+
 fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(), AssistantError> {
     loop {
         let Some(definition) = run.workflow.nodes.get(run.current_node_index) else {
@@ -1570,6 +1661,7 @@ fn compare_guard_values(
 #[cfg(test)]
 mod workflow_run_tests {
     use super::*;
+    use aionui_api_types::AgentWorkflowOutputFormat;
 
     #[test]
     fn guard_evaluator_supports_boolean_numeric_and_string_comparisons() {
@@ -1586,5 +1678,44 @@ mod workflow_run_tests {
     fn guard_evaluator_rejects_arbitrary_expressions() {
         let error = evaluate_guard_expression("process.exit()", &Default::default()).unwrap_err();
         assert!(matches!(error, AssistantError::BadRequest(_)));
+    }
+
+    #[test]
+    fn json_contract_message_is_explicit_and_preserves_input() {
+        let message = build_agent_message("Review this defect", AgentWorkflowOutputFormat::Json);
+
+        assert!(message.starts_with("Review this defect"));
+        assert!(message.contains("Return only one valid JSON value"));
+        assert!(message.contains("Do not use Markdown or code fences"));
+    }
+
+    #[test]
+    fn json_output_is_parsed_into_a_structured_value() {
+        let output =
+            normalize_agent_output(Some(" {\"severity\":\"high\"} "), AgentWorkflowOutputFormat::Json).unwrap();
+
+        assert_eq!(output, json!({ "severity": "high" }));
+    }
+
+    #[test]
+    fn malformed_or_empty_agent_output_fails_the_contract() {
+        assert_eq!(
+            normalize_agent_output(Some("```json\n{}\n```"), AgentWorkflowOutputFormat::Json),
+            Err("workflow agent output must be valid JSON without Markdown code fences".to_owned())
+        );
+        assert_eq!(
+            normalize_agent_output(Some("  "), AgentWorkflowOutputFormat::Markdown),
+            Err("workflow agent returned no output".to_owned())
+        );
+    }
+
+    #[test]
+    fn manual_agent_output_obeys_the_declared_format() {
+        let output = normalize_manual_agent_output(json!({ "ok": true }), AgentWorkflowOutputFormat::Json).unwrap();
+        assert_eq!(output, json!({ "content": { "ok": true } }));
+
+        let error =
+            normalize_manual_agent_output(json!({ "ok": true }), AgentWorkflowOutputFormat::PlainText).unwrap_err();
+        assert_eq!(error, "workflow agent output must be non-empty text");
     }
 }

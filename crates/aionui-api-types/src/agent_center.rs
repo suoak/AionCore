@@ -510,6 +510,9 @@ pub struct AgentWorkflowNodeRun {
 pub enum AgentWorkflowNextAction {
     RunAgent {
         create_conversation: Box<CreateConversationRequestWire>,
+        /// Exact first-turn message, including the workflow output contract.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message: String,
     },
     InvokeTool {
         node_id: String,
@@ -738,5 +741,19 @@ mod tests {
         assert_eq!(run.revision, 0);
         assert_eq!(run.preview_mode, AgentCenterPreviewMode::Draft);
         assert_eq!(run.output, None);
+    }
+
+    #[test]
+    fn legacy_run_agent_action_defaults_to_an_empty_message() {
+        let action: AgentWorkflowNextAction = serde_json::from_value(serde_json::json!({
+            "kind": "run_agent",
+            "create_conversation": { "extra": {} }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            action,
+            AgentWorkflowNextAction::RunAgent { message, .. } if message.is_empty()
+        ));
     }
 }
