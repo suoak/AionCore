@@ -545,9 +545,10 @@ pub enum AgentWorkflowNodeRunStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentWorkflowNodeRun {
-    pub node_id: String,
-    pub kind: String,
+pub struct AgentWorkflowNodeRunAttempt {
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     pub status: AgentWorkflowNodeRunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
@@ -557,6 +558,31 @@ pub struct AgentWorkflowNodeRun {
     pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentWorkflowNodeRun {
+    pub node_id: String,
+    pub kind: String,
+    pub status: AgentWorkflowNodeRunStatus,
+    #[serde(default = "default_workflow_attempt")]
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<AgentWorkflowNodeRunAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+}
+
+fn default_workflow_attempt() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -840,6 +866,21 @@ mod tests {
         assert_eq!(run.revision, 0);
         assert_eq!(run.preview_mode, AgentCenterPreviewMode::Draft);
         assert_eq!(run.output, None);
+    }
+
+    #[test]
+    fn workflow_node_attempt_tracking_defaults_for_legacy_state() {
+        let node: AgentWorkflowNodeRun = serde_json::from_value(serde_json::json!({
+            "node_id": "tool-1",
+            "kind": "tool",
+            "status": "failed",
+            "error": "remote tool failed"
+        }))
+        .unwrap();
+
+        assert_eq!(node.attempt, 1);
+        assert_eq!(node.execution_id, None);
+        assert!(node.attempts.is_empty());
     }
 
     #[test]

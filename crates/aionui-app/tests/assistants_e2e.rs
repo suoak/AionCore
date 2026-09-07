@@ -1792,6 +1792,8 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
     assert_eq!(invoking["data"]["next_action"]["arguments"]["title"], "Review finding");
     let node_id = invoking["data"]["next_action"]["node_id"].as_str().unwrap();
     let execution_id = invoking["data"]["next_action"]["execution_id"].as_str().unwrap();
+    assert_eq!(invoking["data"]["nodes"][2]["attempt"], 1);
+    assert_eq!(invoking["data"]["nodes"][2]["execution_id"], execution_id);
 
     let stale_tool = fx
         .app
@@ -1837,6 +1839,7 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
     let failed = body_json(fail_tool).await;
     assert_eq!(failed["data"]["status"], "failed");
     assert_eq!(failed["data"]["nodes"][2]["output"]["isError"], true);
+    assert_eq!(failed["data"]["nodes"][2]["execution_id"], execution_id);
 
     let retry_without_csrf = fx
         .app
@@ -1869,6 +1872,15 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
     assert_eq!(retried["data"]["status"], "running");
     let retry_execution_id = retried["data"]["next_action"]["execution_id"].as_str().unwrap();
     assert_ne!(retry_execution_id, execution_id);
+    assert_eq!(retried["data"]["nodes"][2]["attempt"], 2);
+    assert_eq!(retried["data"]["nodes"][2]["execution_id"], retry_execution_id);
+    assert_eq!(retried["data"]["nodes"][2]["attempts"][0]["attempt"], 1);
+    assert_eq!(retried["data"]["nodes"][2]["attempts"][0]["execution_id"], execution_id);
+    assert_eq!(
+        retried["data"]["nodes"][2]["attempts"][0]["error"],
+        "remote tool failed"
+    );
+    assert_eq!(retried["data"]["nodes"][2]["attempts"][0]["output"]["isError"], true);
 
     let advance_tool = fx
         .app
@@ -1890,6 +1902,9 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
     let completed = body_json(advance_tool).await;
     assert_eq!(completed["data"]["status"], "completed");
     assert_eq!(completed["data"]["variables"]["tool-1"]["issue_number"], 42);
+    assert_eq!(completed["data"]["nodes"][2]["attempt"], 2);
+    assert_eq!(completed["data"]["nodes"][2]["execution_id"], retry_execution_id);
+    assert_eq!(completed["data"]["nodes"][2]["attempts"][0]["attempt"], 1);
 
     let invalid_start = fx
         .app

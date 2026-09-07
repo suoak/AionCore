@@ -15,12 +15,13 @@ use aionui_api_types::{
     AdvanceAgentWorkflowRunRequest, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta,
     AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
     AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowApprovalDecision,
-    AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunStatus,
-    AgentWorkflowOutputDefinition, AgentWorkflowOutputFieldDefinition, AgentWorkflowOutputFieldType,
-    AgentWorkflowRunResponse, AgentWorkflowRunStatus, AssistantConversationOverridesRequest,
-    AssistantDefaultListRequest, AssistantDefaultsRequest, CreateAgentCenterRequest, CreateConversationRequestWire,
-    DecideAgentWorkflowApprovalRequest, PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest,
-    UpdateAgentCenterRequest, UpdateAssistantRequest,
+    AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunAttempt,
+    AgentWorkflowNodeRunStatus, AgentWorkflowOutputDefinition, AgentWorkflowOutputFieldDefinition,
+    AgentWorkflowOutputFieldType, AgentWorkflowRunResponse, AgentWorkflowRunStatus,
+    AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
+    CreateAgentCenterRequest, CreateConversationRequestWire, DecideAgentWorkflowApprovalRequest,
+    PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest, UpdateAgentCenterRequest,
+    UpdateAssistantRequest,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
@@ -33,6 +34,8 @@ use serde_json::{Value, json};
 
 use crate::error::AssistantError;
 use crate::service::AssistantService;
+
+const MAX_WORKFLOW_TOOL_ATTEMPTS: u32 = 3;
 
 pub struct AgentCenterService {
     assistants: Arc<AssistantService>,
@@ -554,6 +557,9 @@ impl AgentCenterService {
                 } else {
                     AgentWorkflowNodeRunStatus::Pending
                 },
+                attempt: 1,
+                execution_id: None,
+                attempts: Vec::new(),
                 output: None,
                 error: None,
                 started_at: (index <= 1).then_some(now),
@@ -649,6 +655,7 @@ impl AgentCenterService {
             let node_id = node_id.clone();
             let execution_id = execution_id.clone();
             let now = now_ms();
+            node.execution_id = Some(execution_id.clone());
             node.status = AgentWorkflowNodeRunStatus::Failed;
             node.error = Some(
                 "Tool execution was interrupted by an application restart. Verify external side effects before retrying."
@@ -1058,8 +1065,24 @@ impl AgentCenterService {
                 "only a failed tool node can be retried".into(),
             ));
         }
+        validate_tool_retry_attempt(node.attempt)?;
         let next_action = build_tool_action(definition)?;
+        let execution_id = match &next_action {
+            AgentWorkflowNextAction::InvokeTool { execution_id, .. } => execution_id.clone(),
+            _ => unreachable!("build_tool_action always returns invoke_tool"),
+        };
         let now = now_ms();
+        node.attempts.push(AgentWorkflowNodeRunAttempt {
+            attempt: node.attempt,
+            execution_id: node.execution_id.clone(),
+            status: node.status,
+            output: node.output.clone(),
+            error: node.error.clone(),
+            started_at: node.started_at,
+            completed_at: node.completed_at,
+        });
+        node.attempt += 1;
+        node.execution_id = Some(execution_id.clone());
         node.status = AgentWorkflowNodeRunStatus::Running;
         node.output = None;
         node.error = None;
@@ -1068,8 +1091,17 @@ impl AgentCenterService {
         run.status = AgentWorkflowRunStatus::Running;
         run.output = None;
         run.next_action = Some(next_action);
+        let node_id = node.node_id.clone();
+        let attempt = node.attempt;
         let retried = self.persist_workflow_run(user_id, run, &row.state_json).await?;
-        tracing::info!(run_id, user_id, "agent-workflow: failed tool node retried");
+        tracing::info!(
+            run_id,
+            user_id,
+            node_id,
+            attempt,
+            execution_id,
+            "agent-workflow: failed tool node retried"
+        );
         Ok(retried)
     }
 
@@ -1368,6 +1400,15 @@ fn validate_workflow_tools(meta: &AgentCenterMeta, enabled_mcp_ids: &[String]) -
     Ok(())
 }
 
+fn validate_tool_retry_attempt(attempt: u32) -> Result<(), AssistantError> {
+    if attempt >= MAX_WORKFLOW_TOOL_ATTEMPTS {
+        return Err(AssistantError::Conflict(format!(
+            "workflow tool node reached the maximum of {MAX_WORKFLOW_TOOL_ATTEMPTS} attempts"
+        )));
+    }
+    Ok(())
+}
+
 fn serialize_workflow_run(run: &AgentWorkflowRunResponse) -> Result<String, AssistantError> {
     serde_json::to_string(run).map_err(|e| AssistantError::Internal(format!("workflow run serialize: {e}")))
 }
@@ -1564,10 +1605,16 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
 
         match kind.as_str() {
             "tool" => {
+                let next_action = build_tool_action(definition)?;
+                let execution_id = match &next_action {
+                    AgentWorkflowNextAction::InvokeTool { execution_id, .. } => execution_id.clone(),
+                    _ => unreachable!("build_tool_action always returns invoke_tool"),
+                };
                 node.status = AgentWorkflowNodeRunStatus::Running;
                 node.started_at = Some(now);
+                node.execution_id = Some(execution_id);
                 run.status = AgentWorkflowRunStatus::Running;
-                run.next_action = Some(build_tool_action(definition)?);
+                run.next_action = Some(next_action);
                 return Ok(());
             }
             "approval" => {
@@ -1905,5 +1952,17 @@ mod workflow_run_tests {
             normalize_manual_agent_output(lifecycle_output, &structured_output_definition()),
             Err("workflow output field severity must be string".to_owned())
         );
+    }
+
+    #[test]
+    fn tool_retry_limit_allows_recovery_but_stops_repeated_side_effects() {
+        assert!(validate_tool_retry_attempt(MAX_WORKFLOW_TOOL_ATTEMPTS - 1).is_ok());
+        let error = validate_tool_retry_attempt(MAX_WORKFLOW_TOOL_ATTEMPTS).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AssistantError::Conflict(message)
+                if message == "workflow tool node reached the maximum of 3 attempts"
+        ));
     }
 }
