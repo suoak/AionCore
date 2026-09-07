@@ -1530,12 +1530,13 @@ async fn approval_returns_before_its_tool_finishes_and_keeps_cancel_available() 
         .oneshot(json_with_token(
             "POST",
             &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
-            json!({ "success": true, "output": { "summary": "ready" } }),
+            json!({ "success": true, "output": "ready" }),
             &fx.token,
             &fx.csrf,
         ))
         .await
         .unwrap();
+    assert_eq!(waiting.status(), StatusCode::OK);
     assert_eq!(body_json(waiting).await["data"]["status"], "waiting_approval");
 
     let approval = tokio::time::timeout(
@@ -1754,12 +1755,13 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
         .oneshot(json_with_token(
             "POST",
             &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
-            json!({ "success": true, "output": { "summary": "ready" } }),
+            json!({ "success": true, "output": "ready" }),
             &fx.token,
             &fx.csrf,
         ))
         .await
         .unwrap();
+    assert_eq!(advance_agent.status(), StatusCode::OK);
     let invoking = body_json(advance_agent).await;
     assert_eq!(invoking["data"]["next_action"]["kind"], "invoke_tool");
     assert_eq!(invoking["data"]["next_action"]["mcp_server_id"], "github");
