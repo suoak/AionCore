@@ -1872,6 +1872,7 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
 
     let advance_tool = fx
         .app
+        .clone()
         .oneshot(json_with_token(
             "POST",
             &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
