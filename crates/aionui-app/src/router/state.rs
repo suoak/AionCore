@@ -8,18 +8,19 @@ use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AssistantAgentCatalogPort, AssistantError, AssistantRouterState,
-    AssistantService, BuiltinAssistantRegistry, SkillEvolutionRouterState, SkillEvolutionService,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
+    AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+    SkillEvolutionRouterState, SkillEvolutionService,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
-use aionui_common::AgentKillReason;
+use aionui_common::{AgentKillReason, ConversationTurnSettlement, OnConversationTurnSettled};
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
-    IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantAgentCenterRepository,
+    IMcpServerRepository, IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantAgentCenterRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteExperienceArticleRepository,
@@ -35,7 +36,8 @@ use aionui_extension::{
 use aionui_file::{FileRouterState, FileService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
-    McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
+    McpConfigService, McpConnectionTestService, McpRouterState, McpServer, McpSyncService, OpencodeAdapter,
+    QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
@@ -308,6 +310,21 @@ pub async fn build_module_states(
     let system = build_module_state_phase(&boot, "system", || build_system_state(services));
     let agent_center =
         build_module_state_phase(&boot, "agent_center", || build_agent_center_state(services, &assistant));
+    match agent_center.service.recover_interrupted_tool_runs().await {
+        Ok(0) => {}
+        Ok(recovered) => {
+            tracing::warn!(recovered, "agent-workflow: recovered interrupted tool executions");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "agent-workflow: startup recovery failed");
+        }
+    }
+    services
+        .conversation_service
+        .with_turn_settled_hook(Arc::new(AgentWorkflowTurnSettlementAdapter {
+            conversations: services.conversation_repo.clone(),
+            agent_center: agent_center.service.clone(),
+        }));
     let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
         build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
     });
@@ -384,6 +401,143 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+struct AgentWorkflowTurnSettlementAdapter {
+    conversations: Arc<dyn IConversationRepository>,
+    agent_center: Arc<AgentCenterService>,
+}
+
+#[async_trait::async_trait]
+impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
+    async fn on_turn_settled(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        settlement: ConversationTurnSettlement,
+        error_message: Option<&str>,
+        assistant_output: Option<&str>,
+    ) {
+        let conversation = match self.conversations.get(user_id, conversation_id).await {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    "agent-workflow: failed to load settled conversation"
+                );
+                return;
+            }
+        };
+        let run_id = serde_json::from_str::<serde_json::Value>(&conversation.extra)
+            .ok()
+            .and_then(|extra| {
+                extra
+                    .get("agent_workflow_run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let Some(run_id) = run_id else {
+            return;
+        };
+        let assistant_id = match self
+            .conversations
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot.assistant_id,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    run_id,
+                    "agent-workflow: failed to load conversation assistant snapshot"
+                );
+                return;
+            }
+        };
+
+        let result = self
+            .agent_center
+            .settle_agent_turn_for_user(
+                user_id,
+                &run_id,
+                AgentWorkflowTurnResult {
+                    assistant_id: &assistant_id,
+                    conversation_id,
+                    turn_id,
+                    success: settlement == ConversationTurnSettlement::Completed,
+                    error: error_message.map(str::to_owned),
+                    output: assistant_output,
+                },
+            )
+            .await;
+        match result {
+            Ok(Some(run)) => {
+                if let Err(error) = self.agent_center.execute_pending_tools_for_user(user_id, &run.id).await {
+                    tracing::warn!(
+                        user_id,
+                        conversation_id,
+                        turn_id,
+                        run_id,
+                        error = %error,
+                        "agent-workflow: failed to execute pending MCP tool"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    run_id,
+                    "agent-workflow: failed to settle agent turn"
+                );
+            }
+        }
+    }
+}
+
+struct AgentWorkflowMcpToolAdapter {
+    repo: Arc<dyn IMcpServerRepository>,
+    client: McpConnectionTestService,
+}
+
+#[async_trait::async_trait]
+impl AgentWorkflowToolExecutionPort for AgentWorkflowMcpToolAdapter {
+    async fn execute(
+        &self,
+        user_id: &str,
+        mcp_server_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let row = self
+            .repo
+            .find_by_id(user_id, mcp_server_id)
+            .await
+            .map_err(|_| "failed to load MCP server".to_owned())?
+            .ok_or_else(|| "MCP server was not found".to_owned())?;
+        if !row.enabled {
+            return Err("MCP server is disabled".into());
+        }
+        let server = McpServer::from_row(row).map_err(|_| "MCP server configuration is invalid".to_owned())?;
+        self.client
+            .execute_tool(
+                &server.transport,
+                tool_name,
+                arguments,
+                Some(user_id),
+                Some(mcp_server_id),
+            )
+            .await
+    }
 }
 
 /// Cross-session messaging state, plus the process's single drainer.
@@ -494,12 +648,20 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
     let pool = services.database.pool().clone();
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
     let center_repo = Arc::new(SqliteAssistantAgentCenterRepository::new(pool.clone()));
-    let revision_repo = Arc::new(SqliteAssistantDefinitionRevisionRepository::new(pool));
+    let revision_repo = Arc::new(SqliteAssistantDefinitionRevisionRepository::new(pool.clone()));
+    let workflow_run_repo = Arc::new(aionui_db::SqliteAgentWorkflowRunRepository::new(pool.clone()));
+    let mcp_repo: Arc<dyn IMcpServerRepository> = Arc::new(aionui_db::SqliteMcpServerRepository::new(pool));
+    let tool_executor: Arc<dyn AgentWorkflowToolExecutionPort> = Arc::new(AgentWorkflowMcpToolAdapter {
+        repo: mcp_repo,
+        client: McpConnectionTestService::new(reqwest::Client::new(), services.event_bus.clone()),
+    });
     let service = Arc::new(AgentCenterService::new(
         assistant.service.clone(),
         definition_repo,
         center_repo,
         revision_repo,
+        workflow_run_repo,
+        Some(tool_executor),
     ));
     AgentCenterRouterState { service }
 }

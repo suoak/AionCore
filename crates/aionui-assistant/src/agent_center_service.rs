@@ -3,30 +3,94 @@
 //! Reuses [`AssistantService`] for identity/rules/defaults; stores Agent Center
 //! fields in side tables so existing `/api/assistants` CRUD stays intact.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use aionui_api_types::{
-    AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta, AgentCenterMetaPatch, AgentCenterPreviewMode,
-    AgentCenterRevisionResponse, AgentCenterRunPlanResponse, AgentMcpPolicy, AgentPublishStatus, AgentSkillRef,
-    AgentVisibility, AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
-    CreateAgentCenterRequest, CreateConversationRequestWire, PublishAgentCenterRequest, SkillVersionPolicy,
-    UpdateAgentCenterRequest, UpdateAssistantRequest,
+    AdvanceAgentWorkflowRunRequest, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta,
+    AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
+    AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowApprovalDecision,
+    AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunAttempt,
+    AgentWorkflowNodeRunStatus, AgentWorkflowOutputDefinition, AgentWorkflowOutputFieldDefinition,
+    AgentWorkflowOutputFieldType, AgentWorkflowRunResponse, AgentWorkflowRunStatus,
+    AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
+    CreateAgentCenterRequest, CreateConversationRequestWire, DecideAgentWorkflowApprovalRequest,
+    PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest, UpdateAgentCenterRequest,
+    UpdateAssistantRequest,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
-    CreateAssistantDefinitionRevisionParams, IAssistantAgentCenterRepository, IAssistantDefinitionRepository,
-    IAssistantDefinitionRevisionRepository, UpsertAssistantAgentCenterParams,
+    CreateAgentWorkflowRunParams, CreateAssistantDefinitionRevisionParams, IAgentWorkflowRunRepository,
+    IAssistantAgentCenterRepository, IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository,
+    UpsertAssistantAgentCenterParams,
 };
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::error::AssistantError;
 use crate::service::AssistantService;
+
+const MAX_WORKFLOW_TOOL_ATTEMPTS: u32 = 3;
 
 pub struct AgentCenterService {
     assistants: Arc<AssistantService>,
     definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     center_repo: Arc<dyn IAssistantAgentCenterRepository>,
     revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository>,
+    workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
+    tool_executor: Option<Arc<dyn AgentWorkflowToolExecutionPort>>,
+    tool_execution_locks: tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    tool_execution_cancellations: tokio::sync::Mutex<HashMap<String, Weak<WorkflowExecutionCancellation>>>,
+}
+
+#[derive(Default)]
+struct WorkflowExecutionCancellation {
+    cancelled: AtomicBool,
+    notification: tokio::sync::Notify,
+}
+
+impl WorkflowExecutionCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notification.notify_one();
+    }
+
+    async fn cancelled(&self) {
+        while !self.cancelled.load(Ordering::Acquire) {
+            self.notification.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub trait AgentWorkflowToolExecutionPort: Send + Sync {
+    async fn execute(
+        &self,
+        user_id: &str,
+        mcp_server_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
+}
+
+pub struct AgentWorkflowTurnResult<'a> {
+    pub assistant_id: &'a str,
+    pub conversation_id: &'a str,
+    pub turn_id: &'a str,
+    pub success: bool,
+    pub error: Option<String>,
+    pub output: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct PublishedAgentSnapshot {
+    assistant: aionui_api_types::AssistantDetailResponse,
+    meta: AgentCenterMeta,
 }
 
 impl AgentCenterService {
@@ -35,12 +99,18 @@ impl AgentCenterService {
         definition_repo: Arc<dyn IAssistantDefinitionRepository>,
         center_repo: Arc<dyn IAssistantAgentCenterRepository>,
         revision_repo: Arc<dyn IAssistantDefinitionRevisionRepository>,
+        workflow_run_repo: Arc<dyn IAgentWorkflowRunRepository>,
+        tool_executor: Option<Arc<dyn AgentWorkflowToolExecutionPort>>,
     ) -> Self {
         Self {
             assistants,
             definition_repo,
             center_repo,
             revision_repo,
+            workflow_run_repo,
+            tool_executor,
+            tool_execution_locks: tokio::sync::Mutex::new(HashMap::new()),
+            tool_execution_cancellations: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -166,7 +236,6 @@ impl AgentCenterService {
         id: &str,
         req: UpdateAgentCenterRequest,
     ) -> Result<AgentCenterDetailResponse, AssistantError> {
-        let _ = self.assistants.update_for_user(user_id, id, req.assistant).await?;
         let definition = self
             .definition_repo
             .get_by_assistant_id_for_user(user_id, id)
@@ -177,6 +246,12 @@ impl AgentCenterService {
         if current.status == AgentPublishStatus::Archived {
             return Err(AssistantError::Conflict("archived agents cannot be edited".into()));
         }
+        if current.status == AgentPublishStatus::Published {
+            return Err(AssistantError::Conflict(
+                "published agents must be unpublished before editing".into(),
+            ));
+        }
+        let _ = self.assistants.update_for_user(user_id, id, req.assistant).await?;
         let meta = self.upsert_meta(&definition.id, current, &req.meta, true).await?;
         if let Some(mcp_ids) = req.meta.mcp_ids.as_ref() {
             self.apply_mcp_defaults(user_id, id, meta.mcp_policy, mcp_ids.clone())
@@ -212,9 +287,16 @@ impl AgentCenterService {
                 }
             }
         }
+        meta.workflow
+            .validate_for_publish()
+            .map_err(|message| AssistantError::BadRequest(message.into()))?;
+        validate_workflow_tools(&meta, &detail.assistant.defaults.mcps.value)?;
 
         let next_revision = meta.version + 1;
         let revision_id = generate_prefixed_id("arev");
+        meta.status = AgentPublishStatus::Published;
+        meta.version = next_revision;
+        meta.published_revision_id = Some(revision_id.clone());
         let snapshot = json!({
             "assistant_id": id,
             "assistant": detail.assistant,
@@ -242,10 +324,43 @@ impl AgentCenterService {
             ..AgentCenterMetaPatch::default()
         };
         let mut base = meta;
-        base.status = AgentPublishStatus::Published;
-        base.version = next_revision;
-        base.published_revision_id = Some(revision_id);
         let _ = self.upsert_meta_full(&definition.id, &mut base, &patch).await?;
+
+        self.get_detail_for_user(user_id, id, None).await
+    }
+
+    /// Withdraw a published agent while retaining its immutable revision history.
+    ///
+    /// The editable assistant definition remains intact and becomes a draft again.
+    /// A later publish creates the next revision rather than overwriting history.
+    pub async fn unpublish_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<AgentCenterDetailResponse, AssistantError> {
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(id.to_owned()))?;
+        let mut meta = self.load_or_default_meta(&definition.id).await?;
+        if meta.status != AgentPublishStatus::Published {
+            return Err(AssistantError::Conflict(
+                "only published agents can be unpublished".into(),
+            ));
+        }
+
+        meta.status = AgentPublishStatus::Draft;
+        meta.published_revision_id = None;
+        let patch = AgentCenterMetaPatch::default();
+        let _ = self.upsert_meta_full(&definition.id, &mut meta, &patch).await?;
+        tracing::info!(
+            assistant_id = %id,
+            user_id = %user_id,
+            version = meta.version,
+            "agent-center: unpublished agent"
+        );
 
         self.get_detail_for_user(user_id, id, None).await
     }
@@ -285,9 +400,43 @@ impl AgentCenterService {
         user_id: &str,
         id: &str,
     ) -> Result<AgentCenterRunPlanResponse, AssistantError> {
-        let detail = self.get_detail_for_user(user_id, id, None).await?;
+        let mut detail = self.get_detail_for_user(user_id, id, None).await?;
         if detail.meta.status == AgentPublishStatus::Archived {
             return Err(AssistantError::Conflict("archived agents cannot be run".into()));
+        }
+
+        let published_revision_id = detail.meta.published_revision_id.clone();
+        if detail.meta.status == AgentPublishStatus::Published {
+            let definition = self
+                .definition_repo
+                .get_by_assistant_id_for_user(user_id, id)
+                .await
+                .map_err(|e| AssistantError::Internal(e.to_string()))?
+                .ok_or_else(|| AssistantError::NotFound(id.to_owned()))?;
+            let revision_id = published_revision_id
+                .as_deref()
+                .ok_or_else(|| AssistantError::Internal("published agent is missing its revision id".into()))?;
+            let revision = self
+                .revision_repo
+                .get(revision_id)
+                .await
+                .map_err(|e| AssistantError::Internal(e.to_string()))?
+                .ok_or_else(|| AssistantError::Internal("published agent revision was not found".into()))?;
+            if revision.assistant_definition_id != definition.id {
+                return Err(AssistantError::Internal(
+                    "published revision does not belong to the agent".into(),
+                ));
+            }
+            let snapshot: PublishedAgentSnapshot = serde_json::from_str(&revision.snapshot_json)
+                .map_err(|e| AssistantError::Internal(format!("published snapshot parse: {e}")))?;
+            detail.assistant = snapshot.assistant;
+            detail.meta = snapshot.meta;
+            // Older snapshots were captured immediately before the published
+            // lifecycle fields were applied. The immutable revision row is the
+            // source of truth for those fields when replaying such snapshots.
+            detail.meta.status = AgentPublishStatus::Published;
+            detail.meta.version = revision.revision;
+            detail.meta.published_revision_id = Some(revision.id);
         }
 
         let skill_ids: Vec<String> = if !detail.meta.skill_refs.is_empty() {
@@ -315,13 +464,668 @@ impl AgentCenterService {
             _ => AgentCenterPreviewMode::Draft,
         };
 
+        let mut create_conversation = CreateConversationRequestWire::for_assistant(id, Some(overrides));
+        create_conversation.extra = json!({ "agent_workflow": detail.meta.workflow.clone() });
+
         Ok(AgentCenterRunPlanResponse {
             assistant_id: id.to_owned(),
-            revision_id: detail.meta.published_revision_id.clone(),
+            revision_id: published_revision_id,
             revision: detail.meta.version,
             preview_mode,
-            create_conversation: CreateConversationRequestWire::for_assistant(id, Some(overrides)),
+            workflow: detail.meta.workflow,
+            create_conversation,
         })
+    }
+
+    pub async fn start_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        req: StartAgentWorkflowRunRequest,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(assistant_id.to_owned()))?;
+        let mut plan = self.run_plan_for_user(user_id, assistant_id).await?;
+        let plan_mcp_ids = plan
+            .create_conversation
+            .assistant
+            .as_ref()
+            .and_then(|assistant| assistant.conversation_overrides.as_ref())
+            .and_then(|overrides| overrides.mcp_ids.as_ref())
+            .cloned();
+        let validation_meta = AgentCenterMeta {
+            workflow: plan.workflow.clone(),
+            mcp_policy: if plan_mcp_ids.is_some() {
+                AgentMcpPolicy::Allowlist
+            } else {
+                AgentMcpPolicy::InheritUserEnabled
+            },
+            ..AgentCenterMeta::default()
+        };
+        validate_workflow_tools(&validation_meta, plan_mcp_ids.as_deref().unwrap_or_default())?;
+        plan.workflow
+            .validate_for_publish()
+            .map_err(|message| AssistantError::BadRequest(message.into()))?;
+        validate_workflow_input(&plan.workflow, &req.input)?;
+        let input = req
+            .input
+            .as_str()
+            .ok_or_else(|| AssistantError::BadRequest("workflow input must be text".into()))?;
+        let agent_output_definition = effective_agent_output_definition(&plan.workflow);
+        let agent_message = build_agent_message(input, &agent_output_definition);
+
+        let now = now_ms();
+        let run_id = generate_prefixed_id("awrun");
+        plan.create_conversation.extra["agent_workflow_run_id"] = json!(run_id.clone());
+        let mut variables = req.variables;
+        variables.insert("input".to_owned(), req.input);
+        let mut run = AgentWorkflowRunResponse {
+            id: run_id,
+            assistant_id: assistant_id.to_owned(),
+            revision_id: plan.revision_id,
+            revision: plan.revision,
+            preview_mode: plan.preview_mode,
+            status: AgentWorkflowRunStatus::Running,
+            current_node_index: 1,
+            workflow: plan.workflow,
+            nodes: Vec::new(),
+            variables,
+            output: None,
+            next_action: Some(AgentWorkflowNextAction::RunAgent {
+                create_conversation: Box::new(plan.create_conversation),
+                message: agent_message,
+            }),
+            created_at: now,
+            updated_at: now,
+        };
+        run.nodes = run
+            .workflow
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| AgentWorkflowNodeRun {
+                node_id: node.id.clone(),
+                kind: node.kind.clone(),
+                status: if index == 0 {
+                    AgentWorkflowNodeRunStatus::Completed
+                } else if index == 1 {
+                    AgentWorkflowNodeRunStatus::Running
+                } else {
+                    AgentWorkflowNodeRunStatus::Pending
+                },
+                attempt: 1,
+                execution_id: None,
+                attempts: Vec::new(),
+                output: None,
+                error: None,
+                started_at: (index <= 1).then_some(now),
+                completed_at: (index == 0).then_some(now),
+            })
+            .collect();
+        let state_json = serialize_workflow_run(&run)?;
+        self.workflow_run_repo
+            .create(&CreateAgentWorkflowRunParams {
+                id: &run.id,
+                assistant_definition_id: &definition.id,
+                user_id,
+                status: workflow_run_status_str(run.status),
+                state_json: &state_json,
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?;
+        tracing::info!(run_id = %run.id, assistant_id, user_id, "agent-workflow: run started");
+        Ok(run)
+    }
+
+    pub async fn get_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        parse_workflow_run(&row.state_json)
+    }
+
+    pub async fn list_workflow_runs_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Vec<AgentWorkflowRunResponse>, AssistantError> {
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(assistant_id.to_owned()))?;
+        self.workflow_run_repo
+            .list_for_assistant(user_id, &definition.id, 50)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .into_iter()
+            .map(|row| parse_workflow_run(&row.state_json))
+            .collect()
+    }
+
+    /// Mark tool executions left in-flight by a previous process as failed.
+    ///
+    /// Tool calls can have external side effects, so startup recovery must not
+    /// replay them automatically. A user can inspect the external system and
+    /// explicitly retry, which creates a fresh execution id.
+    pub async fn recover_interrupted_tool_runs(&self) -> Result<usize, AssistantError> {
+        let rows = self
+            .workflow_run_repo
+            .list_by_status("running")
+            .await
+            .map_err(|error| AssistantError::Internal(error.to_string()))?;
+        let mut recovered = 0;
+        for row in rows {
+            let mut run = match parse_workflow_run(&row.state_json) {
+                Ok(run) => run,
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = row.id,
+                        user_id = row.user_id,
+                        error = %error,
+                        "agent-workflow: skipped malformed run during startup recovery"
+                    );
+                    continue;
+                }
+            };
+            let Some(AgentWorkflowNextAction::InvokeTool {
+                node_id, execution_id, ..
+            }) = run.next_action.as_ref()
+            else {
+                continue;
+            };
+            let Some(node) = run.nodes.get_mut(run.current_node_index) else {
+                continue;
+            };
+            if node.kind != "tool" || node.status != AgentWorkflowNodeRunStatus::Running {
+                continue;
+            }
+            let node_id = node_id.clone();
+            let execution_id = execution_id.clone();
+            let now = now_ms();
+            node.execution_id = Some(execution_id.clone());
+            node.status = AgentWorkflowNodeRunStatus::Failed;
+            node.error = Some(
+                "Tool execution was interrupted by an application restart. Verify external side effects before retrying."
+                    .into(),
+            );
+            node.completed_at = Some(now);
+            run.status = AgentWorkflowRunStatus::Failed;
+            run.next_action = None;
+            run.updated_at = now;
+            let state_json = serialize_workflow_run(&run)?;
+            let updated = self
+                .workflow_run_repo
+                .update_state_if_current(&row.user_id, &row.id, &row.state_json, "failed", &state_json)
+                .await
+                .map_err(|error| AssistantError::Internal(error.to_string()))?;
+            if updated.is_some() {
+                recovered += 1;
+                tracing::warn!(
+                    run_id = row.id,
+                    user_id = row.user_id,
+                    node_id,
+                    execution_id,
+                    "agent-workflow: interrupted tool execution recovered as failed"
+                );
+            }
+        }
+        Ok(recovered)
+    }
+
+    pub async fn advance_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        mut req: AdvanceAgentWorkflowRunRequest,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
+        if run.status != AgentWorkflowRunStatus::Running {
+            return Err(AssistantError::Conflict(
+                "workflow run is not awaiting node completion".into(),
+            ));
+        }
+        let current_node = run
+            .nodes
+            .get(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no current node".into()))?;
+        if current_node.status != AgentWorkflowNodeRunStatus::Running
+            || !matches!(current_node.kind.as_str(), "agent" | "tool")
+        {
+            return Err(AssistantError::Conflict(
+                "current workflow node cannot be advanced".into(),
+            ));
+        }
+        if current_node.kind == "tool" {
+            let Some(AgentWorkflowNextAction::InvokeTool {
+                node_id, execution_id, ..
+            }) = run.next_action.as_ref()
+            else {
+                return Err(AssistantError::Conflict(
+                    "workflow run is not awaiting a tool result".into(),
+                ));
+            };
+            if req.node_id.as_deref() != Some(node_id.as_str())
+                || req.execution_id.as_deref() != Some(execution_id.as_str())
+            {
+                return Err(AssistantError::Conflict(
+                    "tool result does not match the active workflow execution".into(),
+                ));
+            }
+        } else if req.success {
+            let agent_output_definition = effective_agent_output_definition(&run.workflow);
+            req.output = normalize_manual_agent_output(req.output, &agent_output_definition)
+                .map_err(AssistantError::BadRequest)?;
+        }
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no current node".into()))?;
+        let now = now_ms();
+        if !req.success {
+            node.status = AgentWorkflowNodeRunStatus::Failed;
+            node.output = (!req.output.is_null()).then_some(req.output);
+            node.error = req.error.or_else(|| Some("node execution failed".into()));
+            node.completed_at = Some(now);
+            run.status = AgentWorkflowRunStatus::Failed;
+            run.next_action = None;
+        } else {
+            node.status = AgentWorkflowNodeRunStatus::Completed;
+            node.output = Some(req.output.clone());
+            node.completed_at = Some(now);
+            run.variables.insert(node.node_id.clone(), req.output);
+            run.current_node_index += 1;
+            settle_workflow_run(&mut run, now)?;
+        }
+        self.persist_workflow_run(user_id, run, &row.state_json).await
+    }
+
+    /// Apply a conversation turn result to the active agent node.
+    ///
+    /// Returns `None` when the event is unrelated or stale. This makes the
+    /// lifecycle adapter idempotent while retaining strict conflict responses
+    /// for the user-facing manual advance endpoint.
+    pub async fn settle_agent_turn_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        result: AgentWorkflowTurnResult<'_>,
+    ) -> Result<Option<AgentWorkflowRunResponse>, AssistantError> {
+        let run = self.get_workflow_run_for_user(user_id, run_id).await?;
+        let current_node = run.nodes.get(run.current_node_index);
+        if run.assistant_id != result.assistant_id
+            || run.status != AgentWorkflowRunStatus::Running
+            || !matches!(run.next_action, Some(AgentWorkflowNextAction::RunAgent { .. }))
+            || !matches!(current_node, Some(node) if node.kind == "agent" && node.status == AgentWorkflowNodeRunStatus::Running)
+        {
+            return Ok(None);
+        }
+
+        let mut node_output = json!({
+            "conversation_id": result.conversation_id,
+            "turn_id": result.turn_id,
+        });
+        let agent_output_definition = effective_agent_output_definition(&run.workflow);
+        let (success, error) = if result.success {
+            match normalize_agent_output(result.output, &agent_output_definition) {
+                Ok(content) => {
+                    node_output["content"] = content;
+                    (true, None)
+                }
+                Err(error) => (false, Some(error)),
+            }
+        } else {
+            if let Some(content) = result.output.filter(|content| !content.trim().is_empty()) {
+                node_output["content"] = json!(content);
+            }
+            (false, result.error)
+        };
+        if result.success && !success {
+            tracing::warn!(
+                run_id,
+                user_id,
+                assistant_id = result.assistant_id,
+                conversation_id = result.conversation_id,
+                turn_id = result.turn_id,
+                output_format = ?run.workflow.output.format,
+                "agent-workflow: agent output contract validation failed"
+            );
+        }
+        let updated = self
+            .advance_workflow_run_for_user(
+                user_id,
+                run_id,
+                AdvanceAgentWorkflowRunRequest {
+                    node_id: None,
+                    execution_id: None,
+                    success,
+                    output: node_output,
+                    error,
+                },
+            )
+            .await?;
+        tracing::info!(
+            run_id,
+            user_id,
+            assistant_id = result.assistant_id,
+            conversation_id = result.conversation_id,
+            turn_id = result.turn_id,
+            success,
+            "agent-workflow: agent turn settled"
+        );
+        Ok(Some(updated))
+    }
+
+    pub async fn execute_pending_tools_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let Some(executor) = self.tool_executor.as_ref() else {
+            return self.get_workflow_run_for_user(user_id, run_id).await;
+        };
+        let lock_key = format!("{user_id}:{run_id}");
+        let execution_lock = {
+            let mut locks = self.tool_execution_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&lock_key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(lock_key.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _execution_guard = execution_lock.lock().await;
+        let cancellation = {
+            let mut cancellations = self.tool_execution_cancellations.lock().await;
+            cancellations.retain(|_, cancellation| cancellation.strong_count() > 0);
+            let cancellation = Arc::new(WorkflowExecutionCancellation::default());
+            cancellations.insert(lock_key.clone(), Arc::downgrade(&cancellation));
+            cancellation
+        };
+        loop {
+            let run = self.get_workflow_run_for_user(user_id, run_id).await?;
+            let Some(AgentWorkflowNextAction::InvokeTool {
+                node_id,
+                execution_id,
+                mcp_server_id,
+                tool_name,
+                arguments,
+            }) = run.next_action.clone()
+            else {
+                return Ok(run);
+            };
+            tracing::info!(
+                run_id,
+                user_id,
+                node_id,
+                execution_id,
+                mcp_server_id,
+                tool_name,
+                "agent-workflow: MCP tool execution started"
+            );
+            let result = tokio::select! {
+                result = executor.execute(user_id, &mcp_server_id, &tool_name, arguments) => result,
+                () = cancellation.cancelled() => {
+                    tracing::info!(run_id, user_id, node_id, execution_id, "agent-workflow: MCP tool execution interrupted");
+                    return self.get_workflow_run_for_user(user_id, run_id).await;
+                }
+            };
+            let (success, output, error) = match result {
+                Ok(output) if output.get("isError").and_then(serde_json::Value::as_bool) != Some(true) => {
+                    if serde_json::to_vec(&output).is_ok_and(|encoded| encoded.len() <= 1_048_576) {
+                        (true, output, None)
+                    } else {
+                        (
+                            false,
+                            serde_json::Value::Null,
+                            Some("MCP tool result exceeded the 1 MiB workflow limit".into()),
+                        )
+                    }
+                }
+                Ok(output) => (false, output, Some("MCP tool reported an execution error".into())),
+                Err(error) => (false, serde_json::Value::Null, Some(error)),
+            };
+            let update_result = self
+                .advance_workflow_run_for_user(
+                    user_id,
+                    run_id,
+                    AdvanceAgentWorkflowRunRequest {
+                        node_id: Some(node_id),
+                        execution_id: Some(execution_id),
+                        success,
+                        output,
+                        error,
+                    },
+                )
+                .await;
+            let updated = match update_result {
+                Ok(updated) => updated,
+                Err(error @ AssistantError::Conflict(_)) => {
+                    let current = self.get_workflow_run_for_user(user_id, run_id).await?;
+                    if current.status == AgentWorkflowRunStatus::Cancelled {
+                        return Ok(current);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            tracing::info!(run_id, user_id, success, "agent-workflow: MCP tool execution settled");
+            if !success {
+                return Ok(updated);
+            }
+        }
+    }
+
+    pub async fn decide_workflow_approval_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        req: DecideAgentWorkflowApprovalRequest,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
+        if run.status != AgentWorkflowRunStatus::WaitingApproval {
+            return Err(AssistantError::Conflict(
+                "workflow run is not waiting for approval".into(),
+            ));
+        }
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no approval node".into()))?;
+        if node.kind != "approval" || node.status != AgentWorkflowNodeRunStatus::WaitingApproval {
+            return Err(AssistantError::Conflict(
+                "current workflow node is not an approval".into(),
+            ));
+        }
+        let now = now_ms();
+        node.output = Some(json!({
+            "decision": match req.decision {
+                AgentWorkflowApprovalDecision::Approve => "approve",
+                AgentWorkflowApprovalDecision::Reject => "reject",
+            },
+            "comment": req.comment,
+        }));
+        match req.decision {
+            AgentWorkflowApprovalDecision::Reject => {
+                node.status = AgentWorkflowNodeRunStatus::Rejected;
+                node.completed_at = Some(now);
+                run.status = AgentWorkflowRunStatus::Rejected;
+                run.next_action = None;
+            }
+            AgentWorkflowApprovalDecision::Approve => {
+                node.status = AgentWorkflowNodeRunStatus::Completed;
+                node.completed_at = Some(now);
+                run.current_node_index += 1;
+                run.status = AgentWorkflowRunStatus::Running;
+                settle_workflow_run(&mut run, now)?;
+            }
+        }
+        tracing::info!(run_id, user_id, decision = ?req.decision, "agent-workflow: approval decided");
+        self.persist_workflow_run(user_id, run, &row.state_json).await
+    }
+
+    pub async fn cancel_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
+        if !matches!(
+            run.status,
+            AgentWorkflowRunStatus::Running | AgentWorkflowRunStatus::WaitingApproval
+        ) {
+            return Err(AssistantError::Conflict(
+                "only an active workflow run can be cancelled".into(),
+            ));
+        }
+        let now = now_ms();
+        if let Some(node) = run.nodes.get_mut(run.current_node_index)
+            && matches!(
+                node.status,
+                AgentWorkflowNodeRunStatus::Running | AgentWorkflowNodeRunStatus::WaitingApproval
+            )
+        {
+            node.status = AgentWorkflowNodeRunStatus::Cancelled;
+            node.completed_at = Some(now);
+        }
+        run.status = AgentWorkflowRunStatus::Cancelled;
+        run.next_action = None;
+        let cancelled = self.persist_workflow_run(user_id, run, &row.state_json).await?;
+        let lock_key = format!("{user_id}:{run_id}");
+        let cancellation = {
+            let mut cancellations = self.tool_execution_cancellations.lock().await;
+            cancellations.retain(|_, cancellation| cancellation.strong_count() > 0);
+            cancellations.get(&lock_key).and_then(Weak::upgrade)
+        };
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
+        tracing::info!(run_id, user_id, "agent-workflow: run cancelled");
+        Ok(cancelled)
+    }
+
+    pub async fn retry_workflow_run_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        let row = self
+            .workflow_run_repo
+            .get_for_user(user_id, run_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+        let mut run = parse_workflow_run(&row.state_json)?;
+        let definition = run
+            .workflow
+            .nodes
+            .get(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no failed node".into()))?;
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Conflict("workflow run has no failed node".into()))?;
+        if run.status != AgentWorkflowRunStatus::Failed
+            || node.kind != "tool"
+            || node.status != AgentWorkflowNodeRunStatus::Failed
+        {
+            return Err(AssistantError::Conflict(
+                "only a failed tool node can be retried".into(),
+            ));
+        }
+        validate_tool_retry_attempt(node.attempt)?;
+        let next_action = build_tool_action(definition)?;
+        let execution_id = match &next_action {
+            AgentWorkflowNextAction::InvokeTool { execution_id, .. } => execution_id.clone(),
+            _ => unreachable!("build_tool_action always returns invoke_tool"),
+        };
+        let now = now_ms();
+        node.attempts.push(AgentWorkflowNodeRunAttempt {
+            attempt: node.attempt,
+            execution_id: node.execution_id.clone(),
+            status: node.status,
+            output: node.output.clone(),
+            error: node.error.clone(),
+            started_at: node.started_at,
+            completed_at: node.completed_at,
+        });
+        node.attempt += 1;
+        node.execution_id = Some(execution_id.clone());
+        node.status = AgentWorkflowNodeRunStatus::Running;
+        node.output = None;
+        node.error = None;
+        node.started_at = Some(now);
+        node.completed_at = None;
+        run.status = AgentWorkflowRunStatus::Running;
+        run.output = None;
+        run.next_action = Some(next_action);
+        let node_id = node.node_id.clone();
+        let attempt = node.attempt;
+        let retried = self.persist_workflow_run(user_id, run, &row.state_json).await?;
+        tracing::info!(
+            run_id,
+            user_id,
+            node_id,
+            attempt,
+            execution_id,
+            "agent-workflow: failed tool node retried"
+        );
+        Ok(retried)
+    }
+
+    async fn persist_workflow_run(
+        &self,
+        user_id: &str,
+        mut run: AgentWorkflowRunResponse,
+        expected_state_json: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        run.updated_at = now_ms();
+        let state_json = serialize_workflow_run(&run)?;
+        self.workflow_run_repo
+            .update_state_if_current(
+                user_id,
+                &run.id,
+                expected_state_json,
+                workflow_run_status_str(run.status),
+                &state_json,
+            )
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?
+            .ok_or_else(|| AssistantError::Conflict("workflow run changed concurrently; reload and retry".into()))?;
+        tracing::info!(run_id = %run.id, user_id, status = ?run.status, node_index = run.current_node_index, "agent-workflow: run advanced");
+        Ok(run)
     }
 
     async fn load_or_default_meta(&self, definition_id: &str) -> Result<AgentCenterMeta, AssistantError> {
@@ -373,6 +1177,12 @@ impl AgentCenterService {
         if let Some(ref roles) = patch.role_bindings {
             base.role_bindings = roles.clone();
         }
+        if let Some(ref workflow) = patch.workflow {
+            workflow
+                .validate()
+                .map_err(|message| AssistantError::BadRequest(message.into()))?;
+            base.workflow = workflow.clone();
+        }
 
         let knowledge_scopes =
             serde_json::to_string(&base.knowledge_scopes).map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -380,6 +1190,8 @@ impl AgentCenterService {
             serde_json::to_string(&base.skill_refs).map_err(|e| AssistantError::Internal(e.to_string()))?;
         let role_bindings =
             serde_json::to_string(&base.role_bindings).map_err(|e| AssistantError::Internal(e.to_string()))?;
+        let workflow_definition =
+            serde_json::to_string(&base.workflow).map_err(|e| AssistantError::Internal(e.to_string()))?;
         let visibility = visibility_str(base.visibility);
         let status = status_str(base.status);
         let mcp_policy = mcp_policy_str(base.mcp_policy);
@@ -398,6 +1210,7 @@ impl AgentCenterService {
                 skill_refs: &skill_refs,
                 mcp_policy,
                 role_bindings: &role_bindings,
+                workflow_definition: &workflow_definition,
             })
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -500,6 +1313,7 @@ fn row_to_meta(row: &aionui_db::AssistantAgentCenterRow) -> Result<AgentCenterMe
         skill_refs: serde_json::from_str(&row.skill_refs).unwrap_or_default(),
         mcp_policy,
         role_bindings: serde_json::from_str(&row.role_bindings).unwrap_or_default(),
+        workflow: serde_json::from_str(&row.workflow_definition).unwrap_or_default(),
     })
 }
 
@@ -549,5 +1363,606 @@ fn mcp_policy_str(p: AgentMcpPolicy) -> &'static str {
     match p {
         AgentMcpPolicy::Allowlist => "allowlist",
         AgentMcpPolicy::InheritUserEnabled => "inherit_user_enabled",
+    }
+}
+
+fn workflow_run_status_str(status: AgentWorkflowRunStatus) -> &'static str {
+    match status {
+        AgentWorkflowRunStatus::Running => "running",
+        AgentWorkflowRunStatus::WaitingApproval => "waiting_approval",
+        AgentWorkflowRunStatus::Completed => "completed",
+        AgentWorkflowRunStatus::Rejected => "rejected",
+        AgentWorkflowRunStatus::Failed => "failed",
+        AgentWorkflowRunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn validate_workflow_tools(meta: &AgentCenterMeta, enabled_mcp_ids: &[String]) -> Result<(), AssistantError> {
+    if meta.mcp_policy != AgentMcpPolicy::Allowlist {
+        return Ok(());
+    }
+    let has_unavailable_tool = meta
+        .workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "tool")
+        .any(|node| {
+            node.config
+                .get("mcp_server_id")
+                .or_else(|| node.config.get("tool_id"))
+                .is_some_and(|server_id| !enabled_mcp_ids.contains(server_id))
+        });
+    if has_unavailable_tool {
+        return Err(AssistantError::BadRequest(
+            "workflow tool nodes must reference an enabled MCP server".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_retry_attempt(attempt: u32) -> Result<(), AssistantError> {
+    if attempt >= MAX_WORKFLOW_TOOL_ATTEMPTS {
+        return Err(AssistantError::Conflict(format!(
+            "workflow tool node reached the maximum of {MAX_WORKFLOW_TOOL_ATTEMPTS} attempts"
+        )));
+    }
+    Ok(())
+}
+
+fn serialize_workflow_run(run: &AgentWorkflowRunResponse) -> Result<String, AssistantError> {
+    serde_json::to_string(run).map_err(|e| AssistantError::Internal(format!("workflow run serialize: {e}")))
+}
+
+fn parse_workflow_run(raw: &str) -> Result<AgentWorkflowRunResponse, AssistantError> {
+    serde_json::from_str(raw).map_err(|e| AssistantError::Internal(format!("workflow run parse: {e}")))
+}
+
+fn validate_workflow_input(workflow: &AgentWorkflowDefinition, input: &Value) -> Result<(), AssistantError> {
+    if input.is_null() {
+        return if workflow.input.required {
+            Err(AssistantError::BadRequest("workflow input is required".into()))
+        } else {
+            Ok(())
+        };
+    }
+    let Some(text) = input.as_str() else {
+        return Err(AssistantError::BadRequest("workflow input must be text".into()));
+    };
+    if workflow.input.required && text.trim().is_empty() {
+        return Err(AssistantError::BadRequest("workflow input is required".into()));
+    }
+    Ok(())
+}
+
+fn build_agent_message(input: &str, output: &AgentWorkflowOutputDefinition) -> String {
+    use aionui_api_types::AgentWorkflowOutputFormat;
+
+    match output.format {
+        AgentWorkflowOutputFormat::Markdown => input.to_owned(),
+        AgentWorkflowOutputFormat::PlainText => format!(
+            "{input}\n\n---\nWorkflow output contract: Return plain text only. Do not use Markdown formatting or code fences."
+        ),
+        AgentWorkflowOutputFormat::Json if output.schema.is_empty() => format!(
+            "{input}\n\n---\nWorkflow output contract: Return only one valid JSON value. Do not use Markdown or code fences."
+        ),
+        AgentWorkflowOutputFormat::Json => {
+            let fields = output
+                .schema
+                .iter()
+                .map(|field| {
+                    let requirement = if field.required { "required" } else { "optional" };
+                    let description = field
+                        .description
+                        .as_deref()
+                        .map(|description| format!(", description: {}", description.replace(['\r', '\n'], " ")))
+                        .unwrap_or_default();
+                    format!(
+                        "{}: {} ({requirement}{description})",
+                        field.name,
+                        output_field_type_name(field.field_type)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "{input}\n\n---\nWorkflow output contract: Return only one valid JSON object with exactly these declared fields: {fields}. Optional fields may be omitted. Do not add undeclared fields. Do not use Markdown or code fences."
+            )
+        }
+    }
+}
+
+fn effective_agent_output_definition(workflow: &AgentWorkflowDefinition) -> AgentWorkflowOutputDefinition {
+    if workflow.nodes.iter().any(|node| node.kind == "tool") {
+        AgentWorkflowOutputDefinition::default()
+    } else {
+        workflow.output.clone()
+    }
+}
+
+fn normalize_agent_output(output: Option<&str>, definition: &AgentWorkflowOutputDefinition) -> Result<Value, String> {
+    use aionui_api_types::AgentWorkflowOutputFormat;
+
+    let output = output
+        .map(str::trim)
+        .filter(|output| !output.is_empty())
+        .ok_or_else(|| "workflow agent returned no output".to_owned())?;
+    match definition.format {
+        AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText => Ok(json!(output)),
+        AgentWorkflowOutputFormat::Json => {
+            let output: Value = serde_json::from_str(output)
+                .map_err(|_| "workflow agent output must be valid JSON without Markdown code fences".to_owned())?;
+            validate_json_output_schema(&output, &definition.schema)?;
+            Ok(output)
+        }
+    }
+}
+
+fn normalize_manual_agent_output(output: Value, definition: &AgentWorkflowOutputDefinition) -> Result<Value, String> {
+    use aionui_api_types::AgentWorkflowOutputFormat;
+
+    let is_internal_result = output.get("conversation_id").is_some_and(Value::is_string)
+        && output.get("turn_id").is_some_and(Value::is_string)
+        && output.get("content").is_some();
+    if is_internal_result {
+        let content = output.get("content").expect("checked above");
+        match definition.format {
+            AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText
+                if content.as_str().is_none_or(|content| content.trim().is_empty()) =>
+            {
+                return Err("workflow agent output must be non-empty text".to_owned());
+            }
+            AgentWorkflowOutputFormat::Json => validate_json_output_schema(content, &definition.schema)?,
+            _ => {}
+        }
+        return Ok(output);
+    }
+    let content = match definition.format {
+        AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText => {
+            let text = output
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| "workflow agent output must be non-empty text".to_owned())?;
+            json!(text)
+        }
+        AgentWorkflowOutputFormat::Json if output.is_null() => {
+            return Err("workflow agent output must be a non-null JSON value".to_owned());
+        }
+        AgentWorkflowOutputFormat::Json => {
+            validate_json_output_schema(&output, &definition.schema)?;
+            output
+        }
+    };
+    Ok(json!({ "content": content }))
+}
+
+fn output_field_type_name(field_type: AgentWorkflowOutputFieldType) -> &'static str {
+    match field_type {
+        AgentWorkflowOutputFieldType::String => "string",
+        AgentWorkflowOutputFieldType::Number => "number",
+        AgentWorkflowOutputFieldType::Integer => "integer",
+        AgentWorkflowOutputFieldType::Boolean => "boolean",
+    }
+}
+
+fn validate_json_output_schema(output: &Value, schema: &[AgentWorkflowOutputFieldDefinition]) -> Result<(), String> {
+    if schema.is_empty() {
+        return Ok(());
+    }
+    let object = output
+        .as_object()
+        .ok_or_else(|| "workflow output must be a JSON object for the declared schema".to_owned())?;
+    for field in schema {
+        let Some(value) = object.get(&field.name) else {
+            if field.required {
+                return Err(format!("workflow output is missing required field: {}", field.name));
+            }
+            continue;
+        };
+        let valid = match field.field_type {
+            AgentWorkflowOutputFieldType::String => value.is_string(),
+            AgentWorkflowOutputFieldType::Number => value.is_number(),
+            AgentWorkflowOutputFieldType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+            AgentWorkflowOutputFieldType::Boolean => value.is_boolean(),
+        };
+        if !valid {
+            return Err(format!(
+                "workflow output field {} must be {}",
+                field.name,
+                output_field_type_name(field.field_type)
+            ));
+        }
+    }
+    if let Some(unexpected) = object
+        .keys()
+        .find(|name| !schema.iter().any(|field| field.name.as_str() == name.as_str()))
+    {
+        return Err(format!("workflow output contains undeclared field: {unexpected}"));
+    }
+    Ok(())
+}
+
+fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(), AssistantError> {
+    loop {
+        let Some(definition) = run.workflow.nodes.get(run.current_node_index) else {
+            if run.output.is_none() {
+                run.output = resolve_workflow_output(run);
+            }
+            run.status = AgentWorkflowRunStatus::Completed;
+            run.next_action = None;
+            return Ok(());
+        };
+        let node_id = definition.id.clone();
+        let kind = definition.kind.clone();
+        let config = definition.config.clone();
+        let resolved_output = matches!(kind.as_str(), "condition" | "output")
+            .then(|| resolve_workflow_output(run))
+            .flatten();
+        let node = run
+            .nodes
+            .get_mut(run.current_node_index)
+            .ok_or_else(|| AssistantError::Internal("workflow run node state is incomplete".into()))?;
+
+        match kind.as_str() {
+            "tool" => {
+                let next_action = build_tool_action(definition)?;
+                let execution_id = match &next_action {
+                    AgentWorkflowNextAction::InvokeTool { execution_id, .. } => execution_id.clone(),
+                    _ => unreachable!("build_tool_action always returns invoke_tool"),
+                };
+                node.status = AgentWorkflowNodeRunStatus::Running;
+                node.started_at = Some(now);
+                node.execution_id = Some(execution_id);
+                run.status = AgentWorkflowRunStatus::Running;
+                run.next_action = Some(next_action);
+                return Ok(());
+            }
+            "approval" => {
+                let message = config
+                    .get("message")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .ok_or_else(|| AssistantError::BadRequest("workflow approval node requires message".into()))?;
+                node.status = AgentWorkflowNodeRunStatus::WaitingApproval;
+                node.started_at = Some(now);
+                run.status = AgentWorkflowRunStatus::WaitingApproval;
+                run.next_action = Some(AgentWorkflowNextAction::AwaitApproval { node_id, message });
+                return Ok(());
+            }
+            "condition" => {
+                let expression = config
+                    .get("expression")
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| AssistantError::BadRequest("workflow condition node requires expression".into()))?;
+                let passed = evaluate_guard_expression(expression, &run.variables)?;
+                node.status = AgentWorkflowNodeRunStatus::Completed;
+                node.started_at = Some(now);
+                node.completed_at = Some(now);
+                node.output = Some(serde_json::Value::Bool(passed));
+                if passed {
+                    run.current_node_index += 1;
+                    continue;
+                }
+                let output_schema_error =
+                    validate_declared_output(resolved_output.as_ref(), &run.workflow.output).err();
+                for remaining in run.nodes.iter_mut().skip(run.current_node_index + 1) {
+                    if remaining.kind == "output" {
+                        if let Some(error) = output_schema_error.clone() {
+                            remaining.status = AgentWorkflowNodeRunStatus::Failed;
+                            remaining.error = Some(error);
+                        } else {
+                            remaining.status = AgentWorkflowNodeRunStatus::Completed;
+                            remaining.output = resolved_output.clone();
+                        }
+                    } else {
+                        remaining.status = AgentWorkflowNodeRunStatus::Skipped;
+                    }
+                    remaining.completed_at = Some(now);
+                }
+                run.current_node_index = run.nodes.len().saturating_sub(1);
+                run.status = if output_schema_error.is_some() {
+                    AgentWorkflowRunStatus::Failed
+                } else {
+                    AgentWorkflowRunStatus::Completed
+                };
+                run.output = output_schema_error.is_none().then_some(resolved_output).flatten();
+                run.next_action = None;
+                return Ok(());
+            }
+            "output" => {
+                if let Err(error) = validate_declared_output(resolved_output.as_ref(), &run.workflow.output) {
+                    node.status = AgentWorkflowNodeRunStatus::Failed;
+                    node.started_at = Some(now);
+                    node.completed_at = Some(now);
+                    node.error = Some(error);
+                    run.status = AgentWorkflowRunStatus::Failed;
+                    run.output = None;
+                    run.next_action = None;
+                    return Ok(());
+                }
+                node.status = AgentWorkflowNodeRunStatus::Completed;
+                node.started_at = Some(now);
+                node.completed_at = Some(now);
+                node.output = resolved_output.clone();
+                run.status = AgentWorkflowRunStatus::Completed;
+                run.output = resolved_output;
+                run.next_action = None;
+                return Ok(());
+            }
+            _ => {
+                return Err(AssistantError::Internal(format!(
+                    "workflow cannot automatically settle node kind {kind}"
+                )));
+            }
+        }
+    }
+}
+
+fn resolve_workflow_output(run: &AgentWorkflowRunResponse) -> Option<Value> {
+    run.workflow
+        .nodes
+        .iter()
+        .zip(run.nodes.iter())
+        .rev()
+        .find_map(|(definition, node)| {
+            if node.status != AgentWorkflowNodeRunStatus::Completed {
+                return None;
+            }
+            match definition.kind.as_str() {
+                "tool" => node.output.clone(),
+                "agent" => node.output.as_ref().and_then(|output| output.get("content").cloned()),
+                _ => None,
+            }
+        })
+}
+
+fn validate_declared_output(output: Option<&Value>, definition: &AgentWorkflowOutputDefinition) -> Result<(), String> {
+    if definition.schema.is_empty() {
+        return Ok(());
+    }
+    let output = output.ok_or_else(|| "workflow produced no output for the declared schema".to_owned())?;
+    validate_json_output_schema(output, &definition.schema)
+}
+
+fn build_tool_action(
+    definition: &aionui_api_types::AgentWorkflowNodeDefinition,
+) -> Result<AgentWorkflowNextAction, AssistantError> {
+    let mcp_server_id = definition
+        .config
+        .get("mcp_server_id")
+        .or_else(|| definition.config.get("tool_id"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires mcp_server_id".into()))?;
+    let tool_name = definition
+        .config
+        .get("tool_name")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| AssistantError::BadRequest("workflow tool node requires tool_name".into()))?;
+    let arguments = definition
+        .config
+        .get("arguments_json")
+        .map(|raw| serde_json::from_str(raw))
+        .transpose()
+        .map_err(|_| AssistantError::BadRequest("workflow tool arguments must be valid JSON".into()))?
+        .unwrap_or_else(|| json!({}));
+    if !arguments.is_object() {
+        return Err(AssistantError::BadRequest(
+            "workflow tool arguments must be a JSON object".into(),
+        ));
+    }
+    Ok(AgentWorkflowNextAction::InvokeTool {
+        node_id: definition.id.clone(),
+        execution_id: generate_prefixed_id("awexec"),
+        mcp_server_id,
+        tool_name,
+        arguments,
+    })
+}
+
+fn evaluate_guard_expression(
+    expression: &str,
+    variables: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<bool, AssistantError> {
+    let expression = expression.trim();
+    if expression.eq_ignore_ascii_case("true") {
+        return Ok(true);
+    }
+    if expression.eq_ignore_ascii_case("false") {
+        return Ok(false);
+    }
+    for operator in [">=", "<=", "!=", "==", ">", "<"] {
+        if let Some((left, right)) = expression.split_once(operator) {
+            let actual = variables.get(left.trim()).ok_or_else(|| {
+                AssistantError::BadRequest(format!("workflow condition variable is missing: {}", left.trim()))
+            })?;
+            let expected = parse_guard_literal(right.trim());
+            return compare_guard_values(actual, &expected, operator);
+        }
+    }
+    Err(AssistantError::BadRequest(
+        "workflow condition must be true, false, or a simple variable comparison".into(),
+    ))
+}
+
+fn parse_guard_literal(raw: &str) -> serde_json::Value {
+    let unquoted = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| raw.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')));
+    if let Some(value) = unquoted {
+        return serde_json::Value::String(value.to_owned());
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
+}
+
+fn compare_guard_values(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    operator: &str,
+) -> Result<bool, AssistantError> {
+    match operator {
+        "==" => Ok(actual == expected),
+        "!=" => Ok(actual != expected),
+        ">" | ">=" | "<" | "<=" => {
+            let left = actual
+                .as_f64()
+                .ok_or_else(|| AssistantError::BadRequest("workflow numeric comparison requires numbers".into()))?;
+            let right = expected
+                .as_f64()
+                .ok_or_else(|| AssistantError::BadRequest("workflow numeric comparison requires numbers".into()))?;
+            Ok(match operator {
+                ">" => left > right,
+                ">=" => left >= right,
+                "<" => left < right,
+                "<=" => left <= right,
+                _ => false,
+            })
+        }
+        _ => Err(AssistantError::BadRequest(
+            "unsupported workflow condition operator".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod workflow_run_tests {
+    use super::*;
+    use aionui_api_types::AgentWorkflowOutputFormat;
+
+    fn output_definition(format: AgentWorkflowOutputFormat) -> AgentWorkflowOutputDefinition {
+        AgentWorkflowOutputDefinition {
+            format,
+            ..AgentWorkflowOutputDefinition::default()
+        }
+    }
+
+    fn structured_output_definition() -> AgentWorkflowOutputDefinition {
+        AgentWorkflowOutputDefinition {
+            format: AgentWorkflowOutputFormat::Json,
+            schema: vec![
+                AgentWorkflowOutputFieldDefinition {
+                    name: "severity".to_owned(),
+                    field_type: AgentWorkflowOutputFieldType::String,
+                    required: true,
+                    description: Some("Normalized severity".to_owned()),
+                },
+                AgentWorkflowOutputFieldDefinition {
+                    name: "confidence".to_owned(),
+                    field_type: AgentWorkflowOutputFieldType::Number,
+                    required: false,
+                    description: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn guard_evaluator_supports_boolean_numeric_and_string_comparisons() {
+        let variables = std::collections::BTreeMap::from([
+            ("risk_score".to_owned(), json!(75)),
+            ("region".to_owned(), json!("cn")),
+        ]);
+        assert!(evaluate_guard_expression("true", &variables).unwrap());
+        assert!(evaluate_guard_expression("risk_score > 70", &variables).unwrap());
+        assert!(evaluate_guard_expression("region == \"cn\"", &variables).unwrap());
+    }
+
+    #[test]
+    fn guard_evaluator_rejects_arbitrary_expressions() {
+        let error = evaluate_guard_expression("process.exit()", &Default::default()).unwrap_err();
+        assert!(matches!(error, AssistantError::BadRequest(_)));
+    }
+
+    #[test]
+    fn json_contract_message_is_explicit_and_preserves_input() {
+        let message = build_agent_message("Review this defect", &structured_output_definition());
+
+        assert!(message.starts_with("Review this defect"));
+        assert!(message.contains("Return only one valid JSON object"));
+        assert!(message.contains("severity: string (required"));
+        assert!(message.contains("Do not use Markdown or code fences"));
+    }
+
+    #[test]
+    fn json_output_is_parsed_into_a_structured_value() {
+        let output =
+            normalize_agent_output(Some(" {\"severity\":\"high\"} "), &structured_output_definition()).unwrap();
+
+        assert_eq!(output, json!({ "severity": "high" }));
+    }
+
+    #[test]
+    fn malformed_or_empty_agent_output_fails_the_contract() {
+        assert_eq!(
+            normalize_agent_output(
+                Some("```json\n{}\n```"),
+                &output_definition(AgentWorkflowOutputFormat::Json)
+            ),
+            Err("workflow agent output must be valid JSON without Markdown code fences".to_owned())
+        );
+        assert_eq!(
+            normalize_agent_output(Some("  "), &output_definition(AgentWorkflowOutputFormat::Markdown)),
+            Err("workflow agent returned no output".to_owned())
+        );
+    }
+
+    #[test]
+    fn manual_agent_output_obeys_the_declared_format() {
+        let output =
+            normalize_manual_agent_output(json!({ "severity": "high" }), &structured_output_definition()).unwrap();
+        assert_eq!(output, json!({ "content": { "severity": "high" } }));
+
+        let error = normalize_manual_agent_output(
+            json!({ "ok": true }),
+            &output_definition(AgentWorkflowOutputFormat::PlainText),
+        )
+        .unwrap_err();
+        assert_eq!(error, "workflow agent output must be non-empty text");
+    }
+
+    #[test]
+    fn structured_output_rejects_missing_wrong_type_and_undeclared_fields() {
+        let definition = structured_output_definition();
+
+        assert_eq!(
+            validate_json_output_schema(&json!({}), &definition.schema),
+            Err("workflow output is missing required field: severity".to_owned())
+        );
+        assert_eq!(
+            validate_json_output_schema(&json!({ "severity": 3 }), &definition.schema),
+            Err("workflow output field severity must be string".to_owned())
+        );
+        assert_eq!(
+            validate_json_output_schema(&json!({ "severity": "high", "extra": true }), &definition.schema),
+            Err("workflow output contains undeclared field: extra".to_owned())
+        );
+    }
+
+    #[test]
+    fn lifecycle_shaped_manual_output_cannot_bypass_contract_validation() {
+        let lifecycle_output = json!({
+            "conversation_id": "conversation-1",
+            "turn_id": "turn-1",
+            "content": { "severity": 3 }
+        });
+
+        assert_eq!(
+            normalize_manual_agent_output(lifecycle_output, &structured_output_definition()),
+            Err("workflow output field severity must be string".to_owned())
+        );
+    }
+
+    #[test]
+    fn tool_retry_limit_allows_recovery_but_stops_repeated_side_effects() {
+        assert!(validate_tool_retry_attempt(MAX_WORKFLOW_TOOL_ATTEMPTS - 1).is_ok());
+        let error = validate_tool_retry_attempt(MAX_WORKFLOW_TOOL_ATTEMPTS).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AssistantError::Conflict(message)
+                if message == "workflow tool node reached the maximum of 3 attempts"
+        ));
     }
 }

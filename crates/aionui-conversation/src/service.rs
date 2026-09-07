@@ -30,9 +30,9 @@ use aionui_api_types::{
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
 use aionui_common::{
-    AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
-    now_ms, validate_workspace_path_availability,
+    AgentKillReason, AgentType, ConversationSource, ConversationStatus, ConversationTurnSettlement, ErrorChain,
+    MessageType, OnConversationDelete, OnConversationTurnCancelled, OnConversationTurnSettled, PaginatedResult,
+    TurnCancelCause, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
@@ -361,6 +361,8 @@ pub struct ConversationService {
     /// services can drop work aimed at this conversation. See
     /// `OnConversationTurnCancelled` for why only some branches fire.
     turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
+    /// Hooks invoked after an agent turn reaches a terminal result.
+    turn_settled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnSettled>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -448,6 +450,7 @@ impl ConversationService {
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_settled_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -686,6 +689,40 @@ impl ConversationService {
     pub fn with_turn_cancelled_hook(&self, hook: Arc<dyn OnConversationTurnCancelled>) {
         if let Ok(mut guard) = self.turn_cancelled_hooks.write() {
             guard.push(hook);
+        }
+    }
+
+    /// Register a hook notified after an agent turn reaches a terminal result.
+    pub fn with_turn_settled_hook(&self, hook: Arc<dyn OnConversationTurnSettled>) {
+        if let Ok(mut guard) = self.turn_settled_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    pub(crate) async fn notify_turn_settled(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        settlement: ConversationTurnSettlement,
+        error_message: Option<&str>,
+        assistant_output: Option<&str>,
+    ) {
+        let hooks: Vec<Arc<dyn OnConversationTurnSettled>> = self
+            .turn_settled_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.on_turn_settled(
+                user_id,
+                conversation_id,
+                turn_id,
+                settlement,
+                error_message,
+                assistant_output,
+            )
+            .await;
         }
     }
 

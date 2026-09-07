@@ -22,8 +22,9 @@ use tracing::{debug, info, warn};
 use crate::types::McpServerTransport;
 use protocol::{
     JsonRpcRequest, JsonRpcResponse, SseEvent, build_http_headers, build_initialize_request,
-    build_initialized_notification, build_tools_list_request, error_result, read_sse_events, rpc_error_result,
-    run_stdio_protocol, spawn_error_result, success_result, timeout_result, wait_for_endpoint,
+    build_initialized_notification, build_tools_call_request, build_tools_list_request, ensure_rpc_response_id,
+    ensure_rpc_success, error_result, read_sse_events, rpc_error_result, rpc_result, run_stdio_protocol,
+    run_stdio_tool_call, spawn_error_result, success_result, timeout_result, wait_for_endpoint,
     wait_for_jsonrpc_response,
 };
 
@@ -32,6 +33,13 @@ use protocol::{
 // ---------------------------------------------------------------------------
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ToolExecution<'a> {
+    name: &'a str,
+    arguments: serde_json::Value,
+    user_id: Option<&'a str>,
+    runtime_scope_id: Option<&'a str>,
+}
 
 // ---------------------------------------------------------------------------
 // McpConnectionTestService
@@ -91,6 +99,94 @@ impl McpConnectionTestService {
             McpServerTransport::Sse { url, headers } => self.test_sse(url, headers).await,
         };
         log_mcp_transport_result(mcp_server_id, transport_type, &result);
+        result
+    }
+
+    /// Execute one tool through the same bounded, short-lived transport used
+    /// by connection tests. The returned value is the MCP `tools/call` result.
+    pub async fn execute_tool(
+        &self,
+        transport: &McpServerTransport,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        user_id: Option<&str>,
+        runtime_scope_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        if tool_name.trim().is_empty() || !arguments.is_object() {
+            return Err("tool name and object arguments are required".into());
+        }
+        match transport {
+            McpServerTransport::Stdio { command, args, env } => {
+                self.execute_stdio_tool(
+                    command,
+                    args,
+                    env,
+                    ToolExecution {
+                        name: tool_name,
+                        arguments,
+                        user_id,
+                        runtime_scope_id,
+                    },
+                )
+                .await
+            }
+            McpServerTransport::Http { url, headers } => {
+                tokio::time::timeout(self.timeout, self.execute_http_tool(url, headers, tool_name, arguments))
+                    .await
+                    .map_err(|_| format!("tool execution timed out after {}s", self.timeout.as_secs()))?
+            }
+            McpServerTransport::Sse { url, headers } => {
+                tokio::time::timeout(self.timeout, self.execute_sse_tool(url, headers, tool_name, arguments))
+                    .await
+                    .map_err(|_| format!("tool execution timed out after {}s", self.timeout.as_secs()))?
+            }
+        }
+    }
+
+    async fn execute_stdio_tool(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        execution: ToolExecution<'_>,
+    ) -> Result<serde_json::Value, String> {
+        let reporter = execution
+            .runtime_scope_id
+            .map(|scope_id| self.runtime_reporter(execution.user_id.map(str::to_owned), scope_id.to_owned()));
+        let mut cmd = match probe_runtime_command(command) {
+            RuntimeCommandProbe::NodeTool { .. } => {
+                let resolved = ensure_runtime_command_with_reporter(command, reporter.as_deref())
+                    .await
+                    .map_err(|error| format!("failed to prepare MCP runtime: {error}"))?;
+                CmdBuilder::from_resolved(&resolved)
+            }
+            _ => {
+                let program = resolve_stdio_command(command);
+                CmdBuilder::new(&program)
+            }
+        };
+        cmd.args(args)
+            .envs(env.iter())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd
+            .spawn()
+            .map_err(|error| format!("failed to start MCP server: {error}"))?;
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let result = match tokio::time::timeout(
+            self.timeout,
+            run_stdio_tool_call(stdin, stdout, execution.name, execution.arguments),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!("tool execution timed out after {}s", self.timeout.as_secs())),
+        };
+        if let Err(error) = kill_process_tree(&mut child).await {
+            warn!(%error, "failed to clean up MCP tool execution process tree");
+        }
         result
     }
 
@@ -217,6 +313,50 @@ impl McpConnectionTestService {
         success_result(tools_resp.rpc.result)
     }
 
+    async fn execute_http_tool(
+        &self,
+        url: &str,
+        headers: &HashMap<String, String>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let mut req_headers = build_http_headers(headers);
+        req_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().expect("valid header"),
+        );
+        req_headers.insert(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream".parse().expect("valid header"),
+        );
+        let init = self
+            .http_post_mcp(url, &req_headers, &build_initialize_request(1))
+            .await
+            .map_err(connection_result_error)?;
+        ensure_rpc_response_id("initialize", 1, &init.rpc)?;
+        ensure_rpc_success("initialize", init.rpc)?;
+        if let Some(session_id) = init.session_id
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&session_id)
+        {
+            req_headers.insert("mcp-session-id", value);
+        }
+        self.http_client
+            .post(url)
+            .headers(req_headers.clone())
+            .json(&build_initialized_notification())
+            .send()
+            .await
+            .map_err(|error| format!("failed to send initialized: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("initialized was rejected: {error}"))?;
+        let called = self
+            .http_post_mcp(url, &req_headers, &build_tools_call_request(2, tool_name, arguments))
+            .await
+            .map_err(connection_result_error)?;
+        ensure_rpc_response_id("tools/call", 2, &called.rpc)?;
+        rpc_result("tools/call", called.rpc)
+    }
+
     /// POST a JSON-RPC message and parse the response.
     ///
     /// Returns `Err(McpConnectionTestResult)` for HTTP-level failures
@@ -324,6 +464,51 @@ impl McpConnectionTestService {
         result
     }
 
+    async fn execute_sse_tool(
+        &self,
+        url: &str,
+        headers: &HashMap<String, String>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let mut req_headers = build_http_headers(headers);
+        let response = self
+            .http_client
+            .get(url)
+            .headers(req_headers.clone())
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .map_err(|error| format!("failed to open SSE connection: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {} from MCP server", response.status()));
+        }
+        let (event_tx, mut event_rx) = mpsc::channel::<SseEvent>(16);
+        let reader_handle = tokio::spawn(read_sse_events(response, event_tx));
+        req_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().expect("valid header"),
+        );
+        let result = async {
+            let endpoint = wait_for_endpoint(&mut event_rx, url).await?;
+            self.sse_post(&endpoint, &req_headers, &build_initialize_request(1))
+                .await?;
+            ensure_rpc_success("initialize", wait_for_jsonrpc_response(&mut event_rx, 1).await?)?;
+            self.sse_post(&endpoint, &req_headers, &build_initialized_notification())
+                .await?;
+            self.sse_post(
+                &endpoint,
+                &req_headers,
+                &build_tools_call_request(2, tool_name, arguments),
+            )
+            .await?;
+            rpc_result("tools/call", wait_for_jsonrpc_response(&mut event_rx, 2).await?)
+        }
+        .await;
+        reader_handle.abort();
+        result
+    }
+
     async fn run_sse_protocol(
         &self,
         base_url: &str,
@@ -350,7 +535,7 @@ impl McpConnectionTestService {
                 Some(serde_json::json!({ "transport": "sse", "stage": "initialize_send" })),
             );
         }
-        let init_resp = match wait_for_jsonrpc_response(event_rx).await {
+        let init_resp = match wait_for_jsonrpc_response(event_rx, 1).await {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -377,7 +562,7 @@ impl McpConnectionTestService {
                 Some(serde_json::json!({ "transport": "sse", "stage": "tools_list_send" })),
             );
         }
-        let tools_resp = match wait_for_jsonrpc_response(event_rx).await {
+        let tools_resp = match wait_for_jsonrpc_response(event_rx, 2).await {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -407,9 +592,17 @@ impl McpConnectionTestService {
             .json(body)
             .send()
             .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+fn connection_result_error(result: McpConnectionTestResult) -> String {
+    result
+        .error
+        .unwrap_or_else(|| "MCP connection requires authentication or could not be established".into())
 }
 
 impl McpConnectionTestService {
@@ -544,6 +737,15 @@ mod tests {
     use aionui_realtime::BroadcastEventBus;
     use aionui_realtime::EventBroadcaster;
     use aionui_runtime::{NodeRuntimeProgress, NodeRuntimeProgressPhase};
+    use axum::{
+        Json, Router,
+        body::{Body, Bytes},
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
+    use std::convert::Infallible;
     use std::io::Write;
     use std::sync::Mutex;
     use tracing::Level;
@@ -565,6 +767,133 @@ mod tests {
 
     struct RecordingBroadcaster {
         events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct HttpMcpFixture {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        fail_tool_call: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct SseMcpFixture {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        events: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Bytes>>>>,
+    }
+
+    async fn sse_stream_handler(State(state): State<SseMcpFixture>) -> Response {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Bytes::from_static(b"event: endpoint\ndata: /messages\n\n"))
+            .unwrap();
+        *state.events.lock().unwrap() = Some(tx);
+        let stream = futures_util::stream::unfold(rx, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|bytes| (Ok::<Bytes, Infallible>(bytes), receiver))
+        });
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    async fn sse_message_handler(
+        State(state): State<SseMcpFixture>,
+        Json(body): Json<serde_json::Value>,
+    ) -> StatusCode {
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        state.requests.lock().unwrap().push(body.clone());
+        if let Some(id) = body.get("id") {
+            let result = if method == "tools/call" {
+                serde_json::json!({ "content": [{ "type": "text", "text": "sent" }] })
+            } else {
+                serde_json::json!({})
+            };
+            let event = format!(
+                "event: message\ndata: {}\n\n",
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+            );
+            if let Some(sender) = state.events.lock().unwrap().as_ref() {
+                let _ = sender.send(Bytes::from(event));
+            }
+        }
+        StatusCode::ACCEPTED
+    }
+
+    async fn http_mcp_handler(
+        State(state): State<HttpMcpFixture>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        let method = body
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        state.requests.lock().unwrap().push(serde_json::json!({
+            "method": method,
+            "params": body.get("params"),
+            "session_id": headers.get("mcp-session-id").and_then(|value| value.to_str().ok()),
+        }));
+        if method == "notifications/initialized" {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let response = if method == "tools/call" && state.fail_tool_call {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32602, "message": "invalid arguments" },
+            })
+        } else if method == "tools/call" {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": [{ "type": "text", "text": "created" }] },
+            })
+        } else {
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+        };
+        let mut response = Json(response).into_response();
+        if method == "initialize" {
+            response
+                .headers_mut()
+                .insert("mcp-session-id", HeaderValue::from_static("session-1"));
+        }
+        response
+    }
+
+    async fn start_http_mcp_fixture(fail_tool_call: bool) -> (String, HttpMcpFixture, tokio::task::JoinHandle<()>) {
+        let state = HttpMcpFixture {
+            fail_tool_call,
+            ..HttpMcpFixture::default()
+        };
+        let app = Router::new()
+            .route("/mcp", post(http_mcp_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/mcp"), state, handle)
+    }
+
+    async fn start_sse_mcp_fixture() -> (String, SseMcpFixture, tokio::task::JoinHandle<()>) {
+        let state = SseMcpFixture::default();
+        let app = Router::new()
+            .route("/sse", get(sse_stream_handler))
+            .route("/messages", post(sse_message_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/sse"), state, handle)
     }
 
     impl RecordingBroadcaster {
@@ -612,6 +941,127 @@ mod tests {
         let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
             .with_timeout(Duration::from_secs(5));
         assert_eq!(svc.timeout, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn http_tool_execution_uses_handshake_session_and_configured_arguments() {
+        let (url, fixture, server) = start_http_mcp_fixture(false).await;
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+        let transport = McpServerTransport::Http {
+            url,
+            headers: HashMap::new(),
+        };
+
+        let output = svc
+            .execute_tool(
+                &transport,
+                "create_issue",
+                serde_json::json!({ "title": "Finding" }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        let requests = fixture.requests.lock().unwrap();
+
+        assert_eq!(output["content"][0]["text"], "created");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "notifications/initialized", "tools/call"]
+        );
+        assert_eq!(
+            requests[2],
+            serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "create_issue",
+                    "arguments": { "title": "Finding" },
+                },
+                "session_id": "session-1",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn http_tool_execution_surfaces_rpc_errors() {
+        let (url, _fixture, server) = start_http_mcp_fixture(true).await;
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+        let transport = McpServerTransport::Http {
+            url,
+            headers: HashMap::new(),
+        };
+
+        let error = svc
+            .execute_tool(&transport, "create_issue", serde_json::json!({}), None, None)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert_eq!(error, "tools/call error: invalid arguments (code -32602)");
+    }
+
+    #[tokio::test]
+    async fn sse_tool_execution_uses_endpoint_events_and_returns_result() {
+        let (url, fixture, server) = start_sse_mcp_fixture().await;
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+        let transport = McpServerTransport::Sse {
+            url,
+            headers: HashMap::new(),
+        };
+
+        let output = svc
+            .execute_tool(
+                &transport,
+                "send_message",
+                serde_json::json!({ "channel": "ops" }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        let requests = fixture.requests.lock().unwrap();
+
+        assert_eq!(output["content"][0]["text"], "sent");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "notifications/initialized", "tools/call"]
+        );
+        assert_eq!(requests[2]["params"]["arguments"]["channel"], "ops");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_tool_execution_performs_handshake_and_returns_result() {
+        let transport = McpServerTransport::Stdio {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                concat!(
+                    "read init; ",
+                    "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; ",
+                    "read initialized; read call; ",
+                    "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"stored\"}]}}'",
+                )
+                .into(),
+            ],
+            env: HashMap::new(),
+        };
+        let svc = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)));
+
+        let output = svc
+            .execute_tool(&transport, "store_record", serde_json::json!({ "id": 7 }), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(output["content"][0]["text"], "stored");
     }
 
     #[test]

@@ -59,11 +59,15 @@ pub use agent_build_extra::{
     SlashCommandCompletionBehavior, SlashCommandItem,
 };
 pub use agent_center::{
-    AgentAclRole, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterListQuery, AgentCenterMeta,
-    AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
-    AgentMcpPolicy, AgentPublishStatus, AgentRoleBinding, AgentSkillRef, AgentVisibility, CreateAgentCenterRequest,
-    CreateConversationRequestWire, KnowledgeScopeRef, PublishAgentCenterRequest, SkillVersionPolicy,
-    UpdateAgentCenterRequest,
+    AdvanceAgentWorkflowRunRequest, AgentAclRole, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterListQuery,
+    AgentCenterMeta, AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse,
+    AgentCenterRunPlanResponse, AgentMcpPolicy, AgentPublishStatus, AgentRoleBinding, AgentSkillRef, AgentVisibility,
+    AgentWorkflowApprovalDecision, AgentWorkflowDefinition, AgentWorkflowEdgeDefinition, AgentWorkflowInputDefinition,
+    AgentWorkflowNextAction, AgentWorkflowNodeDefinition, AgentWorkflowNodeRun, AgentWorkflowNodeRunAttempt,
+    AgentWorkflowNodeRunStatus, AgentWorkflowOutputDefinition, AgentWorkflowOutputFieldDefinition,
+    AgentWorkflowOutputFieldType, AgentWorkflowOutputFormat, AgentWorkflowRunResponse, AgentWorkflowRunStatus,
+    CreateAgentCenterRequest, CreateConversationRequestWire, DecideAgentWorkflowApprovalRequest, KnowledgeScopeRef,
+    PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest, UpdateAgentCenterRequest,
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,

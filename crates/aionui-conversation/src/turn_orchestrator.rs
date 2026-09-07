@@ -499,6 +499,7 @@ impl ConversationTurnOrchestrator {
         let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
         let mut final_error_message;
+        let mut final_assistant_output = None;
         let mut auth_failure = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
@@ -536,6 +537,7 @@ impl ConversationTurnOrchestrator {
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
                 final_error_message = None;
+                final_assistant_output = attempt_result.outcome.assistant_output.clone();
                 if replayed {
                     info!(
                         conversation_id = %conv_id,
@@ -669,6 +671,23 @@ impl ConversationTurnOrchestrator {
         self.service
             .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
+
+        if !was_deleting {
+            self.service
+                .notify_turn_settled(
+                    &input.user_id,
+                    &conv_id,
+                    &turn_id,
+                    if final_failed {
+                        aionui_common::ConversationTurnSettlement::Failed
+                    } else {
+                        aionui_common::ConversationTurnSettlement::Completed
+                    },
+                    final_error_message.as_deref(),
+                    final_assistant_output.as_deref(),
+                )
+                .await;
+        }
 
         ConversationTurnResult {
             status: if final_failed {
@@ -894,6 +913,7 @@ mod tests {
                 needs_auth,
                 ..Default::default()
             },
+            assistant_output: None,
         }
     }
 
@@ -905,6 +925,7 @@ mod tests {
                 retryable: None,
             },
             attempt: TurnAttemptSummary::default(),
+            assistant_output: None,
         }
     }
 
