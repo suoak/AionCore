@@ -96,6 +96,26 @@ pub enum AgentWorkflowOutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkflowOutputFieldType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWorkflowOutputFieldDefinition {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub field_type: AgentWorkflowOutputFieldType,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentWorkflowInputDefinition {
     #[serde(default = "default_text_input_kind")]
@@ -124,6 +144,8 @@ impl Default for AgentWorkflowInputDefinition {
 pub struct AgentWorkflowOutputDefinition {
     #[serde(default = "default_markdown_output")]
     pub format: AgentWorkflowOutputFormat,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema: Vec<AgentWorkflowOutputFieldDefinition>,
 }
 
 fn default_markdown_output() -> AgentWorkflowOutputFormat {
@@ -134,6 +156,7 @@ impl Default for AgentWorkflowOutputDefinition {
     fn default() -> Self {
         Self {
             format: default_markdown_output(),
+            schema: Vec::new(),
         }
     }
 }
@@ -238,6 +261,37 @@ impl AgentWorkflowDefinition {
         }
         if self.input.kind != "text" {
             return Err("workflow.input.kind must be text");
+        }
+        if self.output.format != AgentWorkflowOutputFormat::Json && !self.output.schema.is_empty() {
+            return Err("workflow output schema requires JSON format");
+        }
+        if self.output.schema.len() > 20 {
+            return Err("workflow output schema supports at most 20 fields");
+        }
+        let mut output_field_names = HashSet::new();
+        for field in &self.output.schema {
+            let name = field.name.as_str();
+            if name.is_empty() || name.len() > 64 {
+                return Err("workflow output schema field names must contain 1 to 64 characters");
+            }
+            let mut characters = name.chars();
+            if !characters
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+                || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return Err("workflow output schema field names must use letters, numbers, and underscores");
+            }
+            if !output_field_names.insert(name) {
+                return Err("workflow output schema field names must be unique");
+            }
+            if field
+                .description
+                .as_ref()
+                .is_some_and(|description| description.chars().count() > 200)
+            {
+                return Err("workflow output schema field descriptions support at most 200 characters");
+            }
         }
 
         if self.nodes.len() < 3 || self.nodes.len() > 20 {
@@ -660,7 +714,52 @@ mod tests {
         assert_eq!(workflow.nodes.len(), 3);
         assert_eq!(workflow.edges.len(), 2);
         assert_eq!(workflow.output.format, AgentWorkflowOutputFormat::Markdown);
+        assert!(workflow.output.schema.is_empty());
         assert_eq!(workflow.validate(), Ok(()));
+    }
+
+    #[test]
+    fn workflow_validates_structured_json_output_fields() {
+        let mut workflow = AgentWorkflowDefinition::default();
+        workflow.output.format = AgentWorkflowOutputFormat::Json;
+        workflow.output.schema = vec![AgentWorkflowOutputFieldDefinition {
+            name: "severity".to_owned(),
+            field_type: AgentWorkflowOutputFieldType::String,
+            required: true,
+            description: Some("Normalized severity".to_owned()),
+        }];
+
+        assert_eq!(workflow.validate(), Ok(()));
+
+        workflow.output.schema.push(AgentWorkflowOutputFieldDefinition {
+            name: "severity".to_owned(),
+            field_type: AgentWorkflowOutputFieldType::Number,
+            required: false,
+            description: None,
+        });
+        assert_eq!(
+            workflow.validate(),
+            Err("workflow output schema field names must be unique")
+        );
+    }
+
+    #[test]
+    fn workflow_rejects_schema_for_text_output_and_unsafe_field_names() {
+        let mut workflow = AgentWorkflowDefinition::default();
+        workflow.output.schema = vec![AgentWorkflowOutputFieldDefinition {
+            name: "risk score".to_owned(),
+            field_type: AgentWorkflowOutputFieldType::Number,
+            required: true,
+            description: None,
+        }];
+
+        assert_eq!(workflow.validate(), Err("workflow output schema requires JSON format"));
+
+        workflow.output.format = AgentWorkflowOutputFormat::Json;
+        assert_eq!(
+            workflow.validate(),
+            Err("workflow output schema field names must use letters, numbers, and underscores")
+        );
     }
 
     #[test]

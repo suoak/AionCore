@@ -16,6 +16,7 @@ use aionui_api_types::{
     AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
     AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowApprovalDecision,
     AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunStatus,
+    AgentWorkflowOutputDefinition, AgentWorkflowOutputFieldDefinition, AgentWorkflowOutputFieldType,
     AgentWorkflowRunResponse, AgentWorkflowRunStatus, AssistantConversationOverridesRequest,
     AssistantDefaultListRequest, AssistantDefaultsRequest, CreateAgentCenterRequest, CreateConversationRequestWire,
     DecideAgentWorkflowApprovalRequest, PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest,
@@ -511,7 +512,8 @@ impl AgentCenterService {
             .input
             .as_str()
             .ok_or_else(|| AssistantError::BadRequest("workflow input must be text".into()))?;
-        let agent_message = build_agent_message(input, plan.workflow.output.format);
+        let agent_output_definition = effective_agent_output_definition(&plan.workflow);
+        let agent_message = build_agent_message(input, &agent_output_definition);
 
         let now = now_ms();
         let run_id = generate_prefixed_id("awrun");
@@ -722,7 +724,8 @@ impl AgentCenterService {
                 ));
             }
         } else if req.success {
-            req.output = normalize_manual_agent_output(req.output, run.workflow.output.format)
+            let agent_output_definition = effective_agent_output_definition(&run.workflow);
+            req.output = normalize_manual_agent_output(req.output, &agent_output_definition)
                 .map_err(AssistantError::BadRequest)?;
         }
         let node = run
@@ -773,8 +776,9 @@ impl AgentCenterService {
             "conversation_id": result.conversation_id,
             "turn_id": result.turn_id,
         });
+        let agent_output_definition = effective_agent_output_definition(&run.workflow);
         let (success, error) = if result.success {
-            match normalize_agent_output(result.output, run.workflow.output.format) {
+            match normalize_agent_output(result.output, &agent_output_definition) {
                 Ok(content) => {
                     node_output["content"] = content;
                     (true, None)
@@ -1389,50 +1393,89 @@ fn validate_workflow_input(workflow: &AgentWorkflowDefinition, input: &Value) ->
     Ok(())
 }
 
-fn build_agent_message(input: &str, format: aionui_api_types::AgentWorkflowOutputFormat) -> String {
+fn build_agent_message(input: &str, output: &AgentWorkflowOutputDefinition) -> String {
     use aionui_api_types::AgentWorkflowOutputFormat;
 
-    match format {
+    match output.format {
         AgentWorkflowOutputFormat::Markdown => input.to_owned(),
         AgentWorkflowOutputFormat::PlainText => format!(
             "{input}\n\n---\nWorkflow output contract: Return plain text only. Do not use Markdown formatting or code fences."
         ),
-        AgentWorkflowOutputFormat::Json => format!(
+        AgentWorkflowOutputFormat::Json if output.schema.is_empty() => format!(
             "{input}\n\n---\nWorkflow output contract: Return only one valid JSON value. Do not use Markdown or code fences."
         ),
+        AgentWorkflowOutputFormat::Json => {
+            let fields = output
+                .schema
+                .iter()
+                .map(|field| {
+                    let requirement = if field.required { "required" } else { "optional" };
+                    let description = field
+                        .description
+                        .as_deref()
+                        .map(|description| format!(", description: {}", description.replace(['\r', '\n'], " ")))
+                        .unwrap_or_default();
+                    format!(
+                        "{}: {} ({requirement}{description})",
+                        field.name,
+                        output_field_type_name(field.field_type)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "{input}\n\n---\nWorkflow output contract: Return only one valid JSON object with exactly these declared fields: {fields}. Optional fields may be omitted. Do not add undeclared fields. Do not use Markdown or code fences."
+            )
+        }
     }
 }
 
-fn normalize_agent_output(
-    output: Option<&str>,
-    format: aionui_api_types::AgentWorkflowOutputFormat,
-) -> Result<Value, String> {
+fn effective_agent_output_definition(workflow: &AgentWorkflowDefinition) -> AgentWorkflowOutputDefinition {
+    if workflow.nodes.iter().any(|node| node.kind == "tool") {
+        AgentWorkflowOutputDefinition::default()
+    } else {
+        workflow.output.clone()
+    }
+}
+
+fn normalize_agent_output(output: Option<&str>, definition: &AgentWorkflowOutputDefinition) -> Result<Value, String> {
     use aionui_api_types::AgentWorkflowOutputFormat;
 
     let output = output
         .map(str::trim)
         .filter(|output| !output.is_empty())
         .ok_or_else(|| "workflow agent returned no output".to_owned())?;
-    match format {
+    match definition.format {
         AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText => Ok(json!(output)),
-        AgentWorkflowOutputFormat::Json => serde_json::from_str(output)
-            .map_err(|_| "workflow agent output must be valid JSON without Markdown code fences".to_owned()),
+        AgentWorkflowOutputFormat::Json => {
+            let output: Value = serde_json::from_str(output)
+                .map_err(|_| "workflow agent output must be valid JSON without Markdown code fences".to_owned())?;
+            validate_json_output_schema(&output, &definition.schema)?;
+            Ok(output)
+        }
     }
 }
 
-fn normalize_manual_agent_output(
-    output: Value,
-    format: aionui_api_types::AgentWorkflowOutputFormat,
-) -> Result<Value, String> {
+fn normalize_manual_agent_output(output: Value, definition: &AgentWorkflowOutputDefinition) -> Result<Value, String> {
     use aionui_api_types::AgentWorkflowOutputFormat;
 
     let is_internal_result = output.get("conversation_id").is_some_and(Value::is_string)
         && output.get("turn_id").is_some_and(Value::is_string)
         && output.get("content").is_some();
     if is_internal_result {
+        let content = output.get("content").expect("checked above");
+        match definition.format {
+            AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText
+                if content.as_str().is_none_or(|content| content.trim().is_empty()) =>
+            {
+                return Err("workflow agent output must be non-empty text".to_owned());
+            }
+            AgentWorkflowOutputFormat::Json => validate_json_output_schema(content, &definition.schema)?,
+            _ => {}
+        }
         return Ok(output);
     }
-    let content = match format {
+    let content = match definition.format {
         AgentWorkflowOutputFormat::Markdown | AgentWorkflowOutputFormat::PlainText => {
             let text = output
                 .as_str()
@@ -1444,9 +1487,58 @@ fn normalize_manual_agent_output(
         AgentWorkflowOutputFormat::Json if output.is_null() => {
             return Err("workflow agent output must be a non-null JSON value".to_owned());
         }
-        AgentWorkflowOutputFormat::Json => output,
+        AgentWorkflowOutputFormat::Json => {
+            validate_json_output_schema(&output, &definition.schema)?;
+            output
+        }
     };
     Ok(json!({ "content": content }))
+}
+
+fn output_field_type_name(field_type: AgentWorkflowOutputFieldType) -> &'static str {
+    match field_type {
+        AgentWorkflowOutputFieldType::String => "string",
+        AgentWorkflowOutputFieldType::Number => "number",
+        AgentWorkflowOutputFieldType::Integer => "integer",
+        AgentWorkflowOutputFieldType::Boolean => "boolean",
+    }
+}
+
+fn validate_json_output_schema(output: &Value, schema: &[AgentWorkflowOutputFieldDefinition]) -> Result<(), String> {
+    if schema.is_empty() {
+        return Ok(());
+    }
+    let object = output
+        .as_object()
+        .ok_or_else(|| "workflow output must be a JSON object for the declared schema".to_owned())?;
+    for field in schema {
+        let Some(value) = object.get(&field.name) else {
+            if field.required {
+                return Err(format!("workflow output is missing required field: {}", field.name));
+            }
+            continue;
+        };
+        let valid = match field.field_type {
+            AgentWorkflowOutputFieldType::String => value.is_string(),
+            AgentWorkflowOutputFieldType::Number => value.is_number(),
+            AgentWorkflowOutputFieldType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+            AgentWorkflowOutputFieldType::Boolean => value.is_boolean(),
+        };
+        if !valid {
+            return Err(format!(
+                "workflow output field {} must be {}",
+                field.name,
+                output_field_type_name(field.field_type)
+            ));
+        }
+    }
+    if let Some(unexpected) = object
+        .keys()
+        .find(|name| !schema.iter().any(|field| field.name.as_str() == name.as_str()))
+    {
+        return Err(format!("workflow output contains undeclared field: {unexpected}"));
+    }
+    Ok(())
 }
 
 fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(), AssistantError> {
@@ -1504,22 +1596,43 @@ fn settle_workflow_run(run: &mut AgentWorkflowRunResponse, now: i64) -> Result<(
                     run.current_node_index += 1;
                     continue;
                 }
+                let output_schema_error =
+                    validate_declared_output(resolved_output.as_ref(), &run.workflow.output).err();
                 for remaining in run.nodes.iter_mut().skip(run.current_node_index + 1) {
                     if remaining.kind == "output" {
-                        remaining.status = AgentWorkflowNodeRunStatus::Completed;
-                        remaining.output = resolved_output.clone();
+                        if let Some(error) = output_schema_error.clone() {
+                            remaining.status = AgentWorkflowNodeRunStatus::Failed;
+                            remaining.error = Some(error);
+                        } else {
+                            remaining.status = AgentWorkflowNodeRunStatus::Completed;
+                            remaining.output = resolved_output.clone();
+                        }
                     } else {
                         remaining.status = AgentWorkflowNodeRunStatus::Skipped;
                     }
                     remaining.completed_at = Some(now);
                 }
                 run.current_node_index = run.nodes.len().saturating_sub(1);
-                run.status = AgentWorkflowRunStatus::Completed;
-                run.output = resolved_output;
+                run.status = if output_schema_error.is_some() {
+                    AgentWorkflowRunStatus::Failed
+                } else {
+                    AgentWorkflowRunStatus::Completed
+                };
+                run.output = output_schema_error.is_none().then_some(resolved_output).flatten();
                 run.next_action = None;
                 return Ok(());
             }
             "output" => {
+                if let Err(error) = validate_declared_output(resolved_output.as_ref(), &run.workflow.output) {
+                    node.status = AgentWorkflowNodeRunStatus::Failed;
+                    node.started_at = Some(now);
+                    node.completed_at = Some(now);
+                    node.error = Some(error);
+                    run.status = AgentWorkflowRunStatus::Failed;
+                    run.output = None;
+                    run.next_action = None;
+                    return Ok(());
+                }
                 node.status = AgentWorkflowNodeRunStatus::Completed;
                 node.started_at = Some(now);
                 node.completed_at = Some(now);
@@ -1554,6 +1667,14 @@ fn resolve_workflow_output(run: &AgentWorkflowRunResponse) -> Option<Value> {
                 _ => None,
             }
         })
+}
+
+fn validate_declared_output(output: Option<&Value>, definition: &AgentWorkflowOutputDefinition) -> Result<(), String> {
+    if definition.schema.is_empty() {
+        return Ok(());
+    }
+    let output = output.ok_or_else(|| "workflow produced no output for the declared schema".to_owned())?;
+    validate_json_output_schema(output, &definition.schema)
 }
 
 fn build_tool_action(
@@ -1663,6 +1784,33 @@ mod workflow_run_tests {
     use super::*;
     use aionui_api_types::AgentWorkflowOutputFormat;
 
+    fn output_definition(format: AgentWorkflowOutputFormat) -> AgentWorkflowOutputDefinition {
+        AgentWorkflowOutputDefinition {
+            format,
+            ..AgentWorkflowOutputDefinition::default()
+        }
+    }
+
+    fn structured_output_definition() -> AgentWorkflowOutputDefinition {
+        AgentWorkflowOutputDefinition {
+            format: AgentWorkflowOutputFormat::Json,
+            schema: vec![
+                AgentWorkflowOutputFieldDefinition {
+                    name: "severity".to_owned(),
+                    field_type: AgentWorkflowOutputFieldType::String,
+                    required: true,
+                    description: Some("Normalized severity".to_owned()),
+                },
+                AgentWorkflowOutputFieldDefinition {
+                    name: "confidence".to_owned(),
+                    field_type: AgentWorkflowOutputFieldType::Number,
+                    required: false,
+                    description: None,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn guard_evaluator_supports_boolean_numeric_and_string_comparisons() {
         let variables = std::collections::BTreeMap::from([
@@ -1682,17 +1830,18 @@ mod workflow_run_tests {
 
     #[test]
     fn json_contract_message_is_explicit_and_preserves_input() {
-        let message = build_agent_message("Review this defect", AgentWorkflowOutputFormat::Json);
+        let message = build_agent_message("Review this defect", &structured_output_definition());
 
         assert!(message.starts_with("Review this defect"));
-        assert!(message.contains("Return only one valid JSON value"));
+        assert!(message.contains("Return only one valid JSON object"));
+        assert!(message.contains("severity: string (required"));
         assert!(message.contains("Do not use Markdown or code fences"));
     }
 
     #[test]
     fn json_output_is_parsed_into_a_structured_value() {
         let output =
-            normalize_agent_output(Some(" {\"severity\":\"high\"} "), AgentWorkflowOutputFormat::Json).unwrap();
+            normalize_agent_output(Some(" {\"severity\":\"high\"} "), &structured_output_definition()).unwrap();
 
         assert_eq!(output, json!({ "severity": "high" }));
     }
@@ -1700,22 +1849,61 @@ mod workflow_run_tests {
     #[test]
     fn malformed_or_empty_agent_output_fails_the_contract() {
         assert_eq!(
-            normalize_agent_output(Some("```json\n{}\n```"), AgentWorkflowOutputFormat::Json),
+            normalize_agent_output(
+                Some("```json\n{}\n```"),
+                &output_definition(AgentWorkflowOutputFormat::Json)
+            ),
             Err("workflow agent output must be valid JSON without Markdown code fences".to_owned())
         );
         assert_eq!(
-            normalize_agent_output(Some("  "), AgentWorkflowOutputFormat::Markdown),
+            normalize_agent_output(Some("  "), &output_definition(AgentWorkflowOutputFormat::Markdown)),
             Err("workflow agent returned no output".to_owned())
         );
     }
 
     #[test]
     fn manual_agent_output_obeys_the_declared_format() {
-        let output = normalize_manual_agent_output(json!({ "ok": true }), AgentWorkflowOutputFormat::Json).unwrap();
-        assert_eq!(output, json!({ "content": { "ok": true } }));
+        let output =
+            normalize_manual_agent_output(json!({ "severity": "high" }), &structured_output_definition()).unwrap();
+        assert_eq!(output, json!({ "content": { "severity": "high" } }));
 
-        let error =
-            normalize_manual_agent_output(json!({ "ok": true }), AgentWorkflowOutputFormat::PlainText).unwrap_err();
+        let error = normalize_manual_agent_output(
+            json!({ "ok": true }),
+            &output_definition(AgentWorkflowOutputFormat::PlainText),
+        )
+        .unwrap_err();
         assert_eq!(error, "workflow agent output must be non-empty text");
+    }
+
+    #[test]
+    fn structured_output_rejects_missing_wrong_type_and_undeclared_fields() {
+        let definition = structured_output_definition();
+
+        assert_eq!(
+            validate_json_output_schema(&json!({}), &definition.schema),
+            Err("workflow output is missing required field: severity".to_owned())
+        );
+        assert_eq!(
+            validate_json_output_schema(&json!({ "severity": 3 }), &definition.schema),
+            Err("workflow output field severity must be string".to_owned())
+        );
+        assert_eq!(
+            validate_json_output_schema(&json!({ "severity": "high", "extra": true }), &definition.schema),
+            Err("workflow output contains undeclared field: extra".to_owned())
+        );
+    }
+
+    #[test]
+    fn lifecycle_shaped_manual_output_cannot_bypass_contract_validation() {
+        let lifecycle_output = json!({
+            "conversation_id": "conversation-1",
+            "turn_id": "turn-1",
+            "content": { "severity": 3 }
+        });
+
+        assert_eq!(
+            normalize_manual_agent_output(lifecycle_output, &structured_output_definition()),
+            Err("workflow output field severity must be string".to_owned())
+        );
     }
 }

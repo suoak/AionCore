@@ -1121,7 +1121,24 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
         .oneshot(json_with_token(
             "PUT",
             &format!("/api/agent-center/agents/{assistant_id}"),
-            json!({ "meta": { "workflow": { "output": { "format": "json" } } } }),
+            json!({
+                "meta": {
+                    "workflow": {
+                        "output": {
+                            "format": "json",
+                            "schema": [
+                                {
+                                    "name": "severity",
+                                    "type": "string",
+                                    "required": true,
+                                    "description": "Normalized severity"
+                                },
+                                { "name": "confidence", "type": "number", "required": true }
+                            ]
+                        }
+                    }
+                }
+            }),
             &fx.token,
             &fx.csrf,
         ))
@@ -1148,7 +1165,7 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
         started["data"]["next_action"]["message"]
             .as_str()
             .unwrap()
-            .contains("Return only one valid JSON value")
+            .contains("severity: string (required")
     );
 
     let completed = fx
@@ -1162,14 +1179,14 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
                 turn_id: "turn-json",
                 success: true,
                 error: None,
-                output: Some(r#"{"severity":"high"}"#),
+                output: Some(r#"{"severity":"high","confidence":0.9}"#),
             },
         )
         .await
         .unwrap()
         .unwrap();
     assert_eq!(completed.status, aionui_api_types::AgentWorkflowRunStatus::Completed);
-    assert_eq!(completed.output, Some(json!({ "severity": "high" })));
+    assert_eq!(completed.output, Some(json!({ "severity": "high", "confidence": 0.9 })));
 
     let invalid_start = fx
         .app
@@ -1199,7 +1216,7 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
                 turn_id: "turn-invalid-json",
                 success: true,
                 error: None,
-                output: Some("```json\n{}\n```"),
+                output: Some(r#"{"severity":"high","confidence":"certain"}"#),
             },
         )
         .await
@@ -1208,7 +1225,7 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
     assert_eq!(failed.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
     assert_eq!(
         failed.nodes[1].error.as_deref(),
-        Some("workflow agent output must be valid JSON without Markdown code fences")
+        Some("workflow output field confidence must be number")
     );
     assert!(failed.output.is_none());
 }
@@ -1707,6 +1724,10 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
                 "meta": {
                     "mcp_policy": "inherit_user_enabled",
                     "workflow": {
+                        "output": {
+                            "format": "json",
+                            "schema": [{ "name": "issue_number", "type": "integer", "required": true }]
+                        },
                         "nodes": [
                             { "id": "start", "kind": "start" },
                             { "id": "agent", "kind": "agent" },
@@ -1748,7 +1769,9 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
         ))
         .await
         .unwrap();
-    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let started = body_json(start).await;
+    assert_eq!(started["data"]["next_action"]["message"], "review this");
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
     let advance_agent = fx
         .app
         .clone()
@@ -1866,6 +1889,63 @@ async fn workflow_tool_action_carries_server_name_arguments_and_accepts_result()
     let completed = body_json(advance_tool).await;
     assert_eq!(completed["data"]["status"], "completed");
     assert_eq!(completed["data"]["variables"]["tool-1"]["issue_number"], 42);
+
+    let invalid_start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review invalid output" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let invalid_run_id = body_json(invalid_start).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let invoke_invalid = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{invalid_run_id}/advance"),
+            json!({ "success": true, "output": "ready" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let invoking_invalid = body_json(invoke_invalid).await;
+    let invalid_node_id = invoking_invalid["data"]["next_action"]["node_id"].as_str().unwrap();
+    let invalid_execution_id = invoking_invalid["data"]["next_action"]["execution_id"]
+        .as_str()
+        .unwrap();
+    let invalid_tool_output = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{invalid_run_id}/advance"),
+            json!({
+                "node_id": invalid_node_id,
+                "execution_id": invalid_execution_id,
+                "success": true,
+                "output": { "issue_number": "42" }
+            }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let failed = body_json(invalid_tool_output).await;
+    assert_eq!(failed["data"]["status"], "failed");
+    assert_eq!(
+        failed["data"]["nodes"][3]["error"],
+        "workflow output field issue_number must be integer"
+    );
 }
 
 #[tokio::test]
