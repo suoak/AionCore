@@ -64,9 +64,10 @@ pub use agent_center::{
     AgentCenterRunPlanResponse, AgentMcpPolicy, AgentPublishStatus, AgentRoleBinding, AgentSkillRef, AgentVisibility,
     AgentWorkflowApprovalDecision, AgentWorkflowDefinition, AgentWorkflowEdgeDefinition, AgentWorkflowInputDefinition,
     AgentWorkflowNextAction, AgentWorkflowNodeDefinition, AgentWorkflowNodeRun, AgentWorkflowNodeRunStatus,
-    AgentWorkflowOutputDefinition, AgentWorkflowOutputFormat, AgentWorkflowRunResponse, AgentWorkflowRunStatus,
-    CreateAgentCenterRequest, CreateConversationRequestWire, DecideAgentWorkflowApprovalRequest, KnowledgeScopeRef,
-    PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest, UpdateAgentCenterRequest,
+    AgentWorkflowOutputDefinition, AgentWorkflowOutputFieldDefinition, AgentWorkflowOutputFieldType,
+    AgentWorkflowOutputFormat, AgentWorkflowRunResponse, AgentWorkflowRunStatus, CreateAgentCenterRequest,
+    CreateConversationRequestWire, DecideAgentWorkflowApprovalRequest, KnowledgeScopeRef, PublishAgentCenterRequest,
+    SkillVersionPolicy, StartAgentWorkflowRunRequest, UpdateAgentCenterRequest,
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
