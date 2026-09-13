@@ -2,8 +2,9 @@
 //!
 //! Uses the `rmcp` crate (Rust MCP SDK) for protocol handling. Tool calls are
 //! forwarded to the TeamMcpServer TCP listener via 4-byte big-endian
-//! length-prefixed JSON frames — the same wire protocol used by `mcp-bridge`,
-//! but with proper tool registration via rmcp instead of transparent proxying.
+//! length-prefixed JSON frames. Tools are registered properly through rmcp
+//! rather than proxied transparently, so the agent always sees a spec-shaped
+//! `tools/list` regardless of the internal TCP representation.
 //!
 //! Each tool call opens a fresh TCP connection, sends an `initialize` frame
 //! (injecting auth_token + slot_id), then sends the `tools/call` frame, reads
@@ -866,6 +867,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
+        assert_eq!(tools.len(), 13, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()
@@ -891,6 +893,30 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn team_stdio_interrupt_and_clear_context_schemas_match_registry_shape() {
+        let router = TeamStdioServer::tool_router();
+        let tools = router.list_all();
+        let interrupt = tools
+            .iter()
+            .find(|tool| tool.name == "team_interrupt_agent")
+            .expect("team_interrupt_agent tool missing");
+        let interrupt_properties = interrupt.input_schema["properties"].as_object().unwrap();
+        assert_eq!(interrupt_properties.len(), 4);
+        assert!(interrupt_properties.contains_key("slot_id"));
+        assert!(interrupt_properties.contains_key("message"));
+        assert!(interrupt_properties.contains_key("files"));
+        assert!(interrupt_properties.contains_key("reason"));
+
+        let clear = tools
+            .iter()
+            .find(|tool| tool.name == "team_clear_agent_context")
+            .expect("team_clear_agent_context tool missing");
+        let clear_properties = clear.input_schema["properties"].as_object().unwrap();
+        assert_eq!(clear_properties.len(), 1);
+        assert!(clear_properties.contains_key("slot_id"));
     }
 
     #[tokio::test]

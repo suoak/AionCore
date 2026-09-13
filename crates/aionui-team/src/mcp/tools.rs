@@ -154,6 +154,12 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn interrupt_agent_is_lead_only() {
+        assert!(authorize_tool(TeammateRole::Lead, "team_interrupt_agent").is_ok());
+        assert!(authorize_tool(TeammateRole::Teammate, "team_interrupt_agent").is_err());
+    }
+
+    #[test]
     fn all_descriptors_count() {
         assert_eq!(all_tool_descriptors().len(), 13);
     }

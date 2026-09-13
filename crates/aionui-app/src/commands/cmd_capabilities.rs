@@ -148,8 +148,8 @@ fn data() -> Value {
                 "description": "Human/developer self-check for agent backend availability."
             },
             {
-                "name": "mcp-bridge",
-                "description": "Internal stdio to TCP bridge for team MCP."
+                "name": "doctor",
+                "description": "Human/developer self-check for agent backend availability."
             },
             {
                 "name": "mcp-team-stdio",

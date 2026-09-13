@@ -16,6 +16,7 @@ mod chat_file;
 mod confirmation;
 mod connection_test;
 mod conversation;
+mod conversation_tools;
 mod cron;
 mod custom_agent;
 mod extension;
@@ -80,9 +81,10 @@ pub use antigravity_hook::{
 };
 pub use ask::{AskAnswerRequest, AskQuestionAnswer};
 pub use assistant::{
-    AssistantAgentResponse, AssistantCapabilitiesResponse, AssistantDefaultListRequest, AssistantDefaultListResponse,
-    AssistantDefaultScalarRequest, AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse,
-    AssistantDetailResponse, AssistantEngineResponse, AssistantPreferencesResponse, AssistantProfileResponse,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AssistantAgentResponse, AssistantCapabilitiesResponse,
+    AssistantDefaultListRequest, AssistantDefaultListResponse, AssistantDefaultScalarRequest,
+    AssistantDefaultScalarResponse, AssistantDefaultsRequest, AssistantDefaultsResponse, AssistantDetailResponse,
+    AssistantEngineResponse, AssistantMcpBindingChanged, AssistantPreferencesResponse, AssistantProfileResponse,
     AssistantPromptsResponse, AssistantResponse, AssistantRulesResponse, AssistantSource, AssistantStateResponse,
     CreateAssistantRequest, ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest,
     UpdateAssistantRequest, assistant_avatar_response_value, assistant_avatar_response_value_with_version,

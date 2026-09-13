@@ -85,6 +85,9 @@ fn attachment_ids_are_stable_within_a_message_and_distinct_between_messages() {
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
 
+#[path = "service_test/runtime_create_test.rs"]
+mod runtime_create_test;
+
 #[derive(Clone, Debug)]
 struct RecordedViewSync {
     user_id: String,
@@ -3715,6 +3718,78 @@ impl IWorkerTaskManager for MockTaskManager {
 struct SlowBuildTaskManager {
     delay: Duration,
     built: AtomicBool,
+}
+
+struct SlowRestartTaskManager {
+    delay: Duration,
+    agent: Mutex<Option<AgentInstance>>,
+    rebuilt: AtomicBool,
+}
+
+impl SlowRestartTaskManager {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            agent: Mutex::new(None),
+            rebuilt: AtomicBool::new(false),
+        }
+    }
+
+    fn insert_agent(&self, conversation_id: &str) {
+        self.agent
+            .lock()
+            .unwrap()
+            .replace(AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id))));
+    }
+
+    fn was_rebuilt(&self) -> bool {
+        self.rebuilt.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl IWorkerTaskManager for SlowRestartTaskManager {
+    fn get_task(&self, _conversation_id: &str) -> Option<AgentInstance> {
+        self.agent.lock().unwrap().clone()
+    }
+
+    async fn get_or_build_task(
+        &self,
+        conversation_id: &str,
+        _options: BuildTaskOptions,
+    ) -> Result<AgentInstance, AgentError> {
+        tokio::time::sleep(self.delay).await;
+        let agent = AgentInstance::Mock(Arc::new(MockAgent::new(conversation_id)));
+        self.agent.lock().unwrap().replace(agent.clone());
+        self.rebuilt.store(true, Ordering::SeqCst);
+        Ok(agent)
+    }
+
+    fn kill(&self, _conversation_id: &str, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        self.agent.lock().unwrap().take();
+        Ok(())
+    }
+
+    fn kill_and_wait(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let _ = self.kill(conversation_id, reason);
+        Box::pin(std::future::ready(()))
+    }
+
+    async fn clear(&self) {
+        self.agent.lock().unwrap().take();
+    }
+
+    fn active_count(&self) -> usize {
+        usize::from(self.agent.lock().unwrap().is_some())
+    }
+
+    fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl SlowBuildTaskManager {

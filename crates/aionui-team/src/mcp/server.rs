@@ -1572,6 +1572,21 @@ mod tests {
     use crate::types::MailboxMessageType;
     use aionui_api_types::{TeamRunTargetRole, TeamSlotWorkPayload, TeamSlotWorkState};
 
+    fn inbox_message(index: usize, content: impl Into<String>) -> MailboxMessage {
+        MailboxMessage {
+            id: format!("message-{index:02}"),
+            team_id: "team-1".into(),
+            to_agent_id: "lead-1".into(),
+            from_agent_id: format!("worker-{index:02}"),
+            msg_type: MailboxMessageType::Message,
+            content: content.into(),
+            summary: None,
+            files: Some(vec![format!("C:\\work\\file-{index:02}.txt")]),
+            read: false,
+            created_at: index as i64,
+        }
+    }
+
     fn task_owned_by(owner: Option<&str>, status: TaskStatus, blocked_by: Vec<String>) -> TeamTask {
         TeamTask {
             id: "tk1".into(),

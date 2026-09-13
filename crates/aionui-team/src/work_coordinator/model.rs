@@ -7,9 +7,13 @@ pub(crate) const MAX_MESSAGE_DELIVERY_FAILURES: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkPriority {
+    /// User-driven work. Always wins.
     Foreground,
     Directed,
     Control,
+    /// Messages addressed to this slot by another agent.
+    Directed,
+    /// System notifications, welcomes, membership changes, idle nudges.
     Background,
 }
 

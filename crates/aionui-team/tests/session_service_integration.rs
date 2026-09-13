@@ -40,7 +40,7 @@ use aionui_team::ports::{
 use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
     TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
-    TeamProjectionMessageStore,
+    TeamMcpSnapshotResolution, TeamProjectionMessageStore,
 };
 use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
@@ -590,6 +590,28 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         Ok(())
     }
 
+    async fn conversation_model_facts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<aionui_team::TeamConversationModelFacts, aionui_team::TeamError> {
+        let extra = self
+            .repo
+            .get_extra(conversation_id)
+            .ok_or_else(|| aionui_team::TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        let value = |key: &str| {
+            extra
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Ok(aionui_team::TeamConversationModelFacts {
+            confirmed_model_id: value("confirmed_model_id").or_else(|| value("current_model_id")),
+            runtime_seed_model_id: value("current_model_id"),
+        })
+    }
+
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), aionui_team::TeamError> {
         self.patch_runtime_config(conversation_id, serde_json::json!({ "session_mode": mode }))
             .await
@@ -624,6 +646,38 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                     description: None,
                 }],
             }],
+        })
+    }
+
+    /// Stands in for a runtime that accepts the switch but only applies it from
+    /// the next turn — the case where echoing the option's `current_value` back
+    /// would persist the OLD model. Records the call so tests can assert the
+    /// runtime was actually asked, and deliberately leaves the stored
+    /// `current_model_id` alone so any persistence must come from the service.
+    async fn set_config_option(
+        &self,
+        conversation_id: &str,
+        option_id: &str,
+        request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, aionui_team::TeamError> {
+        self.config_option_calls.lock().unwrap().push((
+            conversation_id.to_owned(),
+            option_id.to_owned(),
+            request.value.clone(),
+        ));
+        let mut options = self.get_config_options(conversation_id).await?.config_options;
+        // PendingNextTurn semantics: the readback still reports the old value.
+        if let Some(option) = options.iter_mut().find(|option| option.id == option_id) {
+            option.options.push(AcpConfigSelectOptionDto {
+                value: request.value.clone(),
+                name: None,
+                label: Some(request.value),
+                description: None,
+            });
+        }
+        Ok(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::PendingNextTurn,
+            config_options: Some(options),
         })
     }
 
@@ -1837,6 +1891,112 @@ impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
     }
 }
 
+struct PairAssistantDefinitionRepo {
+    rows: Vec<AssistantDefinitionRow>,
+}
+
+#[async_trait::async_trait]
+impl IAssistantDefinitionRepository for PairAssistantDefinitionRepo {
+    async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.clone())
+    }
+
+    async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
+    async fn list_including_deleted_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
+    async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
+    }
+
+    async fn get_by_assistant_id_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
+    async fn get_by_assistant_id_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
+    async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
+    }
+
+    async fn get_by_id_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_id(definition_id).await
+    }
+
+    async fn get_by_source_ref(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        Ok(self
+            .rows
+            .iter()
+            .find(|row| row.source == source && row.source_ref.as_deref() == Some(source_ref))
+            .cloned())
+    }
+
+    async fn get_by_source_ref_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
+    async fn get_by_source_ref_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
+    async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
+        Err(DbError::Init("not implemented".into()))
+    }
+
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAssistantDefinitionParams<'_>,
+    ) -> Result<AssistantDefinitionRow, DbError> {
+        self.upsert(params).await
+    }
+
+    async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
+    async fn soft_delete_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+        deleted_at: i64,
+    ) -> Result<bool, DbError> {
+        self.soft_delete(definition_id, deleted_at).await
+    }
+}
+
 struct SingleAssistantOverlayRepo {
     row: AssistantOverlayRow,
 }
@@ -1999,25 +2159,29 @@ fn setup_with_ports_team_repo_and_conversation_repo(
     Arc<FakeConversationPorts>,
     Arc<MockConversationRepo>,
 ) {
-    setup_with_ports_metadata_assistants_and_conversation_repo(
+    let (service, repo, ports, conversations, _) = setup_with_ports_metadata_assistants_and_conversation_repo(
         factory,
         agent_metadata_repo,
         Arc::new(EmptyAssistantDefinitionRepo),
         Arc::new(EmptyAssistantOverlayRepo),
-    )
+    );
+    (service, repo, ports, conversations)
 }
+
+type PortsServiceHarness = (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<FakeConversationPorts>,
+    Arc<MockConversationRepo>,
+    Arc<CountingTaskManager>,
+);
 
 fn setup_with_ports_metadata_assistants_and_conversation_repo(
     factory: AgentFactory,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
-) -> (
-    Arc<TeamSessionService>,
-    Arc<FullMockTeamRepo>,
-    Arc<FakeConversationPorts>,
-    Arc<MockConversationRepo>,
-) {
+) -> PortsServiceHarness {
     let team_repo = Arc::new(FullMockTeamRepo::new());
     let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
     let conv_repo = Arc::new(MockConversationRepo::new());
@@ -2025,7 +2189,8 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
     let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
     let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
     let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
-    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(factory));
+    let task_manager = Arc::new(CountingTaskManager::new(factory));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
     let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(TestTeamAssistantCatalog {
@@ -2043,13 +2208,13 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
         conversation_port,
         projection_store,
         broadcaster,
-        task_manager,
+        task_manager_dyn,
         noop_turn_port(),
         noop_cancellation_port(),
         Arc::new(TestTeamToolCapabilityPort),
         backend_binary_path,
     );
-    (svc, team_repo, conversation_ports, conv_repo)
+    (svc, team_repo, conversation_ports, conv_repo, task_manager)
 }
 
 fn setup_with_recording_turn_port() -> (
@@ -2440,6 +2605,15 @@ fn word_creator_definition() -> AssistantDefinitionRow {
         updated_at: 0,
         deleted_at: None,
     }
+}
+
+fn reviewer_definition() -> AssistantDefinitionRow {
+    let mut row = word_creator_definition();
+    row.id = "def-reviewer".into();
+    row.assistant_id = "reviewer".into();
+    row.source_ref = Some("reviewer".into());
+    row.name = "Reviewer".into();
+    row
 }
 
 fn setup_with_metadata_rows(rows: Vec<AgentMetadataRow>) -> Arc<TeamSessionService> {
@@ -3270,12 +3444,13 @@ async fn team_preset_assistant_snapshot_is_frozen() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: word_creator_definition(),
     });
-    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
-        success_factory(),
-        seeded_agent_metadata_repo(),
-        definition_repo,
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
     conversation_ports.upsert_preset_snapshot(
         "word-creator",
         fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
@@ -3387,12 +3562,13 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: word_creator_definition(),
     });
-    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
-        success_factory(),
-        seeded_agent_metadata_repo(),
-        definition_repo,
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
     conversation_ports.upsert_preset_snapshot(
         "word-creator",
         fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
@@ -4250,12 +4426,13 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
         row: word_creator_definition(),
     });
-    let (svc, _team_repo, _conversation_ports, _conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
-        success_factory(),
-        seeded_agent_metadata_repo(),
-        definition_repo,
-        Arc::new(EmptyAssistantOverlayRepo),
-    );
+    let (svc, _team_repo, _conversation_ports, _conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
     let created = svc
         .create_team(
             "user1",
@@ -5476,6 +5653,286 @@ async fn an1_rename_agent() {
     let got = svc.get_team("user1", &created.id).await.unwrap();
     let agent = got.assistants.iter().find(|a| a.slot_id == slot_id).unwrap();
     assert_eq!(agent.name, "Senior Worker");
+}
+
+#[tokio::test]
+async fn observed_model_switch_updates_all_model_facts_and_survives_rebuild() {
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), seeded_agent_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+
+    svc.update_agent_model("user1", &created.id, &worker.slot_id, "gpt-5.6-sol")
+        .await
+        .unwrap();
+
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, "gpt-5.6-sol");
+    let extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+    assert_eq!(extra["current_model_id"], "gpt-5.6-sol");
+    let live_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(live_worker.model, "gpt-5.6-sol");
+
+    svc.stop_session("user1", &created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let rebuilt_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(rebuilt_worker.model, "gpt-5.6-sol");
+}
+
+#[tokio::test]
+async fn ensure_session_repairs_legacy_model_facts_from_confirmed_selection() {
+    let (svc, _, conv_repo) =
+        setup_with_factory_and_metadata_and_conversation_repo(success_factory(), seeded_agent_metadata_repo());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+    let mut extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+    extra["confirmed_model_id"] = serde_json::json!("gpt-5.7-confirmed");
+    extra["current_model_id"] = serde_json::json!("gpt-5.5-stale");
+    conv_repo
+        .update(
+            "user1",
+            &worker.conversation_id,
+            &ConversationRowUpdate {
+                extra: Some(serde_json::to_string(&extra).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.ensure_session("user1", &created.id).await.unwrap();
+
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, "gpt-5.7-confirmed");
+    let repaired_extra = conv_repo.get_extra(&worker.conversation_id).unwrap();
+    assert_eq!(repaired_extra["current_model_id"], "gpt-5.7-confirmed");
+    let live_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(live_worker.model, "gpt-5.7-confirmed");
+}
+
+/// A model switch through the generic config-option path must persist itself.
+///
+/// This used to need a SECOND call from the client (`PATCH .../model`): the
+/// config-option path only told the runtime, so if the client never made the
+/// follow-up call — or it failed — the runtime was switched while the roster and
+/// the conversation seed still held the old model, and the next rebuild silently
+/// reverted it.
+#[tokio::test]
+async fn setting_the_model_config_option_persists_roster_conversation_and_live_session() {
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            Arc::new(PairAssistantDefinitionRepo {
+                rows: vec![word_creator_definition(), reviewer_definition()],
+            }),
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+
+    let response = svc
+        .set_conversation_config_option(
+            "user1",
+            &created.id,
+            &worker.conversation_id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.9-switched".into(),
+            },
+        )
+        .await
+        .expect("model switch must be accepted");
+    // The runtime only promised to apply it from the next turn — persistence must
+    // still happen, otherwise the pending switch is lost on the next rebuild.
+    assert_eq!(response.confirmation, ConfigOptionConfirmation::PendingNextTurn);
+    assert_eq!(
+        conversation_ports.config_option_calls(),
+        vec![(
+            worker.conversation_id.clone(),
+            "model".to_owned(),
+            "gpt-5.9-switched".to_owned()
+        )],
+        "the runtime must be asked exactly once"
+    );
+
+    // 1. the conversation seed a rebuilt runtime reads
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["current_model_id"],
+        "gpt-5.9-switched"
+    );
+    // 2. the persisted team roster
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, "gpt-5.9-switched");
+    // 3. the live in-memory session agent
+    let live_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(live_worker.model, "gpt-5.9-switched");
+}
+
+/// Non-model options must not be mistaken for a model switch.
+#[tokio::test]
+async fn setting_a_non_model_config_option_leaves_the_model_untouched() {
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            Arc::new(PairAssistantDefinitionRepo {
+                rows: vec![word_creator_definition(), reviewer_definition()],
+            }),
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+    let model_before = conv_repo.get_extra(&worker.conversation_id).unwrap()["current_model_id"].clone();
+
+    svc.set_conversation_config_option(
+        "user1",
+        &created.id,
+        &worker.conversation_id,
+        "thought_level",
+        SetConfigOptionRequest { value: "high".into() },
+    )
+    .await
+    .expect("non-model option must still be forwarded");
+
+    assert_eq!(conversation_ports.config_option_calls().len(), 1);
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["current_model_id"],
+        model_before,
+        "a thought-level change must not rewrite the model"
+    );
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, worker.model);
+}
+
+#[tokio::test]
+async fn update_agent_model_rejects_an_empty_model_without_changing_the_roster() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = &created.assistants[1];
+
+    let error = svc
+        .update_agent_model("user1", &created.id, &worker.slot_id, "  ")
+        .await
+        .expect_err("empty model must be rejected");
+
+    assert!(error.to_string().contains("model must not be empty"));
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, worker.model);
 }
 
 #[tokio::test]
