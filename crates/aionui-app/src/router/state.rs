@@ -8,9 +8,10 @@ use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentExecutionCancellationPort,
-    AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult, AssistantAgentCatalogPort, AssistantError,
-    AssistantRouterState, AssistantService, BuiltinAssistantRegistry, SkillEvolutionRouterState, SkillEvolutionService,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentCancellationOutcome,
+    AgentWorkflowAgentExecutionCancellationPort, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
+    AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+    SkillEvolutionRouterState, SkillEvolutionService,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
@@ -473,15 +474,15 @@ impl AgentWorkflowAgentExecutionCancellationPort for AgentWorkflowExecutionCance
         _run_id: &str,
         _execution_id: &str,
         conversation_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<AgentWorkflowAgentCancellationOutcome, String> {
         let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) else {
-            return Ok(());
+            return Ok(AgentWorkflowAgentCancellationOutcome::NotRunning);
         };
         self.conversation_service
             .cancel(user_id, conversation_id, &turn_id, &self.task_manager)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(AgentWorkflowAgentCancellationOutcome::Requested)
     }
 }
 
@@ -525,6 +526,21 @@ impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
         let Some((run_id, execution_id)) = workflow_context else {
             return;
         };
+        if let Some(execution_id) = execution_id.as_deref()
+            && let Err(error) = self
+                .agent_center
+                .confirm_agent_cancellation_for_user(user_id, &run_id, execution_id, conversation_id)
+                .await
+        {
+            tracing::warn!(
+                user_id,
+                conversation_id,
+                turn_id,
+                run_id,
+                error = %error,
+                "agent-workflow: failed to confirm agent cancellation"
+            );
+        }
         let assistant_id = match self
             .conversations
             .get_assistant_snapshot(user_id, conversation_id)

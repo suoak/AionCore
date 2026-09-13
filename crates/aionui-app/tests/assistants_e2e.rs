@@ -21,9 +21,9 @@ use aionui_api_types::{
 };
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentExecutionCancellationPort,
-    AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult, AssistantAgentCatalogPort, AssistantRouterState,
-    AssistantService, BuiltinAssistantRegistry,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentCancellationOutcome,
+    AgentWorkflowAgentExecutionCancellationPort, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
+    AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_common::AgentType;
 use aionui_db::{
@@ -61,6 +61,7 @@ struct Fixture {
     services: AppServices,
     agent_center: Arc<AgentCenterService>,
     cancelled_agent_executions: Arc<Mutex<Vec<(String, String, String, String)>>>,
+    fail_next_agent_cancellation: Arc<AtomicBool>,
     token: String,
     csrf: String,
     // user-data root containing assistant-rules / assistant-skills / assistant-avatars
@@ -74,6 +75,7 @@ struct Fixture {
 
 struct RecordingAgentExecutionCanceller {
     calls: Arc<Mutex<Vec<(String, String, String, String)>>>,
+    fail_next: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -84,14 +86,17 @@ impl AgentWorkflowAgentExecutionCancellationPort for RecordingAgentExecutionCanc
         run_id: &str,
         execution_id: &str,
         conversation_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<AgentWorkflowAgentCancellationOutcome, String> {
         self.calls.lock().unwrap().push((
             user_id.to_owned(),
             run_id.to_owned(),
             execution_id.to_owned(),
             conversation_id.to_owned(),
         ));
-        Ok(())
+        if self.fail_next.swap(false, Ordering::AcqRel) {
+            return Err("injected cancellation failure".to_owned());
+        }
+        Ok(AgentWorkflowAgentCancellationOutcome::NotRunning)
     }
 }
 
@@ -397,10 +402,12 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
         tool_executor,
     ));
     let cancelled_agent_executions = Arc::new(Mutex::new(Vec::new()));
+    let fail_next_agent_cancellation = Arc::new(AtomicBool::new(false));
     states.agent_center = AgentCenterRouterState {
         service: agent_center.clone(),
         agent_execution_canceller: Some(Arc::new(RecordingAgentExecutionCanceller {
             calls: cancelled_agent_executions.clone(),
+            fail_next: fail_next_agent_cancellation.clone(),
         })),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
@@ -416,6 +423,7 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
         services,
         agent_center,
         cancelled_agent_executions,
+        fail_next_agent_cancellation,
         token,
         csrf,
         user_data_dir,
@@ -2209,6 +2217,7 @@ async fn active_workflow_run_can_be_cancelled_once() {
     assert_eq!(cancelled.status(), StatusCode::OK);
     let cancelled = body_json(cancelled).await;
     assert_eq!(cancelled["data"]["status"], "cancelled");
+    assert_eq!(cancelled["data"]["cancellation_status"], "confirmed");
     assert_eq!(cancelled["data"]["nodes"][1]["status"], "cancelled");
     assert_eq!(cancelled["data"]["next_action"], Value::Null);
     assert_eq!(
@@ -2241,8 +2250,71 @@ async fn active_workflow_run_can_be_cancelled_once() {
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
     assert_eq!(
         body_json(duplicate).await["error"],
-        "only an active workflow run can be cancelled"
+        "only an active workflow run or failed cancellation can be cancelled"
     );
+}
+
+#[tokio::test]
+async fn failed_agent_cancellation_is_visible_and_can_be_retried() {
+    let fx = fixture().await;
+    let assistant_id = "bare:632f31d2";
+    let start = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/agents/{assistant_id}/workflow-runs"),
+            json!({ "input": "review this" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
+    let execution_id = started["data"]["next_action"]["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fx.agent_center
+        .claim_agent_execution_conversation_for_user(DEFAULT_USER_ID, &run_id, &execution_id, "conversation-1")
+        .await
+        .unwrap();
+    fx.fail_next_agent_cancellation.store(true, Ordering::Release);
+
+    let failed = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/cancel"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::OK);
+    let failed = body_json(failed).await;
+    assert_eq!(failed["data"]["status"], "cancelled");
+    assert_eq!(failed["data"]["cancellation_status"], "failed");
+
+    let retried = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/cancel"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), StatusCode::OK);
+    let retried = body_json(retried).await;
+    assert_eq!(retried["data"]["cancellation_status"], "confirmed");
+    assert_eq!(fx.cancelled_agent_executions.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -27,6 +27,12 @@ pub struct AgentCenterRouterState {
     pub agent_execution_canceller: Option<Arc<dyn AgentWorkflowAgentExecutionCancellationPort>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentWorkflowAgentCancellationOutcome {
+    NotRunning,
+    Requested,
+}
+
 #[async_trait::async_trait]
 pub trait AgentWorkflowAgentExecutionCancellationPort: Send + Sync {
     async fn cancel_agent_execution(
@@ -35,7 +41,7 @@ pub trait AgentWorkflowAgentExecutionCancellationPort: Send + Sync {
         run_id: &str,
         execution_id: &str,
         conversation_id: &str,
-    ) -> Result<(), String>;
+    ) -> Result<AgentWorkflowAgentCancellationOutcome, String>;
 }
 
 pub fn agent_center_routes(state: AgentCenterRouterState) -> Router {
@@ -213,27 +219,48 @@ async fn cancel_workflow_run(
     Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentWorkflowRunResponse>>, ApiError> {
-    let run = state
+    let mut run = state
         .service
         .cancel_workflow_run_for_user(&current_user.id, &id)
         .await?;
-    if let Some(node) = run.nodes.get(run.current_node_index)
-        && node.kind == "agent"
-        && let Some(execution_id) = node.execution_id.as_deref()
-        && let Some(conversation_id) = node.conversation_id.as_deref()
-        && let Some(canceller) = state.agent_execution_canceller.as_ref()
-        && let Err(error) = canceller
-            .cancel_agent_execution(&current_user.id, &run.id, execution_id, conversation_id)
-            .await
-    {
-        tracing::error!(
-            user_id = %current_user.id,
-            run_id = %run.id,
-            execution_id,
-            conversation_id,
-            error,
-            "agent-workflow: failed to cancel conversation-backed agent execution"
-        );
+    let execution = run.nodes.get(run.current_node_index).and_then(|node| {
+        if node.kind != "agent" {
+            return None;
+        }
+        Some((node.execution_id.clone()?, node.conversation_id.clone()?))
+    });
+    if let Some((execution_id, conversation_id)) = execution {
+        let outcome = match state.agent_execution_canceller.as_ref() {
+            Some(canceller) => {
+                canceller
+                    .cancel_agent_execution(&current_user.id, &run.id, &execution_id, &conversation_id)
+                    .await
+            }
+            None => Err("agent execution cancellation is unavailable".to_owned()),
+        };
+        run = match outcome {
+            Ok(AgentWorkflowAgentCancellationOutcome::NotRunning) => {
+                state
+                    .service
+                    .confirm_agent_cancellation_for_user(&current_user.id, &run.id, &execution_id, &conversation_id)
+                    .await?
+            }
+            Ok(AgentWorkflowAgentCancellationOutcome::Requested) => run,
+            Err(error) => {
+                tracing::error!(
+                    user_id = %current_user.id,
+                    run_id = %run.id,
+                    execution_id,
+                    conversation_id,
+                    error,
+                    "agent-workflow: failed to cancel conversation-backed agent execution"
+                );
+                state
+                    .service
+                    .fail_agent_cancellation_for_user(&current_user.id, &run.id, &execution_id, &conversation_id)
+                    .await?
+            }
+        };
     }
     Ok(Json(ApiResponse::ok(run)))
 }

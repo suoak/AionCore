@@ -15,8 +15,8 @@ use aionui_api_types::{
     AdvanceAgentWorkflowRunRequest, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta,
     AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
     AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowAgentPlan,
-    AgentWorkflowApprovalDecision, AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun,
-    AgentWorkflowNodeRunAttempt, AgentWorkflowNodeRunStatus, AgentWorkflowOutputDefinition,
+    AgentWorkflowApprovalDecision, AgentWorkflowCancellationStatus, AgentWorkflowDefinition, AgentWorkflowNextAction,
+    AgentWorkflowNodeRun, AgentWorkflowNodeRunAttempt, AgentWorkflowNodeRunStatus, AgentWorkflowOutputDefinition,
     AgentWorkflowOutputFieldDefinition, AgentWorkflowOutputFieldType, AgentWorkflowRunResponse, AgentWorkflowRunStatus,
     AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
     CreateAgentCenterRequest, CreateConversationRequestWire, DecideAgentWorkflowApprovalRequest,
@@ -537,6 +537,7 @@ impl AgentCenterService {
             revision: plan.revision,
             preview_mode: plan.preview_mode,
             status: AgentWorkflowRunStatus::Running,
+            cancellation_status: None,
             current_node_index: 1,
             workflow: plan.workflow,
             nodes: Vec::new(),
@@ -1143,16 +1144,21 @@ impl AgentCenterService {
             .map_err(|e| AssistantError::Internal(e.to_string()))?
             .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
         let mut run = parse_workflow_run(&row.state_json)?;
-        if !matches!(
-            run.status,
-            AgentWorkflowRunStatus::Running | AgentWorkflowRunStatus::WaitingApproval
-        ) {
+        let retry_failed_cancellation = run.status == AgentWorkflowRunStatus::Cancelled
+            && run.cancellation_status == Some(AgentWorkflowCancellationStatus::Failed);
+        if !retry_failed_cancellation
+            && !matches!(
+                run.status,
+                AgentWorkflowRunStatus::Running | AgentWorkflowRunStatus::WaitingApproval
+            )
+        {
             return Err(AssistantError::Conflict(
-                "only an active workflow run can be cancelled".into(),
+                "only an active workflow run or failed cancellation can be cancelled".into(),
             ));
         }
         let now = now_ms();
-        if let Some(node) = run.nodes.get_mut(run.current_node_index)
+        if !retry_failed_cancellation
+            && let Some(node) = run.nodes.get_mut(run.current_node_index)
             && matches!(
                 node.status,
                 AgentWorkflowNodeRunStatus::Running | AgentWorkflowNodeRunStatus::WaitingApproval
@@ -1162,6 +1168,15 @@ impl AgentCenterService {
             node.completed_at = Some(now);
         }
         run.status = AgentWorkflowRunStatus::Cancelled;
+        run.cancellation_status = if run
+            .nodes
+            .get(run.current_node_index)
+            .is_some_and(|node| node.kind == "agent" && node.conversation_id.is_some())
+        {
+            Some(AgentWorkflowCancellationStatus::Requested)
+        } else {
+            Some(AgentWorkflowCancellationStatus::Confirmed)
+        };
         run.next_action = None;
         let cancelled = self.persist_workflow_run(user_id, run, &row.state_json).await?;
         let lock_key = format!("{user_id}:{run_id}");
@@ -1175,6 +1190,98 @@ impl AgentCenterService {
         }
         tracing::info!(run_id, user_id, "agent-workflow: run cancelled");
         Ok(cancelled)
+    }
+
+    pub async fn confirm_agent_cancellation_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        self.update_agent_cancellation_status_for_user(
+            user_id,
+            run_id,
+            execution_id,
+            conversation_id,
+            AgentWorkflowCancellationStatus::Confirmed,
+        )
+        .await
+    }
+
+    pub async fn fail_agent_cancellation_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        self.update_agent_cancellation_status_for_user(
+            user_id,
+            run_id,
+            execution_id,
+            conversation_id,
+            AgentWorkflowCancellationStatus::Failed,
+        )
+        .await
+    }
+
+    async fn update_agent_cancellation_status_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
+        status: AgentWorkflowCancellationStatus,
+    ) -> Result<AgentWorkflowRunResponse, AssistantError> {
+        for _ in 0..3 {
+            let row = self
+                .workflow_run_repo
+                .get_for_user(user_id, run_id)
+                .await
+                .map_err(|error| AssistantError::Internal(error.to_string()))?
+                .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+            let mut run = parse_workflow_run(&row.state_json)?;
+            let matches_execution = run.status == AgentWorkflowRunStatus::Cancelled
+                && run.nodes.get(run.current_node_index).is_some_and(|node| {
+                    node.kind == "agent"
+                        && node.execution_id.as_deref() == Some(execution_id)
+                        && node.conversation_id.as_deref() == Some(conversation_id)
+                });
+            if !matches_execution {
+                // Conversation settlement can race with a retry or a newer execution.
+                // A stale lifecycle callback must never mutate the current run.
+                return Ok(run);
+            }
+            if run.cancellation_status == Some(status) {
+                return Ok(run);
+            }
+            if status == AgentWorkflowCancellationStatus::Failed
+                && run.cancellation_status != Some(AgentWorkflowCancellationStatus::Requested)
+            {
+                return Ok(run);
+            }
+            run.cancellation_status = Some(status);
+            run.updated_at = now_ms();
+            let state_json = serialize_workflow_run(&run)?;
+            let updated = self
+                .workflow_run_repo
+                .update_state_if_current(
+                    user_id,
+                    run_id,
+                    &row.state_json,
+                    workflow_run_status_str(run.status),
+                    &state_json,
+                )
+                .await
+                .map_err(|error| AssistantError::Internal(error.to_string()))?;
+            if updated.is_some() {
+                return Ok(run);
+            }
+        }
+        Err(AssistantError::Conflict(
+            "workflow run changed while recording cancellation status".into(),
+        ))
     }
 
     pub async fn retry_workflow_run_for_user(

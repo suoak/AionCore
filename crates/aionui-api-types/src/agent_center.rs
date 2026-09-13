@@ -533,6 +533,14 @@ pub enum AgentWorkflowRunStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum AgentWorkflowCancellationStatus {
+    Requested,
+    Confirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentWorkflowNodeRunStatus {
     Pending,
     Running,
@@ -640,6 +648,8 @@ pub struct AgentWorkflowRunResponse {
     #[serde(default)]
     pub preview_mode: AgentCenterPreviewMode,
     pub status: AgentWorkflowRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_status: Option<AgentWorkflowCancellationStatus>,
     pub current_node_index: usize,
     pub workflow: AgentWorkflowDefinition,
     pub nodes: Vec<AgentWorkflowNodeRun>,
@@ -880,6 +890,7 @@ mod tests {
         assert_eq!(run.revision_id, None);
         assert_eq!(run.revision, 0);
         assert_eq!(run.preview_mode, AgentCenterPreviewMode::Draft);
+        assert_eq!(run.cancellation_status, None);
         assert_eq!(run.output, None);
     }
 
