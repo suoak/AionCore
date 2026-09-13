@@ -124,6 +124,12 @@ pub use conversation::{
     SessionRef, SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest,
     UpdateConversationRequest,
 };
+pub use conversation_tools::{
+    CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,
+    ConversationCreateRequest, ConversationCreateResponse, ConversationToolDescriptor, ConversationToolErrorCode,
+    ConversationToolErrorPayload, ConversationToolName, conversation_tool_descriptor, conversation_tool_descriptors,
+    tool_name_for_conversation_cli_path,
+};
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
     CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto, CronJobPayloadDto, CronJobRemovedPayload,
