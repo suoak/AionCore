@@ -60,7 +60,7 @@ struct Fixture {
     app: axum::Router,
     services: AppServices,
     agent_center: Arc<AgentCenterService>,
-    cancelled_agent_executions: Arc<Mutex<Vec<(String, String, String)>>>,
+    cancelled_agent_executions: Arc<Mutex<Vec<(String, String, String, String)>>>,
     token: String,
     csrf: String,
     // user-data root containing assistant-rules / assistant-skills / assistant-avatars
@@ -73,16 +73,24 @@ struct Fixture {
 }
 
 struct RecordingAgentExecutionCanceller {
-    calls: Arc<Mutex<Vec<(String, String, String)>>>,
+    calls: Arc<Mutex<Vec<(String, String, String, String)>>>,
 }
 
 #[async_trait::async_trait]
 impl AgentWorkflowAgentExecutionCancellationPort for RecordingAgentExecutionCanceller {
-    async fn cancel_agent_execution(&self, user_id: &str, run_id: &str, execution_id: &str) -> Result<(), String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((user_id.to_owned(), run_id.to_owned(), execution_id.to_owned()));
+    async fn cancel_agent_execution(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        self.calls.lock().unwrap().push((
+            user_id.to_owned(),
+            run_id.to_owned(),
+            execution_id.to_owned(),
+            conversation_id.to_owned(),
+        ));
         Ok(())
     }
 }
@@ -1178,6 +1186,11 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
         failed_execution_id
     );
     assert_eq!(
+        retried["data"]["nodes"][1]["attempts"][0]["conversation_id"],
+        "conversation-2"
+    );
+    assert_eq!(retried["data"]["nodes"][1]["conversation_id"], Value::Null);
+    assert_eq!(
         retried["data"]["next_action"]["create_conversation"]["assistant"],
         failed_started["data"]["next_action"]["create_conversation"]["assistant"]
     );
@@ -2152,6 +2165,20 @@ async fn active_workflow_run_can_be_cancelled_once() {
         .ensure_agent_execution_active_for_user(DEFAULT_USER_ID, &run_id, &execution_id)
         .await
         .unwrap();
+    fx.agent_center
+        .claim_agent_execution_conversation_for_user(DEFAULT_USER_ID, &run_id, &execution_id, "conversation-1")
+        .await
+        .unwrap();
+    fx.agent_center
+        .claim_agent_execution_conversation_for_user(DEFAULT_USER_ID, &run_id, &execution_id, "conversation-1")
+        .await
+        .unwrap();
+    assert!(matches!(
+        fx.agent_center
+            .claim_agent_execution_conversation_for_user(DEFAULT_USER_ID, &run_id, &execution_id, "conversation-2",)
+            .await,
+        Err(aionui_assistant::AssistantError::Conflict(_))
+    ));
 
     let missing_csrf = fx
         .app
@@ -2186,7 +2213,12 @@ async fn active_workflow_run_can_be_cancelled_once() {
     assert_eq!(cancelled["data"]["next_action"], Value::Null);
     assert_eq!(
         fx.cancelled_agent_executions.lock().unwrap().as_slice(),
-        &[(DEFAULT_USER_ID.to_owned(), run_id.clone(), execution_id.clone())]
+        &[(
+            DEFAULT_USER_ID.to_owned(),
+            run_id.clone(),
+            execution_id.clone(),
+            "conversation-1".to_owned(),
+        )]
     );
     assert!(matches!(
         fx.agent_center

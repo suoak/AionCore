@@ -87,16 +87,6 @@ pub trait IConversationRepository: Send + Sync {
         agent_type: &str,
     ) -> Result<Option<ConversationRow>, DbError>;
 
-    /// Finds the conversation created for one exact Agent Workflow execution.
-    async fn find_by_agent_workflow_execution(
-        &self,
-        _user_id: &str,
-        _run_id: &str,
-        _execution_id: &str,
-    ) -> Result<Option<ConversationRow>, DbError> {
-        Ok(None)
-    }
-
     /// Lists conversations whose `extra.cronJobId` matches.
     async fn list_by_cron_job(&self, user_id: &str, cron_job_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 

@@ -424,7 +424,7 @@ impl OnConversationTurnStarting for AgentWorkflowTurnStartGuard {
     async fn validate_turn_start(
         &self,
         user_id: &str,
-        _conversation_id: &str,
+        conversation_id: &str,
         conversation_extra: &str,
     ) -> Result<(), String> {
         let Some(agent_center) = self.agent_center.upgrade() else {
@@ -434,7 +434,7 @@ impl OnConversationTurnStarting for AgentWorkflowTurnStartGuard {
             return Ok(());
         };
         agent_center
-            .ensure_agent_execution_active_for_user(user_id, &run_id, &execution_id)
+            .claim_agent_execution_conversation_for_user(user_id, &run_id, &execution_id, conversation_id)
             .await
             .map_err(|_| "Agent Workflow run is no longer active".to_owned())
     }
@@ -460,7 +460,6 @@ fn workflow_execution_context(conversation_extra: &str) -> Result<Option<(String
 }
 
 struct AgentWorkflowExecutionCancellationAdapter {
-    conversations: Arc<dyn IConversationRepository>,
     conversation_service: ConversationService,
     runtime_state: Arc<aionui_conversation::runtime_state::ConversationRuntimeStateService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
@@ -468,20 +467,18 @@ struct AgentWorkflowExecutionCancellationAdapter {
 
 #[async_trait::async_trait]
 impl AgentWorkflowAgentExecutionCancellationPort for AgentWorkflowExecutionCancellationAdapter {
-    async fn cancel_agent_execution(&self, user_id: &str, run_id: &str, execution_id: &str) -> Result<(), String> {
-        let Some(conversation) = self
-            .conversations
-            .find_by_agent_workflow_execution(user_id, run_id, execution_id)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(());
-        };
-        let Some(turn_id) = self.runtime_state.active_turn_id_for(&conversation.id) else {
+    async fn cancel_agent_execution(
+        &self,
+        user_id: &str,
+        _run_id: &str,
+        _execution_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) else {
             return Ok(());
         };
         self.conversation_service
-            .cancel(user_id, &conversation.id, &turn_id, &self.task_manager)
+            .cancel(user_id, conversation_id, &turn_id, &self.task_manager)
             .await
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -750,7 +747,6 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
         Some(tool_executor),
     ));
     let agent_execution_canceller = Arc::new(AgentWorkflowExecutionCancellationAdapter {
-        conversations: services.conversation_repo.clone(),
         conversation_service: services.conversation_service.clone(),
         runtime_state: services.conversation_runtime_state.clone(),
         task_manager: services.worker_task_manager.clone(),

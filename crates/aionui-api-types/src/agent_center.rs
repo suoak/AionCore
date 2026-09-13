@@ -549,6 +549,8 @@ pub struct AgentWorkflowNodeRunAttempt {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     pub status: AgentWorkflowNodeRunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
@@ -576,6 +578,8 @@ pub struct AgentWorkflowNodeRun {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<AgentWorkflowNodeRunAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -891,6 +895,7 @@ mod tests {
 
         assert_eq!(node.attempt, 1);
         assert_eq!(node.execution_id, None);
+        assert_eq!(node.conversation_id, None);
         assert!(node.attempts.is_empty());
         assert_eq!(node.agent_plan, None);
     }

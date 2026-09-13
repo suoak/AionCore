@@ -567,6 +567,7 @@ impl AgentCenterService {
                 },
                 attempt: 1,
                 execution_id: (index == 1).then(|| execution_id.clone()),
+                conversation_id: None,
                 attempts: Vec::new(),
                 agent_plan: (index == 1).then(|| agent_plan.clone()),
                 output: None,
@@ -626,6 +627,70 @@ impl AgentCenterService {
                 "workflow agent execution is no longer active".into(),
             ))
         }
+    }
+
+    /// Atomically binds an agent execution to its single conversation.
+    /// Repeated checks from that conversation are idempotent; another
+    /// conversation cannot reuse the same execution id.
+    pub async fn claim_agent_execution_conversation_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), AssistantError> {
+        for _ in 0..3 {
+            let row = self
+                .workflow_run_repo
+                .get_for_user(user_id, run_id)
+                .await
+                .map_err(|error| AssistantError::Internal(error.to_string()))?
+                .ok_or_else(|| AssistantError::NotFound(run_id.to_owned()))?;
+            let mut run = parse_workflow_run(&row.state_json)?;
+            let active = run.status == AgentWorkflowRunStatus::Running
+                && run.nodes.get(run.current_node_index).is_some_and(|node| {
+                    node.kind == "agent"
+                        && node.status == AgentWorkflowNodeRunStatus::Running
+                        && node.execution_id.as_deref() == Some(execution_id)
+                });
+            if !active {
+                return Err(AssistantError::Conflict(
+                    "workflow agent execution is no longer active".into(),
+                ));
+            }
+            let node = run
+                .nodes
+                .get_mut(run.current_node_index)
+                .ok_or_else(|| AssistantError::Conflict("workflow run has no current node".into()))?;
+            match node.conversation_id.as_deref() {
+                Some(bound) if bound == conversation_id => return Ok(()),
+                Some(_) => {
+                    return Err(AssistantError::Conflict(
+                        "workflow agent execution is already bound to another conversation".into(),
+                    ));
+                }
+                None => node.conversation_id = Some(conversation_id.to_owned()),
+            }
+            run.updated_at = now_ms();
+            let state_json = serialize_workflow_run(&run)?;
+            let updated = self
+                .workflow_run_repo
+                .update_state_if_current(
+                    user_id,
+                    run_id,
+                    &row.state_json,
+                    workflow_run_status_str(run.status),
+                    &state_json,
+                )
+                .await
+                .map_err(|error| AssistantError::Internal(error.to_string()))?;
+            if updated.is_some() {
+                return Ok(());
+            }
+        }
+        Err(AssistantError::Conflict(
+            "workflow run changed while binding its conversation".into(),
+        ))
     }
 
     pub async fn list_workflow_runs_for_user(
@@ -838,6 +903,21 @@ impl AgentCenterService {
             || !matches!(current_node, Some(node) if node.kind == "agent" && node.status == AgentWorkflowNodeRunStatus::Running)
         {
             return Ok(None);
+        }
+        if !expected_execution_id.is_empty() {
+            match self
+                .claim_agent_execution_conversation_for_user(
+                    user_id,
+                    run_id,
+                    expected_execution_id,
+                    result.conversation_id,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(AssistantError::Conflict(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            }
         }
 
         let mut node_output = json!({
@@ -1141,6 +1221,7 @@ impl AgentCenterService {
         node.attempts.push(AgentWorkflowNodeRunAttempt {
             attempt: node.attempt,
             execution_id: node.execution_id.clone(),
+            conversation_id: node.conversation_id.clone(),
             status: node.status,
             output: node.output.clone(),
             error: node.error.clone(),
@@ -1149,6 +1230,7 @@ impl AgentCenterService {
         });
         node.attempt += 1;
         node.execution_id = Some(execution_id.clone());
+        node.conversation_id = None;
         node.status = AgentWorkflowNodeRunStatus::Running;
         node.output = None;
         node.error = None;

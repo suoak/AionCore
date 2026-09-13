@@ -314,30 +314,6 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(user_id)
     }
 
-    async fn find_by_agent_workflow_execution(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        execution_id: &str,
-    ) -> Result<Option<ConversationRow>, DbError> {
-        let row = sqlx::query_as::<_, ConversationRow>(
-            "SELECT * FROM conversations \
-             WHERE user_id = ? \
-               AND json_valid(extra) \
-               AND json_extract(extra, '$.agent_workflow_run_id') = ? \
-               AND json_extract(extra, '$.agent_workflow_execution_id') = ? \
-             ORDER BY created_at DESC, id DESC \
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .bind(execution_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row)
-    }
-
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO conversations \
@@ -2579,38 +2555,6 @@ mod tests {
             .await
             .unwrap();
         assert!(not_found.is_none());
-    }
-
-    #[tokio::test]
-    async fn finds_exact_agent_workflow_execution_without_cross_user_leakage() {
-        let (repo, _db) = setup().await;
-        let mut expected = sample_conversation(SYSTEM_USER_ID);
-        expected.extra = serde_json::json!({
-            "agent_workflow_run_id": "awrun-1",
-            "agent_workflow_execution_id": "awexec-2",
-        })
-        .to_string();
-        repo.create(&expected).await.unwrap();
-        let mut other_execution = sample_conversation(SYSTEM_USER_ID);
-        other_execution.extra = serde_json::json!({
-            "agent_workflow_run_id": "awrun-1",
-            "agent_workflow_execution_id": "awexec-old",
-        })
-        .to_string();
-        repo.create(&other_execution).await.unwrap();
-
-        let found = repo
-            .find_by_agent_workflow_execution(SYSTEM_USER_ID, "awrun-1", "awexec-2")
-            .await
-            .unwrap();
-
-        assert_eq!(found.map(|row| row.id), Some(expected.id));
-        assert!(
-            repo.find_by_agent_workflow_execution("another-user", "awrun-1", "awexec-2")
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[tokio::test]
