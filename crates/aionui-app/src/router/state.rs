@@ -432,15 +432,20 @@ impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
                 return;
             }
         };
-        let run_id = serde_json::from_str::<serde_json::Value>(&conversation.extra)
+        let workflow_context = serde_json::from_str::<serde_json::Value>(&conversation.extra)
             .ok()
             .and_then(|extra| {
-                extra
+                let run_id = extra
                     .get("agent_workflow_run_id")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_owned();
+                let execution_id = extra
+                    .get("agent_workflow_execution_id")
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
+                    .map(str::to_owned);
+                Some((run_id, execution_id))
             });
-        let Some(run_id) = run_id else {
+        let Some((run_id, execution_id)) = workflow_context else {
             return;
         };
         let assistant_id = match self
@@ -469,6 +474,7 @@ impl OnConversationTurnSettled for AgentWorkflowTurnSettlementAdapter {
                 &run_id,
                 AgentWorkflowTurnResult {
                     assistant_id: &assistant_id,
+                    execution_id: execution_id.as_deref(),
                     conversation_id,
                     turn_id,
                     success: settlement == ConversationTurnSettlement::Completed,

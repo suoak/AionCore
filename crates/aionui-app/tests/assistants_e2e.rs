@@ -1008,6 +1008,25 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
     assert_eq!(start.status(), StatusCode::CREATED);
     let started = body_json(start).await;
     let run_id = started["data"]["id"].as_str().unwrap();
+    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
+
+    let stale_advance = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/advance"),
+            json!({ "execution_id": "awexec-stale", "success": true, "output": "stale result" }),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_advance.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(stale_advance).await["error"],
+        "agent result does not match the active workflow execution"
+    );
 
     let mismatch = fx
         .agent_center
@@ -1016,6 +1035,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
             run_id,
             AgentWorkflowTurnResult {
                 assistant_id: "bare:another-agent",
+                execution_id: Some(execution_id),
                 conversation_id: "conversation-1",
                 turn_id: "turn-1",
                 success: true,
@@ -1034,6 +1054,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
             run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(execution_id),
                 conversation_id: "conversation-1",
                 turn_id: "turn-1",
                 success: true,
@@ -1064,6 +1085,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
             run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(execution_id),
                 conversation_id: "conversation-1",
                 turn_id: "turn-1",
                 success: true,
@@ -1089,6 +1111,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
         .unwrap();
     let failed_started = body_json(failed_start).await;
     let failed_run_id = failed_started["data"]["id"].as_str().unwrap();
+    let failed_execution_id = failed_started["data"]["next_action"]["execution_id"].as_str().unwrap();
     let failed = fx
         .agent_center
         .settle_agent_turn_for_user(
@@ -1096,6 +1119,7 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
             failed_run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(failed_execution_id),
                 conversation_id: "conversation-2",
                 turn_id: "turn-2",
                 success: false,
@@ -1109,6 +1133,80 @@ async fn settled_agent_turn_advances_once_and_rejects_assistant_mismatch() {
     assert_eq!(failed.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
     assert_eq!(failed.nodes[1].error.as_deref(), Some("agent turn failed"));
     assert!(failed.next_action.is_none());
+
+    let retry = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{failed_run_id}/retry"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retried = body_json(retry).await;
+    let retry_execution_id = retried["data"]["next_action"]["execution_id"].as_str().unwrap();
+    assert_ne!(retry_execution_id, failed_execution_id);
+    assert_eq!(retried["data"]["nodes"][1]["attempt"], 2);
+    assert_eq!(
+        retried["data"]["nodes"][1]["attempts"][0]["execution_id"],
+        failed_execution_id
+    );
+    assert_eq!(
+        retried["data"]["next_action"]["create_conversation"]["assistant"],
+        failed_started["data"]["next_action"]["create_conversation"]["assistant"]
+    );
+    assert_eq!(
+        retried["data"]["next_action"]["message"],
+        failed_started["data"]["next_action"]["message"]
+    );
+
+    let stale = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            failed_run_id,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                execution_id: Some(failed_execution_id),
+                conversation_id: "conversation-stale",
+                turn_id: "turn-stale",
+                success: true,
+                error: None,
+                output: Some("stale agent result"),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(stale.is_none());
+
+    let recovered = fx
+        .agent_center
+        .settle_agent_turn_for_user(
+            DEFAULT_USER_ID,
+            failed_run_id,
+            AgentWorkflowTurnResult {
+                assistant_id,
+                execution_id: Some(retry_execution_id),
+                conversation_id: "conversation-retry",
+                turn_id: "turn-retry",
+                success: true,
+                error: None,
+                output: Some("recovered agent result"),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("matching retry execution should settle the agent node");
+    assert_eq!(recovered.status, aionui_api_types::AgentWorkflowRunStatus::Completed);
+    assert_eq!(recovered.nodes[1].attempt, 2);
+    assert_eq!(
+        recovered.nodes[1].attempts[0].error.as_deref(),
+        Some("agent turn failed")
+    );
 }
 
 #[tokio::test]
@@ -1161,6 +1259,7 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
     assert_eq!(start.status(), StatusCode::CREATED);
     let started = body_json(start).await;
     let run_id = started["data"]["id"].as_str().unwrap();
+    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
     assert!(
         started["data"]["next_action"]["message"]
             .as_str()
@@ -1175,6 +1274,7 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
             run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(execution_id),
                 conversation_id: "conversation-json",
                 turn_id: "turn-json",
                 success: true,
@@ -1201,10 +1301,9 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
         .await
         .unwrap();
     assert_eq!(invalid_start.status(), StatusCode::CREATED);
-    let invalid_run_id = body_json(invalid_start).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let invalid_started = body_json(invalid_start).await;
+    let invalid_run_id = invalid_started["data"]["id"].as_str().unwrap().to_owned();
+    let invalid_execution_id = invalid_started["data"]["next_action"]["execution_id"].as_str().unwrap();
     let failed = fx
         .agent_center
         .settle_agent_turn_for_user(
@@ -1212,6 +1311,7 @@ async fn json_workflow_contract_guides_and_validates_agent_output() {
             &invalid_run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(invalid_execution_id),
                 conversation_id: "conversation-invalid-json",
                 turn_id: "turn-invalid-json",
                 success: true,
@@ -1339,13 +1439,16 @@ async fn pending_tool_is_executed_and_settled_with_the_configured_contract() {
         ))
         .await
         .unwrap();
-    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
+    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
     fx.agent_center
         .settle_agent_turn_for_user(
             DEFAULT_USER_ID,
             &run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(execution_id),
                 conversation_id: "conversation-1",
                 turn_id: "turn-1",
                 success: true,
@@ -1436,13 +1539,16 @@ async fn cancelling_a_run_interrupts_its_in_flight_tool_execution() {
         ))
         .await
         .unwrap();
-    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
+    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
     fx.agent_center
         .settle_agent_turn_for_user(
             DEFAULT_USER_ID,
             &run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(execution_id),
                 conversation_id: "conversation-1",
                 turn_id: "turn-1",
                 success: true,
@@ -1540,7 +1646,9 @@ async fn approval_returns_before_its_tool_finishes_and_keeps_cancel_available() 
         ))
         .await
         .unwrap();
-    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
+    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
     let waiting = fx
         .app
         .clone()
@@ -1650,13 +1758,16 @@ async fn interrupted_tool_is_failed_without_automatic_replay() {
         ))
         .await
         .unwrap();
-    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
+    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
     fx.agent_center
         .settle_agent_turn_for_user(
             DEFAULT_USER_ID,
             &run_id,
             AgentWorkflowTurnResult {
                 assistant_id,
+                execution_id: Some(execution_id),
                 conversation_id: "conversation-1",
                 turn_id: "turn-1",
                 success: true,

@@ -14,10 +14,10 @@ use std::{
 use aionui_api_types::{
     AdvanceAgentWorkflowRunRequest, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta,
     AgentCenterMetaPatch, AgentCenterPreviewMode, AgentCenterRevisionResponse, AgentCenterRunPlanResponse,
-    AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowApprovalDecision,
-    AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun, AgentWorkflowNodeRunAttempt,
-    AgentWorkflowNodeRunStatus, AgentWorkflowOutputDefinition, AgentWorkflowOutputFieldDefinition,
-    AgentWorkflowOutputFieldType, AgentWorkflowRunResponse, AgentWorkflowRunStatus,
+    AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility, AgentWorkflowAgentPlan,
+    AgentWorkflowApprovalDecision, AgentWorkflowDefinition, AgentWorkflowNextAction, AgentWorkflowNodeRun,
+    AgentWorkflowNodeRunAttempt, AgentWorkflowNodeRunStatus, AgentWorkflowOutputDefinition,
+    AgentWorkflowOutputFieldDefinition, AgentWorkflowOutputFieldType, AgentWorkflowRunResponse, AgentWorkflowRunStatus,
     AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
     CreateAgentCenterRequest, CreateConversationRequestWire, DecideAgentWorkflowApprovalRequest,
     PublishAgentCenterRequest, SkillVersionPolicy, StartAgentWorkflowRunRequest, UpdateAgentCenterRequest,
@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use crate::error::AssistantError;
 use crate::service::AssistantService;
 
-const MAX_WORKFLOW_TOOL_ATTEMPTS: u32 = 3;
+const MAX_WORKFLOW_NODE_ATTEMPTS: u32 = 3;
 
 pub struct AgentCenterService {
     assistants: Arc<AssistantService>,
@@ -80,6 +80,7 @@ pub trait AgentWorkflowToolExecutionPort: Send + Sync {
 
 pub struct AgentWorkflowTurnResult<'a> {
     pub assistant_id: &'a str,
+    pub execution_id: Option<&'a str>,
     pub conversation_id: &'a str,
     pub turn_id: &'a str,
     pub success: bool,
@@ -520,7 +521,13 @@ impl AgentCenterService {
 
         let now = now_ms();
         let run_id = generate_prefixed_id("awrun");
+        let execution_id = generate_prefixed_id("awexec");
         plan.create_conversation.extra["agent_workflow_run_id"] = json!(run_id.clone());
+        plan.create_conversation.extra["agent_workflow_execution_id"] = json!(execution_id.clone());
+        let agent_plan = AgentWorkflowAgentPlan {
+            create_conversation: Box::new(plan.create_conversation.clone()),
+            message: agent_message.clone(),
+        };
         let mut variables = req.variables;
         variables.insert("input".to_owned(), req.input);
         let mut run = AgentWorkflowRunResponse {
@@ -536,6 +543,7 @@ impl AgentCenterService {
             variables,
             output: None,
             next_action: Some(AgentWorkflowNextAction::RunAgent {
+                execution_id: execution_id.clone(),
                 create_conversation: Box::new(plan.create_conversation),
                 message: agent_message,
             }),
@@ -558,8 +566,9 @@ impl AgentCenterService {
                     AgentWorkflowNodeRunStatus::Pending
                 },
                 attempt: 1,
-                execution_id: None,
+                execution_id: (index == 1).then(|| execution_id.clone()),
                 attempts: Vec::new(),
+                agent_plan: (index == 1).then(|| agent_plan.clone()),
                 output: None,
                 error: None,
                 started_at: (index <= 1).then_some(now),
@@ -730,10 +739,27 @@ impl AgentCenterService {
                     "tool result does not match the active workflow execution".into(),
                 ));
             }
-        } else if req.success {
-            let agent_output_definition = effective_agent_output_definition(&run.workflow);
-            req.output = normalize_manual_agent_output(req.output, &agent_output_definition)
-                .map_err(AssistantError::BadRequest)?;
+        } else {
+            if let Some(provided_execution_id) = req.execution_id.as_deref() {
+                let expected_execution_id = match run.next_action.as_ref() {
+                    Some(AgentWorkflowNextAction::RunAgent { execution_id, .. }) => execution_id,
+                    _ => {
+                        return Err(AssistantError::Conflict(
+                            "workflow run is not awaiting an agent result".into(),
+                        ));
+                    }
+                };
+                if provided_execution_id != expected_execution_id {
+                    return Err(AssistantError::Conflict(
+                        "agent result does not match the active workflow execution".into(),
+                    ));
+                }
+            }
+            if req.success {
+                let agent_output_definition = effective_agent_output_definition(&run.workflow);
+                req.output = normalize_manual_agent_output(req.output, &agent_output_definition)
+                    .map_err(AssistantError::BadRequest)?;
+            }
         }
         let node = run
             .nodes
@@ -771,9 +797,14 @@ impl AgentCenterService {
     ) -> Result<Option<AgentWorkflowRunResponse>, AssistantError> {
         let run = self.get_workflow_run_for_user(user_id, run_id).await?;
         let current_node = run.nodes.get(run.current_node_index);
+        let expected_execution_id = match run.next_action.as_ref() {
+            Some(AgentWorkflowNextAction::RunAgent { execution_id, .. }) => execution_id.as_str(),
+            _ => "",
+        };
         if run.assistant_id != result.assistant_id
             || run.status != AgentWorkflowRunStatus::Running
             || !matches!(run.next_action, Some(AgentWorkflowNextAction::RunAgent { .. }))
+            || (!expected_execution_id.is_empty() && result.execution_id != Some(expected_execution_id))
             || !matches!(current_node, Some(node) if node.kind == "agent" && node.status == AgentWorkflowNodeRunStatus::Running)
         {
             return Ok(None);
@@ -815,7 +846,7 @@ impl AgentCenterService {
                 run_id,
                 AdvanceAgentWorkflowRunRequest {
                     node_id: None,
-                    execution_id: None,
+                    execution_id: result.execution_id.map(str::to_owned),
                     success,
                     output: node_output,
                     error,
@@ -1058,18 +1089,23 @@ impl AgentCenterService {
             .get_mut(run.current_node_index)
             .ok_or_else(|| AssistantError::Conflict("workflow run has no failed node".into()))?;
         if run.status != AgentWorkflowRunStatus::Failed
-            || node.kind != "tool"
+            || !matches!(node.kind.as_str(), "agent" | "tool")
             || node.status != AgentWorkflowNodeRunStatus::Failed
         {
             return Err(AssistantError::Conflict(
-                "only a failed tool node can be retried".into(),
+                "only a failed agent or tool node can be retried".into(),
             ));
         }
-        validate_tool_retry_attempt(node.attempt)?;
-        let next_action = build_tool_action(definition)?;
+        validate_node_retry_attempt(node.attempt)?;
+        let next_action = if node.kind == "agent" {
+            build_agent_retry_action(node)?
+        } else {
+            build_tool_action(definition)?
+        };
         let execution_id = match &next_action {
-            AgentWorkflowNextAction::InvokeTool { execution_id, .. } => execution_id.clone(),
-            _ => unreachable!("build_tool_action always returns invoke_tool"),
+            AgentWorkflowNextAction::RunAgent { execution_id, .. }
+            | AgentWorkflowNextAction::InvokeTool { execution_id, .. } => execution_id.clone(),
+            AgentWorkflowNextAction::AwaitApproval { .. } => unreachable!("retry actions are executable"),
         };
         let now = now_ms();
         node.attempts.push(AgentWorkflowNodeRunAttempt {
@@ -1100,7 +1136,8 @@ impl AgentCenterService {
             node_id,
             attempt,
             execution_id,
-            "agent-workflow: failed tool node retried"
+            kind = %retried.nodes[retried.current_node_index].kind,
+            "agent-workflow: failed node retried"
         );
         Ok(retried)
     }
@@ -1400,10 +1437,10 @@ fn validate_workflow_tools(meta: &AgentCenterMeta, enabled_mcp_ids: &[String]) -
     Ok(())
 }
 
-fn validate_tool_retry_attempt(attempt: u32) -> Result<(), AssistantError> {
-    if attempt >= MAX_WORKFLOW_TOOL_ATTEMPTS {
+fn validate_node_retry_attempt(attempt: u32) -> Result<(), AssistantError> {
+    if attempt >= MAX_WORKFLOW_NODE_ATTEMPTS {
         return Err(AssistantError::Conflict(format!(
-            "workflow tool node reached the maximum of {MAX_WORKFLOW_TOOL_ATTEMPTS} attempts"
+            "workflow node reached the maximum of {MAX_WORKFLOW_NODE_ATTEMPTS} attempts"
         )));
     }
     Ok(())
@@ -1761,6 +1798,21 @@ fn build_tool_action(
     })
 }
 
+fn build_agent_retry_action(node: &AgentWorkflowNodeRun) -> Result<AgentWorkflowNextAction, AssistantError> {
+    let plan = node
+        .agent_plan
+        .as_ref()
+        .ok_or_else(|| AssistantError::Conflict("workflow agent retry snapshot is unavailable".into()))?;
+    let execution_id = generate_prefixed_id("awexec");
+    let mut create_conversation = (*plan.create_conversation).clone();
+    create_conversation.extra["agent_workflow_execution_id"] = json!(execution_id.clone());
+    Ok(AgentWorkflowNextAction::RunAgent {
+        execution_id,
+        create_conversation: Box::new(create_conversation),
+        message: plan.message.clone(),
+    })
+}
+
 fn evaluate_guard_expression(
     expression: &str,
     variables: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -1955,14 +2007,14 @@ mod workflow_run_tests {
     }
 
     #[test]
-    fn tool_retry_limit_allows_recovery_but_stops_repeated_side_effects() {
-        assert!(validate_tool_retry_attempt(MAX_WORKFLOW_TOOL_ATTEMPTS - 1).is_ok());
-        let error = validate_tool_retry_attempt(MAX_WORKFLOW_TOOL_ATTEMPTS).unwrap_err();
+    fn node_retry_limit_allows_recovery_but_stops_repeated_execution() {
+        assert!(validate_node_retry_attempt(MAX_WORKFLOW_NODE_ATTEMPTS - 1).is_ok());
+        let error = validate_node_retry_attempt(MAX_WORKFLOW_NODE_ATTEMPTS).unwrap_err();
 
         assert!(matches!(
             error,
             AssistantError::Conflict(message)
-                if message == "workflow tool node reached the maximum of 3 attempts"
+                if message == "workflow node reached the maximum of 3 attempts"
         ));
     }
 }

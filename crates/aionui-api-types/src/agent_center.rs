@@ -561,6 +561,13 @@ pub struct AgentWorkflowNodeRunAttempt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentWorkflowAgentPlan {
+    pub create_conversation: Box<CreateConversationRequestWire>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentWorkflowNodeRun {
     pub node_id: String,
     pub kind: String,
@@ -571,6 +578,8 @@ pub struct AgentWorkflowNodeRun {
     pub execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<AgentWorkflowNodeRunAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_plan: Option<AgentWorkflowAgentPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -589,6 +598,8 @@ fn default_workflow_attempt() -> u32 {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentWorkflowNextAction {
     RunAgent {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        execution_id: String,
         create_conversation: Box<CreateConversationRequestWire>,
         /// Exact first-turn message, including the workflow output contract.
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -881,6 +892,7 @@ mod tests {
         assert_eq!(node.attempt, 1);
         assert_eq!(node.execution_id, None);
         assert!(node.attempts.is_empty());
+        assert_eq!(node.agent_plan, None);
     }
 
     #[test]
@@ -891,9 +903,13 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(matches!(
-            action,
-            AgentWorkflowNextAction::RunAgent { message, .. } if message.is_empty()
-        ));
+        let AgentWorkflowNextAction::RunAgent {
+            execution_id, message, ..
+        } = action
+        else {
+            panic!("expected a run_agent action");
+        };
+        assert!(execution_id.is_empty());
+        assert!(message.is_empty());
     }
 }
