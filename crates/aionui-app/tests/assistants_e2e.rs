@@ -1648,7 +1648,6 @@ async fn approval_returns_before_its_tool_finishes_and_keeps_cancel_available() 
         .unwrap();
     let started = body_json(start).await;
     let run_id = started["data"]["id"].as_str().unwrap().to_owned();
-    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
     let waiting = fx
         .app
         .clone()
