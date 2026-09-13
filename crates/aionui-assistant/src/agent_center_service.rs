@@ -624,12 +624,13 @@ impl AgentCenterService {
             .collect()
     }
 
-    /// Mark tool executions left in-flight by a previous process as failed.
+    /// Mark workflow executions left in-flight by a previous process as failed.
     ///
-    /// Tool calls can have external side effects, so startup recovery must not
-    /// replay them automatically. A user can inspect the external system and
-    /// explicitly retry, which creates a fresh execution id.
-    pub async fn recover_interrupted_tool_runs(&self) -> Result<usize, AssistantError> {
+    /// Agent and tool executions can both have external side effects, so startup
+    /// recovery must not replay them automatically. A user can inspect the
+    /// conversation and external systems before explicitly retrying, which
+    /// creates a fresh execution id.
+    pub async fn recover_interrupted_workflow_runs(&self) -> Result<usize, AssistantError> {
         let rows = self
             .workflow_run_repo
             .list_by_status("running")
@@ -649,27 +650,31 @@ impl AgentCenterService {
                     continue;
                 }
             };
-            let Some(AgentWorkflowNextAction::InvokeTool {
-                node_id, execution_id, ..
-            }) = run.next_action.as_ref()
-            else {
-                continue;
+            let (action_kind, action_execution_id) = match run.next_action.as_ref() {
+                Some(AgentWorkflowNextAction::RunAgent { execution_id, .. }) => ("agent", execution_id.as_str()),
+                Some(AgentWorkflowNextAction::InvokeTool { execution_id, .. }) => ("tool", execution_id.as_str()),
+                Some(AgentWorkflowNextAction::AwaitApproval { .. }) | None => continue,
             };
             let Some(node) = run.nodes.get_mut(run.current_node_index) else {
                 continue;
             };
-            if node.kind != "tool" || node.status != AgentWorkflowNodeRunStatus::Running {
+            if node.kind != action_kind || node.status != AgentWorkflowNodeRunStatus::Running {
                 continue;
             }
-            let node_id = node_id.clone();
-            let execution_id = execution_id.clone();
+            let node_id = node.node_id.clone();
+            let execution_id = action_execution_id.to_owned();
             let now = now_ms();
-            node.execution_id = Some(execution_id.clone());
+            if !execution_id.is_empty() {
+                node.execution_id = Some(execution_id.clone());
+            }
             node.status = AgentWorkflowNodeRunStatus::Failed;
-            node.error = Some(
+            node.error = Some(if action_kind == "agent" {
+                "Agent execution was interrupted by an application restart. Review the conversation and external side effects before retrying."
+                    .into()
+            } else {
                 "Tool execution was interrupted by an application restart. Verify external side effects before retrying."
-                    .into(),
-            );
+                    .into()
+            });
             node.completed_at = Some(now);
             run.status = AgentWorkflowRunStatus::Failed;
             run.next_action = None;
@@ -687,7 +692,8 @@ impl AgentCenterService {
                     user_id = row.user_id,
                     node_id,
                     execution_id,
-                    "agent-workflow: interrupted tool execution recovered as failed"
+                    kind = action_kind,
+                    "agent-workflow: interrupted execution recovered as failed"
                 );
             }
         }

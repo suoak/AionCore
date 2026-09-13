@@ -310,10 +310,10 @@ pub async fn build_module_states(
     let system = build_module_state_phase(&boot, "system", || build_system_state(services));
     let agent_center =
         build_module_state_phase(&boot, "agent_center", || build_agent_center_state(services, &assistant));
-    match agent_center.service.recover_interrupted_tool_runs().await {
+    match agent_center.service.recover_interrupted_workflow_runs().await {
         Ok(0) => {}
         Ok(recovered) => {
-            tracing::warn!(recovered, "agent-workflow: recovered interrupted tool executions");
+            tracing::warn!(recovered, "agent-workflow: recovered interrupted executions");
         }
         Err(error) => {
             tracing::warn!(error = %error, "agent-workflow: startup recovery failed");

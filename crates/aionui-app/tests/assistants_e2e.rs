@@ -1777,7 +1777,7 @@ async fn interrupted_tool_is_failed_without_automatic_replay() {
         .await
         .unwrap();
 
-    assert_eq!(fx.agent_center.recover_interrupted_tool_runs().await.unwrap(), 1);
+    assert_eq!(fx.agent_center.recover_interrupted_workflow_runs().await.unwrap(), 1);
     let recovered = fx
         .agent_center
         .get_workflow_run_for_user(DEFAULT_USER_ID, &run_id)
@@ -1794,7 +1794,7 @@ async fn interrupted_tool_is_failed_without_automatic_replay() {
 }
 
 #[tokio::test]
-async fn startup_recovery_leaves_agent_turns_running() {
+async fn interrupted_agent_is_failed_without_automatic_replay_and_can_be_retried() {
     let fx = fixture().await;
     let assistant_id = "bare:632f31d2";
     let start = fx
@@ -1809,15 +1809,45 @@ async fn startup_recovery_leaves_agent_turns_running() {
         ))
         .await
         .unwrap();
-    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
+    let execution_id = started["data"]["next_action"]["execution_id"].as_str().unwrap();
 
-    assert_eq!(fx.agent_center.recover_interrupted_tool_runs().await.unwrap(), 0);
-    let unchanged = fx
+    assert_eq!(fx.agent_center.recover_interrupted_workflow_runs().await.unwrap(), 1);
+    let recovered = fx
         .agent_center
         .get_workflow_run_for_user(DEFAULT_USER_ID, &run_id)
         .await
         .unwrap();
-    assert_eq!(unchanged.status, aionui_api_types::AgentWorkflowRunStatus::Running);
+    assert_eq!(recovered.status, aionui_api_types::AgentWorkflowRunStatus::Failed);
+    assert_eq!(recovered.nodes[1].execution_id.as_deref(), Some(execution_id));
+    assert!(
+        recovered.nodes[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Review the conversation and external side effects")
+    );
+    assert!(recovered.next_action.is_none());
+    assert_eq!(fx.agent_center.recover_interrupted_workflow_runs().await.unwrap(), 0);
+
+    let retry = fx
+        .app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/agent-center/workflow-runs/{run_id}/retry"),
+            json!({}),
+            &fx.token,
+            &fx.csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retried = body_json(retry).await;
+    assert_eq!(retried["data"]["status"], "running");
+    assert_eq!(retried["data"]["nodes"][1]["attempt"], 2);
+    assert_ne!(retried["data"]["next_action"]["execution_id"], execution_id);
+    assert_eq!(retried["data"]["nodes"][1]["attempts"][0]["execution_id"], execution_id);
 }
 
 #[tokio::test]
