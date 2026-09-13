@@ -32,7 +32,7 @@ pub use error::{
 };
 pub use hooks::{
     ConversationTurnSettlement, OnConversationDelete, OnConversationTurnCancelled, OnConversationTurnSettled,
-    TurnCancelCause,
+    OnConversationTurnStarting, TurnCancelCause,
 };
 pub use id::{fnv1a_hex8, generate_id, generate_id_with_length, generate_prefixed_id, generate_short_id};
 pub use pagination::PaginatedResult;

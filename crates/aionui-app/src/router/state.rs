@@ -3,18 +3,20 @@
 //! `ModuleStates` is the bundle returned by `build_module_states`; each
 //! `build_*_state` constructs one `*RouterState` from `AppServices`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
-    AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
-    SkillEvolutionRouterState, SkillEvolutionService,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentExecutionCancellationPort,
+    AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult, AssistantAgentCatalogPort, AssistantError,
+    AssistantRouterState, AssistantService, BuiltinAssistantRegistry, SkillEvolutionRouterState, SkillEvolutionService,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
-use aionui_common::{AgentKillReason, ConversationTurnSettlement, OnConversationTurnSettled};
+use aionui_common::{
+    AgentKillReason, ConversationTurnSettlement, OnConversationTurnSettled, OnConversationTurnStarting,
+};
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
@@ -325,6 +327,11 @@ pub async fn build_module_states(
             conversations: services.conversation_repo.clone(),
             agent_center: agent_center.service.clone(),
         }));
+    services
+        .conversation_service
+        .with_turn_starting_hook(Arc::new(AgentWorkflowTurnStartGuard {
+            agent_center: Arc::downgrade(&agent_center.service),
+        }));
     let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
         build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
     });
@@ -406,6 +413,79 @@ pub async fn build_module_states(
 struct AgentWorkflowTurnSettlementAdapter {
     conversations: Arc<dyn IConversationRepository>,
     agent_center: Arc<AgentCenterService>,
+}
+
+struct AgentWorkflowTurnStartGuard {
+    agent_center: Weak<AgentCenterService>,
+}
+
+#[async_trait::async_trait]
+impl OnConversationTurnStarting for AgentWorkflowTurnStartGuard {
+    async fn validate_turn_start(
+        &self,
+        user_id: &str,
+        _conversation_id: &str,
+        conversation_extra: &str,
+    ) -> Result<(), String> {
+        let Some(agent_center) = self.agent_center.upgrade() else {
+            return Err("Agent Workflow service is unavailable".into());
+        };
+        let Some((run_id, execution_id)) = workflow_execution_context(conversation_extra)? else {
+            return Ok(());
+        };
+        agent_center
+            .ensure_agent_execution_active_for_user(user_id, &run_id, &execution_id)
+            .await
+            .map_err(|_| "Agent Workflow run is no longer active".to_owned())
+    }
+}
+
+fn workflow_execution_context(conversation_extra: &str) -> Result<Option<(String, String)>, String> {
+    let Ok(extra) = serde_json::from_str::<serde_json::Value>(conversation_extra) else {
+        return Ok(None);
+    };
+    let Some(run_value) = extra.get("agent_workflow_run_id") else {
+        return Ok(None);
+    };
+    let run_id = run_value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Agent Workflow conversation has an invalid run id".to_owned())?;
+    let execution_id = extra
+        .get("agent_workflow_execution_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Agent Workflow conversation has no execution id".to_owned())?;
+    Ok(Some((run_id.to_owned(), execution_id.to_owned())))
+}
+
+struct AgentWorkflowExecutionCancellationAdapter {
+    conversations: Arc<dyn IConversationRepository>,
+    conversation_service: ConversationService,
+    runtime_state: Arc<aionui_conversation::runtime_state::ConversationRuntimeStateService>,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+}
+
+#[async_trait::async_trait]
+impl AgentWorkflowAgentExecutionCancellationPort for AgentWorkflowExecutionCancellationAdapter {
+    async fn cancel_agent_execution(&self, user_id: &str, run_id: &str, execution_id: &str) -> Result<(), String> {
+        let Some(conversation) = self
+            .conversations
+            .find_by_agent_workflow_execution(user_id, run_id, execution_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let Some(turn_id) = self.runtime_state.active_turn_id_for(&conversation.id) else {
+            return Ok(());
+        };
+        self.conversation_service
+            .cancel(user_id, &conversation.id, &turn_id, &self.task_manager)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -669,7 +749,16 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
         workflow_run_repo,
         Some(tool_executor),
     ));
-    AgentCenterRouterState { service }
+    let agent_execution_canceller = Arc::new(AgentWorkflowExecutionCancellationAdapter {
+        conversations: services.conversation_repo.clone(),
+        conversation_service: services.conversation_service.clone(),
+        runtime_state: services.conversation_runtime_state.clone(),
+        task_manager: services.worker_task_manager.clone(),
+    });
+    AgentCenterRouterState {
+        service,
+        agent_execution_canceller: Some(agent_execution_canceller),
+    }
 }
 
 /// Build Skill Evolution router state (经验库 / 技能提案 + Phase 2 evolve/apply).

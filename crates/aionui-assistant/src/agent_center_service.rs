@@ -604,6 +604,30 @@ impl AgentCenterService {
         parse_workflow_run(&row.state_json)
     }
 
+    /// Rejects a conversation turn unless it belongs to the currently active
+    /// agent execution for the workflow run.
+    pub async fn ensure_agent_execution_active_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        execution_id: &str,
+    ) -> Result<(), AssistantError> {
+        let run = self.get_workflow_run_for_user(user_id, run_id).await?;
+        let active = run.status == AgentWorkflowRunStatus::Running
+            && run.nodes.get(run.current_node_index).is_some_and(|node| {
+                node.kind == "agent"
+                    && node.status == AgentWorkflowNodeRunStatus::Running
+                    && node.execution_id.as_deref() == Some(execution_id)
+            });
+        if active {
+            Ok(())
+        } else {
+            Err(AssistantError::Conflict(
+                "workflow agent execution is no longer active".into(),
+            ))
+        }
+    }
+
     pub async fn list_workflow_runs_for_user(
         &self,
         user_id: &str,

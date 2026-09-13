@@ -29,7 +29,7 @@ use aionui_api_types::{
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, ConversationTurnSettlement,
-    OnConversationTurnSettled, PaginatedResult, ProviderWithModel, TimestampMs,
+    OnConversationTurnSettled, OnConversationTurnStarting, PaginatedResult, ProviderWithModel, TimestampMs,
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
@@ -6087,6 +6087,58 @@ async fn send_message_wrong_user_returns_not_found() {
         .await
         .unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
+}
+
+struct RejectSecondTurnStartCheck {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl OnConversationTurnStarting for RejectSecondTurnStartCheck {
+    async fn validate_turn_start(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _conversation_extra: &str,
+    ) -> Result<(), String> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            Ok(())
+        } else {
+            Err("owning workflow was cancelled".into())
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_message_rechecks_turn_guard_after_claim_and_releases_cancelled_start() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    svc.with_turn_starting_hook(Arc::new(RejectSecondTurnStartCheck { calls: calls.clone() }));
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let error = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert!(svc.runtime_state().active_turn_id_for(&conv.id).is_none());
+    assert!(
+        repo.list_messages_page(
+            "user_1",
+            &conv.id,
+            &MessagePageParams {
+                limit: 10,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .is_empty()
+    );
 }
 
 #[tokio::test]

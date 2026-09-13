@@ -24,6 +24,12 @@ use crate::agent_center_service::AgentCenterService;
 #[derive(Clone)]
 pub struct AgentCenterRouterState {
     pub service: Arc<AgentCenterService>,
+    pub agent_execution_canceller: Option<Arc<dyn AgentWorkflowAgentExecutionCancellationPort>>,
+}
+
+#[async_trait::async_trait]
+pub trait AgentWorkflowAgentExecutionCancellationPort: Send + Sync {
+    async fn cancel_agent_execution(&self, user_id: &str, run_id: &str, execution_id: &str) -> Result<(), String>;
 }
 
 pub fn agent_center_routes(state: AgentCenterRouterState) -> Router {
@@ -205,6 +211,22 @@ async fn cancel_workflow_run(
         .service
         .cancel_workflow_run_for_user(&current_user.id, &id)
         .await?;
+    if let Some(node) = run.nodes.get(run.current_node_index)
+        && node.kind == "agent"
+        && let Some(execution_id) = node.execution_id.as_deref()
+        && let Some(canceller) = state.agent_execution_canceller.as_ref()
+        && let Err(error) = canceller
+            .cancel_agent_execution(&current_user.id, &run.id, execution_id)
+            .await
+    {
+        tracing::error!(
+            user_id = %current_user.id,
+            run_id = %run.id,
+            execution_id,
+            error,
+            "agent-workflow: failed to cancel conversation-backed agent execution"
+        );
+    }
     Ok(Json(ApiResponse::ok(run)))
 }
 

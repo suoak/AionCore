@@ -21,8 +21,9 @@ use aionui_api_types::{
 };
 use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{
-    AgentCenterRouterState, AgentCenterService, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
-    AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+    AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentExecutionCancellationPort,
+    AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult, AssistantAgentCatalogPort, AssistantRouterState,
+    AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_common::AgentType;
 use aionui_db::{
@@ -59,6 +60,7 @@ struct Fixture {
     app: axum::Router,
     services: AppServices,
     agent_center: Arc<AgentCenterService>,
+    cancelled_agent_executions: Arc<Mutex<Vec<(String, String, String)>>>,
     token: String,
     csrf: String,
     // user-data root containing assistant-rules / assistant-skills / assistant-avatars
@@ -68,6 +70,21 @@ struct Fixture {
     _user_tmp: TempDir,
     _builtin_tmp: TempDir,
     _ext_tmp: TempDir,
+}
+
+struct RecordingAgentExecutionCanceller {
+    calls: Arc<Mutex<Vec<(String, String, String)>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentWorkflowAgentExecutionCancellationPort for RecordingAgentExecutionCanceller {
+    async fn cancel_agent_execution(&self, user_id: &str, run_id: &str, execution_id: &str) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), run_id.to_owned(), execution_id.to_owned()));
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -371,8 +388,12 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
         workflow_run_repo,
         tool_executor,
     ));
+    let cancelled_agent_executions = Arc::new(Mutex::new(Vec::new()));
     states.agent_center = AgentCenterRouterState {
         service: agent_center.clone(),
+        agent_execution_canceller: Some(Arc::new(RecordingAgentExecutionCanceller {
+            calls: cancelled_agent_executions.clone(),
+        })),
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
     // endpoints route through the test-configured service.
@@ -386,6 +407,7 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
         app,
         services,
         agent_center,
+        cancelled_agent_executions,
         token,
         csrf,
         user_data_dir,
@@ -2120,7 +2142,16 @@ async fn active_workflow_run_can_be_cancelled_once() {
         ))
         .await
         .unwrap();
-    let run_id = body_json(start).await["data"]["id"].as_str().unwrap().to_owned();
+    let started = body_json(start).await;
+    let run_id = started["data"]["id"].as_str().unwrap().to_owned();
+    let execution_id = started["data"]["next_action"]["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fx.agent_center
+        .ensure_agent_execution_active_for_user(DEFAULT_USER_ID, &run_id, &execution_id)
+        .await
+        .unwrap();
 
     let missing_csrf = fx
         .app
@@ -2153,6 +2184,16 @@ async fn active_workflow_run_can_be_cancelled_once() {
     assert_eq!(cancelled["data"]["status"], "cancelled");
     assert_eq!(cancelled["data"]["nodes"][1]["status"], "cancelled");
     assert_eq!(cancelled["data"]["next_action"], Value::Null);
+    assert_eq!(
+        fx.cancelled_agent_executions.lock().unwrap().as_slice(),
+        &[(DEFAULT_USER_ID.to_owned(), run_id.clone(), execution_id.clone())]
+    );
+    assert!(matches!(
+        fx.agent_center
+            .ensure_agent_execution_active_for_user(DEFAULT_USER_ID, &run_id, &execution_id)
+            .await,
+        Err(aionui_assistant::AssistantError::Conflict(_))
+    ));
 
     let duplicate = fx
         .app
