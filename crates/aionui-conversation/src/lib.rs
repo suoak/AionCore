@@ -44,6 +44,8 @@ pub use error::ConversationError;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
+pub use runtime_create::ConversationCreateError;
+pub use runtime_routes::{ConversationRuntimeRouterState, conversation_runtime_routes};
 pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
