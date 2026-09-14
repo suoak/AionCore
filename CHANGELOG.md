@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.2.11](https://github.com/suoak/AionCore/compare/v0.2.10...v0.2.11) (2026-09-14)
+
+
+### Features
+
+* **agent-center:** advance workflows from agent turns ([bc58beb](https://github.com/suoak/AionCore/commit/bc58beb6baef8ef6c33cd50f349bccb4bfa4c57c))
+* **agent-center:** execute workflow MCP tools ([fb16033](https://github.com/suoak/AionCore/commit/fb1603352a812a31d26d4fec304a4ad09ffba68e))
+* **agent-center:** harden workflow run lifecycle ([671ba62](https://github.com/suoak/AionCore/commit/671ba62e1451d27de33d5d72ca3fe68bd8a18166))
+* **agent-center:** harden workflow tool execution ([d17ec8f](https://github.com/suoak/AionCore/commit/d17ec8ff1c42b65abf5e1e9284686ddfefc19045))
+* **agent-center:** persist workflow contracts ([3f9c4f5](https://github.com/suoak/AionCore/commit/3f9c4f57dd6f1d17001fd1b47cb4c090e73665dd))
+* **agent-center:** persist workflow run state ([00ec9e6](https://github.com/suoak/AionCore/commit/00ec9e6dc4143d140bffaa4a164979c15763144c))
+* **agent-center:** persist workflow run state ([e707014](https://github.com/suoak/AionCore/commit/e7070149aa5632c805387a084955a79cd306f9f6))
+* **agent-center:** support unpublishing agents ([b9899bb](https://github.com/suoak/AionCore/commit/b9899bb5eddb0a601f6acea3e9be002c32a5d708))
+* **agent-center:** validate linear workflow nodes ([92309ca](https://github.com/suoak/AionCore/commit/92309caed6ddddc58e93b6799634c9ed6657766f))
+* **agent-workflow:** enforce output contracts ([3d2ad36](https://github.com/suoak/AionCore/commit/3d2ad362a8f630ac2cd0dc2e859e8643b7f85103))
+* **agent-workflow:** enforce structured output schema ([0c95ea1](https://github.com/suoak/AionCore/commit/0c95ea1e6a8f70099ce4cf763530b1bda6fe53ba))
+* **agent-workflow:** persist final run output ([9f8a9f3](https://github.com/suoak/AionCore/commit/9f8a9f39ba8292c7e49ce3666eade1c40149fb7d))
+* **agent-workflow:** record run revision provenance ([b737db4](https://github.com/suoak/AionCore/commit/b737db4b2706de64d47e8db11937137280741c9f))
+* **agent-workflow:** retain tool retry attempts ([f45789b](https://github.com/suoak/AionCore/commit/f45789ba2225f6eeec39dfd8fe11cc0544ec397a))
+* **agent-workflow:** retry failed agent nodes ([314e710](https://github.com/suoak/AionCore/commit/314e710c805d70fac36144043e8c1145245a6382))
+* **conversation:** add aioncore conversation create for agent-driven conversation creation ([#977](https://github.com/suoak/AionCore/issues/977)) ([23daff5](https://github.com/suoak/AionCore/commit/23daff534ceb93cfb6371fb5993a383cbbe2e223))
+
+
+### Bug Fixes
+
+* **agent-center:** do not fail entire list on one bad assistant meta ([#118](https://github.com/suoak/AionCore/issues/118)) ([e8101f3](https://github.com/suoak/AionCore/commit/e8101f362469c8bb96af4083b174d4c3c50b62ce))
+* **agent-center:** recover interrupted tool runs ([68a98c5](https://github.com/suoak/AionCore/commit/68a98c551f6151b5dc66c3120b4b1829763b3261))
+* **agent-center:** satisfy workflow lifecycle lint ([2cc023c](https://github.com/suoak/AionCore/commit/2cc023c82ae9a1530acae069672d593cacb30ea2))
+* **agent-center:** satisfy workflow run checks ([8e32fc6](https://github.com/suoak/AionCore/commit/8e32fc6cd39f4f5ab6ab9179b01f70610f4e2d6b))
+* **agent-workflow:** bind runs to one conversation ([a1a5df7](https://github.com/suoak/AionCore/commit/a1a5df70e07bcf057e1ffe6311317a6120b9aaf7))
+* **agent-workflow:** cancel conversation-backed runs ([a7048be](https://github.com/suoak/AionCore/commit/a7048be14bc2b1503d846e4f223e122a304a7867))
+* **agent-workflow:** dispatch tools without blocking controls ([49a8d12](https://github.com/suoak/AionCore/commit/49a8d12baa470da15e5fade07303ac4ec22c2e2b))
+* **agent-workflow:** export output schema types ([bef6443](https://github.com/suoak/AionCore/commit/bef6443f7c1f267b6892eb5c071d9f52d8675929))
+* **agent-workflow:** import input validation types ([976d4ac](https://github.com/suoak/AionCore/commit/976d4ac2829b20599dc2c95aa98e491cd12b8df0))
+* **agent-workflow:** interrupt cancelled tool executions ([684b1ca](https://github.com/suoak/AionCore/commit/684b1ca5a20906f8ad4857c3a0e0f7f587ee7ff0))
+* **agent-workflow:** make cancellation state truthful ([eaa63e1](https://github.com/suoak/AionCore/commit/eaa63e1013ba42c4ba99b4fe5a2e626c5e7b8865))
+* **agent-workflow:** recover interrupted agent runs ([441c11c](https://github.com/suoak/AionCore/commit/441c11cede43b3c566c46593cb9f43f82883bb80))
+* **agent-workflow:** retain cancellation lookup key ([cbe2af5](https://github.com/suoak/AionCore/commit/cbe2af512426ff4b896f6e513dab8abee15cf11f))
+* **agent-workflow:** validate required run input ([37eac7d](https://github.com/suoak/AionCore/commit/37eac7d763f8406dd7336bbc3d36efbc97cdd03e))
+* **branding:** use WorkMate release sources ([8715bfc](https://github.com/suoak/AionCore/commit/8715bfc8a2dbddc03e5e201bd78768e8d9ee79f2))
+* **branding:** use WorkMate release sources ([2ca1d70](https://github.com/suoak/AionCore/commit/2ca1d70ccd2c20480ef1aaba93bde0d40d3a2e98))
+* **sync:** close conversation runtime route wiring ([058a598](https://github.com/suoak/AionCore/commit/058a598057de001f6ae706ee21c888a6a4828bf4))
+* **sync:** deduplicate runtime restart message ([0a58f6f](https://github.com/suoak/AionCore/commit/0a58f6fcddf34981a457394c8518c3c9ece871a9))
+* **sync:** keep team subsystem version-coherent ([00743e3](https://github.com/suoak/AionCore/commit/00743e3884efd6f152ad5167d1f2c02c2b41b99b))
+* **sync:** mount conversation runtime routes ([8665770](https://github.com/suoak/AionCore/commit/8665770088bc55df385167bed9af9bbe4e447827))
+* **sync:** preserve fork team reliability semantics ([4efea0c](https://github.com/suoak/AionCore/commit/4efea0c4070ee863d022f2738daaa813b3e38a13))
+* **sync:** publish conversation CLI capability ([9c08ba7](https://github.com/suoak/AionCore/commit/9c08ba70b9788f4671d665d2a58e0d95c9ab7fb0))
+* **sync:** resolve semantic merge conflicts ([2b164eb](https://github.com/suoak/AionCore/commit/2b164ebd046d60d32b0527989ade028006895470))
+* **sync:** scope legacy MCP helpers to tests ([c55b83c](https://github.com/suoak/AionCore/commit/c55b83c20fe884cfdc0bd8b04163e8c5a9d9aa57))
+* **sync:** wire agent conversation CLI ([6979003](https://github.com/suoak/AionCore/commit/6979003e506aceaa7fcf6ff5b0eba889a3bcbee2))
+
+
+### Code Refactoring
+
+* **agent-center:** group turn settlement data ([ec33875](https://github.com/suoak/AionCore/commit/ec33875da7ad372d46dcb6cb2f52816fdb55a9a7))
+* **mcp:** group tool execution context ([5638116](https://github.com/suoak/AionCore/commit/5638116ef6d66e5ef17c981502653694f2521db4))
+
 ## [0.2.10](https://github.com/suoak/AionCore/compare/v0.2.9...v0.2.10) (2026-09-05)
 
 ### Features
