@@ -12,10 +12,10 @@ use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
-    SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
-    SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetModeRequest, SetModelRequest,
+    TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability, TeamContextResetResponse,
+    TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSetConfigOptionResponse, TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -642,7 +642,7 @@ async fn set_conversation_config_option(
     Extension(user): Extension<CurrentUser>,
     Path((id, conversation_id, option_id)): Path<(String, String, String)>,
     body: Result<Json<SetConfigOptionRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<SetConfigOptionResponse>>, ApiError> {
+) -> Result<Json<ApiResponse<TeamSetConfigOptionResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state

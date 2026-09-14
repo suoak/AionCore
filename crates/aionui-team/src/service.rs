@@ -10,11 +10,12 @@ use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTas
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, InterruptTeamAgentRequest, SetConfigOptionRequest,
-    SetConfigOptionResponse, TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus,
-    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
-    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
+    TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
+    TeamConfigPersistenceStatus, TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus,
+    TeamContextResetStatus, TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamSetConfigOptionResponse, TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode,
+    TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -1587,7 +1588,7 @@ impl TeamSessionService {
         conversation_id: &str,
         option_id: &str,
         request: SetConfigOptionRequest,
-    ) -> Result<SetConfigOptionResponse, TeamError> {
+    ) -> Result<TeamSetConfigOptionResponse, TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         let member = team
             .agents
@@ -1605,21 +1606,31 @@ impl TeamSessionService {
             .set_config_option(conversation_id, option_id, request)
             .await?;
 
-        if let Some(model) = requested_model.filter(|value| !value.is_empty())
-            && let Err(error) = self
+        let persistence = if let Some(model) = requested_model.filter(|value| !value.is_empty()) {
+            match self
                 .persist_member_model_selection(user_id, team_id, &member.slot_id, &model)
                 .await
-        {
-            warn!(
-                team_id,
-                slot_id = member.slot_id,
-                conversation_id,
-                model,
-                error = %error,
-                "team member model switch applied but could not be persisted"
-            );
-        }
-        Ok(response)
+            {
+                Ok(()) => TeamConfigPersistenceStatus::Persisted,
+                Err(error) => {
+                    warn!(
+                        team_id,
+                        slot_id = member.slot_id,
+                        conversation_id,
+                        model,
+                        error = %error,
+                        "team member model switch applied but could not be persisted"
+                    );
+                    TeamConfigPersistenceStatus::Failed
+                }
+            }
+        } else {
+            TeamConfigPersistenceStatus::NotRequired
+        };
+        Ok(TeamSetConfigOptionResponse {
+            runtime: response,
+            persistence,
+        })
     }
 
     fn broadcast_session_status<F>(
