@@ -22,11 +22,11 @@ struct ConversationRuntimeState {
     active_tool_executions: HashMap<String, HashSet<String>>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
+    restarting_conversations: HashSet<String>,
     /// Cancels that arrived before the turn's agent registered, keyed by
     /// conversation and holding the turn they were meant for.
     deferred_cancels: HashMap<String, String>,
     cancellation_outcomes: HashMap<String, (String, CancellationState)>,
-    restarting_conversations: HashSet<String>,
     /// The turn each (event, conversation) pair has already been reported for.
     logged_once_per_turn: HashMap<(OncePerTurn, String), String>,
     shutting_down: bool,
@@ -550,19 +550,22 @@ impl ConversationRuntimeStateService {
         pending_confirmations: usize,
         supports_midturn_delivery: bool,
     ) -> ConversationRuntimeSummary {
-        let (active_turn_id, cancelling) = self
+        let (active_turn_id, cancelling, restarting) = self
             .state
             .lock()
             .map(|state| {
                 (
                     state.active_turns.get(conversation_id).cloned(),
                     state.cancelling_conversations.contains(conversation_id),
+                    state.restarting_conversations.contains(conversation_id),
                 )
             })
-            .unwrap_or((None, false));
+            .unwrap_or((None, false, true));
         let claimed = active_turn_id.is_some();
 
-        let state = if pending_confirmations > 0 {
+        let state = if restarting {
+            ConversationRuntimeStateKind::Restarting
+        } else if pending_confirmations > 0 {
             ConversationRuntimeStateKind::WaitingConfirmation
         } else if cancelling {
             ConversationRuntimeStateKind::Cancelling
@@ -926,6 +929,51 @@ mod tests {
         assert!(!state.is_deleting("conv-1"));
         assert!(!state.is_cancelling("conv-1"));
         assert!(state.active_turn_id_for("conv-1").is_none());
+    }
+
+    #[test]
+    fn restart_gate_rejects_turns_and_duplicate_restarts_until_released() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        state.begin_restart("conv-1").expect("first restart should claim gate");
+
+        let duplicate = state
+            .begin_restart("conv-1")
+            .expect_err("duplicate restart should be rejected");
+        assert!(matches!(duplicate, ConversationError::RuntimeRestarting { .. }));
+        assert_eq!(duplicate.error_code(), "runtime_restarting");
+        let turn = state
+            .try_claim_turn("conv-1", "turn-1")
+            .expect_err("send must be rejected while restart owns the runtime");
+        // Asserted by CODE, not message text: clients gate on the code, so the
+        // wording must stay free to change without breaking them.
+        assert!(matches!(turn, ConversationError::RuntimeRestarting { .. }));
+        assert_eq!(turn.error_code(), "runtime_restarting");
+
+        let summary = state.summary_from_parts("conv-1", None, false, 0, false);
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Restarting);
+        assert!(summary.is_processing);
+        assert!(!summary.can_send_message);
+
+        state.clear_restarting("conv-1");
+        assert!(state.try_claim_turn("conv-1", "turn-2").is_ok());
+    }
+
+    #[test]
+    fn clearing_old_turn_for_restart_preserves_restart_gate() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-before-restart")
+            .expect("turn should be active before restart");
+        state.mark_cancelling("conv-1");
+        state.begin_restart("conv-1").expect("restart should claim gate");
+
+        state.clear_turn_state_for_restart("conv-1");
+
+        assert!(!state.is_claimed("conv-1"));
+        assert!(!state.is_cancelling("conv-1"));
+        assert!(state.is_restarting("conv-1"));
+        assert!(state.try_claim_turn("conv-1", "turn-during-restart").is_err());
     }
 
     #[test]

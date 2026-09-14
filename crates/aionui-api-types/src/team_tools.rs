@@ -604,6 +604,7 @@ mod tests {
             ("team_members", vec!["members"]),
             ("team_read_messages", vec!["read-messages"]),
             ("team_send_message", vec!["send-message"]),
+            ("team_interrupt_agent", vec!["interrupt-agent"]),
             ("team_task_create", vec!["task", "create"]),
             ("team_task_update", vec!["task", "update"]),
             ("team_task_list", vec!["task", "list"]),

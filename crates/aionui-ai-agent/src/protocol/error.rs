@@ -61,13 +61,13 @@ impl CloseReason {
                 Some(AgentKillReason::TeamDeleted) => "Agent killed: team deleted".to_owned(),
                 Some(AgentKillReason::ConversationDeleted) => "Agent killed: conversation deleted".to_owned(),
                 Some(AgentKillReason::UserCancelTimeout) => "Conversation cancelled; agent restarted".to_owned(),
+                Some(AgentKillReason::RuntimeRestart) => "Conversation cancelled; agent restarted".to_owned(),
                 Some(AgentKillReason::RuntimeCapabilityChanged) => {
                     "Agent killed: runtime capability changed".to_owned()
                 }
                 Some(AgentKillReason::ModelChanged) => "Agent killed: model changed".to_owned(),
                 Some(AgentKillReason::SessionRevoked) => "Agent killed: session revoked".to_owned(),
                 Some(AgentKillReason::Archived) => "Agent killed: archived".to_owned(),
-                Some(AgentKillReason::RuntimeRestart) => "Agent killed: runtime restart".to_owned(),
                 None => "Agent killed".to_owned(),
             },
             CloseReason::ProcessExited {

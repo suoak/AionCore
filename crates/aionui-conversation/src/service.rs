@@ -16,8 +16,9 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::{
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CancellationChangedEvent,
-    CancellationState, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
+    AssistantMcpBindingChanged, CancelConversationResponse, CancellationChangedEvent, CancellationState,
+    CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
@@ -26,7 +27,7 @@ use aionui_api_types::{
     RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
     SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
     UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version,
+    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
 use aionui_common::{
@@ -35,12 +36,14 @@ use aionui_common::{
     OnConversationTurnStarting, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
     now_ms, validate_workspace_path_availability,
 };
+#[cfg(test)]
+use aionui_db::models::McpServerRow;
 use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IUsageEventRepository,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
+    IUsageEventRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
     UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
@@ -90,7 +93,7 @@ fn cancellation_event_suffix(state: CancellationState) -> &'static str {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-struct AssistantConversationOverrides {
+pub(crate) struct AssistantConversationOverrides {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -119,9 +122,9 @@ impl From<AssistantConversationOverridesRequest> for AssistantConversationOverri
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AssistantSnapshotResolvedDefaults {
+pub(crate) struct AssistantSnapshotResolvedDefaults {
     #[serde(default)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     #[serde(default)]
     permission: Option<String>,
     #[serde(default)]
@@ -154,12 +157,12 @@ struct AssistantSnapshotRules {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AssistantSnapshot {
+pub(crate) struct AssistantSnapshot {
     assistant_definition_id: String,
     assistant_id: String,
     assistant_source: String,
     #[serde(default)]
-    name: String,
+    pub(crate) name: String,
     #[serde(default)]
     avatar_type: String,
     #[serde(default)]
@@ -169,13 +172,13 @@ struct AssistantSnapshot {
     #[serde(default, deserialize_with = "deserialize_string_or_null")]
     agent_source: String,
     #[serde(default, alias = "agent_backend", deserialize_with = "deserialize_string_or_null")]
-    runtime_backend: String,
+    pub(crate) runtime_backend: String,
     #[serde(default = "default_assistant_snapshot_agent_type")]
-    agent_type: AgentType,
+    pub(crate) agent_type: AgentType,
     rules: AssistantSnapshotRules,
     #[serde(default)]
     default_modes: AssistantSnapshotDefaultModes,
-    resolved_defaults: AssistantSnapshotResolvedDefaults,
+    pub(crate) resolved_defaults: AssistantSnapshotResolvedDefaults,
     created_at: i64,
 }
 
@@ -370,6 +373,9 @@ pub struct ConversationService {
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
+    /// Only the agent-facing `conversation create` path reads this, to match an
+    /// aionrs assistant's default model to one of the user's providers.
+    provider_repo: Arc<RwLock<Option<Arc<dyn IProviderRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
@@ -459,6 +465,7 @@ impl ConversationService {
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
             assistant_preference_repo: Arc::new(RwLock::new(None)),
+            provider_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
@@ -661,6 +668,12 @@ impl ConversationService {
 
     pub fn with_assistant_preference_repo(&self, repo: Arc<dyn IAssistantPreferenceRepository>) {
         if let Ok(mut guard) = self.assistant_preference_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub fn with_provider_repo(&self, repo: Arc<dyn IProviderRepository>) {
+        if let Ok(mut guard) = self.provider_repo.write() {
             *guard = Some(repo);
         }
     }
@@ -869,25 +882,29 @@ impl ConversationService {
         auto_provisioned_workspace_to_delete(&self.workspace_root, row, conversation_id)
     }
 
-    fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
+    pub(crate) fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
         self.assistant_definition_repo
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
     }
 
-    fn assistant_state_repo(&self) -> Option<Arc<dyn IAssistantOverlayRepository>> {
+    pub(crate) fn assistant_state_repo(&self) -> Option<Arc<dyn IAssistantOverlayRepository>> {
         self.assistant_state_repo
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
     }
 
-    fn assistant_preference_repo(&self) -> Option<Arc<dyn IAssistantPreferenceRepository>> {
+    pub(crate) fn assistant_preference_repo(&self) -> Option<Arc<dyn IAssistantPreferenceRepository>> {
         self.assistant_preference_repo
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    pub(crate) fn provider_repo(&self) -> Option<Arc<dyn IProviderRepository>> {
+        self.provider_repo.read().ok().and_then(|guard| guard.as_ref().cloned())
     }
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
@@ -1594,7 +1611,6 @@ impl ConversationService {
                     assistant_snapshot
                         .as_ref()
                         .map(|snapshot| snapshot.resolved_defaults.mcp_ids.clone())
-                        .filter(|ids| !ids.is_empty())
                 }
             }
             None => None,
@@ -1904,7 +1920,7 @@ impl ConversationService {
         Ok(resolve_agent_binding_from_rows(&rows, value))
     }
 
-    async fn resolve_assistant_snapshot(
+    pub(crate) async fn resolve_assistant_snapshot(
         &self,
         user_id: &str,
         assistant_id: &str,
@@ -2124,6 +2140,16 @@ impl ConversationService {
                 .map(|row| row.last_mcp_ids.clone())
                 .unwrap_or_else(|| "[]".to_string())
         };
+        // Computed BEFORE the upsert overwrites the stored value: in `auto` mode
+        // this preference IS the assistant's effective MCP binding (see
+        // `resolve_effective_assistant_mcp_ids`), so changing it here is the same
+        // event a live team session gets from an assistant update. Only an
+        // already-seeded preference counts — first-time seeding is not a change.
+        let mcp_binding_fingerprint = changed_assistant_mcp_fingerprint(
+            &snapshot.default_modes.mcps,
+            &snapshot.resolved_defaults.mcp_ids,
+            existing_preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
+        )?;
 
         preference_repo
             .upsert_for_user(
@@ -2141,7 +2167,40 @@ impl ConversationService {
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference upsert failed: {e}")))?;
 
+        if let Some(fingerprint) = mcp_binding_fingerprint {
+            self.publish_assistant_mcp_binding_changed(user_id, &snapshot.assistant_id, fingerprint);
+        }
+
         Ok(())
+    }
+
+    /// Announce that an assistant's effective MCP binding changed.
+    ///
+    /// The assistant domain publishes the same event on assistant create/update.
+    /// Preferences are the OTHER half of the same binding for `auto`-mode
+    /// assistants, and a running team session that never hears about this half
+    /// keeps its members on the previous MCP set until their next attach.
+    fn publish_assistant_mcp_binding_changed(&self, user_id: &str, assistant_id: &str, fingerprint: String) {
+        let payload = AssistantMcpBindingChanged {
+            user_id: user_id.to_owned(),
+            assistant_id: assistant_id.to_owned(),
+            fingerprint,
+        };
+        match serde_json::to_value(&payload) {
+            Ok(value) => {
+                info!(
+                    user_id,
+                    assistant_id,
+                    fingerprint = %payload.fingerprint,
+                    "assistant MCP binding changed through a conversation preference"
+                );
+                self.broadcaster
+                    .broadcast(WebSocketMessage::new(ASSISTANT_MCP_BINDING_CHANGED_EVENT, value));
+            }
+            Err(error) => {
+                warn!(user_id, assistant_id, error = %error, "failed to encode assistant MCP binding event");
+            }
+        }
     }
 
     pub(crate) async fn persist_runtime_assistant_snapshot(
@@ -6163,6 +6222,54 @@ fn parse_json_string_list(raw: Option<&str>, field: &str) -> Result<Vec<String>,
     }
 }
 
+/// The new binding fingerprint when writing `resolved_mcp_ids` changes an
+/// `auto`-mode assistant's effective MCP selection, else `None`.
+///
+/// `fixed` mode is excluded because its effective ids come from the definition
+/// rather than the preference — `persist_assistant_preferences_from_snapshot`
+/// does not rewrite the preference in that mode at all, so it can never be a
+/// binding change. A missing `stored_mcp_ids` is first-time seeding, not a
+/// change: announcing it would restart a member that is already starting with
+/// exactly this selection.
+fn changed_assistant_mcp_fingerprint(
+    mode: &str,
+    resolved_mcp_ids: &[String],
+    stored_mcp_ids: Option<&str>,
+) -> Result<Option<String>, ConversationError> {
+    if mode != "auto" {
+        return Ok(None);
+    }
+    let Some(stored) = stored_mcp_ids else {
+        return Ok(None);
+    };
+    let previous = parse_json_string_list(Some(stored), "last_mcp_ids")?;
+    let next = assistant_mcp_binding_fingerprint(resolved_mcp_ids);
+    // Compare fingerprints rather than raw JSON: the fingerprint sorts and
+    // dedups, so a reordered selection is correctly treated as unchanged.
+    Ok((assistant_mcp_binding_fingerprint(&previous) != next).then_some(next))
+}
+
+#[cfg(test)]
+fn resolve_effective_assistant_mcp_ids(
+    mode: &str,
+    default_mcp_ids: &str,
+    last_mcp_ids: Option<&str>,
+) -> Result<Vec<String>, ConversationError> {
+    if mode == "fixed" {
+        parse_json_string_list(Some(default_mcp_ids), "default_mcp_ids")
+    } else {
+        last_mcp_ids
+            .map(|value| parse_json_string_list(Some(value), "last_mcp_ids"))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
+#[cfg(test)]
+fn assistant_mcp_row_is_injectable(row: &McpServerRow) -> bool {
+    row.name != TEAM_MCP_SERVER_NAME
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AssistantLineage<'a> {
     agent_type: &'a str,
@@ -6514,6 +6621,83 @@ mod tests {
         );
 
         assert_eq!(status.status, ConversationMcpStatusKind::Failed);
+    }
+
+    #[test]
+    fn fixed_empty_mcp_binding_stays_explicitly_empty() {
+        let ids = resolve_effective_assistant_mcp_ids("fixed", "[]", Some(r#"["globally-enabled"]"#)).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn overwriting_an_auto_mcp_preference_reports_the_new_fingerprint() {
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("auto", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some(r#"["mcp-b"]"#));
+    }
+
+    #[test]
+    fn reordered_auto_mcp_preference_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint(
+            "auto",
+            &["mcp-b".to_owned(), "mcp-a".to_owned()],
+            Some(r#"["mcp-a","mcp-b"]"#),
+        )
+        .unwrap();
+
+        assert_eq!(fingerprint, None, "sorting/dedup must absorb pure reordering");
+    }
+
+    #[test]
+    fn clearing_an_auto_mcp_preference_reports_the_empty_fingerprint() {
+        // "no MCP" is a real selection, not a no-op: a member left running the
+        // previous set would keep tools the user just removed.
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &[], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn first_time_auto_mcp_seeding_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &["mcp-a".to_owned()], None).unwrap();
+
+        assert_eq!(
+            fingerprint, None,
+            "seeding a brand new preference must not restart a member that is already starting with it"
+        );
+    }
+
+    #[test]
+    fn fixed_mode_never_reports_a_preference_binding_change() {
+        // In `fixed` mode the effective ids come from the definition, and the
+        // preference is copied through untouched — it can never be the change.
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("fixed", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint, None);
+    }
+
+    #[test]
+    fn explicitly_selected_disabled_mcp_row_remains_injectable() {
+        let row = McpServerRow {
+            id: "mcp-disabled".into(),
+            user_id: "user-1".into(),
+            name: "selected-disabled".into(),
+            description: None,
+            enabled: false,
+            transport_type: "stdio".into(),
+            transport_config: r#"{"command":"node"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(assistant_mcp_row_is_injectable(&row));
     }
 
     #[tokio::test]

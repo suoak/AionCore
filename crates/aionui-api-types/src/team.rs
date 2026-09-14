@@ -1893,6 +1893,17 @@ mod tests {
         assert_eq!(parsed, TeamAgentRuntimeStatus::Dormant);
     }
 
+    #[test]
+    fn interrupt_request_defaults_to_retaining_the_existing_queue() {
+        let request: InterruptTeamAgentRequest = serde_json::from_value(json!({
+            "message": "corrected requirement"
+        }))
+        .unwrap();
+        assert_eq!(request.queued_policy, TeamQueuedPolicy::Retain);
+        assert!(request.files.is_none());
+        assert!(request.reason.is_none());
+    }
+
     // -- G. Team activity read DTOs & events ----------------------------------
 
     #[test]
