@@ -10,7 +10,7 @@ use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTas
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, InterruptTeamAgentRequest, SetConfigOptionRequest,
-    SetConfigOptionResponse, TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
+    TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamConfigPersistenceStatus, TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus,
     TeamContextResetStatus, TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
     TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
