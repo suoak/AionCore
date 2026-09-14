@@ -16,8 +16,9 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::{
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CancellationChangedEvent,
-    CancellationState, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
+    AssistantMcpBindingChanged, CancelConversationResponse, CancellationChangedEvent, CancellationState,
+    CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
@@ -26,7 +27,7 @@ use aionui_api_types::{
     RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
     SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
     UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version,
+    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
 use aionui_common::{
@@ -34,11 +35,14 @@ use aionui_common::{
     OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
     now_ms, validate_workspace_path_availability,
 };
+use aionui_db::models::{
+    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
+};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IUsageEventRepository,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
+    IUsageEventRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
     UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;

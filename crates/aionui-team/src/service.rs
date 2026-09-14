@@ -85,29 +85,6 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
     }
 }
 
-/// Why a member's model selection is being persisted. Decides whether a runtime
-/// that is mid-start may block the write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelPersistTrigger {
-    /// A direct preference update from the model endpoint. Nothing has been
-    /// applied yet, so a runtime that is mid-start is a legitimate reason to
-    /// refuse — the caller can retry once it settles.
-    ExplicitRequest,
-    /// The member's runtime has already accepted the switch through the generic
-    /// config-option path. Persistence must go through regardless of runtime
-    /// state: refusing would leave the roster disagreeing with a live runtime.
-    RuntimeConfirmed,
-}
-
-impl ModelPersistTrigger {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ExplicitRequest => "explicit_request",
-            Self::RuntimeConfirmed => "runtime_confirmed",
-        }
-    }
-}
-
 struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
@@ -315,109 +292,6 @@ impl TeamSessionService {
             self.conversation_port.clone(),
             self.capability_port.clone(),
         )
-    }
-
-    /// Apply an assistant MCP binding event to matching members in active team
-    /// sessions. Persisted snapshots update immediately; ready idle runtimes are
-    /// rebuilt now, while active work records a deferred refresh.
-    pub async fn handle_assistant_mcp_binding_changed(&self, event: AssistantMcpBindingChanged) {
-        let sessions = self
-            .sessions
-            .iter()
-            .filter(|entry| entry.session.user_id() == event.user_id)
-            .map(|entry| Arc::clone(&entry.session))
-            .collect::<Vec<_>>();
-        for session in sessions {
-            let agents = session.scheduler().list_agents().await;
-            for agent in agents
-                .into_iter()
-                .filter(|agent| agent.assistant_id.as_deref() == Some(event.assistant_id.as_str()))
-            {
-                self.refresh_member_mcp_binding(&session, &event.user_id, &agent).await;
-            }
-        }
-    }
-
-    /// Re-resolve the MCP binding of EVERY member in EVERY active session.
-    ///
-    /// Recovery path for when binding-change events were missed rather than
-    /// observed — the shared event bus can drop events under load, and a dropped
-    /// event would otherwise leave a member running a stale MCP set until its
-    /// next attach. Idempotent: members whose fingerprint already matches take
-    /// the `Unchanged` branch and are left alone.
-    pub async fn reconcile_all_assistant_mcp_bindings(&self) {
-        let sessions = self
-            .sessions
-            .iter()
-            .map(|entry| Arc::clone(&entry.session))
-            .collect::<Vec<_>>();
-        let session_count = sessions.len();
-        let mut member_count = 0usize;
-        for session in sessions {
-            let user_id = session.user_id().to_owned();
-            for agent in session.scheduler().list_agents().await {
-                member_count += 1;
-                self.refresh_member_mcp_binding(&session, &user_id, &agent).await;
-            }
-        }
-        info!(
-            session_count,
-            member_count, "reconciled assistant MCP bindings across active team sessions"
-        );
-    }
-
-    /// Refresh one member's persisted MCP snapshot and decide what to do with its
-    /// runtime: leave dormant/failed slots alone, defer while attaching or
-    /// removing, and restart a ready idle runtime so it picks the new set up.
-    async fn refresh_member_mcp_binding(&self, session: &Arc<TeamSession>, user_id: &str, agent: &TeamAgent) {
-        let fingerprint = match self.provisioner().refresh_agent_mcp_snapshot(user_id, agent).await {
-            Ok(Some(fingerprint)) => fingerprint,
-            Ok(None) => return,
-            Err(error) => {
-                warn!(
-                    team_id = session.team_id(),
-                    slot_id = agent.slot_id,
-                    assistant_id = agent.assistant_id.as_deref().unwrap_or_default(),
-                    error = %error,
-                    "assistant MCP snapshot refresh failed"
-                );
-                return;
-            }
-        };
-        match session.member_runtimes().snapshot(&agent.slot_id) {
-            MemberRuntimeSnapshot::Absent
-            | MemberRuntimeSnapshot::Failed { .. }
-            | MemberRuntimeSnapshot::SessionStopped => {}
-            MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => {
-                session
-                    .work_coordinator()
-                    .defer_mcp_refresh(&agent.slot_id, &fingerprint);
-            }
-            MemberRuntimeSnapshot::Ready => {
-                match session
-                    .work_coordinator()
-                    .request_mcp_refresh(&agent.slot_id, &fingerprint)
-                {
-                    McpRefreshDisposition::Unchanged | McpRefreshDisposition::Deferred => {}
-                    McpRefreshDisposition::RestartNow => {
-                        if let Err(error) = self
-                            .restart_agent_runtime_for_mcp_refresh(user_id, session.team_id(), &agent.slot_id)
-                            .await
-                        {
-                            session
-                                .work_coordinator()
-                                .defer_mcp_refresh(&agent.slot_id, &fingerprint);
-                            warn!(
-                                team_id = session.team_id(),
-                                slot_id = agent.slot_id,
-                                error = %error,
-                                "assistant MCP runtime refresh deferred after restart race"
-                            );
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Inject the project-bind service (project-bind side branch). When unset,
@@ -854,22 +728,11 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
         let row = self.load_owned_team_row(user_id, team_id).await?;
         // Project-bind side branch: lazily backfill binding only when a single
         // team is opened (never during list_teams / lease renew).
         self.backfill_team_binding_best_effort(&row).await;
         let team = Team::from_row(&row)?;
-        // Deliberately does NOT reconcile legacy model facts. That repair reads
-        // three extra tables PER MEMBER, and this is a plain read endpoint the
-        // frontend hits whenever a team is opened. Session start owns the repair
-        // (`ensure_session`), which is the point where a stale roster would
-        // actually feed a rebuilt runtime.
         self.build_team_response(user_id, &team).await
     }
 
@@ -1226,158 +1089,6 @@ impl TeamSessionService {
         Ok(())
     }
 
-    pub async fn update_agent_model(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        slot_id: &str,
-        model: &str,
-    ) -> Result<(), TeamError> {
-        let model = model.trim();
-        if model.is_empty() {
-            return Err(TeamError::InvalidRequest("model must not be empty".into()));
-        }
-        self.persist_member_model_selection(user_id, team_id, slot_id, model, ModelPersistTrigger::ExplicitRequest)
-            .await
-    }
-
-    /// Record that a team member's model is now `model`, in every place a rebuilt
-    /// member runtime reads it from.
-    ///
-    /// Sole implementation on purpose. A model switch has to land in three places
-    /// — the conversation's persisted runtime state, the team roster, and the live
-    /// session's in-memory agent — and both entry points (the explicit model
-    /// endpoint and the generic config-option path) must update all three.
-    /// Previously each did half and the frontend chained them, so a failure
-    /// between the two calls left the runtime switched and the roster stale.
-    async fn persist_member_model_selection(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        slot_id: &str,
-        model: &str,
-        trigger: ModelPersistTrigger,
-    ) -> Result<(), TeamError> {
-        let lock = self
-            .add_agent_locks
-            .entry(team_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
-        let mut team = self.load_owned_team(user_id, team_id).await?;
-        let target = team
-            .agents
-            .iter()
-            .find(|agent| agent.slot_id == slot_id)
-            .cloned()
-            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
-        // Only an explicit preference update is refused mid-start. When the
-        // runtime has ALREADY accepted the switch, refusing here would drop the
-        // persistence and silently revert the member on its next rebuild.
-        if trigger == ModelPersistTrigger::ExplicitRequest && self.member_runtime_is_starting(team_id, &target.slot_id)
-        {
-            return Err(Self::member_runtime_starting_error(team_id, &target));
-        }
-        let agent = team
-            .agents
-            .iter_mut()
-            .find(|agent| agent.slot_id == slot_id)
-            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
-        let conversation_id = agent.conversation_id.clone();
-
-        self.conversation_port
-            .persist_confirmed_model(&conversation_id, model)
-            .await?;
-        agent.model = model.to_owned();
-        self.repo
-            .update_team(
-                user_id,
-                team_id,
-                &UpdateTeamParams {
-                    agents: Some(serde_json::to_string(&team.agents)?),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
-            session.update_agent_model(slot_id, model).await?;
-        }
-        info!(
-            team_id,
-            slot_id,
-            conversation_id,
-            model,
-            trigger = trigger.as_str(),
-            "team agent model preference persisted"
-        );
-        Ok(())
-    }
-
-    async fn reconcile_legacy_team_models(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        team: &mut Team,
-    ) -> Result<(), TeamError> {
-        let mut roster_changed = false;
-        let mut repaired = Vec::new();
-
-        for agent in &mut team.agents {
-            let facts = self
-                .conversation_port
-                .conversation_model_facts(&agent.conversation_id)
-                .await?;
-            let Some(model) = facts
-                .confirmed_model_id
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let seed_changed = facts.runtime_seed_model_id.as_deref() != Some(model.as_str());
-            if seed_changed {
-                self.conversation_port
-                    .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "current_model_id": model }))
-                    .await?;
-            }
-            let agent_changed = agent.model != model;
-            if agent_changed {
-                agent.model.clone_from(&model);
-                roster_changed = true;
-            }
-            if seed_changed || agent_changed {
-                repaired.push((agent.slot_id.clone(), model));
-            }
-        }
-
-        if roster_changed {
-            self.repo
-                .update_team(
-                    user_id,
-                    team_id,
-                    &UpdateTeamParams {
-                        agents: Some(serde_json::to_string(&team.agents)?),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-        }
-        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
-            for (slot_id, model) in &repaired {
-                session.update_agent_model(slot_id, model).await?;
-            }
-        }
-        if !repaired.is_empty() {
-            info!(
-                team_id,
-                repaired_agent_count = repaired.len(),
-                "reconciled legacy team model facts"
-            );
-        }
-        Ok(())
-    }
-
     /// Start the team's MCP server and rebuild every agent process so it
     /// carries a fresh `team_mcp_stdio_config` pointing at the new server.
     ///
@@ -1437,8 +1148,7 @@ impl TeamSessionService {
             }
         };
         let user_id = row.user_id.clone();
-        let mut team = Team::from_row(&row)?;
-        self.reconcile_legacy_team_models(&user_id, team_id, &mut team).await?;
+        let team = Team::from_row(&row)?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
@@ -1862,13 +1572,9 @@ impl TeamSessionService {
         let row = self.load_owned_team_row(user_id, team_id).await?;
 
         let team = Team::from_row(&row)?;
-        let member = team
-            .agents
-            .iter()
-            .find(|agent| agent.conversation_id == conversation_id)
-            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
-        if self.member_runtime_is_starting(team_id, &member.slot_id) {
-            return Err(Self::member_runtime_starting_error(team_id, member));
+        let member = team.agents.iter().any(|agent| agent.conversation_id == conversation_id);
+        if !member {
+            return Err(TeamError::AgentNotFound(conversation_id.to_owned()));
         }
 
         self.conversation_port.get_config_options(conversation_id).await
@@ -3078,13 +2784,6 @@ impl TeamSessionService {
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
-        if let Some(starting_member) = team
-            .agents
-            .iter()
-            .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
-        {
-            return Err(Self::member_runtime_starting_error(team_id, starting_member));
-        }
         let provisioner = self.provisioner();
         self.repo
             .update_team(

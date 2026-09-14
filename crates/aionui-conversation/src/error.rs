@@ -68,12 +68,6 @@ pub enum ConversationError {
         requested: String,
     },
 
-    /// The conversation's runtime is mid-restart, so it cannot take work or
-    /// config changes yet. A distinct variant rather than a `Busy { reason }`
-    /// so clients can recognise it by code instead of matching the message text.
-    #[error("Conversation runtime is restarting: {conversation_id}")]
-    RuntimeRestarting { conversation_id: String },
-
     #[error("Team runtime is required for conversation: {conversation_id}")]
     TeamRuntimeRequired { conversation_id: String, team_id: String },
 
@@ -124,9 +118,6 @@ impl ConversationError {
             }
             Self::BadRequest { reason } => AgentError::bad_request(reason.clone()),
             Self::Busy { reason } => AgentError::conflict(reason.clone()),
-            Self::RuntimeRestarting { conversation_id } => {
-                AgentError::conflict(format!("conversation {conversation_id} runtime is restarting"))
-            }
             Self::Forbidden { reason } => AgentError::forbidden(reason.clone()),
             Self::NotFoundReason { reason } => AgentError::not_found(reason.clone()),
             Self::Unauthorized { reason } => AgentError::unauthorized(reason.clone()),
@@ -168,7 +159,6 @@ impl ConversationError {
             Self::Unauthorized { .. } => "UNAUTHORIZED",
             Self::Forbidden { .. } => "FORBIDDEN",
             Self::Busy { .. } => "CONFLICT",
-            Self::RuntimeRestarting { .. } => "runtime_restarting",
             Self::RateLimited => "RATE_LIMITED",
             Self::Internal { .. } | Self::Acp(_) => "INTERNAL_ERROR",
             Self::BadGateway { .. } => "BAD_GATEWAY",

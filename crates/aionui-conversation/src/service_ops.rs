@@ -25,7 +25,7 @@ use aionui_api_types::{
 };
 use aionui_common::{AgentKillReason, ErrorChain, now_ms};
 use aionui_db::models::{ConversationInputRow, UpsertConversationCapabilitySnapshotParams};
-use aionui_db::{ConversationInputInsert, ConversationInputUpdate};
+use aionui_db::{ConversationInputInsert, ConversationInputUpdate, SaveRuntimeStateParams};
 use sha2::{Digest, Sha256};
 
 use tracing::{info, warn};

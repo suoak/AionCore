@@ -244,7 +244,6 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                     }
                 }
                 StartCommitResult::CancelImmediately => {
-                    let interrupt = coordinator.take_interrupt_metadata(&batch.batch_id);
                     if let Err(error) = cancellation_port
                         .cancel_agent_turn(&user_id, &conversation_id, &started.turn_id)
                         .await

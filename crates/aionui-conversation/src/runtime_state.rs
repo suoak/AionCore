@@ -27,7 +27,6 @@ struct ConversationRuntimeState {
     /// conversation and holding the turn they were meant for.
     deferred_cancels: HashMap<String, String>,
     cancellation_outcomes: HashMap<String, (String, CancellationState)>,
-    restarting_conversations: HashSet<String>,
     /// The turn each (event, conversation) pair has already been reported for.
     logged_once_per_turn: HashMap<(OncePerTurn, String), String>,
     shutting_down: bool,

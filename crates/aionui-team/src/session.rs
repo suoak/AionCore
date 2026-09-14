@@ -18,7 +18,7 @@ use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
 use crate::events::{TEAM_CHILD_TURN_CANCELLED_EVENT, TeamEventEmitter};
 use crate::mailbox::Mailbox;
-use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig};
+use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
 use crate::member_runtime::{
     AttachLease, AttachOutcome, BeginRemove, MemberRuntimeFailure, MemberRuntimeRegistry, MemberRuntimeSnapshot,
     ReserveAttach,
@@ -323,6 +323,14 @@ impl TeamSession {
         }
     }
 
+    /// Returns the stdio server spec that `TeamSessionService::ensure_session`
+    /// (D9) persists into each agent's `conversation.extra` and that ACP
+    /// `session/new` consumes via `mcp_servers`.
+    pub fn stdio_spec(&self, slot_id: &str) -> TeamMcpStdioServerSpec {
+        let binary_path = self.backend_binary_path.to_string_lossy();
+        TeamMcpStdioServerSpec::from_config(binary_path.as_ref(), &self.mcp_stdio_config(slot_id))
+    }
+
     async fn team_tool_transport_for_agent(&self, agent: &TeamAgent) -> Result<TeamToolTransport, TeamError> {
         let Some(service) = self.service.upgrade() else {
             return Ok(TeamToolTransport::Mcp);
@@ -331,9 +339,6 @@ impl TeamSession {
     }
 
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
-        if self.start_pending_mcp_refresh(slot_id) {
-            return Ok(PrepareBatchResult::Blocked);
-        }
         let agent = self.scheduler.get_agent(slot_id).await?;
         let runtime_constraint = match self.member_runtimes.snapshot(slot_id) {
             MemberRuntimeSnapshot::Absent if self.event_loops.has(slot_id) => RuntimeConstraint::Ready,
@@ -2186,7 +2191,6 @@ async fn attach_member_runtime_inner(
         kill_existing,
     )
     .await;
-    let mcp_fingerprint = attach_result.as_ref().ok().and_then(|value| value.clone());
     if let Err(error) = attach_result {
         service
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
@@ -2329,11 +2333,6 @@ async fn attach_member_runtime_inner(
     session
         .work_coordinator
         .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
-    if let Some(fingerprint) = mcp_fingerprint {
-        session
-            .work_coordinator
-            .complete_mcp_refresh(&agent.slot_id, &fingerprint);
-    }
     session.event_loops.notify(&agent.slot_id);
 
     if !service.publish_member_runtime_ready_if_current(&session, &agent) {
@@ -2811,14 +2810,17 @@ mod tests {
         assert_eq!(config.team_id, "t1");
         assert_eq!(config.slot_id, "lead-1");
         assert_eq!(config.port, session.mcp_server.port());
-        assert_eq!(config.token, session.mcp_server.auth_token());
+        session.stop();
+    }
 
-        // Every agent shares the team's listener and token but must carry its own
-        // slot_id — that is the only thing distinguishing callers on the MCP server.
-        let worker = session.mcp_stdio_config("worker-1");
-        assert_eq!(worker.port, config.port);
-        assert_eq!(worker.token, config.token);
-        assert_ne!(worker.slot_id, config.slot_id);
+    #[tokio::test]
+    async fn stdio_spec_uses_fixed_name_and_binary_path() {
+        let session = start_session().await;
+        let spec = session.stdio_spec("lead-1");
+        assert_eq!(spec.name, crate::mcp::TEAM_MCP_SERVER_NAME);
+        assert_eq!(spec.command, "/tmp/aioncore-test");
+        assert_eq!(spec.args, vec!["mcp-bridge".to_string()]);
+        assert!(spec.env.iter().any(|(k, v)| k == "TEAM_AGENT_SLOT_ID" && v == "lead-1"));
         session.stop();
     }
 

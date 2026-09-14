@@ -79,18 +79,6 @@ pub struct TeamConversationCreateResult {
     pub workspace: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct TeamMcpSnapshotResolution {
-    pub snapshot: McpRuntimeSnapshot,
-    pub fingerprint: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TeamConversationModelFacts {
-    pub confirmed_model_id: Option<String>,
-    pub runtime_seed_model_id: Option<String>,
-}
-
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn create_team_conversation(
@@ -306,9 +294,6 @@ impl TeamAgentProvisioner {
             let backend = self
                 .resolve_requested_backend(user_id, input.backend.as_deref(), assistant_id.as_deref())
                 .await?;
-            let mcp_selection = self
-                .resolve_assistant_mcp_selection(user_id, assistant_id.as_deref())
-                .await?;
             let conversation = self
                 .create_team_conversation_for_agent(
                     user_id,
@@ -522,48 +507,7 @@ impl TeamAgentProvisioner {
             outcome = "attached",
             "Team agent provisioner attached runtime process"
         );
-        Ok(mcp_resolution.fingerprint)
-    }
-
-    /// Resolve the MCP selection for an agent that is about to be CREATED.
-    ///
-    /// An unresolvable `assistant_id` is a hard error here, matching
-    /// `resolve_requested_backend`: the caller passed an assistant that does not
-    /// exist, and failing before anything is persisted is the correct response.
-    /// This is deliberately asymmetric with the attach/refresh path — see
-    /// `resolve_conversation_mcp_snapshot`, where a vanished assistant must
-    /// degrade to the persisted snapshot instead of stranding a live member.
-    async fn resolve_assistant_mcp_selection(
-        &self,
-        user_id: &str,
-        assistant_id: Option<&str>,
-    ) -> Result<TeamMcpSelection, TeamError> {
-        let Some(assistant_id) = assistant_id else {
-            return Ok(TeamMcpSelection::default());
-        };
-        self.conversation_port
-            .resolve_assistant_mcp_selection(user_id, assistant_id)
-            .await?
-            .ok_or_else(|| TeamError::InvalidRequest(format!("Assistant MCP binding is unavailable: {assistant_id}")))
-    }
-
-    /// Persist the latest assistant MCP snapshot without disturbing a dormant
-    /// or currently working runtime.
-    pub(crate) async fn refresh_agent_mcp_snapshot(
-        &self,
-        user_id: &str,
-        agent: &TeamAgent,
-    ) -> Result<Option<String>, TeamError> {
-        let resolution = self
-            .conversation_port
-            .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
-            .await?;
-        let mut patch = serde_json::json!({});
-        merge_mcp_snapshot_into_patch(&mut patch, &resolution);
-        self.conversation_port
-            .patch_runtime_config(&agent.conversation_id, patch)
-            .await?;
-        Ok(resolution.fingerprint)
+        Ok(())
     }
 
     /// Pick how team tools reach this agent from the unified capability port.
@@ -937,35 +881,6 @@ impl TeamAgentProvisioner {
             }
         }
         None
-    }
-}
-
-/// Merge a resolved MCP snapshot into a conversation runtime-config patch.
-///
-/// The four snapshot fields are always written — an empty selection is a real
-/// selection and must overwrite whatever was stored. `assistant_mcp_fingerprint`
-/// is written ONLY when the resolution carries one: a `None` fingerprint means
-/// the assistant binding could not be resolved and the snapshot came from what
-/// was already persisted (see `resolve_conversation_mcp_snapshot`). Writing
-/// `null` there would erase the last known binding identity and leave no way to
-/// tell which MCP set a degraded member is actually running.
-fn merge_mcp_snapshot_into_patch(patch: &mut serde_json::Value, resolution: &TeamMcpSnapshotResolution) {
-    let Some(object) = patch.as_object_mut() else {
-        return;
-    };
-    let snapshot = &resolution.snapshot;
-    object.insert("mcp_server_ids".to_owned(), serde_json::json!(snapshot.mcp_server_ids));
-    object.insert(
-        "session_mcp_servers".to_owned(),
-        serde_json::json!(snapshot.session_mcp_servers),
-    );
-    object.insert("mcp_servers".to_owned(), serde_json::json!(snapshot.mcp_servers));
-    object.insert("mcp_statuses".to_owned(), serde_json::json!(snapshot.mcp_statuses));
-    if let Some(fingerprint) = resolution.fingerprint.as_deref() {
-        object.insert(
-            "assistant_mcp_fingerprint".to_owned(),
-            serde_json::Value::String(fingerprint.to_owned()),
-        );
     }
 }
 

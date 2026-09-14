@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
@@ -449,20 +449,6 @@ async fn rename_agent(
     Ok(Json(ApiResponse::success()))
 }
 
-async fn update_agent_model(
-    State(state): State<TeamRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    Path(params): Path<AgentPathParams>,
-    body: Result<Json<SetModelRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    state
-        .service
-        .update_agent_model(&user.id, &params.id, &params.slot_id, &req.model_id)
-        .await?;
-    Ok(Json(ApiResponse::success()))
-}
-
 /// Directed retry/wakeup of a single member runtime (dormant or failed).
 /// Backs the send-box "retry start" entry. State-changing → auth + CSRF apply
 /// via the team router middleware layer, same as add/remove/send.
@@ -556,20 +542,6 @@ async fn send_message_to_agent(
         .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
         .await?;
     Ok(Json(ApiResponse::ok(ack)))
-}
-
-async fn interrupt_agent(
-    State(state): State<TeamRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    Path(params): Path<AgentPathParams>,
-    body: Result<Json<InterruptTeamAgentRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<TeamInterruptAgentResponse>>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let response = state
-        .service
-        .interrupt_agent(&user.id, &params.id, &params.slot_id, req)
-        .await?;
-    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn cancel_run(
