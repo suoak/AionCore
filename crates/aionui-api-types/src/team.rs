@@ -3,7 +3,25 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::TeamMcpStdioConfig;
 use crate::chat_file::ChatFileRef;
-use crate::{ConversationMcpStatus, SessionMcpServer};
+use crate::{ConversationMcpStatus, SessionMcpServer, SetConfigOptionResponse};
+
+/// Persistence outcome for a team-owned runtime config change. Runtime
+/// confirmation and durable roster persistence are separate operations, so the
+/// API must not report a partial success as an unqualified success.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamConfigPersistenceStatus {
+    NotRequired,
+    Persisted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSetConfigOptionResponse {
+    #[serde(flatten)]
+    pub runtime: SetConfigOptionResponse,
+    pub persistence: TeamConfigPersistenceStatus,
+}
 
 // ---------------------------------------------------------------------------
 // A. Team management — Request DTOs
@@ -2027,5 +2045,20 @@ mod tests {
         assert_eq!(value["message"]["read"], json!(true));
         let restored: TeamMailboxChangedPayload = serde_json::from_value(value).unwrap();
         assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn team_config_response_exposes_partial_persistence_failure() {
+        let response = TeamSetConfigOptionResponse {
+            runtime: SetConfigOptionResponse {
+                confirmation: crate::ConfigOptionConfirmation::Observed,
+                config_options: Some(Vec::new()),
+            },
+            persistence: TeamConfigPersistenceStatus::Failed,
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["confirmation"], json!("observed"));
+        assert_eq!(value["persistence"], json!("failed"));
     }
 }
