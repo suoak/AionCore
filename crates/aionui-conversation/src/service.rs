@@ -35,9 +35,9 @@ use aionui_common::{
     OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
     now_ms, validate_workspace_path_availability,
 };
-use aionui_db::models::{
-    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
-};
+#[cfg(test)]
+use aionui_db::models::McpServerRow;
+use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -6162,6 +6162,7 @@ fn changed_assistant_mcp_fingerprint(
     Ok((assistant_mcp_binding_fingerprint(&previous) != next).then_some(next))
 }
 
+#[cfg(test)]
 fn resolve_effective_assistant_mcp_ids(
     mode: &str,
     default_mcp_ids: &str,
@@ -6177,6 +6178,7 @@ fn resolve_effective_assistant_mcp_ids(
     }
 }
 
+#[cfg(test)]
 fn assistant_mcp_row_is_injectable(row: &McpServerRow) -> bool {
     row.name != TEAM_MCP_SERVER_NAME
 }
