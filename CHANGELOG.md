@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.12](https://github.com/suoak/AionCore/compare/v0.2.11...v0.2.12) (2026-09-14)
+
+
+### Bug Fixes
+
+* **team:** report config persistence outcome ([#123](https://github.com/suoak/AionCore/issues/123)) ([d23c867](https://github.com/suoak/AionCore/commit/d23c8674bb934b7805b123d9f3844792da41a25b))
+
 ## [0.2.11](https://github.com/suoak/AionCore/compare/v0.2.10...v0.2.11) (2026-09-14)
 
 
