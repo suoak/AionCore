@@ -124,6 +124,6 @@ description: 'CSBU WorkMate WebUI configuration expert: Helps users configure CS
 
 ## 参考资源
 
-- [CSBU WorkMate Wiki - Remote Internet Access Guide](https://github.com/iOfficeAI/AionUi/wiki/Remote-Internet-Access-Guide)
-- [CSBU WorkMate Wiki - WebUI Configuration Guide](https://github.com/iOfficeAI/AionUi/wiki/WebUI-Configuration-Guide)
+- [CSBU WorkMate Wiki - Remote Internet Access Guide](https://github.com/suoak/AionUi/wiki/Remote-Internet-Access-Guide)
+- [CSBU WorkMate Wiki - WebUI Configuration Guide](https://github.com/suoak/AionUi/wiki/WebUI-Configuration-Guide)
 - [Tailscale 官方文档](https://tailscale.com/kb/)
