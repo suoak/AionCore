@@ -435,8 +435,8 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /Applications/
 
 ## 相关资源
 
-- [CSBU WorkMate Wiki - Remote Internet Access Guide](https://github.com/iOfficeAI/AionUi/wiki/Remote-Internet-Access-Guide)
-- [CSBU WorkMate Wiki - WebUI Configuration Guide](https://github.com/iOfficeAI/AionUi/wiki/WebUI-Configuration-Guide)
+- [CSBU WorkMate Wiki - Remote Internet Access Guide](https://github.com/suoak/AionUi/wiki/Remote-Internet-Access-Guide)
+- [CSBU WorkMate Wiki - WebUI Configuration Guide](https://github.com/suoak/AionUi/wiki/WebUI-Configuration-Guide)
 - [Tailscale 官方文档](https://tailscale.com/kb/)
 
 ---
