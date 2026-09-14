@@ -117,6 +117,9 @@ pub(crate) enum Command {
     /// Cross-session messaging: list deliverable conversations and deliver a
     /// message to one of them.
     Session(SessionArgs),
+    /// Agent-facing conversation CLI: create a new conversation for this user
+    /// that inherits (or overrides) the current conversation's setup.
+    Conversation(ConversationArgs),
     /// Agent-facing read-only runtime CLI for THIS conversation's skills.
     /// Channel A of skill delivery: a normal tool call instead of the
     /// `[LOAD_SKILL]` text-protocol round trip.
@@ -160,6 +163,7 @@ impl Command {
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
             Self::Session(_) => "session",
+            Self::Conversation(_) => "conversation",
             Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
@@ -240,6 +244,20 @@ pub(crate) enum SessionCommand {
     Capabilities,
     List,
     SendMessage,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConversationArgs {
+    #[command(subcommand)]
+    pub command: ConversationCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConversationCommand {
+    Capabilities,
+    Create,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
@@ -819,8 +837,9 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SecretArgs,
-        SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
+        Cli, Command, ConfigArgs, ConfigCommand, ConversationCommand, ManagedResourcesModeArg,
+        PrepareManagedResourcesArgs, SecretArgs, SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand,
+        UserStatusArgs,
     };
 
     #[test]
@@ -1069,6 +1088,41 @@ mod tests {
             SessionCommand::Unknown(_) => None,
             command => Some(command),
         }
+    }
+
+    fn parse_conversation_command(argv: &[&str]) -> Option<ConversationCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Conversation(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            ConversationCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    #[test]
+    fn every_registry_tool_has_a_wired_conversation_cli_subcommand() {
+        for tool in aionui_api_types::conversation_tool_descriptors() {
+            let mut argv = vec!["aioncore", "conversation"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_conversation_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into ConversationCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_cli_paths_match_the_tool_registry() {
+        assert!(parse_conversation_command(&["aioncore", "conversation", "capabilities"]).is_some());
+        assert!(matches!(
+            parse_conversation_command(&["aioncore", "conversation", "create"]),
+            Some(ConversationCommand::Create)
+        ));
+        assert!(parse_conversation_command(&["aioncore", "conversation", "definitely-not-a-command"]).is_none());
     }
 
     /// Every tool in the session registry advertises a `cli_command`, and that
