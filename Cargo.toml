@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.11"
+version = "0.2.12"
 edition = "2024"
 license = "MIT"
 
@@ -65,12 +65,12 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.22" }
-aion-providers = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.22" }
-aion-types = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.22" }
-aion-protocol = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.22" }
-aion-config = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.22" }
-aion-mcp = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.22" }
+aion-agent = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.23" }
+aion-providers = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.23" }
+aion-types = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.23" }
+aion-protocol = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.23" }
+aion-config = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.23" }
+aion-mcp = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.23" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
