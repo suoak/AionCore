@@ -92,7 +92,7 @@ pub(super) async fn run_stdio_protocol(
             Some(serde_json::json!({ "transport": "stdio", "stage": "initialize_send" })),
         );
     }
-    let init_resp = match read_jsonrpc_response(&mut reader).await {
+    let init_resp = match read_jsonrpc_response(&mut reader, 1).await {
         Ok(r) => r,
         Err(e) => {
             return error_result(
@@ -123,7 +123,7 @@ pub(super) async fn run_stdio_protocol(
             Some(serde_json::json!({ "transport": "stdio", "stage": "tools_list_send" })),
         );
     }
-    let tools_resp = match read_jsonrpc_response(&mut reader).await {
+    let tools_resp = match read_jsonrpc_response(&mut reader, 2).await {
         Ok(r) => r,
         Err(e) => {
             return error_result(
@@ -140,6 +140,27 @@ pub(super) async fn run_stdio_protocol(
     success_result(tools_resp.result)
 }
 
+/// Run one MCP tool call over a freshly initialized stdio connection.
+pub(super) async fn run_stdio_tool_call(
+    mut stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut reader = BufReader::new(stdout);
+    write_jsonrpc_line(&mut stdin, &build_initialize_request(1))
+        .await
+        .map_err(|error| format!("failed to send initialize: {error}"))?;
+    ensure_rpc_success("initialize", read_jsonrpc_response(&mut reader, 1).await?)?;
+    write_jsonrpc_line(&mut stdin, &build_initialized_notification())
+        .await
+        .map_err(|error| format!("failed to send initialized: {error}"))?;
+    write_jsonrpc_line(&mut stdin, &build_tools_call_request(2, tool_name, arguments))
+        .await
+        .map_err(|error| format!("failed to send tools/call: {error}"))?;
+    rpc_result("tools/call", read_jsonrpc_response(&mut reader, 2).await?)
+}
+
 /// Write a JSON-RPC message as a newline-delimited line to stdin.
 async fn write_jsonrpc_line<T: Serialize>(stdin: &mut tokio::process::ChildStdin, msg: &T) -> std::io::Result<()> {
     let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
@@ -152,7 +173,10 @@ async fn write_jsonrpc_line<T: Serialize>(stdin: &mut tokio::process::ChildStdin
 ///
 /// Skips server notifications (messages without an `id` field) and
 /// non-JSON lines (e.g. logging output).
-async fn read_jsonrpc_response(reader: &mut BufReader<tokio::process::ChildStdout>) -> Result<JsonRpcResponse, String> {
+async fn read_jsonrpc_response(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    expected_id: u64,
+) -> Result<JsonRpcResponse, String> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -168,7 +192,7 @@ async fn read_jsonrpc_response(reader: &mut BufReader<tokio::process::ChildStdou
             continue;
         }
         if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed)
-            && resp.id.is_some()
+            && resp.id == Some(expected_id)
         {
             return Ok(resp);
         }
@@ -244,13 +268,14 @@ pub(super) async fn wait_for_endpoint(
 /// Wait for the next JSON-RPC response from the SSE stream.
 pub(super) async fn wait_for_jsonrpc_response(
     event_rx: &mut mpsc::Receiver<SseEvent>,
+    expected_id: u64,
 ) -> Result<JsonRpcResponse, String> {
     loop {
         match event_rx.recv().await {
             Some(event) if event.event_type == "message" => {
                 let resp: JsonRpcResponse =
                     serde_json::from_str(&event.data).map_err(|e| format!("Invalid JSON-RPC in SSE: {e}"))?;
-                if resp.id.is_some() {
+                if resp.id == Some(expected_id) {
                     return Ok(resp);
                 }
             }
@@ -355,6 +380,42 @@ pub(super) fn build_tools_list_request(id: u64) -> JsonRpcRequest {
         method: "tools/list".into(),
         params: None,
     }
+}
+
+pub(super) fn build_tools_call_request(id: u64, tool_name: &str, arguments: serde_json::Value) -> JsonRpcRequest {
+    JsonRpcRequest {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments,
+        })),
+    }
+}
+
+pub(super) fn ensure_rpc_success(method: &str, response: JsonRpcResponse) -> Result<(), String> {
+    rpc_result(method, response).map(|_| ())
+}
+
+pub(super) fn ensure_rpc_response_id(method: &str, expected_id: u64, response: &JsonRpcResponse) -> Result<(), String> {
+    if response.id == Some(expected_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{method} response id mismatch: expected {expected_id}, received {:?}",
+            response.id
+        ))
+    }
+}
+
+pub(super) fn rpc_result(method: &str, response: JsonRpcResponse) -> Result<serde_json::Value, String> {
+    if let Some(error) = response.error {
+        return Err(format!("{method} error: {} (code {})", error.message, error.code));
+    }
+    response
+        .result
+        .ok_or_else(|| format!("{method} response is missing result"))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +600,47 @@ fn detect_auth_method(www_authenticate: &str) -> McpAuthMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_call_request_preserves_name_and_object_arguments() {
+        let request = build_tools_call_request(7, "create_issue", serde_json::json!({ "title": "Finding" }));
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["method"], "tools/call");
+        assert_eq!(value["params"]["name"], "create_issue");
+        assert_eq!(value["params"]["arguments"]["title"], "Finding");
+    }
+
+    #[test]
+    fn tool_call_rpc_error_keeps_method_and_code() {
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(2),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32602,
+                message: "invalid arguments".into(),
+            }),
+        };
+        assert_eq!(
+            rpc_result("tools/call", response),
+            Err("tools/call error: invalid arguments (code -32602)".into())
+        );
+    }
+
+    #[test]
+    fn rpc_response_id_must_match_the_request() {
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(9),
+            result: Some(serde_json::json!({})),
+            error: None,
+        };
+        assert!(
+            ensure_rpc_response_id("tools/call", 2, &response)
+                .unwrap_err()
+                .contains("expected 2")
+        );
+    }
 
     // -- SSE event parsing ------------------------------------------------
 

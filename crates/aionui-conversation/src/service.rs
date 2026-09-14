@@ -31,8 +31,9 @@ use aionui_api_types::{
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
 use aionui_common::{
-    AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
+    AgentKillReason, AgentType, ConversationSource, ConversationStatus, ConversationTurnSettlement, ErrorChain,
+    MessageType, OnConversationDelete, OnConversationTurnCancelled, OnConversationTurnSettled,
+    OnConversationTurnStarting, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
     now_ms, validate_workspace_path_availability,
 };
 #[cfg(test)]
@@ -364,6 +365,10 @@ pub struct ConversationService {
     /// services can drop work aimed at this conversation. See
     /// `OnConversationTurnCancelled` for why only some branches fire.
     turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
+    /// Hooks invoked after an agent turn reaches a terminal result.
+    turn_settled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnSettled>>>>,
+    /// Guards invoked before and immediately after claiming a new turn.
+    turn_starting_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnStarting>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -454,6 +459,8 @@ impl ConversationService {
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_settled_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_starting_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -699,6 +706,66 @@ impl ConversationService {
     pub fn with_turn_cancelled_hook(&self, hook: Arc<dyn OnConversationTurnCancelled>) {
         if let Ok(mut guard) = self.turn_cancelled_hooks.write() {
             guard.push(hook);
+        }
+    }
+
+    /// Register a hook notified after an agent turn reaches a terminal result.
+    pub fn with_turn_settled_hook(&self, hook: Arc<dyn OnConversationTurnSettled>) {
+        if let Ok(mut guard) = self.turn_settled_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    /// Register a guard that may reject creation of a new conversation turn.
+    pub fn with_turn_starting_hook(&self, hook: Arc<dyn OnConversationTurnStarting>) {
+        if let Ok(mut guard) = self.turn_starting_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    async fn validate_turn_start(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        conversation_extra: &str,
+    ) -> Result<(), ConversationError> {
+        let hooks = self
+            .turn_starting_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.validate_turn_start(user_id, conversation_id, conversation_extra)
+                .await
+                .map_err(|reason| ConversationError::Busy { reason })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn notify_turn_settled(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        settlement: ConversationTurnSettlement,
+        error_message: Option<&str>,
+        assistant_output: Option<&str>,
+    ) {
+        let hooks: Vec<Arc<dyn OnConversationTurnSettled>> = self
+            .turn_settled_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.on_turn_settled(
+                user_id,
+                conversation_id,
+                turn_id,
+                settlement,
+                error_message,
+                assistant_output,
+            )
+            .await;
         }
     }
 
@@ -4114,6 +4181,7 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+        self.validate_turn_start(user_id, conversation_id, &row.extra).await?;
 
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
@@ -4201,6 +4269,13 @@ impl ConversationService {
             let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
             (turn_id, turn_claim)
         };
+        if let Err(error) = self.validate_turn_start(user_id, conversation_id, &row.extra).await {
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                .await;
+            return Err(error);
+        }
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -4354,9 +4429,21 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+        self.validate_turn_start(&request.user_id, &request.conversation_id, &row.extra)
+            .await?;
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        if let Err(error) = self
+            .validate_turn_start(&request.user_id, &request.conversation_id, &row.extra)
+            .await
+        {
+            let mut turn_claim = turn_claim;
+            let was_deleting = turn_claim.release();
+            self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
+                .await;
+            return Err(error);
+        }
         if request.persist_user_message {
             let user_msg_id = Self::mint_msg_id();
             let user_msg = aionui_db::models::MessageRow {

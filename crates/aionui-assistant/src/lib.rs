@@ -21,8 +21,11 @@ pub mod skill_evolution_service;
 pub mod state;
 
 pub use agent_catalog::AssistantAgentCatalogPort;
-pub use agent_center_routes::{AgentCenterRouterState, agent_center_routes};
-pub use agent_center_service::AgentCenterService;
+pub use agent_center_routes::{
+    AgentCenterRouterState, AgentWorkflowAgentCancellationOutcome, AgentWorkflowAgentExecutionCancellationPort,
+    agent_center_routes,
+};
+pub use agent_center_service::{AgentCenterService, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult};
 pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};
 pub use error::AssistantError;
 pub use routes::{AssistantRouterState, assistant_routes};

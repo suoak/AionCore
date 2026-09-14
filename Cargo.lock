@@ -741,6 +741,7 @@ dependencies = [
  "axum",
  "dashmap",
  "dirs",
+ "futures-util",
  "oauth2",
  "open",
  "reqwest",

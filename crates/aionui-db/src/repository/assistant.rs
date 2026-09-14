@@ -2,10 +2,11 @@
 
 use crate::error::DbError;
 use crate::models::{
-    AssistantAgentCenterRow, AssistantDefinitionRevisionRow, AssistantDefinitionRow, AssistantOverlayRow,
-    AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CreateAssistantDefinitionRevisionParams,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertOverrideParams,
+    AgentWorkflowRunRow, AssistantAgentCenterRow, AssistantDefinitionRevisionRow, AssistantDefinitionRow,
+    AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CreateAgentWorkflowRunParams,
+    CreateAssistantDefinitionRevisionParams, CreateAssistantParams, UpdateAssistantParams,
+    UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
 
 /// CRUD access for user-authored assistant rows.
@@ -246,4 +247,28 @@ pub trait IAssistantDefinitionRevisionRepository: Send + Sync {
         &self,
         params: &CreateAssistantDefinitionRevisionParams<'_>,
     ) -> Result<AssistantDefinitionRevisionRow, DbError>;
+}
+
+#[async_trait::async_trait]
+pub trait IAgentWorkflowRunRepository: Send + Sync {
+    async fn create(&self, params: &CreateAgentWorkflowRunParams<'_>) -> Result<AgentWorkflowRunRow, DbError>;
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentWorkflowRunRow>, DbError>;
+    async fn list_by_status(&self, status: &str) -> Result<Vec<AgentWorkflowRunRow>, DbError>;
+    async fn list_for_assistant(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentWorkflowRunRow>, DbError>;
+    /// Atomically updates a run only when its serialized state still matches
+    /// the state read by the caller. Returns `None` on a concurrent change or
+    /// when the scoped run does not exist.
+    async fn update_state_if_current(
+        &self,
+        user_id: &str,
+        id: &str,
+        expected_state_json: &str,
+        status: &str,
+        state_json: &str,
+    ) -> Result<Option<AgentWorkflowRunRow>, DbError>;
 }

@@ -57,3 +57,46 @@ pub enum TurnCancelCause {
 pub trait OnConversationTurnCancelled: Send + Sync {
     async fn on_turn_cancelled(&self, user_id: &str, conversation_id: &str, turn_id: &str, cause: TurnCancelCause);
 }
+
+/// Guards the boundary immediately before a new conversation turn starts.
+///
+/// Application adapters use this to keep conversation-backed workflows from
+/// starting work after their owning run has already reached a terminal state.
+/// The check is intentionally repeated after the runtime turn claim is taken,
+/// closing the race between an initial check and concurrent cancellation.
+#[async_trait]
+pub trait OnConversationTurnStarting: Send + Sync {
+    async fn validate_turn_start(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        conversation_extra: &str,
+    ) -> Result<(), String>;
+}
+
+/// Terminal result of an agent turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationTurnSettlement {
+    Completed,
+    Failed,
+}
+
+/// Notified after an agent turn has reached a terminal result and the
+/// conversation runtime state has been released.
+///
+/// This hook is intentionally defined in the common crate so an application
+/// adapter can connect conversation lifecycle events to another domain without
+/// introducing a dependency from `aionui-conversation` to that domain. Hooks
+/// run sequentially and must handle their own failures.
+#[async_trait]
+pub trait OnConversationTurnSettled: Send + Sync {
+    async fn on_turn_settled(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        settlement: ConversationTurnSettlement,
+        error_message: Option<&str>,
+        assistant_output: Option<&str>,
+    );
+}
