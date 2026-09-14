@@ -198,29 +198,6 @@ fn directed_message_follows_a_coalesced_foreground_backlog() {
 }
 
 #[test]
-fn directed_message_follows_a_coalesced_foreground_backlog() {
-    let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
-    enqueue(&coordinator, WorkSource::McpSendMessage, "directed-1");
-    for index in 1..=5 {
-        enqueue(&coordinator, WorkSource::UserMessage, &format!("foreground-{index}"));
-    }
-
-    let ReconcileDecision::Claim(foreground) = coordinator.next("lead-1") else {
-        panic!("foreground backlog must be claimable");
-    };
-    assert_eq!(foreground.highest_priority, WorkPriority::Foreground);
-    assert_eq!(foreground.mailbox_message_ids.len(), 5);
-    assert_eq!(coordinator.complete_batch(&foreground), CommitResult::Committed);
-
-    let ReconcileDecision::Claim(directed) = coordinator.next("lead-1") else {
-        panic!("directed message must follow the foreground batch");
-    };
-    assert_eq!(directed.highest_priority, WorkPriority::Directed);
-    assert_eq!(directed.mailbox_message_ids, vec!["directed-1"]);
-}
-
-#[test]
 fn five_enqueues_require_one_reconcile_not_five_signals() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);

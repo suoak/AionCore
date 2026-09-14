@@ -417,7 +417,6 @@ pub(crate) mod workspace_harness {
     };
     use crate::provisioning::{
         TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
-        TeamMcpSnapshotResolution,
     };
     use crate::{TeamError, TeamProjectionMessageStore, TeamSessionService};
 
@@ -1007,28 +1006,6 @@ pub(crate) mod workspace_harness {
             })
         }
 
-        // This harness deliberately models NO assistant MCP bindings: the tests
-        // built on it cover scheduling, mailbox and runtime lifecycle, not MCP
-        // injection (see `tests/session_service_integration.rs` for that). Stated
-        // explicitly rather than inherited from a trait default so that "no MCP
-        // here" is a choice this double makes, not an accident.
-        async fn resolve_assistant_mcp_selection(
-            &self,
-            _user_id: &str,
-            _assistant_id: &str,
-        ) -> Result<Option<TeamMcpSelection>, TeamError> {
-            Ok(Some(TeamMcpSelection::default()))
-        }
-
-        async fn resolve_conversation_mcp_snapshot(
-            &self,
-            _user_id: &str,
-            _conversation_id: &str,
-            _assistant_id: Option<&str>,
-        ) -> Result<TeamMcpSnapshotResolution, TeamError> {
-            Ok(TeamMcpSnapshotResolution::default())
-        }
-
         async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
             Ok(self.repo.get_extra(conversation_id).and_then(|extra| {
                 extra
@@ -1095,28 +1072,6 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
-        async fn conversation_model_facts(
-            &self,
-            conversation_id: &str,
-        ) -> Result<crate::TeamConversationModelFacts, TeamError> {
-            let extra = self
-                .repo
-                .get_extra(conversation_id)
-                .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
-            let value = |key: &str| {
-                extra
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-            };
-            Ok(crate::TeamConversationModelFacts {
-                confirmed_model_id: value("confirmed_model_id").or_else(|| value("current_model_id")),
-                runtime_seed_model_id: value("current_model_id"),
-            })
-        }
-
         async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
             self.patch_runtime_config(conversation_id, serde_json::json!({ "session_mode": mode }))
                 .await
@@ -1142,38 +1097,21 @@ pub(crate) mod workspace_harness {
                 .unwrap_or("mock-model")
                 .to_owned();
             Ok(GetConfigOptionsResponse {
-                config_options: vec![
-                    AcpConfigOptionDto {
-                        id: "model".to_owned(),
+                config_options: vec![AcpConfigOptionDto {
+                    id: "model".to_owned(),
+                    name: None,
+                    label: Some("Model".to_owned()),
+                    description: None,
+                    category: Some("model".to_owned()),
+                    option_type: "select".to_owned(),
+                    current_value: Some(model.clone()),
+                    options: vec![AcpConfigSelectOptionDto {
+                        value: model.clone(),
                         name: None,
-                        label: Some("Model".to_owned()),
+                        label: Some(model),
                         description: None,
-                        category: Some("model".to_owned()),
-                        option_type: "select".to_owned(),
-                        current_value: Some(model.clone()),
-                        options: vec![AcpConfigSelectOptionDto {
-                            value: model.clone(),
-                            name: None,
-                            label: Some(model),
-                            description: None,
-                        }],
-                    },
-                    AcpConfigOptionDto {
-                        id: "mode".to_owned(),
-                        name: None,
-                        label: Some("Mode".to_owned()),
-                        description: None,
-                        category: Some("mode".to_owned()),
-                        option_type: "select".to_owned(),
-                        current_value: Some("default".to_owned()),
-                        options: vec![AcpConfigSelectOptionDto {
-                            value: "default".to_owned(),
-                            name: None,
-                            label: Some("Default".to_owned()),
-                            description: None,
-                        }],
-                    },
-                ],
+                    }],
+                }],
             })
         }
 
