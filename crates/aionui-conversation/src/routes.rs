@@ -43,9 +43,6 @@ impl From<ConversationError> for ApiError {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", reason, None)
             }
             ConversationError::Busy { reason } => ApiError::Conflict(reason),
-            ConversationError::RuntimeRestarting { conversation_id } => {
-                ApiError::Conflict(format!("conversation {conversation_id} runtime is restarting"))
-            }
             ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
             ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
             ConversationError::Unauthorized { reason } => ApiError::Unauthorized(reason),
@@ -81,6 +78,12 @@ impl From<ConversationError> for ApiError {
                     "option_id": option_id,
                     "requested": requested,
                 })),
+            ),
+            ConversationError::RuntimeRestarting { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "runtime_restarting",
+                "Conversation runtime is restarting",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
             ),
             ConversationError::TeamRuntimeRequired {
                 conversation_id,

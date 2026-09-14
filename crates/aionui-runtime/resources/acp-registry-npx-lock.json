@@ -58,7 +58,7 @@
     "sigit": {
       "registry_json_id": "sigit",
       "package": "@smbcloud/sigit",
-      "version": "1.5.2",
+      "version": "1.5.7",
       "skip_version_probe": true
     }
   }

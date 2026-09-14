@@ -118,9 +118,6 @@ impl ConversationError {
             }
             Self::BadRequest { reason } => AgentError::bad_request(reason.clone()),
             Self::Busy { reason } => AgentError::conflict(reason.clone()),
-            Self::RuntimeRestarting { conversation_id } => {
-                AgentError::conflict(format!("conversation {conversation_id} runtime is restarting"))
-            }
             Self::Forbidden { reason } => AgentError::forbidden(reason.clone()),
             Self::NotFoundReason { reason } => AgentError::not_found(reason.clone()),
             Self::Unauthorized { reason } => AgentError::unauthorized(reason.clone()),
@@ -129,6 +126,9 @@ impl ConversationError {
             Self::Timeout { reason } => AgentError::timeout(reason.clone()),
             Self::ConfigConfirmationTimeout { .. } => AgentError::timeout("ACP config option confirmation timed out"),
             Self::ConfigUpdateInProgress { .. } => AgentError::conflict("ACP config update is already in progress"),
+            Self::RuntimeRestarting { conversation_id } => {
+                AgentError::conflict(format!("conversation {conversation_id} runtime is restarting"))
+            }
             Self::TeamRuntimeRequired { .. } => {
                 AgentError::conflict("This conversation belongs to a team; use the team runtime session")
             }
@@ -159,13 +159,13 @@ impl ConversationError {
             Self::Unauthorized { .. } => "UNAUTHORIZED",
             Self::Forbidden { .. } => "FORBIDDEN",
             Self::Busy { .. } => "CONFLICT",
-            Self::RuntimeRestarting { .. } => "runtime_restarting",
             Self::RateLimited => "RATE_LIMITED",
             Self::Internal { .. } | Self::Acp(_) => "INTERNAL_ERROR",
             Self::BadGateway { .. } => "BAD_GATEWAY",
             Self::Timeout { .. } => "TIMEOUT",
             Self::ConfigConfirmationTimeout { .. } => "confirmation_timeout",
             Self::ConfigUpdateInProgress { .. } => "config_update_in_progress",
+            Self::RuntimeRestarting { .. } => "runtime_restarting",
             Self::TeamRuntimeRequired { .. } => "TEAM_RUNTIME_REQUIRED",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
