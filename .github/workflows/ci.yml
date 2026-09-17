@@ -45,6 +45,19 @@ jobs:
           prefix-key: v1-rust
       - run: cargo clippy --workspace -- -D warnings
 
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+      - run: cargo check --workspace
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -58,6 +71,7 @@ jobs:
           prefix-key: v1-rust
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
+      - run: cargo test --workspace
 
   changes:
     name: Detect dependency changes
