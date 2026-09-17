@@ -34,10 +34,12 @@ mod sqlite_settings;
 mod sqlite_sidebar;
 mod sqlite_skill;
 mod sqlite_skill_evolution;
+mod sqlite_task_session;
 mod sqlite_team;
 mod sqlite_usage_event;
 mod sqlite_user;
 mod sqlite_user_order;
+pub mod task_session;
 pub mod team;
 pub mod usage_event;
 mod user;
@@ -94,10 +96,12 @@ pub use sqlite_skill::SqliteSkillRepository;
 pub use sqlite_skill_evolution::{
     SqliteExperienceArticleRepository, SqliteSkillEvolutionProposalRepository, SqliteSkillEvolutionSettingsRepository,
 };
+pub use sqlite_task_session::SqliteTaskSessionRepository;
 pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_usage_event::SqliteUsageEventRepository;
 pub use sqlite_user::SqliteUserRepository;
 pub use sqlite_user_order::SqliteUserOrderStore;
+pub use task_session::ITaskSessionRepository;
 pub use team::{ActivityCursor, ITeamRepository, PageDirection};
 pub use usage_event::{IUsageEventRepository, InsertUsageEventParams};
 pub use user::IUserRepository;

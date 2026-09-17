@@ -15,6 +15,7 @@ mod remote_agent;
 mod skill;
 mod skill_evolution;
 mod system_settings;
+mod task_session;
 mod team;
 mod usage_event;
 mod user;
@@ -52,6 +53,7 @@ pub use skill_evolution::{
     SkillEvolutionSettingsRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
 };
 pub use system_settings::SystemSettings;
+pub use task_session::{TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow};
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use usage_event::UsageEventRow;
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};

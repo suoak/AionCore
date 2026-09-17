@@ -16,8 +16,8 @@ use aionui_db::{
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
-    SqliteUserRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteTaskSessionRepository,
+    SqliteUserOrderStore, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -405,6 +405,10 @@ impl AppServices {
             project_service: project_service.clone(),
             user_order_store: user_order_store.clone(),
         });
+        conversation_service
+            .recover_task_sessions()
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to recover task sessions: {error}"))?;
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());
@@ -515,6 +519,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         deps.database.pool().clone(),
     )));
     service.with_provider_repo(Arc::new(SqliteProviderRepository::new(deps.database.pool().clone())));
+    service.with_task_session_repo(Arc::new(SqliteTaskSessionRepository::new(deps.database.pool().clone())));
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }

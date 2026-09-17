@@ -37,6 +37,7 @@ mod skill_delivery;
 mod skill_evolution;
 mod skill_runtime;
 mod system;
+mod task_session;
 mod team;
 mod team_mcp;
 mod team_tools;
@@ -240,6 +241,14 @@ pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
     FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
     FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
+};
+pub use task_session::{
+    AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,
+    CreateTaskSessionRequest, DecideTaskApprovalRequest, ExecuteApprovedPlanRequest, ListTaskSessionsQuery,
+    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalDecision, TaskApprovalResponse,
+    TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskArtifactStatus, TaskRunResponse, TaskRunStatus,
+    TaskSessionMode, TaskSessionResponse, TaskSessionStatus, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,

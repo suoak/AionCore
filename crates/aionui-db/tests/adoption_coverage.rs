@@ -37,6 +37,11 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("cron_job_runs", "job_id", "cron_jobs"),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
+    // Plan/Goal execution records inherit ownership from task_sessions.user_id.
+    ("task_acceptance_criteria", "task_session_id", "task_sessions"),
+    ("task_approvals", "task_session_id", "task_sessions"),
+    ("task_artifacts", "task_session_id", "task_sessions"),
+    ("task_runs", "task_session_id", "task_sessions"),
     ("team_tasks", "team_id", "teams"),
 ];
 
