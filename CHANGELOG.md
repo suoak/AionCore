@@ -17,6 +17,8 @@
   * Structured Goal acceptance criteria
   * Database migrations 060 / 061
 
+  Release targets: Linux x64/ARM64, macOS x64/ARM64, and Windows x64/ARM64.
+
 ## [0.2.12](https://github.com/suoak/AionCore/compare/v0.2.11...v0.2.12) (2026-09-14)
 
 
