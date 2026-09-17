@@ -917,7 +917,12 @@ mod tests {
             resolved_at: 10,
         };
 
-        let (left, right) = tokio::join!(repo.resolve_approval(&params()), repo.resolve_approval(&params()));
+        let left_params = params();
+        let right_params = params();
+        let (left, right) = tokio::join!(
+            repo.resolve_approval(&left_params),
+            repo.resolve_approval(&right_params)
+        );
         assert_eq!(
             [left.is_ok(), right.is_ok()].into_iter().filter(|value| *value).count(),
             1
@@ -982,7 +987,9 @@ mod tests {
             started_at: 21,
         };
 
-        let (left, right) = tokio::join!(repo.create_run(&params()), repo.create_run(&params()));
+        let left_params = params();
+        let right_params = params();
+        let (left, right) = tokio::join!(repo.create_run(&left_params), repo.create_run(&right_params));
         assert_eq!(
             [left.is_ok(), right.is_ok()].into_iter().filter(|value| *value).count(),
             1

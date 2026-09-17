@@ -769,6 +769,14 @@ impl ConversationService {
                 "Task session cannot transition from {current_status} to {next}"
             )));
         }
+        if request.status == Some(TaskSessionStatus::Completed) && existing.mode == "goal" {
+            let criteria = repo.list_acceptance_criteria(user_id, id).await?;
+            if criteria.is_empty() || criteria.iter().any(|criterion| criterion.status != "passed") {
+                return Err(ConversationError::bad_request(
+                    "Goal tasks cannot complete until every acceptance criterion has passed",
+                ));
+            }
+        }
         let title = request.title.as_deref().unwrap_or(&existing.title);
         let objective = request.objective.as_deref().unwrap_or(&existing.objective);
         let agent_type = request.agent_type.as_deref().unwrap_or(&existing.agent_type);
@@ -847,14 +855,6 @@ impl ConversationService {
             return Err(ConversationError::bad_request(
                 "Artifacts cannot be submitted in the current task state",
             ));
-        }
-        if request.status == Some(TaskSessionStatus::Completed) && existing.mode == "goal" {
-            let criteria = repo.list_acceptance_criteria(user_id, id).await?;
-            if criteria.is_empty() || criteria.iter().any(|criterion| criterion.status != "passed") {
-                return Err(ConversationError::bad_request(
-                    "Goal tasks cannot complete until every acceptance criterion has passed",
-                ));
-            }
         }
         if request.content.trim().is_empty() || request.content.chars().count() > 100_000 {
             return Err(ConversationError::bad_request(
