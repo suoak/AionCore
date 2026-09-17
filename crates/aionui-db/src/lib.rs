@@ -32,7 +32,8 @@ pub use models::{
     CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection,
     FolderRow, JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow,
     Role, SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillImportRecordRow, SkillRegistryInstallRow,
-    SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    SkillRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow,
+    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
     UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams, UpsertAssistantAgentCenterParams,
     UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
     UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
@@ -53,6 +54,10 @@ pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
+pub use repository::task_session::{
+    CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
+    ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
+};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
     ActivityCursor, ArchiveScope, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
@@ -63,19 +68,19 @@ pub use repository::{
     IClientPreferenceRepository, IConversationRepository, ICronRepository, IExperienceArticleRepository,
     IFeedbackDiagnosticsRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository,
     IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillEvolutionProposalRepository,
-    ISkillEvolutionSettingsRepository, ISkillRepository, ITeamRepository, IUsageEventRepository, IUserOrderStore,
-    IUserRepository, InsertUsageEventParams, MoveOutcome, OrderItemRef, PageDirection, PersistedSessionState,
-    PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAgentWorkflowRunRepository,
-    SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRepository,
+    ISkillEvolutionSettingsRepository, ISkillRepository, ITaskSessionRepository, ITeamRepository,
+    IUsageEventRepository, IUserOrderStore, IUserRepository, InsertUsageEventParams, MoveOutcome, OrderItemRef,
+    PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin,
+    SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAgentWorkflowRunRepository, SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteChannelRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteExperienceArticleRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository,
     SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
     SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillEvolutionProposalRepository,
-    SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteTeamRepository, SqliteUsageEventRepository,
-    SqliteUserOrderStore, SqliteUserRepository,
+    SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteTaskSessionRepository, SqliteTeamRepository,
+    SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

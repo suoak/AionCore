@@ -16,17 +16,21 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::{
-    ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
-    AssistantMcpBindingChanged, CancelConversationResponse, CancellationChangedEvent, CancellationState,
-    CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
-    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, ApprovalCheckResponse,
+    AssistantConversationOverridesRequest, AssistantMcpBindingChanged, CancelConversationResponse,
+    CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
+    CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
     ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
     MessageListResponse, MessageResponse, MessageSearchResponse, PromptCapabilityView,
     RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    SessionMcpTransport, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME,
+    TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse,
+    TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TeamMcpSelection,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
@@ -38,12 +42,17 @@ use aionui_common::{
 };
 #[cfg(test)]
 use aionui_db::models::McpServerRow;
-use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
+use aionui_db::models::{
+    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow, TaskAcceptanceCriterionRow,
+    TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow,
+};
 use aionui_db::{
-    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
+    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
+    CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
-    IUsageEventRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    ITaskSessionRepository, IUsageEventRepository, MessagePageCursor, MessagePageDirection, MessagePageParams,
+    ResolveTaskApprovalParams, SaveRuntimeStateParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
     UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
@@ -74,6 +83,133 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
+fn validate_task_session_text(
+    title: &str,
+    objective: &str,
+    agent_type: &str,
+    acceptance_criteria: &[String],
+) -> Result<(), ConversationError> {
+    if title.trim().is_empty() || title.chars().count() > 200 {
+        return Err(ConversationError::bad_request(
+            "Task session title must contain 1 to 200 characters",
+        ));
+    }
+    if agent_type.trim().is_empty() || agent_type.chars().count() > 100 {
+        return Err(ConversationError::bad_request(
+            "Task session agent_type must contain 1 to 100 characters",
+        ));
+    }
+    if objective.chars().count() > 20_000 {
+        return Err(ConversationError::bad_request(
+            "Task session objective must contain at most 20000 characters",
+        ));
+    }
+    if acceptance_criteria.len() > 100
+        || acceptance_criteria
+            .iter()
+            .any(|criterion| criterion.trim().is_empty() || criterion.chars().count() > 2_000)
+    {
+        return Err(ConversationError::bad_request(
+            "Task session acceptance criteria must contain at most 100 non-empty entries of 2000 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn task_session_response(row: TaskSessionRow) -> Result<TaskSessionResponse, ConversationError> {
+    let mode = row
+        .mode
+        .parse::<TaskSessionMode>()
+        .map_err(|_| ConversationError::internal("Persisted task session has an invalid mode"))?;
+    let status = row
+        .status
+        .parse::<TaskSessionStatus>()
+        .map_err(|_| ConversationError::internal("Persisted task session has an invalid status"))?;
+    let acceptance_criteria = serde_json::from_str::<Vec<String>>(&row.acceptance_criteria)
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted acceptance criteria: {error}")))?;
+    Ok(TaskSessionResponse {
+        id: row.id,
+        title: row.title,
+        project_id: row.project_id,
+        conversation_id: row.conversation_id,
+        mode,
+        objective: row.objective,
+        acceptance_criteria,
+        status,
+        agent_type: row.agent_type,
+        agent_session_id: row.agent_session_id,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn parse_persisted<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, ConversationError> {
+    value
+        .parse()
+        .map_err(|_| ConversationError::internal(format!("Persisted {name} has an invalid value")))
+}
+
+fn task_artifact_response(row: TaskArtifactRow) -> Result<TaskArtifactResponse, ConversationError> {
+    Ok(TaskArtifactResponse {
+        id: row.id,
+        task_session_id: row.task_session_id,
+        kind: parse_persisted(&row.kind, "task artifact kind")?,
+        version: row.version,
+        content: row.content,
+        content_hash: row.content_hash,
+        status: parse_persisted(&row.status, "task artifact status")?,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn task_approval_response(row: TaskApprovalRow) -> Result<TaskApprovalResponse, ConversationError> {
+    Ok(TaskApprovalResponse {
+        id: row.id,
+        task_session_id: row.task_session_id,
+        run_id: row.run_id,
+        approval_type: parse_persisted(&row.approval_type, "task approval type")?,
+        artifact_id: row.artifact_id,
+        artifact_hash: row.artifact_hash,
+        status: parse_persisted(&row.status, "task approval status")?,
+        requested_at: row.requested_at,
+        resolved_at: row.resolved_at,
+        resolved_by: row.resolved_by,
+        comment: row.comment,
+    })
+}
+
+fn task_run_response(row: TaskRunRow) -> Result<TaskRunResponse, ConversationError> {
+    Ok(TaskRunResponse {
+        id: row.id,
+        task_session_id: row.task_session_id,
+        conversation_id: row.conversation_id,
+        plan_artifact_id: row.plan_artifact_id,
+        goal_artifact_id: row.goal_artifact_id,
+        approval_id: row.approval_id,
+        status: parse_persisted(&row.status, "task run status")?,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        error_message: row.error_message,
+    })
+}
+
+fn acceptance_criterion_response(
+    row: TaskAcceptanceCriterionRow,
+) -> Result<AcceptanceCriterionResponse, ConversationError> {
+    Ok(AcceptanceCriterionResponse {
+        id: row.id,
+        task_session_id: row.task_session_id,
+        goal_artifact_id: row.goal_artifact_id,
+        position: row.position,
+        description: row.description,
+        status: parse_persisted(&row.status, "acceptance criterion status")?,
+        evidence: serde_json::from_str(&row.evidence)
+            .map_err(|error| ConversationError::internal(format!("Invalid persisted acceptance evidence: {error}")))?,
+        verified_at: row.verified_at,
+    })
+}
 
 pub(crate) fn scope_prompt_attachment_ids(msg_id: &str, attachments: &mut [PromptAttachmentV1]) {
     for attachment in attachments {
@@ -399,6 +535,7 @@ pub struct ConversationService {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
     usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
+    task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
     input_queue_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -479,6 +616,7 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
             usage_event_repo: Arc::new(RwLock::new(None)),
+            task_session_repo: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -516,6 +654,582 @@ impl ConversationService {
         if let Ok(mut guard) = self.usage_event_repo.write() {
             *guard = Some(repo);
         }
+    }
+
+    pub fn with_task_session_repo(&self, repo: Arc<dyn ITaskSessionRepository>) {
+        if let Ok(mut guard) = self.task_session_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    fn task_session_repo(&self) -> Result<Arc<dyn ITaskSessionRepository>, ConversationError> {
+        self.task_session_repo_optional()
+            .ok_or_else(|| ConversationError::internal("Task session repository is not configured"))
+    }
+
+    fn task_session_repo_optional(&self) -> Option<Arc<dyn ITaskSessionRepository>> {
+        self.task_session_repo.read().ok().and_then(|guard| guard.clone())
+    }
+
+    pub async fn create_task_session(
+        &self,
+        user_id: &str,
+        request: CreateTaskSessionRequest,
+    ) -> Result<TaskSessionResponse, ConversationError> {
+        validate_task_session_text(
+            &request.title,
+            &request.objective,
+            &request.agent_type,
+            &request.acceptance_criteria,
+        )?;
+        if !matches!(request.status, TaskSessionStatus::Draft | TaskSessionStatus::Ready) {
+            return Err(ConversationError::bad_request(
+                "A task session must be created as draft or ready",
+            ));
+        }
+        self.validate_task_conversation_binding(user_id, request.conversation_id.as_deref())
+            .await?;
+        self.validate_task_project_binding(user_id, request.project_id.as_deref())
+            .await?;
+        let criteria = serde_json::to_string(&request.acceptance_criteria)
+            .map_err(|error| ConversationError::internal(format!("Failed to encode acceptance criteria: {error}")))?;
+        let mode = request.mode.to_string();
+        let status = request.status.to_string();
+        let row = self
+            .task_session_repo()?
+            .create(&CreateTaskSessionParams {
+                user_id,
+                title: request.title.trim(),
+                project_id: request.project_id.as_deref(),
+                conversation_id: request.conversation_id.as_deref(),
+                mode: &mode,
+                objective: request.objective.trim(),
+                acceptance_criteria: &criteria,
+                status: &status,
+                agent_type: request.agent_type.trim(),
+                agent_session_id: request.agent_session_id.as_deref(),
+            })
+            .await?;
+        info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, "task session created");
+        task_session_response(row)
+    }
+
+    pub async fn list_task_sessions(
+        &self,
+        user_id: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<Vec<TaskSessionResponse>, ConversationError> {
+        self.task_session_repo()?
+            .list(user_id, conversation_id)
+            .await?
+            .into_iter()
+            .map(task_session_response)
+            .collect()
+    }
+
+    pub async fn get_task_session(&self, user_id: &str, id: &str) -> Result<TaskSessionResponse, ConversationError> {
+        let row = self
+            .task_session_repo()?
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
+        task_session_response(row)
+    }
+
+    pub async fn update_task_session(
+        &self,
+        user_id: &str,
+        id: &str,
+        request: UpdateTaskSessionRequest,
+    ) -> Result<TaskSessionResponse, ConversationError> {
+        let repo = self.task_session_repo()?;
+        let existing = repo
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
+        let current_status = existing
+            .status
+            .parse::<TaskSessionStatus>()
+            .map_err(|_| ConversationError::internal("Persisted task session has an invalid status"))?;
+        let artifacts = repo.list_artifacts(user_id, id).await?;
+        if !artifacts.is_empty()
+            && (request.mode.is_some()
+                || request.objective.is_some()
+                || request.acceptance_criteria.is_some()
+                || request.conversation_id.is_some())
+        {
+            return Err(ConversationError::bad_request(
+                "Task mode, binding, objective, and acceptance criteria are immutable after an artifact is submitted",
+            ));
+        }
+        if let Some(next) = request.status
+            && !current_status.can_transition_to(next)
+        {
+            return Err(ConversationError::bad_request(format!(
+                "Task session cannot transition from {current_status} to {next}"
+            )));
+        }
+        let title = request.title.as_deref().unwrap_or(&existing.title);
+        let objective = request.objective.as_deref().unwrap_or(&existing.objective);
+        let agent_type = request.agent_type.as_deref().unwrap_or(&existing.agent_type);
+        let acceptance_criteria = request
+            .acceptance_criteria
+            .as_ref()
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| &[]);
+        validate_task_session_text(title, objective, agent_type, acceptance_criteria)?;
+        self.validate_task_conversation_binding(user_id, request.conversation_id.as_deref())
+            .await?;
+        self.validate_task_project_binding(user_id, request.project_id.as_deref())
+            .await?;
+        let criteria = request
+            .acceptance_criteria
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| ConversationError::internal(format!("Failed to encode acceptance criteria: {error}")))?;
+        let mode = request.mode.map(|value| value.to_string());
+        let status = request.status.map(|value| value.to_string());
+        let row = repo
+            .update(
+                user_id,
+                id,
+                &UpdateTaskSessionParams {
+                    title: request.title.as_deref().map(str::trim),
+                    project_id: request.project_id.as_deref(),
+                    conversation_id: request.conversation_id.as_deref(),
+                    mode: mode.as_deref(),
+                    objective: request.objective.as_deref().map(str::trim),
+                    acceptance_criteria: criteria.as_deref(),
+                    status: status.as_deref(),
+                    agent_type: request.agent_type.as_deref().map(str::trim),
+                    agent_session_id: request.agent_session_id.as_deref(),
+                },
+            )
+            .await?;
+        info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, "task session updated");
+        task_session_response(row)
+    }
+
+    pub async fn recover_task_sessions(&self) -> Result<u64, ConversationError> {
+        let repo = self.task_session_repo()?;
+        let recovered_at = now_ms();
+        let recovered = repo.pause_incomplete(recovered_at).await?;
+        let recovered_runs = repo.pause_incomplete_runs(recovered_at).await?;
+        if recovered > 0 {
+            info!(
+                recovered,
+                recovered_runs, "startup: paused incomplete task sessions without replay"
+            );
+        }
+        Ok(recovered)
+    }
+
+    pub async fn submit_task_artifact(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        request: SubmitTaskArtifactRequest,
+    ) -> Result<SubmitTaskArtifactResponse, ConversationError> {
+        let repo = self.task_session_repo()?;
+        let task = repo.get(user_id, task_session_id).await?.ok_or_else(|| {
+            ConversationError::not_found_reason(format!("Task session '{task_session_id}' not found"))
+        })?;
+        let mode = parse_persisted::<TaskSessionMode>(&task.mode, "task session mode")?;
+        let status = parse_persisted::<TaskSessionStatus>(&task.status, "task session status")?;
+        if matches!(
+            status,
+            TaskSessionStatus::Running
+                | TaskSessionStatus::Completed
+                | TaskSessionStatus::Failed
+                | TaskSessionStatus::Cancelled
+        ) {
+            return Err(ConversationError::bad_request(
+                "Artifacts cannot be submitted in the current task state",
+            ));
+        }
+        if request.status == Some(TaskSessionStatus::Completed) && existing.mode == "goal" {
+            let criteria = repo.list_acceptance_criteria(user_id, id).await?;
+            if criteria.is_empty() || criteria.iter().any(|criterion| criterion.status != "passed") {
+                return Err(ConversationError::bad_request(
+                    "Goal tasks cannot complete until every acceptance criterion has passed",
+                ));
+            }
+        }
+        if request.content.trim().is_empty() || request.content.chars().count() > 100_000 {
+            return Err(ConversationError::bad_request(
+                "Task artifact content must contain 1 to 100000 characters",
+            ));
+        }
+        match (mode, request.kind) {
+            (TaskSessionMode::Plan, TaskArtifactKind::Plan)
+            | (TaskSessionMode::Goal, TaskArtifactKind::Plan)
+            | (TaskSessionMode::Goal, TaskArtifactKind::Goal) => {}
+            _ => {
+                return Err(ConversationError::bad_request(
+                    "Artifact kind is not valid for this task mode",
+                ));
+            }
+        }
+        if request.kind == TaskArtifactKind::Goal {
+            validate_task_session_text(
+                &task.title,
+                request.content.trim(),
+                &task.agent_type,
+                &request.acceptance_criteria,
+            )?;
+            if request.acceptance_criteria.is_empty() {
+                return Err(ConversationError::bad_request(
+                    "A goal artifact requires at least one acceptance criterion",
+                ));
+            }
+        } else if !request.acceptance_criteria.is_empty() {
+            return Err(ConversationError::bad_request(
+                "Acceptance criteria may only be attached to a goal artifact",
+            ));
+        }
+
+        let content = request.content.trim();
+        let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let (artifact, approval, criteria) = repo
+            .create_artifact_with_approval(&CreateTaskArtifactParams {
+                user_id,
+                task_session_id,
+                kind: &request.kind.to_string(),
+                content,
+                content_hash: &content_hash,
+                acceptance_criteria: &request.acceptance_criteria,
+            })
+            .await?;
+        Ok(SubmitTaskArtifactResponse {
+            artifact: task_artifact_response(artifact)?,
+            approval: task_approval_response(approval)?,
+            acceptance_criteria: criteria
+                .into_iter()
+                .map(acceptance_criterion_response)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    pub async fn list_task_artifacts(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+    ) -> Result<Vec<TaskArtifactResponse>, ConversationError> {
+        self.task_session_repo()?
+            .list_artifacts(user_id, task_session_id)
+            .await?
+            .into_iter()
+            .map(task_artifact_response)
+            .collect()
+    }
+
+    pub async fn list_task_approvals(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+    ) -> Result<Vec<TaskApprovalResponse>, ConversationError> {
+        self.task_session_repo()?
+            .list_approvals(user_id, task_session_id)
+            .await?
+            .into_iter()
+            .map(task_approval_response)
+            .collect()
+    }
+
+    pub async fn decide_task_approval(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        approval_id: &str,
+        request: DecideTaskApprovalRequest,
+    ) -> Result<TaskApprovalResponse, ConversationError> {
+        if request
+            .comment
+            .as_ref()
+            .is_some_and(|comment| comment.chars().count() > 2_000)
+        {
+            return Err(ConversationError::bad_request(
+                "Approval comment must contain at most 2000 characters",
+            ));
+        }
+        let status = match request.decision {
+            TaskApprovalDecision::Approve => TaskApprovalStatus::Approved,
+            TaskApprovalDecision::Reject => TaskApprovalStatus::Rejected,
+        };
+        let row = self
+            .task_session_repo()?
+            .resolve_approval(&ResolveTaskApprovalParams {
+                user_id,
+                task_session_id,
+                approval_id,
+                artifact_id: &request.artifact_id,
+                artifact_hash: &request.artifact_hash,
+                status: &status.to_string(),
+                resolved_by: user_id,
+                comment: request.comment.as_deref(),
+                resolved_at: now_ms(),
+            })
+            .await?;
+        task_approval_response(row)
+    }
+
+    pub async fn list_task_runs(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+    ) -> Result<Vec<TaskRunResponse>, ConversationError> {
+        self.task_session_repo()?
+            .list_runs(user_id, task_session_id)
+            .await?
+            .into_iter()
+            .map(task_run_response)
+            .collect()
+    }
+
+    pub async fn list_acceptance_criteria(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+    ) -> Result<Vec<AcceptanceCriterionResponse>, ConversationError> {
+        self.task_session_repo()?
+            .list_acceptance_criteria(user_id, task_session_id)
+            .await?
+            .into_iter()
+            .map(acceptance_criterion_response)
+            .collect()
+    }
+
+    pub async fn verify_acceptance_criterion(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        criterion_id: &str,
+        request: VerifyAcceptanceCriterionRequest,
+    ) -> Result<AcceptanceCriterionResponse, ConversationError> {
+        if request.status == AcceptanceCriterionStatus::Pending {
+            return Err(ConversationError::bad_request(
+                "Verification must produce a terminal or review status",
+            ));
+        }
+        if request.evidence.is_empty()
+            || request.evidence.iter().any(|evidence| {
+                evidence.summary.trim().is_empty()
+                    || evidence.summary.chars().count() > 2_000
+                    || evidence
+                        .reference
+                        .as_ref()
+                        .is_some_and(|value| value.chars().count() > 4_000)
+            })
+        {
+            return Err(ConversationError::bad_request(
+                "Verification requires bounded, non-empty structured evidence",
+            ));
+        }
+        let evidence = serde_json::to_string(&request.evidence)
+            .map_err(|error| ConversationError::internal(format!("Failed to encode evidence: {error}")))?;
+        let repo = self.task_session_repo()?;
+        let row = repo
+            .update_acceptance_criterion(&UpdateAcceptanceCriterionParams {
+                user_id,
+                task_session_id,
+                criterion_id,
+                status: &request.status.to_string(),
+                evidence: &evidence,
+                verified_at: now_ms(),
+            })
+            .await?;
+        let criteria = repo.list_acceptance_criteria(user_id, task_session_id).await?;
+        let current_criteria: Vec<_> = criteria
+            .iter()
+            .filter(|criterion| criterion.goal_artifact_id == row.goal_artifact_id)
+            .collect();
+        if !current_criteria.is_empty() && current_criteria.iter().all(|criterion| criterion.status == "passed") {
+            repo.update(
+                user_id,
+                task_session_id,
+                &UpdateTaskSessionParams {
+                    status: Some("completed"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        acceptance_criterion_response(row)
+    }
+
+    pub async fn execute_approved_plan(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        request: ExecuteApprovedPlanRequest,
+    ) -> Result<TaskRunResponse, ConversationError> {
+        let repo = self.task_session_repo()?;
+        let task = repo.get(user_id, task_session_id).await?.ok_or_else(|| {
+            ConversationError::not_found_reason(format!("Task session '{task_session_id}' not found"))
+        })?;
+        let mode = parse_persisted::<TaskSessionMode>(&task.mode, "task session mode")?;
+        if mode == TaskSessionMode::Agent {
+            return Err(ConversationError::bad_request(
+                "Agent-mode tasks do not execute approved plans",
+            ));
+        }
+        let conversation_id = task
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| ConversationError::bad_request("Task session must be bound to a conversation"))?;
+        let artifact = repo
+            .get_artifact(user_id, task_session_id, &request.artifact_id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason("Approved plan artifact was not found"))?;
+        if artifact.kind != "plan" || artifact.status != "approved" || artifact.content_hash != request.artifact_hash {
+            return Err(ConversationError::bad_request(
+                "Execution artifact does not match the approved plan",
+            ));
+        }
+        let goal_artifact_id = if mode == TaskSessionMode::Goal {
+            Some(
+                repo.list_artifacts(user_id, task_session_id)
+                    .await?
+                    .into_iter()
+                    .find(|candidate| candidate.kind == "goal" && candidate.status == "approved")
+                    .map(|candidate| candidate.id)
+                    .ok_or_else(|| {
+                        ConversationError::bad_request("Goal execution requires an approved goal artifact")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let run = repo
+            .create_run(&CreateTaskRunParams {
+                user_id,
+                task_session_id,
+                conversation_id,
+                plan_artifact_id: &artifact.id,
+                goal_artifact_id: goal_artifact_id.as_deref(),
+                approval_id: &request.approval_id,
+                artifact_hash: &request.artifact_hash,
+                started_at: now_ms(),
+            })
+            .await?;
+
+        let outcome = self
+            .run_agent_turn_internal(
+                ConversationAgentTurnRequest {
+                    user_id: user_id.to_owned(),
+                    conversation_id: conversation_id.to_owned(),
+                    content: artifact.content,
+                    files: Vec::new(),
+                    inject_skills: Vec::new(),
+                    required_runtime_mode: None,
+                    persist_user_message: true,
+                    user_message_hidden: true,
+                    on_started: None,
+                },
+                true,
+            )
+            .await;
+        let (run_status, task_status, error_message) = match outcome {
+            Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => {
+                if mode == TaskSessionMode::Goal {
+                    let criteria = repo.list_acceptance_criteria(user_id, task_session_id).await?;
+                    let goal_artifact_id = goal_artifact_id.as_deref().expect("goal mode has a goal artifact");
+                    let current_criteria: Vec<_> = criteria
+                        .iter()
+                        .filter(|criterion| criterion.goal_artifact_id == goal_artifact_id)
+                        .collect();
+                    if !current_criteria.is_empty()
+                        && current_criteria.iter().all(|criterion| criterion.status == "passed")
+                    {
+                        (TaskRunStatus::Completed, TaskSessionStatus::Completed, None)
+                    } else {
+                        (TaskRunStatus::Completed, TaskSessionStatus::Paused, None)
+                    }
+                } else {
+                    (TaskRunStatus::Completed, TaskSessionStatus::Completed, None)
+                }
+            }
+            Ok(outcome) => (TaskRunStatus::Failed, TaskSessionStatus::Failed, outcome.error_message),
+            Err(error) => (
+                TaskRunStatus::Failed,
+                TaskSessionStatus::Failed,
+                Some(error.to_string()),
+            ),
+        };
+        let finished = repo
+            .finish_run(&FinishTaskRunParams {
+                user_id,
+                task_session_id,
+                run_id: &run.id,
+                run_status: &run_status.to_string(),
+                task_status: &task_status.to_string(),
+                finished_at: now_ms(),
+                error_message: error_message.as_deref(),
+            })
+            .await?;
+        task_run_response(finished)
+    }
+
+    async fn enforce_task_execution_gate(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        approved_execution: bool,
+    ) -> Result<(), ConversationError> {
+        if approved_execution {
+            return Ok(());
+        }
+        let Some(repo) = self.task_session_repo_optional() else {
+            return Ok(());
+        };
+        let guarded = repo
+            .list(user_id, Some(conversation_id))
+            .await?
+            .into_iter()
+            .any(|task| task.mode != "agent" && !matches!(task.status.as_str(), "completed" | "failed" | "cancelled"));
+        if guarded {
+            return Err(ConversationError::Forbidden {
+                reason: "Plan and goal tasks may execute only through an approved immutable plan".into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn validate_task_conversation_binding(
+        &self,
+        user_id: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        let Some(conversation_id) = conversation_id else {
+            return Ok(());
+        };
+        if self.conversation_repo.get(user_id, conversation_id).await?.is_none() {
+            return Err(ConversationError::bad_request(format!(
+                "Conversation '{conversation_id}' does not exist for this user"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn validate_task_project_binding(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        let Some(project_id) = project_id else {
+            return Ok(());
+        };
+        let project_service = self
+            .project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| ConversationError::internal("Project service is not configured"))?;
+        project_service.get_project(user_id, project_id).await.map_err(|_| {
+            ConversationError::bad_request(format!("Project '{project_id}' does not exist for this user"))
+        })?;
+        Ok(())
     }
 
     pub(crate) fn usage_event_repo(&self) -> Option<Arc<dyn IUsageEventRepository>> {
@@ -4167,6 +4881,9 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
+        self.enforce_task_execution_gate(user_id, conversation_id, false)
+            .await?;
+
         if let Some(team_id) = team_id_from_extra(&row.extra) {
             info!(
                 conversation_id = %conversation_id,
@@ -4414,6 +5131,14 @@ impl ConversationService {
         &self,
         request: ConversationAgentTurnRequest,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
+        self.run_agent_turn_internal(request, false).await
+    }
+
+    async fn run_agent_turn_internal(
+        &self,
+        request: ConversationAgentTurnRequest,
+        approved_execution: bool,
+    ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if request.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Agent turn content must not be empty".into(),
@@ -4427,6 +5152,9 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: request.conversation_id.clone(),
             })?;
+
+        self.enforce_task_execution_gate(&request.user_id, &request.conversation_id, approved_execution)
+            .await?;
 
         reject_deprecated_runtime_row(&row)?;
         self.validate_turn_start(&request.user_id, &request.conversation_id, &row.extra)

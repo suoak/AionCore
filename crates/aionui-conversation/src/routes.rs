@@ -7,14 +7,17 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
-    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationCapabilities,
+    AcceptanceCriterionResponse, ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse,
+    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactListResponse, ConversationArtifactResponse, ConversationCapabilities,
     ConversationInputListResponse, ConversationInputReceipt, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationInputsQuery,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    CreateConversationRequest, CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse,
+    ExecuteApprovedPlanRequest, ForkConversationRequest, ListConversationInputsQuery, ListConversationsQuery,
+    ListMessagesQuery, ListTaskSessionsQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskRunResponse,
+    TaskSessionResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -130,6 +133,30 @@ impl From<ConversationError> for ApiError {
 /// All routes require authentication (applied by the caller).
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
+        .route("/api/task-sessions", post(create_task_session).get(list_task_sessions))
+        .route(
+            "/api/task-sessions/{id}",
+            get(get_task_session).patch(update_task_session),
+        )
+        .route(
+            "/api/task-sessions/{id}/artifacts",
+            post(submit_task_artifact).get(list_task_artifacts),
+        )
+        .route("/api/task-sessions/{id}/approvals", get(list_task_approvals))
+        .route(
+            "/api/task-sessions/{id}/approvals/{approval_id}/decision",
+            post(decide_task_approval),
+        )
+        .route("/api/task-sessions/{id}/execute", post(execute_approved_plan))
+        .route("/api/task-sessions/{id}/runs", get(list_task_runs))
+        .route(
+            "/api/task-sessions/{id}/acceptance-criteria",
+            get(list_acceptance_criteria),
+        )
+        .route(
+            "/api/task-sessions/{id}/acceptance-criteria/{criterion_id}",
+            patch(verify_acceptance_criterion),
+        )
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
@@ -168,6 +195,154 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
+
+async fn create_task_session(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateTaskSessionRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<TaskSessionResponse>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let session = state
+        .service
+        .create_task_session(&user.id, request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(session))))
+}
+
+async fn list_task_sessions(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<ListTaskSessionsQuery>,
+) -> Result<Json<ApiResponse<Vec<TaskSessionResponse>>>, ApiError> {
+    let sessions = state
+        .service
+        .list_task_sessions(&user.id, query.conversation_id.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(sessions)))
+}
+
+async fn get_task_session(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TaskSessionResponse>>, ApiError> {
+    let session = state
+        .service
+        .get_task_session(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(session)))
+}
+
+async fn update_task_session(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateTaskSessionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TaskSessionResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let session = state
+        .service
+        .update_task_session(&user.id, &id, request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(session)))
+}
+
+async fn submit_task_artifact(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SubmitTaskArtifactRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<SubmitTaskArtifactResponse>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = state.service.submit_task_artifact(&user.id, &id, request).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
+async fn list_task_artifacts(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<TaskArtifactResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_task_artifacts(&user.id, &id).await?,
+    )))
+}
+
+async fn list_task_approvals(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<TaskApprovalResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_task_approvals(&user.id, &id).await?,
+    )))
+}
+
+async fn decide_task_approval(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, approval_id)): Path<(String, String)>,
+    body: Result<Json<DecideTaskApprovalRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TaskApprovalResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .decide_task_approval(&user.id, &id, &approval_id, request)
+            .await?,
+    )))
+}
+
+async fn execute_approved_plan(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ExecuteApprovedPlanRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TaskRunResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.execute_approved_plan(&user.id, &id, request).await?,
+    )))
+}
+
+async fn list_task_runs(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<TaskRunResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_task_runs(&user.id, &id).await?,
+    )))
+}
+
+async fn list_acceptance_criteria(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<AcceptanceCriterionResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_acceptance_criteria(&user.id, &id).await?,
+    )))
+}
+
+async fn verify_acceptance_criterion(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, criterion_id)): Path<(String, String)>,
+    body: Result<Json<VerifyAcceptanceCriterionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AcceptanceCriterionResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .verify_acceptance_criterion(&user.id, &id, &criterion_id, request)
+            .await?,
+    )))
+}
 
 async fn create(
     State(state): State<ConversationRouterState>,
