@@ -6,6 +6,9 @@
 ### Features
 
 * **task-session:** add plan and goal execution contracts ([e7251b4](https://github.com/suoak/AionCore/commit/e7251b4e2073b09c532357102c053cbfdeeec14a))
+
+  Release guarantees:
+
   * TaskSession persistence
   * Plan / Goal execution contracts
   * Immutable, versioned artifacts and hash-bound approvals
