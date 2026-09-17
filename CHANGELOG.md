@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.13](https://github.com/suoak/AionCore/compare/v0.2.12...v0.2.13) (2026-09-17)
+
+
+### Features
+
+* **task-session:** add plan and goal execution contracts ([e7251b4](https://github.com/suoak/AionCore/commit/e7251b4e2073b09c532357102c053cbfdeeec14a))
+
 ## [0.2.12](https://github.com/suoak/AionCore/compare/v0.2.11...v0.2.12) (2026-09-14)
 
 
