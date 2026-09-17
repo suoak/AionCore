@@ -780,7 +780,7 @@ impl ConversationService {
         let title = request.title.as_deref().unwrap_or(&existing.title);
         let objective = request.objective.as_deref().unwrap_or(&existing.objective);
         let agent_type = request.agent_type.as_deref().unwrap_or(&existing.agent_type);
-        let acceptance_criteria = request.acceptance_criteria.as_deref().unwrap_or_else(|| &[]);
+        let acceptance_criteria = request.acceptance_criteria.as_deref().unwrap_or(&[]);
         validate_task_session_text(title, objective, agent_type, acceptance_criteria)?;
         self.validate_task_conversation_binding(user_id, request.conversation_id.as_deref())
             .await?;
