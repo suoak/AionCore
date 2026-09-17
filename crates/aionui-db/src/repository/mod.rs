@@ -101,7 +101,7 @@ pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_usage_event::SqliteUsageEventRepository;
 pub use sqlite_user::SqliteUserRepository;
 pub use sqlite_user_order::SqliteUserOrderStore;
-pub use task_session::{CreateTaskSessionParams, ITaskSessionRepository, UpdateTaskSessionParams};
+pub use task_session::ITaskSessionRepository;
 pub use team::{ActivityCursor, ITeamRepository, PageDirection};
 pub use usage_event::{IUsageEventRepository, InsertUsageEventParams};
 pub use user::IUserRepository;
