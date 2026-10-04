@@ -41,10 +41,13 @@ impl StrictPlanningProvider {
                         usage: TokenUsage::default(),
                     },
                 ],
-                vec![LlmEvent::Done {
-                    stop_reason: StopReason::EndTurn,
-                    usage: TokenUsage::default(),
-                }],
+                vec![
+                    LlmEvent::TextDelta("Planning complete".into()),
+                    LlmEvent::Done {
+                        stop_reason: StopReason::EndTurn,
+                        usage: TokenUsage::default(),
+                    },
+                ],
             ]),
             advertised_tools: std::sync::Mutex::new(Vec::new()),
             observed_tool_results: std::sync::Mutex::new(Vec::new()),
@@ -65,7 +68,20 @@ impl LlmProvider for StrictPlanningProvider {
                 _ => None,
             })
             .collect();
-        let events = self.turns.lock().unwrap().remove(0);
+        let events = {
+            let mut turns = self.turns.lock().unwrap();
+            if turns.is_empty() {
+                vec![
+                    LlmEvent::TextDelta("Planning complete".into()),
+                    LlmEvent::Done {
+                        stop_reason: StopReason::EndTurn,
+                        usage: TokenUsage::default(),
+                    },
+                ]
+            } else {
+                turns.remove(0)
+            }
+        };
         let (sender, receiver) = mpsc::channel(16);
         tokio::spawn(async move {
             for event in events {
