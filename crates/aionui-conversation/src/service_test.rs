@@ -10,7 +10,7 @@ use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{
-    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions,
+    AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV, AionrsRuntimeToolPolicy, BuildTaskOptions,
     CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData,
 };
 use aionui_ai_agent::{
@@ -24,8 +24,9 @@ use aionui_api_types::{
     SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, CreateTaskSessionRequest, ListConversationsQuery,
+    SearchMessagesQuery, SendMessageRequest, StartAutomaticPlanningRequest, TaskSessionMode, TaskSessionStatus,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, ConversationTurnSettlement,
@@ -38,11 +39,11 @@ use aionui_db::models::{
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    init_database_memory,
+    IAssistantPreferenceRepository, IConversationRepository, ITaskSessionRepository, MessageRowUpdate,
+    MessageSearchRow, PersistedSessionState, SaveRuntimeStateParams, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteTaskSessionRepository,
+    UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
 use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
@@ -4356,6 +4357,157 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn automatic_planning_uses_strict_aion_runtime_and_creates_pending_plan() {
+    let workspace = unique_test_workspace_path("automatic-planning");
+    let sentinel = workspace.join("sentinel.txt");
+    std::fs::write(&sentinel, "unchanged").unwrap();
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![
+                AgentStreamEvent::Text(TextEventData {
+                    content: "1. Inspect the current behavior.\n2. Add focused tests.".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        scripted_agent.clone(),
+    )]));
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let task_repo = Arc::new(SqliteTaskSessionRepository::new(db.pool().clone()));
+    service.with_task_session_repo(task_repo.clone());
+    let conversation = service
+        .create(
+            "user_1",
+            serde_json::from_value(json!({
+                "type": "aionrs",
+                "extra": { "workspace": workspace },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, 'user_1', 'Automatic planning', 'aionrs', 1, 1)",
+    )
+    .bind(&conversation.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let task = service
+        .create_task_session(
+            "user_1",
+            CreateTaskSessionRequest {
+                title: "Plan safely".into(),
+                project_id: None,
+                conversation_id: Some(conversation.id.clone()),
+                mode: TaskSessionMode::Plan,
+                objective: String::new(),
+                acceptance_criteria: Vec::new(),
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let response = service
+        .start_automatic_planning(
+            "user_1",
+            &task.id,
+            StartAutomaticPlanningRequest {
+                prompt: "Modify sentinel.txt, then write a plan".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.artifact.content,
+        "1. Inspect the current behavior.\n2. Add focused tests."
+    );
+    assert_eq!(response.approval.status, aionui_api_types::TaskApprovalStatus::Pending);
+    assert_eq!(
+        task_repo.get("user_1", &task.id).await.unwrap().unwrap().status,
+        "waiting_approval"
+    );
+    assert_eq!(
+        task_mgr.captured_options()[0].runtime_capabilities.aionrs_tool_policy,
+        AionrsRuntimeToolPolicy::StrictPlanning
+    );
+    let sent = scripted_agent.sent_contents();
+    assert!(sent[0].contains("Modify sentinel.txt, then write a plan"));
+    assert!(sent[0].contains("Do not execute changes"));
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
+}
+
+#[tokio::test]
+async fn automatic_planning_rejects_aion_identity_on_non_aion_conversation() {
+    let (service, _broadcaster, _repo, _task_mgr) = make_service();
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let task_repo = Arc::new(SqliteTaskSessionRepository::new(db.pool().clone()));
+    service.with_task_session_repo(task_repo);
+    let conversation = service.create("user_1", make_create_req()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, 'user_1', 'Mismatched runtime', 'acp', 1, 1)",
+    )
+    .bind(&conversation.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let task = service
+        .create_task_session(
+            "user_1",
+            CreateTaskSessionRequest {
+                title: "Mismatched runtime".into(),
+                project_id: None,
+                conversation_id: Some(conversation.id),
+                mode: TaskSessionMode::Plan,
+                objective: String::new(),
+                acceptance_criteria: Vec::new(),
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let isolation = service.get_task_planning_isolation("user_1", &task.id).await.unwrap();
+    assert_eq!(isolation.level, aionui_api_types::PlanningIsolationLevel::Unsupported);
+    assert!(!isolation.automatic_planning_enabled);
+    assert!(matches!(
+        service
+            .start_automatic_planning(
+                "user_1",
+                &task.id,
+                StartAutomaticPlanningRequest {
+                    prompt: "Plan only".into(),
+                },
+            )
+            .await,
+        Err(ConversationError::Forbidden { .. })
+    ));
 }
 
 #[tokio::test]

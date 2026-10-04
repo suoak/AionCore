@@ -14,6 +14,8 @@ pub trait ITaskSessionRepository: Send + Sync {
         id: &str,
         params: &UpdateTaskSessionParams<'_>,
     ) -> Result<TaskSessionRow, DbError>;
+    async fn claim_automatic_planning(&self, user_id: &str, id: &str, updated_at: TimestampMs)
+    -> Result<bool, DbError>;
     async fn pause_incomplete(&self, updated_at: TimestampMs) -> Result<u64, DbError>;
     async fn create_artifact_with_approval(
         &self,

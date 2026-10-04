@@ -15,9 +15,10 @@ use aionui_api_types::{
     ExecuteApprovedPlanRequest, ForkConversationRequest, ListConversationInputsQuery, ListConversationsQuery,
     ListMessagesQuery, ListTaskSessionsQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
     PlanningIsolationResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SubmitConversationInputRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalResponse,
-    TaskArtifactResponse, TaskRunResponse, TaskSessionResponse, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
+    StartAutomaticPlanningRequest, SubmitConversationInputRequest, SubmitTaskArtifactRequest,
+    SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskRunResponse, TaskSessionResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -142,6 +143,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
             "/api/task-sessions/{id}/planning-isolation",
             get(get_task_planning_isolation),
         )
+        .route("/api/task-sessions/{id}/automatic-plan", post(start_automatic_planning))
         .route(
             "/api/task-sessions/{id}/artifacts",
             post(submit_task_artifact).get(list_task_artifacts),
@@ -273,6 +275,17 @@ async fn submit_task_artifact(
 ) -> Result<(StatusCode, Json<ApiResponse<SubmitTaskArtifactResponse>>), ApiError> {
     let Json(request) = body.map_err(ApiError::from)?;
     let response = state.service.submit_task_artifact(&user.id, &id, request).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
+async fn start_automatic_planning(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<StartAutomaticPlanningRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<SubmitTaskArtifactResponse>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = state.service.start_automatic_planning(&user.id, &id, request).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
 }
 

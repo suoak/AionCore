@@ -246,10 +246,10 @@ pub use task_session::{
     AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,
     AgentIntegrationMode, CreateTaskSessionRequest, DecideTaskApprovalRequest, ExecuteApprovedPlanRequest,
     ListTaskSessionsQuery, PlanningIsolationLevel, PlanningIsolationResponse, PolicyDecision, PolicyDecisionKind,
-    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalDecision, TaskApprovalResponse,
-    TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskArtifactStatus, TaskRunResponse, TaskRunStatus,
-    TaskSessionMode, TaskSessionResponse, TaskSessionStatus, ToolCapability, UpdateTaskSessionRequest,
-    VerifyAcceptanceCriterionRequest,
+    StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalDecision,
+    TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskArtifactStatus,
+    TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, ToolCapability,
+    UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,

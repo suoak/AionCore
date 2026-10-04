@@ -356,6 +356,11 @@ pub struct SubmitTaskArtifactRequest {
     pub acceptance_criteria: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartAutomaticPlanningRequest {
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskArtifactResponse {
     pub id: String,
