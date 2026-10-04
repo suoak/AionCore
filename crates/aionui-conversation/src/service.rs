@@ -4,11 +4,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_ai_agent::types::{AionrsRuntimeToolPolicy, BuildTaskOptions};
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
-    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, audited_runtime_capabilities,
-    resolve_planning_isolation,
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+    audited_aion_strict_runtime_capabilities, audited_runtime_capabilities, resolve_planning_isolation,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -170,8 +170,11 @@ fn integration_mode_evidence(agent_type: &str, runtime_backend: &str) -> (AgentI
         ("aionrs", _) | (_, "aionrs") => (
             AgentIntegrationMode::InProcessToolRegistry,
             vec![
-                "Aion tool definitions are filtered through the in-process registry".to_owned(),
-                "The registry execution entry point has no WorkMate capability-policy hook".to_owned(),
+                "Aion strict planning uses a host-selected exact-name allowlist before bootstrap".to_owned(),
+                "Hooks, MCP servers, native plan tools, skills, spawning, and tool search are disabled in strict planning"
+                    .to_owned(),
+                "Task-manager capability identity rebuilds the runtime when planning and execution policies differ"
+                    .to_owned(),
             ],
         ),
         ("acp", _) => (
@@ -187,6 +190,25 @@ fn integration_mode_evidence(agent_type: &str, runtime_backend: &str) -> (AgentI
             )],
         ),
     }
+}
+
+fn audited_capabilities_for_integration(
+    integration_mode: AgentIntegrationMode,
+) -> aionui_ai_agent::RuntimeEnforcementCapabilities {
+    if integration_mode == AgentIntegrationMode::InProcessToolRegistry {
+        audited_aion_strict_runtime_capabilities()
+    } else {
+        audited_runtime_capabilities(integration_mode)
+    }
+}
+
+fn validate_planning_turn_content(policy: AionrsRuntimeToolPolicy, content: &str) -> Result<(), ConversationError> {
+    if policy == AionrsRuntimeToolPolicy::StrictPlanning && content.trim_start().starts_with('/') {
+        return Err(ConversationError::Forbidden {
+            reason: "Slash commands are disabled during guaranteed planning".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -221,6 +243,22 @@ mod planning_isolation_tests {
             assert_eq!(assessment.level, aionui_api_types::PlanningIsolationLevel::Unsupported);
             assert!(!assessment.automatic_planning_enabled);
         }
+    }
+
+    #[test]
+    fn aion_strict_profile_is_guaranteed_only_after_mandatory_enforcement() {
+        let (mode, evidence) = integration_mode_evidence("aionrs", "aionrs");
+        let assessment = resolve_planning_isolation(audited_capabilities_for_integration(mode), evidence);
+
+        assert_eq!(assessment.level, aionui_api_types::PlanningIsolationLevel::Guaranteed);
+        assert!(assessment.automatic_planning_enabled);
+    }
+
+    #[test]
+    fn strict_planning_rejects_slash_commands_before_turn_start() {
+        assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "  /skill mutate").is_err());
+        assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "inspect the repo").is_ok());
+        assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::Unrestricted, "/allowed-in-execution").is_ok());
     }
 }
 
@@ -829,7 +867,7 @@ impl ConversationService {
             ),
         };
         Ok(resolve_planning_isolation(
-            audited_runtime_capabilities(integration_mode),
+            audited_capabilities_for_integration(integration_mode),
             evidence,
         ))
     }
@@ -1270,24 +1308,49 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         approved_execution: bool,
-    ) -> Result<(), ConversationError> {
+    ) -> Result<AionrsRuntimeToolPolicy, ConversationError> {
         if approved_execution {
-            return Ok(());
+            return Ok(AionrsRuntimeToolPolicy::Unrestricted);
         }
         let Some(repo) = self.task_session_repo_optional() else {
-            return Ok(());
+            return Ok(AionrsRuntimeToolPolicy::Unrestricted);
         };
-        let guarded = repo
-            .list(user_id, Some(conversation_id))
-            .await?
+        let active_tasks = repo.list(user_id, Some(conversation_id)).await?;
+        let mut policy = AionrsRuntimeToolPolicy::Unrestricted;
+        for task in active_tasks
             .into_iter()
-            .any(|task| task.mode != "agent" && !matches!(task.status.as_str(), "completed" | "failed" | "cancelled"));
-        if guarded {
-            return Err(ConversationError::Forbidden {
-                reason: "Plan and goal tasks may execute only through an approved immutable plan".into(),
-            });
+            .filter(|task| !matches!(task.status.as_str(), "completed" | "failed" | "cancelled"))
+        {
+            match task.mode.as_str() {
+                "agent" => {}
+                "goal" => {
+                    return Err(ConversationError::Forbidden {
+                        reason: "Goal tasks may execute only through an approved immutable plan".into(),
+                    });
+                }
+                "plan" => {
+                    let binding = self.resolve_assistant_agent_binding(user_id, &task.agent_type).await?;
+                    let integration_mode = binding
+                        .as_ref()
+                        .map(|binding| integration_mode_evidence(&binding.agent_type, &binding.runtime_backend).0)
+                        .unwrap_or(AgentIntegrationMode::Unknown);
+                    let isolation =
+                        resolve_planning_isolation(audited_capabilities_for_integration(integration_mode), Vec::new());
+                    if !isolation.automatic_planning_enabled {
+                        return Err(ConversationError::Forbidden {
+                            reason: "This agent does not provide guaranteed non-mutating planning".into(),
+                        });
+                    }
+                    policy = AionrsRuntimeToolPolicy::StrictPlanning;
+                }
+                _ => {
+                    return Err(ConversationError::Forbidden {
+                        reason: "Unknown task modes cannot start an agent turn".into(),
+                    });
+                }
+            }
         }
-        Ok(())
+        Ok(policy)
     }
 
     async fn validate_task_conversation_binding(
@@ -4975,8 +5038,10 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        self.enforce_task_execution_gate(user_id, conversation_id, false)
+        let runtime_tool_policy = self
+            .enforce_task_execution_gate(user_id, conversation_id, false)
             .await?;
+        validate_planning_turn_content(runtime_tool_policy, &req.content)?;
 
         if let Some(team_id) = team_id_from_extra(&row.extra) {
             info!(
@@ -5033,7 +5098,8 @@ impl ConversationService {
         // with the active turn's id. Every other case (including the 409 for
         // non-supporting backends) is unchanged and handled by the claim below.
         let mut fallback_user_msg: Option<String> = None;
-        if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
+        if runtime_tool_policy == AionrsRuntimeToolPolicy::Unrestricted
+            && let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
             && let Some(agent) = task_manager.get_task(conversation_id)
             && agent.supports_midturn_delivery()
         {
@@ -5187,6 +5253,7 @@ impl ConversationService {
             }
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
+        build_opts.runtime_capabilities.aionrs_tool_policy = runtime_tool_policy;
         self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
@@ -5247,8 +5314,10 @@ impl ConversationService {
                 id: request.conversation_id.clone(),
             })?;
 
-        self.enforce_task_execution_gate(&request.user_id, &request.conversation_id, approved_execution)
+        let runtime_tool_policy = self
+            .enforce_task_execution_gate(&request.user_id, &request.conversation_id, approved_execution)
             .await?;
+        validate_planning_turn_content(runtime_tool_policy, &request.content)?;
 
         reject_deprecated_runtime_row(&row)?;
         self.validate_turn_start(&request.user_id, &request.conversation_id, &row.extra)
@@ -5349,6 +5418,7 @@ impl ConversationService {
         };
 
         self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
+        build_opts.runtime_capabilities.aionrs_tool_policy = runtime_tool_policy;
         self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
