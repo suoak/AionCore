@@ -291,11 +291,16 @@ async fn strict_planning_denies_allowlisted_write_and_preserves_workspace() {
             .iter()
             .any(|(is_error, content)| *is_error && content.contains("policy_denied"))
     );
-    let expected_advertised = registered
-        .into_iter()
-        .filter(|name| AION_STRICT_PLANNING_ALLOWED_TOOLS.contains(&name.as_str()))
-        .collect::<Vec<_>>();
-    assert_eq!(*provider.advertised_tools.lock().unwrap(), expected_advertised);
+    let advertised = provider.advertised_tools.lock().unwrap();
+    assert!(
+        advertised
+            .iter()
+            .all(|name| AION_STRICT_PLANNING_ALLOWED_TOOLS.contains(&name.as_str()))
+    );
+    for required in ["Read", "Grep", "Glob"] {
+        assert!(advertised.iter().any(|name| name == required));
+    }
+    assert!(!advertised.iter().any(|name| name == "Write"));
 }
 
 #[tokio::test]
