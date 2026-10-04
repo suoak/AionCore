@@ -59,15 +59,17 @@ impl StrictPlanningProvider {
 impl LlmProvider for StrictPlanningProvider {
     async fn stream(&self, request: &LlmRequest) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
         *self.advertised_tools.lock().unwrap() = request.tools.iter().map(|tool| tool.name.clone()).collect();
-        *self.observed_tool_results.lock().unwrap() = request
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult { content, is_error, .. } => Some((*is_error, content.clone())),
-                _ => None,
-            })
-            .collect();
+        self.observed_tool_results.lock().unwrap().extend(
+            request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult { content, is_error, .. } => Some((*is_error, content.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
         let events = {
             let mut turns = self.turns.lock().unwrap();
             if turns.is_empty() {
@@ -289,10 +291,11 @@ async fn strict_planning_denies_allowlisted_write_and_preserves_workspace() {
             .iter()
             .any(|(is_error, content)| *is_error && content.contains("policy_denied"))
     );
-    assert_eq!(
-        *provider.advertised_tools.lock().unwrap(),
-        AION_STRICT_PLANNING_ALLOWED_TOOLS.map(str::to_owned).to_vec()
-    );
+    let expected_advertised = registered
+        .into_iter()
+        .filter(|name| AION_STRICT_PLANNING_ALLOWED_TOOLS.contains(&name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(*provider.advertised_tools.lock().unwrap(), expected_advertised);
 }
 
 #[tokio::test]
