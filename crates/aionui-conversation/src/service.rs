@@ -153,14 +153,14 @@ fn parse_persisted<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, C
 
 fn integration_mode_evidence(agent_type: &str, runtime_backend: &str) -> (AgentIntegrationMode, Vec<String>) {
     match (agent_type, runtime_backend) {
-        ("codex", "codex") => (
+        ("codex" | "acp", "codex") => (
             AgentIntegrationMode::NativeSandbox,
             vec![
                 "Native session config applies the Codex read-only sandbox before the turn".to_owned(),
                 "MCP, external network, plugin, and delegated-tool enforcement are not host-proven".to_owned(),
             ],
         ),
-        ("claude", "claude") => (
+        ("claude" | "acp", "claude") => (
             AgentIntegrationMode::NativePermissionMode,
             vec![
                 "Native session config applies Claude permission mode".to_owned(),
@@ -217,14 +217,14 @@ mod planning_isolation_tests {
 
     #[test]
     fn active_integration_selects_runtime_profile_without_assigning_a_brand_level() {
-        assert_eq!(
-            integration_mode_evidence("codex", "codex").0,
-            AgentIntegrationMode::NativeSandbox,
-        );
-        assert_eq!(
-            integration_mode_evidence("claude", "claude").0,
-            AgentIntegrationMode::NativePermissionMode,
-        );
+        for (agent_type, backend, expected) in [
+            ("codex", "codex", AgentIntegrationMode::NativeSandbox),
+            ("acp", "codex", AgentIntegrationMode::NativeSandbox),
+            ("claude", "claude", AgentIntegrationMode::NativePermissionMode),
+            ("acp", "claude", AgentIntegrationMode::NativePermissionMode),
+        ] {
+            assert_eq!(integration_mode_evidence(agent_type, backend).0, expected,);
+        }
         assert_eq!(
             integration_mode_evidence("acp", "codebuddy").0,
             AgentIntegrationMode::GenericAcp,
