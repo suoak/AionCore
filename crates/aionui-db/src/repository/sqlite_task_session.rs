@@ -116,6 +116,24 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
             .ok_or_else(|| DbError::NotFound(format!("Task session '{id}' not found after update")))
     }
 
+    async fn claim_automatic_planning(
+        &self,
+        user_id: &str,
+        id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE task_sessions SET status = 'running', updated_at = ? \
+             WHERE user_id = ? AND id = ? AND mode = 'plan' AND status IN ('ready', 'paused')",
+        )
+        .bind(updated_at)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn pause_incomplete(&self, updated_at: TimestampMs) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE task_sessions SET status = 'paused', updated_at = ? \
@@ -598,6 +616,25 @@ mod tests {
         assert_eq!(repo.pause_incomplete(42).await.unwrap(), 1);
         assert_eq!(repo.get(USER, &running.id).await.unwrap().unwrap().status, "paused");
         assert_eq!(repo.get(USER, &ready.id).await.unwrap().unwrap().status, "ready");
+    }
+
+    #[tokio::test]
+    async fn automatic_planning_claim_is_atomic_and_plan_only() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteTaskSessionRepository::new(db.pool().clone());
+        let ready = repo.create(&create_params("ready")).await.unwrap();
+        let paused = repo.create(&create_params("paused")).await.unwrap();
+        let mut agent_params = create_params("ready");
+        agent_params.mode = "agent";
+        let agent = repo.create(&agent_params).await.unwrap();
+
+        assert!(repo.claim_automatic_planning(USER, &ready.id, 10).await.unwrap());
+        assert!(!repo.claim_automatic_planning(USER, &ready.id, 11).await.unwrap());
+        assert!(repo.claim_automatic_planning(USER, &paused.id, 12).await.unwrap());
+        assert!(!repo.claim_automatic_planning(USER, &agent.id, 13).await.unwrap());
+        assert_eq!(repo.get(USER, &ready.id).await.unwrap().unwrap().status, "running");
+        assert_eq!(repo.get(USER, &paused.id).await.unwrap().unwrap().status, "running");
+        assert_eq!(repo.get(USER, &agent.id).await.unwrap().unwrap().status, "ready");
     }
 
     #[tokio::test]

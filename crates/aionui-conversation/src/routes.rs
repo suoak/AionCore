@@ -14,9 +14,10 @@ use aionui_api_types::{
     CreateConversationRequest, CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse,
     ExecuteApprovedPlanRequest, ForkConversationRequest, ListConversationInputsQuery, ListConversationsQuery,
     ListMessagesQuery, ListTaskSessionsQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest,
-    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskRunResponse,
-    TaskSessionResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    PlanningIsolationResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    StartAutomaticPlanningRequest, SubmitConversationInputRequest, SubmitTaskArtifactRequest,
+    SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskRunResponse, TaskSessionResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
     VerifyAcceptanceCriterionRequest,
 };
 use aionui_auth::CurrentUser;
@@ -139,6 +140,11 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
             get(get_task_session).patch(update_task_session),
         )
         .route(
+            "/api/task-sessions/{id}/planning-isolation",
+            get(get_task_planning_isolation),
+        )
+        .route("/api/task-sessions/{id}/automatic-plan", post(start_automatic_planning))
+        .route(
             "/api/task-sessions/{id}/artifacts",
             post(submit_task_artifact).get(list_task_artifacts),
         )
@@ -236,6 +242,16 @@ async fn get_task_session(
     Ok(Json(ApiResponse::ok(session)))
 }
 
+async fn get_task_planning_isolation(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<PlanningIsolationResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.get_task_planning_isolation(&user.id, &id).await?,
+    )))
+}
+
 async fn update_task_session(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -259,6 +275,17 @@ async fn submit_task_artifact(
 ) -> Result<(StatusCode, Json<ApiResponse<SubmitTaskArtifactResponse>>), ApiError> {
     let Json(request) = body.map_err(ApiError::from)?;
     let response = state.service.submit_task_artifact(&user.id, &id, request).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
+async fn start_automatic_planning(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<StartAutomaticPlanningRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<SubmitTaskArtifactResponse>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = state.service.start_automatic_planning(&user.id, &id, request).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
 }
 

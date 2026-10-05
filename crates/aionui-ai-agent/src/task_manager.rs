@@ -391,7 +391,7 @@ mod tests {
     use crate::session_context::{
         AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, ConversationContext, WorkspaceContext,
     };
-    use crate::types::{CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
+    use crate::types::{AionrsRuntimeToolPolicy, CONVERSATION_RUNTIME_CONTEXT_VERSION, SendMessageData};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -649,6 +649,23 @@ mod tests {
         let h2 = mgr.get_or_build_task("conv-1", options).await.unwrap();
 
         assert!(!same_mock(&h1, &h2));
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_or_build_never_reuses_an_engine_across_aionrs_tool_policy_boundaries() {
+        let mgr = make_manager();
+        let unrestricted = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+
+        let mut strict_options = make_options("conv-1");
+        strict_options.runtime_capabilities.aionrs_tool_policy = AionrsRuntimeToolPolicy::StrictPlanning;
+        let strict = mgr.get_or_build_task("conv-1", strict_options).await.unwrap();
+
+        assert!(!same_mock(&unrestricted, &strict));
+
+        let unrestricted_again = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
+
+        assert!(!same_mock(&strict, &unrestricted_again));
         assert_eq!(mgr.active_count(), 1);
     }
 

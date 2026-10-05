@@ -4,10 +4,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_ai_agent::types::{AionrsRuntimeToolPolicy, BuildTaskOptions};
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+    audited_aion_strict_runtime_capabilities, audited_runtime_capabilities, resolve_planning_isolation,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -16,21 +17,21 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::{
-    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, ApprovalCheckResponse,
-    AssistantConversationOverridesRequest, AssistantMcpBindingChanged, CancelConversationResponse,
-    CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, AgentIntegrationMode,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, AssistantMcpBindingChanged,
+    CancelConversationResponse, CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
     ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
-    MessageListResponse, MessageResponse, MessageSearchResponse, PromptCapabilityView,
+    MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationResponse, PromptCapabilityView,
     RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME,
-    TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse,
-    TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TeamMcpSelection,
-    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
-    VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
+    SessionMcpTransport, StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse,
+    TEAM_MCP_SERVER_NAME, TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind,
+    TaskArtifactResponse, TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus,
+    TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
@@ -148,6 +149,117 @@ fn parse_persisted<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, C
     value
         .parse()
         .map_err(|_| ConversationError::internal(format!("Persisted {name} has an invalid value")))
+}
+
+fn integration_mode_evidence(agent_type: &str, runtime_backend: &str) -> (AgentIntegrationMode, Vec<String>) {
+    match (agent_type, runtime_backend) {
+        ("codex", "codex") => (
+            AgentIntegrationMode::NativeSandbox,
+            vec![
+                "Native session config applies the Codex read-only sandbox before the turn".to_owned(),
+                "MCP, external network, plugin, and delegated-tool enforcement are not host-proven".to_owned(),
+            ],
+        ),
+        ("claude", "claude") => (
+            AgentIntegrationMode::NativePermissionMode,
+            vec![
+                "Native session config applies Claude permission mode".to_owned(),
+                "MCP and delegated-agent mutation coverage is not host-proven".to_owned(),
+            ],
+        ),
+        ("aionrs", _) | (_, "aionrs") => (
+            AgentIntegrationMode::InProcessToolRegistry,
+            vec![
+                "Aion strict planning uses a host-selected exact-name allowlist before bootstrap".to_owned(),
+                "Hooks, MCP servers, native plan tools, skills, spawning, and tool search are disabled in strict planning"
+                    .to_owned(),
+                "Task-manager capability identity rebuilds the runtime when planning and execution policies differ"
+                    .to_owned(),
+            ],
+        ),
+        ("acp", _) => (
+            AgentIntegrationMode::GenericAcp,
+            vec![
+                "ACP request_permission is advisory and is not a mandatory proxy for internal or MCP tools".to_owned(),
+            ],
+        ),
+        _ => (
+            AgentIntegrationMode::Unknown,
+            vec![format!(
+                "No audited planning enforcement profile exists for agent_type={agent_type}, runtime_backend={runtime_backend}"
+            )],
+        ),
+    }
+}
+
+fn audited_capabilities_for_integration(
+    integration_mode: AgentIntegrationMode,
+) -> aionui_ai_agent::RuntimeEnforcementCapabilities {
+    if integration_mode == AgentIntegrationMode::InProcessToolRegistry {
+        audited_aion_strict_runtime_capabilities()
+    } else {
+        audited_runtime_capabilities(integration_mode)
+    }
+}
+
+fn validate_planning_turn_content(policy: AionrsRuntimeToolPolicy, content: &str) -> Result<(), ConversationError> {
+    if policy == AionrsRuntimeToolPolicy::StrictPlanning && content.trim_start().starts_with('/') {
+        return Err(ConversationError::Forbidden {
+            reason: "Slash commands are disabled during guaranteed planning".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod planning_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn active_integration_selects_runtime_profile_without_assigning_a_brand_level() {
+        assert_eq!(
+            integration_mode_evidence("codex", "codex").0,
+            AgentIntegrationMode::NativeSandbox,
+        );
+        assert_eq!(
+            integration_mode_evidence("claude", "claude").0,
+            AgentIntegrationMode::NativePermissionMode,
+        );
+        assert_eq!(
+            integration_mode_evidence("acp", "codebuddy").0,
+            AgentIntegrationMode::GenericAcp,
+        );
+        assert_eq!(
+            integration_mode_evidence("aionrs", "aionrs").0,
+            AgentIntegrationMode::InProcessToolRegistry,
+        );
+    }
+
+    #[test]
+    fn unknown_and_generic_acp_profiles_fail_closed() {
+        for (agent_type, backend) in [("acp", "codebuddy"), ("future", "future")] {
+            let (mode, evidence) = integration_mode_evidence(agent_type, backend);
+            let assessment = resolve_planning_isolation(audited_runtime_capabilities(mode), evidence);
+            assert_eq!(assessment.level, aionui_api_types::PlanningIsolationLevel::Unsupported);
+            assert!(!assessment.automatic_planning_enabled);
+        }
+    }
+
+    #[test]
+    fn aion_strict_profile_is_guaranteed_only_after_mandatory_enforcement() {
+        let (mode, evidence) = integration_mode_evidence("aionrs", "aionrs");
+        let assessment = resolve_planning_isolation(audited_capabilities_for_integration(mode), evidence);
+
+        assert_eq!(assessment.level, aionui_api_types::PlanningIsolationLevel::Guaranteed);
+        assert!(assessment.automatic_planning_enabled);
+    }
+
+    #[test]
+    fn strict_planning_rejects_slash_commands_before_turn_start() {
+        assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "  /skill mutate").is_err());
+        assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "inspect the repo").is_ok());
+        assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::Unrestricted, "/allowed-in-execution").is_ok());
+    }
 }
 
 fn task_artifact_response(row: TaskArtifactRow) -> Result<TaskArtifactResponse, ConversationError> {
@@ -573,6 +685,7 @@ pub struct ConversationAgentTurnOutcome {
     pub turn_id: String,
     pub status: ConversationAgentTurnStatus,
     pub error_message: Option<String>,
+    pub assistant_output: Option<String>,
     pub runtime: ConversationRuntimeSummary,
 }
 
@@ -734,6 +847,190 @@ impl ConversationService {
             .await?
             .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
         task_session_response(row)
+    }
+
+    pub async fn get_task_planning_isolation(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<PlanningIsolationResponse, ConversationError> {
+        let task = self
+            .task_session_repo()?
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
+        let binding = self.resolve_assistant_agent_binding(user_id, &task.agent_type).await?;
+        let (integration_mode, evidence) = match binding {
+            Some(binding) => {
+                let (integration_mode, mut evidence) =
+                    integration_mode_evidence(&binding.agent_type, &binding.runtime_backend);
+                if integration_mode == AgentIntegrationMode::InProcessToolRegistry {
+                    let conversation_is_aion = match task.conversation_id.as_deref() {
+                        Some(conversation_id) => {
+                            self.conversation_repo
+                                .get(user_id, conversation_id)
+                                .await?
+                                .and_then(|row| parse_agent_type_from_row(&row))
+                                == Some(AgentType::Aionrs)
+                        }
+                        None => false,
+                    };
+                    if !conversation_is_aion {
+                        evidence.push("The bound conversation is not an Aion runtime".to_owned());
+                        return Ok(resolve_planning_isolation(
+                            audited_runtime_capabilities(AgentIntegrationMode::Unknown),
+                            evidence,
+                        ));
+                    }
+                }
+                (integration_mode, evidence)
+            }
+            None => (
+                AgentIntegrationMode::Unknown,
+                vec!["No agent_metadata binding was resolved for this runtime instance".to_owned()],
+            ),
+        };
+        Ok(resolve_planning_isolation(
+            audited_capabilities_for_integration(integration_mode),
+            evidence,
+        ))
+    }
+
+    pub async fn start_automatic_planning(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        request: StartAutomaticPlanningRequest,
+    ) -> Result<SubmitTaskArtifactResponse, ConversationError> {
+        let prompt = request.prompt.trim();
+        if prompt.is_empty() || prompt.chars().count() > 100_000 {
+            return Err(ConversationError::bad_request(
+                "Automatic planning prompt must contain 1 to 100000 characters",
+            ));
+        }
+
+        let repo = self.task_session_repo()?;
+        let task = repo.get(user_id, task_session_id).await?.ok_or_else(|| {
+            ConversationError::not_found_reason(format!("Task session '{task_session_id}' not found"))
+        })?;
+        if parse_persisted::<TaskSessionMode>(&task.mode, "task session mode")? != TaskSessionMode::Plan {
+            return Err(ConversationError::bad_request(
+                "Automatic planning requires a Plan task session",
+            ));
+        }
+        let conversation_id = task
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| ConversationError::bad_request("Automatic planning requires a conversation binding"))?;
+        let isolation = self.get_task_planning_isolation(user_id, task_session_id).await?;
+        if !isolation.automatic_planning_enabled {
+            return Err(ConversationError::Forbidden {
+                reason: "This agent does not provide guaranteed non-mutating planning".into(),
+            });
+        }
+        if !repo
+            .claim_automatic_planning(user_id, task_session_id, now_ms())
+            .await?
+        {
+            return Err(ConversationError::Busy {
+                reason: "Automatic planning is already active or the task is not ready".into(),
+            });
+        }
+
+        let planning_prompt = format!(
+            "Create an implementation plan for the objective below. Investigate only with the available read-only tools. Do not execute changes. Return only the proposed plan.\n\nObjective:\n{prompt}"
+        );
+        let outcome = self
+            .run_agent_turn_internal(
+                ConversationAgentTurnRequest {
+                    user_id: user_id.to_owned(),
+                    conversation_id: conversation_id.to_owned(),
+                    content: planning_prompt,
+                    files: Vec::new(),
+                    inject_skills: Vec::new(),
+                    required_runtime_mode: None,
+                    persist_user_message: true,
+                    user_message_hidden: true,
+                    on_started: None,
+                },
+                false,
+            )
+            .await;
+
+        let content = match outcome {
+            Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => outcome
+                .assistant_output
+                .map(|content| content.trim().to_owned())
+                .filter(|content| !content.is_empty() && content.chars().count() <= 100_000),
+            Ok(outcome) => {
+                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                return Err(ConversationError::BadGateway {
+                    reason: outcome
+                        .error_message
+                        .unwrap_or_else(|| "Automatic planning did not complete".to_owned()),
+                });
+            }
+            Err(error) => {
+                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                return Err(error);
+            }
+        }
+        .ok_or_else(|| ConversationError::BadGateway {
+            reason: "Automatic planning returned no valid plan content".into(),
+        });
+
+        let content = match content {
+            Ok(content) => content,
+            Err(error) => {
+                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                return Err(error);
+            }
+        };
+        let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let kind = TaskArtifactKind::Plan.to_string();
+        let persisted = repo
+            .create_artifact_with_approval(&CreateTaskArtifactParams {
+                user_id,
+                task_session_id,
+                kind: &kind,
+                content: &content,
+                content_hash: &content_hash,
+                acceptance_criteria: &[],
+            })
+            .await;
+        let (artifact, approval, criteria) = match persisted {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                return Err(error.into());
+            }
+        };
+        Ok(SubmitTaskArtifactResponse {
+            artifact: task_artifact_response(artifact)?,
+            approval: task_approval_response(approval)?,
+            acceptance_criteria: criteria
+                .into_iter()
+                .map(acceptance_criterion_response)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    async fn pause_automatic_planning(
+        &self,
+        repo: &Arc<dyn ITaskSessionRepository>,
+        user_id: &str,
+        task_session_id: &str,
+    ) -> Result<(), ConversationError> {
+        repo.update(
+            user_id,
+            task_session_id,
+            &UpdateTaskSessionParams {
+                status: Some("paused"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn update_task_session(
@@ -1172,24 +1469,61 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         approved_execution: bool,
-    ) -> Result<(), ConversationError> {
+    ) -> Result<AionrsRuntimeToolPolicy, ConversationError> {
         if approved_execution {
-            return Ok(());
+            return Ok(AionrsRuntimeToolPolicy::Unrestricted);
         }
         let Some(repo) = self.task_session_repo_optional() else {
-            return Ok(());
+            return Ok(AionrsRuntimeToolPolicy::Unrestricted);
         };
-        let guarded = repo
-            .list(user_id, Some(conversation_id))
-            .await?
+        let active_tasks = repo.list(user_id, Some(conversation_id)).await?;
+        let mut policy = AionrsRuntimeToolPolicy::Unrestricted;
+        for task in active_tasks
             .into_iter()
-            .any(|task| task.mode != "agent" && !matches!(task.status.as_str(), "completed" | "failed" | "cancelled"));
-        if guarded {
-            return Err(ConversationError::Forbidden {
-                reason: "Plan and goal tasks may execute only through an approved immutable plan".into(),
-            });
+            .filter(|task| !matches!(task.status.as_str(), "completed" | "failed" | "cancelled"))
+        {
+            match task.mode.as_str() {
+                "agent" => {}
+                "goal" => {
+                    return Err(ConversationError::Forbidden {
+                        reason: "Goal tasks may execute only through an approved immutable plan".into(),
+                    });
+                }
+                "plan" => {
+                    let conversation =
+                        self.conversation_repo
+                            .get(user_id, conversation_id)
+                            .await?
+                            .ok_or_else(|| ConversationError::NotFound {
+                                id: conversation_id.to_owned(),
+                            })?;
+                    if parse_agent_type_from_row(&conversation) != Some(AgentType::Aionrs) {
+                        return Err(ConversationError::Forbidden {
+                            reason: "Guaranteed planning requires an Aion conversation runtime".into(),
+                        });
+                    }
+                    let binding = self.resolve_assistant_agent_binding(user_id, &task.agent_type).await?;
+                    let integration_mode = binding
+                        .as_ref()
+                        .map(|binding| integration_mode_evidence(&binding.agent_type, &binding.runtime_backend).0)
+                        .unwrap_or(AgentIntegrationMode::Unknown);
+                    let isolation =
+                        resolve_planning_isolation(audited_capabilities_for_integration(integration_mode), Vec::new());
+                    if !isolation.automatic_planning_enabled {
+                        return Err(ConversationError::Forbidden {
+                            reason: "This agent does not provide guaranteed non-mutating planning".into(),
+                        });
+                    }
+                    policy = AionrsRuntimeToolPolicy::StrictPlanning;
+                }
+                _ => {
+                    return Err(ConversationError::Forbidden {
+                        reason: "Unknown task modes cannot start an agent turn".into(),
+                    });
+                }
+            }
         }
-        Ok(())
+        Ok(policy)
     }
 
     async fn validate_task_conversation_binding(
@@ -4877,8 +5211,10 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        self.enforce_task_execution_gate(user_id, conversation_id, false)
+        let runtime_tool_policy = self
+            .enforce_task_execution_gate(user_id, conversation_id, false)
             .await?;
+        validate_planning_turn_content(runtime_tool_policy, &req.content)?;
 
         if let Some(team_id) = team_id_from_extra(&row.extra) {
             info!(
@@ -4935,7 +5271,8 @@ impl ConversationService {
         // with the active turn's id. Every other case (including the 409 for
         // non-supporting backends) is unchanged and handled by the claim below.
         let mut fallback_user_msg: Option<String> = None;
-        if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
+        if runtime_tool_policy == AionrsRuntimeToolPolicy::Unrestricted
+            && let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
             && let Some(agent) = task_manager.get_task(conversation_id)
             && agent.supports_midturn_delivery()
         {
@@ -5089,6 +5426,7 @@ impl ConversationService {
             }
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
+        build_opts.runtime_capabilities.aionrs_tool_policy = runtime_tool_policy;
         self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
@@ -5149,8 +5487,10 @@ impl ConversationService {
                 id: request.conversation_id.clone(),
             })?;
 
-        self.enforce_task_execution_gate(&request.user_id, &request.conversation_id, approved_execution)
+        let runtime_tool_policy = self
+            .enforce_task_execution_gate(&request.user_id, &request.conversation_id, approved_execution)
             .await?;
+        validate_planning_turn_content(runtime_tool_policy, &request.content)?;
 
         reject_deprecated_runtime_row(&row)?;
         self.validate_turn_start(&request.user_id, &request.conversation_id, &row.extra)
@@ -5245,12 +5585,14 @@ impl ConversationService {
                     turn_id,
                     status: ConversationAgentTurnStatus::Failed,
                     error_message: Some(send_error_display_message(&send_error)),
+                    assistant_output: None,
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
                 });
             }
         };
 
         self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
+        build_opts.runtime_capabilities.aionrs_tool_policy = runtime_tool_policy;
         self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
@@ -5279,6 +5621,7 @@ impl ConversationService {
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
             },
             error_message: result.error_message,
+            assistant_output: result.assistant_output,
         })
     }
 

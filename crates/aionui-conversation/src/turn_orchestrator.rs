@@ -56,6 +56,7 @@ pub(crate) enum ConversationTurnStatus {
 pub(crate) struct ConversationTurnResult {
     pub status: ConversationTurnStatus,
     pub error_message: Option<String>,
+    pub assistant_output: Option<String>,
 }
 
 pub(crate) struct ConversationTurnOrchestrator {
@@ -175,6 +176,7 @@ impl ConversationTurnOrchestrator {
                 return Err(ConversationTurnResult {
                     status: ConversationTurnStatus::Failed,
                     error_message: Some(failure_message),
+                    assistant_output: None,
                 });
             }
         };
@@ -211,6 +213,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Failed,
                 error_message: Some(failure_message),
+                assistant_output: None,
             });
         }
 
@@ -269,6 +272,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Completed,
                 error_message: None,
+                assistant_output: None,
             });
         }
 
@@ -381,6 +385,7 @@ impl ConversationTurnOrchestrator {
                         return Err(ConversationTurnResult {
                             status: ConversationTurnStatus::Failed,
                             error_message: Some(failure_message),
+                            assistant_output: None,
                         });
                     }
                 }
@@ -696,6 +701,7 @@ impl ConversationTurnOrchestrator {
                 ConversationTurnStatus::Completed
             },
             error_message: if final_failed { final_error_message } else { None },
+            assistant_output: if final_failed { None } else { final_assistant_output },
         }
     }
 }
