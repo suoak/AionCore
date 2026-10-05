@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.14](https://github.com/suoak/AionCore/compare/v0.2.13...v0.2.14) (2026-10-05)
+
+
+### Features
+
+* **policy:** enforce strict aion planning tools ([#129](https://github.com/suoak/AionCore/issues/129)) ([f0f7f42](https://github.com/suoak/AionCore/commit/f0f7f42c1b1291852bedaf7804114c5d83bfe78a))
+
 ## [0.2.13](https://github.com/suoak/AionCore/compare/v0.2.12...v0.2.13) (2026-09-17)
 
 
