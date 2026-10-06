@@ -248,7 +248,8 @@ pub use task_session::{
     ListTaskSessionsQuery, PlanningIsolationLevel, PlanningIsolationResponse, PolicyDecision, PolicyDecisionKind,
     StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalDecision,
     TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskArtifactStatus,
-    TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, ToolCapability,
+    TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse,
+    TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, ToolCapability,
     UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
 pub use team::{

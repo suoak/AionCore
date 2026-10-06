@@ -45,12 +45,14 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
+    pub task_trace: Option<crate::task_trace::TaskTraceContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConversationTurnStatus {
     Completed,
     Failed,
+    Cancelled,
 }
 
 pub(crate) struct ConversationTurnResult {
@@ -78,6 +80,7 @@ struct TurnAttemptInput {
     defer_clean_terminal_errors: bool,
     /// Shared by every attempt of this turn — see the field's use in run_attempt.
     superseding_tips: SupersedingTipTotals,
+    task_trace: Option<crate::task_trace::TaskTraceContext>,
 }
 
 struct TurnAttemptResult {
@@ -270,7 +273,7 @@ impl ConversationTurnOrchestrator {
                 &input.msg_id,
             );
             return Err(ConversationTurnResult {
-                status: ConversationTurnStatus::Completed,
+                status: ConversationTurnStatus::Cancelled,
                 error_message: None,
                 assistant_output: None,
             });
@@ -305,6 +308,7 @@ impl ConversationTurnOrchestrator {
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
             .with_output_retention(self.service.output_retention_policy())
             .with_event_journal(self.service.canonical_event_journal())
+            .with_task_trace(input.task_trace.clone())
             .with_usage_event_repo(self.service.usage_event_repo())
             .with_permission_auto_reject({
                 let agent = agent.clone();
@@ -509,7 +513,7 @@ impl ConversationTurnOrchestrator {
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
-        let final_failed = loop {
+        let final_status = loop {
             let attempt_number = if replayed { 2 } else { 1 };
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
@@ -525,13 +529,14 @@ impl ConversationTurnOrchestrator {
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
                     superseding_tips: superseding_tips.clone(),
+                    task_trace: input.task_trace.clone(),
                 })
                 .await
             {
                 Ok(result) => result,
                 Err(result) => {
                     final_error_message = result.error_message;
-                    break result.status == ConversationTurnStatus::Failed;
+                    break result.status;
                 }
             };
 
@@ -554,7 +559,7 @@ impl ConversationTurnOrchestrator {
                         "conversation turn auto replay completed"
                     );
                 }
-                break false;
+                break ConversationTurnStatus::Completed;
             }
             final_error_message = turn_attempt_error_message(&attempt_result.summary);
             if replayed {
@@ -644,11 +649,12 @@ impl ConversationTurnOrchestrator {
                                 .await;
                         }
                     }
-                    break true;
+                    break ConversationTurnStatus::Failed;
                 }
             }
         };
 
+        let final_failed = final_status == ConversationTurnStatus::Failed;
         if auth_failure {
             // The agent connected (detection saw it online) but a real turn hit
             // an explicit auth signal — write "needs sign-in" back to its
@@ -695,11 +701,7 @@ impl ConversationTurnOrchestrator {
         }
 
         ConversationTurnResult {
-            status: if final_failed {
-                ConversationTurnStatus::Failed
-            } else {
-                ConversationTurnStatus::Completed
-            },
+            status: final_status,
             error_message: if final_failed { final_error_message } else { None },
             assistant_output: if final_failed { None } else { final_assistant_output },
         }

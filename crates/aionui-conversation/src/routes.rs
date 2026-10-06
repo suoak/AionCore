@@ -16,9 +16,9 @@ use aionui_api_types::{
     ListMessagesQuery, ListTaskSessionsQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
     PlanningIsolationResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     StartAutomaticPlanningRequest, SubmitConversationInputRequest, SubmitTaskArtifactRequest,
-    SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskRunResponse, TaskSessionResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
-    VerifyAcceptanceCriterionRequest,
+    SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskEvidenceResponse, TaskReviewResponse,
+    TaskRunResponse, TaskSessionResponse, TaskTraceEventResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -155,6 +155,20 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         )
         .route("/api/task-sessions/{id}/execute", post(execute_approved_plan))
         .route("/api/task-sessions/{id}/runs", get(list_task_runs))
+        .route("/api/task-sessions/{id}/runs/{run_id}/review", get(get_task_run_review))
+        .route("/api/task-sessions/{id}/runs/{run_id}/trace", get(get_task_run_trace))
+        .route(
+            "/api/task-sessions/{id}/runs/{run_id}/changes",
+            get(get_task_run_changes),
+        )
+        .route(
+            "/api/task-sessions/{id}/runs/{run_id}/approvals",
+            get(get_task_run_approvals),
+        )
+        .route(
+            "/api/task-sessions/{id}/runs/{run_id}/verification",
+            get(get_task_run_verification),
+        )
         .route(
             "/api/task-sessions/{id}/acceptance-criteria",
             get(list_acceptance_criteria),
@@ -343,6 +357,68 @@ async fn list_task_runs(
 ) -> Result<Json<ApiResponse<Vec<TaskRunResponse>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state.service.list_task_runs(&user.id, &id).await?,
+    )))
+}
+
+async fn get_task_run_review(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<TaskReviewResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.get_task_run_review(&user.id, &id, &run_id).await?,
+    )))
+}
+
+async fn get_task_run_trace(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<Vec<TaskTraceEventResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.get_task_run_trace(&user.id, &id, &run_id).await?,
+    )))
+}
+
+async fn get_task_run_changes(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<Vec<TaskEvidenceResponse>>>, ApiError> {
+    let evidence = state.service.get_task_run_evidence(&user.id, &id, &run_id).await?;
+    Ok(Json(ApiResponse::ok(
+        evidence
+            .into_iter()
+            .filter(|item| matches!(item.kind.as_str(), "file" | "diff"))
+            .collect(),
+    )))
+}
+
+async fn get_task_run_approvals(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<Vec<TaskApprovalResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_task_run_review(&user.id, &id, &run_id)
+            .await?
+            .approvals,
+    )))
+}
+
+async fn get_task_run_verification(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<Vec<AcceptanceCriterionResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_task_run_review(&user.id, &id, &run_id)
+            .await?
+            .acceptance_criteria,
     )))
 }
 

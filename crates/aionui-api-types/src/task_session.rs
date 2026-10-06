@@ -414,16 +414,98 @@ pub struct TaskRunResponse {
     pub id: String,
     pub task_session_id: String,
     pub conversation_id: String,
-    pub plan_artifact_id: String,
+    pub run_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_artifact_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_artifact_id: Option<String>,
-    pub approval_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
     pub status: TaskRunStatus,
     pub started_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TaskSessionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planning_isolation: Option<PlanningIsolationLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskTraceEventResponse {
+    pub event_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub sequence: i64,
+    pub timestamp: i64,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskCheckpointResponse {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub checkpoint_type: String,
+    pub sequence: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    pub state: serde_json::Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvidenceResponse {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub criterion_id: Option<String>,
+    pub kind: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    pub metadata: serde_json::Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskReviewSummary {
+    pub status: TaskRunStatus,
+    pub files_changed: usize,
+    pub tool_calls: usize,
+    pub policy_decisions: usize,
+    pub denied_decisions: usize,
+    pub criteria_passed: usize,
+    pub criteria_total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskReviewResponse {
+    pub task: TaskSessionResponse,
+    pub run: TaskRunResponse,
+    pub artifacts: Vec<TaskArtifactResponse>,
+    pub approvals: Vec<TaskApprovalResponse>,
+    pub acceptance_criteria: Vec<AcceptanceCriterionResponse>,
+    pub trace: Vec<TaskTraceEventResponse>,
+    pub checkpoints: Vec<TaskCheckpointResponse>,
+    pub evidence: Vec<TaskEvidenceResponse>,
+    pub summary: TaskReviewSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

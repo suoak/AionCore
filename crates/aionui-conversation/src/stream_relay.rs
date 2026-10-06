@@ -24,7 +24,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 type PermissionAutoReject = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -186,6 +186,7 @@ pub struct StreamRelay {
     event_journal: Option<CanonicalEventJournal>,
     permission_auto_reject: Option<PermissionAutoReject>,
     usage_event_repo: Option<Arc<dyn IUsageEventRepository>>,
+    task_trace: Option<crate::task_trace::TaskTraceContext>,
     last_model_id: Option<String>,
 }
 
@@ -224,6 +225,7 @@ impl StreamRelay {
             event_journal: None,
             permission_auto_reject: None,
             usage_event_repo: None,
+            task_trace: None,
             last_model_id: None,
         }
     }
@@ -269,6 +271,11 @@ impl StreamRelay {
 
     pub(crate) fn with_output_retention(mut self, policy: OutputRetentionPolicy) -> Self {
         self.output_retention = Some(policy);
+        self
+    }
+
+    pub(crate) fn with_task_trace(mut self, context: Option<crate::task_trace::TaskTraceContext>) -> Self {
+        self.task_trace = context;
         self
     }
 
@@ -445,6 +452,17 @@ impl StreamRelay {
                                 ));
                             }
                         }
+                    }
+                    if let Some(task_trace) = &self.task_trace
+                        && let Err(error) = task_trace.observe(&event).await
+                    {
+                        error!(
+                            task_id = %task_trace.task_id,
+                            run_id = %task_trace.run_id,
+                            event_type = Self::event_kind(&event),
+                            error = %ErrorChain(&error),
+                            "Failed to persist task trace projection"
+                        );
                     }
                     let deleting = self.is_deleting();
                     if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
