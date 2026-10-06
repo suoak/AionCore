@@ -32,13 +32,13 @@ pub use models::{
     CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection,
     FolderRow, JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow,
     Role, SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillImportRecordRow, SkillRegistryInstallRow,
-    SkillRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow,
-    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
-    UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams, UpsertAssistantAgentCenterParams,
-    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
-    UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
-    UpsertJournalProjectionCheckpointParams, UpsertOverrideParams, UpsertSkillEvolutionSettingsParams, UsageEventRow,
-    UserOrderRow, UserStatus, UserType,
+    SkillRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow,
+    TaskRunRow, TaskSessionRow, TaskTraceEventRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+    UpdateAssistantParams, UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams,
+    UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
+    UpsertConversationCapabilitySnapshotParams, UpsertJournalProjectionCheckpointParams, UpsertOverrideParams,
+    UpsertSkillEvolutionSettingsParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -55,7 +55,8 @@ pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
 pub use repository::task_session::{
-    CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
+    AppendTaskTraceEventParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams, CreateTaskCheckpointParams,
+    CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
     ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
 };
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};

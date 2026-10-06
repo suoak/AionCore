@@ -53,7 +53,10 @@ pub use skill_evolution::{
     SkillEvolutionSettingsRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
 };
 pub use system_settings::SystemSettings;
-pub use task_session::{TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow};
+pub use task_session::{
+    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
+    TaskSessionRow, TaskTraceEventRow,
+};
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use usage_event::UsageEventRow;
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};

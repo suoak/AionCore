@@ -1430,7 +1430,7 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
         .unwrap()
         .expect("imported skill row should exist for the importing user");
     assert!(
-        alpha_row.path.contains("/skills/users/"),
+        alpha_row.path.replace('\\', "/").contains("/skills/users/"),
         "import must use user-scoped storage: {}",
         alpha_row.path
     );

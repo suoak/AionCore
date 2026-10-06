@@ -17,21 +17,23 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::{
-    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, AgentIntegrationMode,
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, AssistantMcpBindingChanged,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence,
+    AgentIntegrationMode, ApprovalCheckResponse, AssistantConversationOverridesRequest, AssistantMcpBindingChanged,
     CancelConversationResponse, CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest,
     ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
     ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
-    MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationResponse, PromptCapabilityView,
-    RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse,
-    TEAM_MCP_SERVER_NAME, TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind,
-    TaskArtifactResponse, TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus,
-    TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
+    MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationLevel, PlanningIsolationResponse,
+    PromptCapabilityView, RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SessionMcpServer, SessionMcpTransport, StartAutomaticPlanningRequest,
+    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME, TaskApprovalDecision,
+    TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskCheckpointResponse,
+    TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse, TaskRunStatus, TaskSessionMode,
+    TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, TeamMcpSelection, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
@@ -45,16 +47,17 @@ use aionui_common::{
 use aionui_db::models::McpServerRow;
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow, TaskAcceptanceCriterionRow,
-    TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow,
+    TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow,
+    TaskTraceEventRow,
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
-    CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
-    ITaskSessionRepository, IUsageEventRepository, MessagePageCursor, MessagePageDirection, MessagePageParams,
-    ResolveTaskApprovalParams, SaveRuntimeStateParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
-    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
+    CreatePlanningTaskRunParams, CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams,
+    FinishTaskRunParams, IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository,
+    IProviderRepository, ITaskSessionRepository, IUsageEventRepository, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, ResolveTaskApprovalParams, SaveRuntimeStateParams, UpdateAcceptanceCriterionParams,
+    UpdateTaskSessionParams, UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -293,10 +296,31 @@ fn task_approval_response(row: TaskApprovalRow) -> Result<TaskApprovalResponse, 
 }
 
 fn task_run_response(row: TaskRunRow) -> Result<TaskRunResponse, ConversationError> {
+    let planning_isolation = row
+        .planning_isolation
+        .as_deref()
+        .map(|value| match value {
+            "guaranteed" => Ok(PlanningIsolationLevel::Guaranteed),
+            "best_effort" => Ok(PlanningIsolationLevel::BestEffort),
+            "unsupported" => Ok(PlanningIsolationLevel::Unsupported),
+            _ => Err(ConversationError::internal(format!(
+                "Invalid persisted planning isolation: {value}"
+            ))),
+        })
+        .transpose()?;
+    let usage = row
+        .usage
+        .as_deref()
+        .map(|value| {
+            serde_json::from_str(value)
+                .map_err(|error| ConversationError::internal(format!("Invalid persisted task run usage: {error}")))
+        })
+        .transpose()?;
     Ok(TaskRunResponse {
         id: row.id,
         task_session_id: row.task_session_id,
         conversation_id: row.conversation_id,
+        run_kind: row.run_kind,
         plan_artifact_id: row.plan_artifact_id,
         goal_artifact_id: row.goal_artifact_id,
         approval_id: row.approval_id,
@@ -304,6 +328,63 @@ fn task_run_response(row: TaskRunRow) -> Result<TaskRunResponse, ConversationErr
         started_at: row.started_at,
         finished_at: row.finished_at,
         error_message: row.error_message,
+        agent_id: row.agent_id,
+        agent_runtime: row.agent_runtime,
+        model: row.model,
+        mode: row
+            .mode
+            .as_deref()
+            .map(|value| parse_persisted(value, "task run mode"))
+            .transpose()?,
+        planning_isolation,
+        result_summary: row.result_summary,
+        usage,
+    })
+}
+
+fn task_trace_event_response(row: TaskTraceEventRow) -> Result<TaskTraceEventResponse, ConversationError> {
+    let payload: serde_json::Value = serde_json::from_str(&row.payload)
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted task trace payload: {error}")))?;
+    Ok(TaskTraceEventResponse {
+        event_id: row.id,
+        task_id: row.task_session_id,
+        run_id: row.run_id,
+        sequence: row.sequence,
+        timestamp: row.timestamp,
+        event_type: row.event_type,
+        payload: crate::trace_redaction::sanitize_json(&payload),
+    })
+}
+
+fn task_checkpoint_response(row: TaskCheckpointRow) -> Result<TaskCheckpointResponse, ConversationError> {
+    let state: serde_json::Value = serde_json::from_str(&row.state)
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted task checkpoint state: {error}")))?;
+    Ok(TaskCheckpointResponse {
+        id: row.id,
+        task_id: row.task_session_id,
+        run_id: row.run_id,
+        checkpoint_type: row.checkpoint_type,
+        sequence: row.sequence,
+        artifact_id: row.artifact_id,
+        state: crate::trace_redaction::sanitize_json(&state),
+        created_at: row.created_at,
+    })
+}
+
+fn task_evidence_response(row: TaskEvidenceRow) -> Result<TaskEvidenceResponse, ConversationError> {
+    let metadata: serde_json::Value = serde_json::from_str(&row.metadata)
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted task evidence metadata: {error}")))?;
+    Ok(TaskEvidenceResponse {
+        id: row.id,
+        task_id: row.task_session_id,
+        run_id: row.run_id,
+        trace_event_id: row.trace_event_id,
+        criterion_id: row.criterion_id,
+        kind: row.kind,
+        summary: crate::trace_redaction::redact_and_bound(&row.summary),
+        reference: row.reference,
+        metadata: crate::trace_redaction::sanitize_json(&metadata),
+        created_at: row.created_at,
     })
 }
 
@@ -677,6 +758,7 @@ pub struct ConversationAgentTurnStarted {
 pub enum ConversationAgentTurnStatus {
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -928,14 +1010,23 @@ impl ConversationService {
                 reason: "This agent does not provide guaranteed non-mutating planning".into(),
             });
         }
-        if !repo
-            .claim_automatic_planning(user_id, task_session_id, now_ms())
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
             .await?
-        {
-            return Err(ConversationError::Busy {
-                reason: "Automatic planning is already active or the task is not ready".into(),
-            });
-        }
+            .ok_or_else(|| ConversationError::not_found_reason("Task conversation was not found"))?;
+        let planning_run = repo
+            .create_planning_run(&CreatePlanningTaskRunParams {
+                user_id,
+                task_session_id,
+                conversation_id,
+                agent_id: &task.agent_type,
+                agent_runtime: Some(&conversation.r#type),
+                model: conversation.model.as_deref(),
+                planning_isolation: "guaranteed",
+                started_at: now_ms(),
+            })
+            .await?;
 
         let planning_prompt = format!(
             "Create an implementation plan for the objective below. Investigate only with the available read-only tools. Do not execute changes. Return only the proposed plan.\n\nObjective:\n{prompt}"
@@ -954,8 +1045,18 @@ impl ConversationService {
                     on_started: None,
                 },
                 false,
+                Some(crate::task_trace::TaskTraceContext::new(
+                    user_id.to_owned(),
+                    task_session_id.to_owned(),
+                    planning_run.id.clone(),
+                    conversation_id.to_owned(),
+                    crate::task_trace::TaskTracePolicy::StrictPlanning,
+                    repo.clone(),
+                    self.output_retention_policy(),
+                )),
             )
             .await;
+        let planning_usage = self.capture_task_run_usage(conversation_id).await;
 
         let content = match outcome {
             Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => outcome
@@ -963,7 +1064,14 @@ impl ConversationService {
                 .map(|content| content.trim().to_owned())
                 .filter(|content| !content.is_empty() && content.chars().count() <= 100_000),
             Ok(outcome) => {
-                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                self.fail_automatic_planning(
+                    &repo,
+                    user_id,
+                    task_session_id,
+                    &planning_run.id,
+                    outcome.error_message.as_deref(),
+                )
+                .await?;
                 return Err(ConversationError::BadGateway {
                     reason: outcome
                         .error_message
@@ -971,7 +1079,9 @@ impl ConversationService {
                 });
             }
             Err(error) => {
-                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                let reason = error.to_string();
+                self.fail_automatic_planning(&repo, user_id, task_session_id, &planning_run.id, Some(&reason))
+                    .await?;
                 return Err(error);
             }
         }
@@ -982,11 +1092,14 @@ impl ConversationService {
         let content = match content {
             Ok(content) => content,
             Err(error) => {
-                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                let reason = error.to_string();
+                self.fail_automatic_planning(&repo, user_id, task_session_id, &planning_run.id, Some(&reason))
+                    .await?;
                 return Err(error);
             }
         };
         let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let planning_result_summary = crate::trace_redaction::redact_and_bound(&content);
         let kind = TaskArtifactKind::Plan.to_string();
         let persisted = repo
             .create_artifact_with_approval(&CreateTaskArtifactParams {
@@ -996,12 +1109,17 @@ impl ConversationService {
                 content: &content,
                 content_hash: &content_hash,
                 acceptance_criteria: &[],
+                planning_run_id: Some(&planning_run.id),
+                planning_result_summary: Some(&planning_result_summary),
+                planning_usage: planning_usage.as_deref(),
             })
             .await;
         let (artifact, approval, criteria) = match persisted {
             Ok(persisted) => persisted,
             Err(error) => {
-                self.pause_automatic_planning(&repo, user_id, task_session_id).await?;
+                let reason = error.to_string();
+                self.fail_automatic_planning(&repo, user_id, task_session_id, &planning_run.id, Some(&reason))
+                    .await?;
                 return Err(error.into());
             }
         };
@@ -1015,22 +1133,44 @@ impl ConversationService {
         })
     }
 
-    async fn pause_automatic_planning(
+    async fn fail_automatic_planning(
         &self,
         repo: &Arc<dyn ITaskSessionRepository>,
         user_id: &str,
         task_session_id: &str,
+        run_id: &str,
+        error_message: Option<&str>,
     ) -> Result<(), ConversationError> {
-        repo.update(
+        let bounded = error_message.map(crate::trace_redaction::redact_and_bound);
+        repo.finish_run(&FinishTaskRunParams {
             user_id,
             task_session_id,
-            &UpdateTaskSessionParams {
-                status: Some("paused"),
-                ..Default::default()
-            },
-        )
+            run_id,
+            run_status: "failed",
+            task_status: "paused",
+            finished_at: now_ms(),
+            error_message: bounded.as_deref(),
+            result_summary: None,
+            usage: None,
+        })
         .await?;
         Ok(())
+    }
+
+    async fn capture_task_run_usage(&self, conversation_id: &str) -> Option<String> {
+        let agent = self.task_manager.get_task(conversation_id)?;
+        match agent.get_usage().await {
+            Ok(Some(usage)) => Some(crate::trace_redaction::sanitize_json(&usage).to_string()),
+            Ok(None) => None,
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Task run usage snapshot was unavailable"
+                );
+                None
+            }
+        }
     }
 
     pub async fn update_task_session(
@@ -1192,6 +1332,9 @@ impl ConversationService {
                 content,
                 content_hash: &content_hash,
                 acceptance_criteria: &request.acceptance_criteria,
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await?;
         Ok(SubmitTaskArtifactResponse {
@@ -1280,6 +1423,138 @@ impl ConversationService {
             .collect()
     }
 
+    pub async fn get_task_run_trace(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskTraceEventResponse>, ConversationError> {
+        self.task_session_repo()?
+            .list_trace_events(user_id, task_session_id, run_id)
+            .await?
+            .into_iter()
+            .map(task_trace_event_response)
+            .collect()
+    }
+
+    pub async fn get_task_run_evidence(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskEvidenceResponse>, ConversationError> {
+        self.task_session_repo()?
+            .list_evidence(user_id, task_session_id, run_id)
+            .await?
+            .into_iter()
+            .map(task_evidence_response)
+            .collect()
+    }
+
+    pub async fn get_task_run_review(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<TaskReviewResponse, ConversationError> {
+        let repo = self.task_session_repo()?;
+        let task_row = repo.get(user_id, task_session_id).await?.ok_or_else(|| {
+            ConversationError::not_found_reason(format!("Task session '{task_session_id}' not found"))
+        })?;
+        let run_row = repo
+            .get_run(user_id, task_session_id, run_id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task run '{run_id}' not found")))?;
+        let run = task_run_response(run_row.clone())?;
+
+        let artifact_rows = repo.list_artifacts(user_id, task_session_id).await?;
+        let artifacts = artifact_rows
+            .into_iter()
+            .filter(|artifact| {
+                run_row.plan_artifact_id.as_deref() == Some(artifact.id.as_str())
+                    || run_row.goal_artifact_id.as_deref() == Some(artifact.id.as_str())
+            })
+            .map(task_artifact_response)
+            .collect::<Result<Vec<_>, _>>()?;
+        let approvals = repo
+            .list_approvals(user_id, task_session_id)
+            .await?
+            .into_iter()
+            .filter(|approval| {
+                run_row.approval_id.as_deref() == Some(approval.id.as_str())
+                    || run_row.goal_artifact_id.as_deref() == Some(approval.artifact_id.as_str())
+            })
+            .map(task_approval_response)
+            .collect::<Result<Vec<_>, _>>()?;
+        let acceptance_criteria = repo
+            .list_acceptance_criteria(user_id, task_session_id)
+            .await?
+            .into_iter()
+            .filter(|criterion| run_row.goal_artifact_id.as_deref() == Some(criterion.goal_artifact_id.as_str()))
+            .map(acceptance_criterion_response)
+            .collect::<Result<Vec<_>, _>>()?;
+        let trace = repo
+            .list_trace_events(user_id, task_session_id, run_id)
+            .await?
+            .into_iter()
+            .map(task_trace_event_response)
+            .collect::<Result<Vec<_>, _>>()?;
+        let checkpoints = repo
+            .list_checkpoints(user_id, task_session_id, run_id)
+            .await?
+            .into_iter()
+            .map(task_checkpoint_response)
+            .collect::<Result<Vec<_>, _>>()?;
+        let evidence = repo
+            .list_evidence(user_id, task_session_id, run_id)
+            .await?
+            .into_iter()
+            .map(task_evidence_response)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let files_changed = evidence
+            .iter()
+            .filter(|item| item.kind == "file")
+            .filter_map(|item| item.reference.as_deref())
+            .collect::<HashSet<_>>()
+            .len();
+        let tool_calls = trace
+            .iter()
+            .filter(|event| event.event_type == "tool.requested")
+            .count();
+        let policy_decisions = trace
+            .iter()
+            .filter(|event| matches!(event.event_type.as_str(), "tool.allowed" | "tool.denied"))
+            .count();
+        let denied_decisions = trace.iter().filter(|event| event.event_type == "tool.denied").count();
+        let criteria_passed = acceptance_criteria
+            .iter()
+            .filter(|criterion| criterion.status == AcceptanceCriterionStatus::Passed)
+            .count();
+        let criteria_total = acceptance_criteria.len();
+        let status = run.status;
+
+        Ok(TaskReviewResponse {
+            task: task_session_response(task_row)?,
+            run,
+            artifacts,
+            approvals,
+            acceptance_criteria,
+            trace,
+            checkpoints,
+            evidence,
+            summary: TaskReviewSummary {
+                status,
+                files_changed,
+                tool_calls,
+                policy_decisions,
+                denied_decisions,
+                criteria_passed,
+                criteria_total,
+            },
+        })
+    }
+
     pub async fn list_acceptance_criteria(
         &self,
         user_id: &str,
@@ -1319,7 +1594,19 @@ impl ConversationService {
                 "Verification requires bounded, non-empty structured evidence",
             ));
         }
-        let evidence = serde_json::to_string(&request.evidence)
+        let safe_evidence = request
+            .evidence
+            .into_iter()
+            .map(|evidence| AcceptanceEvidence {
+                kind: evidence.kind,
+                summary: crate::trace_redaction::redact_and_bound(&evidence.summary),
+                reference: evidence
+                    .reference
+                    .as_deref()
+                    .map(crate::trace_redaction::redact_and_bound),
+            })
+            .collect::<Vec<_>>();
+        let evidence = serde_json::to_string(&safe_evidence)
             .map_err(|error| ConversationError::internal(format!("Failed to encode evidence: {error}")))?;
         let repo = self.task_session_repo()?;
         let row = repo
@@ -1371,6 +1658,11 @@ impl ConversationService {
             .conversation_id
             .as_deref()
             .ok_or_else(|| ConversationError::bad_request("Task session must be bound to a conversation"))?;
+        let conversation = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason("Task conversation was not found"))?;
         let artifact = repo
             .get_artifact(user_id, task_session_id, &request.artifact_id)
             .await?
@@ -1404,6 +1696,17 @@ impl ConversationService {
                 approval_id: &request.approval_id,
                 artifact_hash: &request.artifact_hash,
                 started_at: now_ms(),
+                agent_id: &task.agent_type,
+                agent_runtime: Some(&conversation.r#type),
+                model: conversation.model.as_deref(),
+                mode: &task.mode,
+                planning_isolation: if mode == TaskSessionMode::Plan
+                    && parse_agent_type_from_row(&conversation) == Some(AgentType::Aionrs)
+                {
+                    Some("guaranteed")
+                } else {
+                    None
+                },
             })
             .await?;
 
@@ -1421,10 +1724,24 @@ impl ConversationService {
                     on_started: None,
                 },
                 true,
+                Some(crate::task_trace::TaskTraceContext::new(
+                    user_id.to_owned(),
+                    task_session_id.to_owned(),
+                    run.id.clone(),
+                    conversation_id.to_owned(),
+                    crate::task_trace::TaskTracePolicy::ApprovedExecution,
+                    repo.clone(),
+                    self.output_retention_policy(),
+                )),
             )
             .await;
-        let (run_status, task_status, error_message) = match outcome {
+        let run_usage = self.capture_task_run_usage(conversation_id).await;
+        let (run_status, task_status, error_message, result_summary) = match outcome {
             Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => {
+                let result_summary = outcome
+                    .assistant_output
+                    .as_deref()
+                    .map(crate::trace_redaction::redact_and_bound);
                 if mode == TaskSessionMode::Goal {
                     let criteria = repo.list_acceptance_criteria(user_id, task_session_id).await?;
                     let goal_artifact_id = goal_artifact_id.as_deref().expect("goal mode has a goal artifact");
@@ -1435,19 +1752,54 @@ impl ConversationService {
                     if !current_criteria.is_empty()
                         && current_criteria.iter().all(|criterion| criterion.status == "passed")
                     {
-                        (TaskRunStatus::Completed, TaskSessionStatus::Completed, None)
+                        (
+                            TaskRunStatus::Completed,
+                            TaskSessionStatus::Completed,
+                            None,
+                            result_summary,
+                        )
                     } else {
-                        (TaskRunStatus::Completed, TaskSessionStatus::Paused, None)
+                        (
+                            TaskRunStatus::Completed,
+                            TaskSessionStatus::Paused,
+                            None,
+                            result_summary,
+                        )
                     }
                 } else {
-                    (TaskRunStatus::Completed, TaskSessionStatus::Completed, None)
+                    (
+                        TaskRunStatus::Completed,
+                        TaskSessionStatus::Completed,
+                        None,
+                        result_summary,
+                    )
                 }
             }
-            Ok(outcome) => (TaskRunStatus::Failed, TaskSessionStatus::Failed, outcome.error_message),
+            Ok(outcome) => (
+                if outcome.status == ConversationAgentTurnStatus::Cancelled {
+                    TaskRunStatus::Cancelled
+                } else {
+                    TaskRunStatus::Failed
+                },
+                if outcome.status == ConversationAgentTurnStatus::Cancelled {
+                    TaskSessionStatus::Cancelled
+                } else {
+                    TaskSessionStatus::Failed
+                },
+                outcome
+                    .error_message
+                    .as_deref()
+                    .map(crate::trace_redaction::redact_and_bound),
+                outcome
+                    .assistant_output
+                    .as_deref()
+                    .map(crate::trace_redaction::redact_and_bound),
+            ),
             Err(error) => (
                 TaskRunStatus::Failed,
                 TaskSessionStatus::Failed,
-                Some(error.to_string()),
+                Some(crate::trace_redaction::redact_and_bound(&error.to_string())),
+                None,
             ),
         };
         let finished = repo
@@ -1459,6 +1811,8 @@ impl ConversationService {
                 task_status: &task_status.to_string(),
                 finished_at: now_ms(),
                 error_message: error_message.as_deref(),
+                result_summary: result_summary.as_deref(),
+                usage: run_usage.as_deref(),
             })
             .await?;
         task_run_response(finished)
@@ -5443,6 +5797,7 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            task_trace: None,
         });
 
         info!(
@@ -5465,13 +5820,14 @@ impl ConversationService {
         &self,
         request: ConversationAgentTurnRequest,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
-        self.run_agent_turn_internal(request, false).await
+        self.run_agent_turn_internal(request, false, None).await
     }
 
     async fn run_agent_turn_internal(
         &self,
         request: ConversationAgentTurnRequest,
         approved_execution: bool,
+        task_trace: Option<crate::task_trace::TaskTraceContext>,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if request.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
@@ -5609,6 +5965,7 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                task_trace,
             })
             .await;
 
@@ -5619,6 +5976,7 @@ impl ConversationService {
             status: match result.status {
                 ConversationTurnStatus::Completed => ConversationAgentTurnStatus::Completed,
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
+                ConversationTurnStatus::Cancelled => ConversationAgentTurnStatus::Cancelled,
             },
             error_message: result.error_message,
             assistant_output: result.assistant_output,

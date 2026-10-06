@@ -1,12 +1,57 @@
 use aionui_common::TimestampMs;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::DbError;
-use crate::models::{TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow};
+use crate::models::{
+    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
+    TaskSessionRow, TaskTraceEventRow,
+};
 use crate::repository::task_session::{
-    CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
+    AppendTaskTraceEventParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams, CreateTaskCheckpointParams,
+    CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
     ITaskSessionRepository, ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
 };
+
+async fn append_trace_event_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_session_id: &str,
+    run_id: &str,
+    event_type: &str,
+    timestamp: TimestampMs,
+    payload: &str,
+) -> Result<TaskTraceEventRow, DbError> {
+    let sequence: i64 = sqlx::query_scalar(
+        "UPDATE task_runs SET next_trace_sequence = next_trace_sequence + 1 \
+         WHERE id = ? AND task_session_id = ? RETURNING next_trace_sequence",
+    )
+    .bind(run_id)
+    .bind(task_session_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let id = aionui_common::generate_prefixed_id("trace");
+    sqlx::query(
+        "INSERT INTO task_trace_events \
+         (id, task_session_id, run_id, sequence, event_type, timestamp, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(task_session_id)
+    .bind(run_id)
+    .bind(sequence)
+    .bind(event_type)
+    .bind(timestamp)
+    .bind(payload)
+    .execute(&mut **tx)
+    .await?;
+    Ok(TaskTraceEventRow {
+        id,
+        task_session_id: task_session_id.to_owned(),
+        run_id: run_id.to_owned(),
+        sequence,
+        event_type: event_type.to_owned(),
+        timestamp,
+        payload: payload.to_owned(),
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct SqliteTaskSessionRepository {
@@ -134,6 +179,76 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         Ok(result.rows_affected() == 1)
     }
 
+    async fn create_planning_run(&self, params: &CreatePlanningTaskRunParams<'_>) -> Result<TaskRunRow, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query(
+            "UPDATE task_sessions SET status = 'running', updated_at = ? \
+             WHERE user_id = ? AND id = ? AND mode = 'plan' AND conversation_id = ? \
+             AND status IN ('ready', 'paused')",
+        )
+        .bind(params.started_at)
+        .bind(params.user_id)
+        .bind(params.task_session_id)
+        .bind(params.conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "Automatic planning is already active or the task is not ready".into(),
+            ));
+        }
+        let run_id = aionui_common::generate_prefixed_id("run");
+        sqlx::query(
+            "INSERT INTO task_runs \
+             (id, task_session_id, conversation_id, run_kind, status, started_at, agent_id, agent_runtime, model, \
+              mode, planning_isolation) \
+             VALUES (?, ?, ?, 'planning', 'running', ?, ?, ?, ?, 'plan', ?)",
+        )
+        .bind(&run_id)
+        .bind(params.task_session_id)
+        .bind(params.conversation_id)
+        .bind(params.started_at)
+        .bind(params.agent_id)
+        .bind(params.agent_runtime)
+        .bind(params.model)
+        .bind(params.planning_isolation)
+        .execute(&mut *tx)
+        .await?;
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "task.created",
+            params.started_at,
+            r#"{"mode":"plan"}"#,
+        )
+        .await?;
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "run.started",
+            params.started_at,
+            "{}",
+        )
+        .await?;
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "planning.started",
+            params.started_at,
+            r#"{"policy":"strict_planning","isolation":"guaranteed"}"#,
+        )
+        .await?;
+        let row = sqlx::query_as::<_, TaskRunRow>("SELECT * FROM task_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
     async fn pause_incomplete(&self, updated_at: TimestampMs) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE task_sessions SET status = 'paused', updated_at = ? \
@@ -252,6 +367,92 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .bind(params.user_id)
         .execute(&mut *tx)
         .await?;
+        if let Some(run_id) = params.planning_run_id {
+            let completed = sqlx::query(
+                "UPDATE task_runs SET plan_artifact_id = ?, approval_id = ?, status = 'completed', finished_at = ?, \
+                 result_summary = ?, usage = ? \
+                 WHERE id = ? AND task_session_id = ? AND run_kind = 'planning' AND status = 'running' \
+                 AND task_session_id IN (SELECT id FROM task_sessions WHERE user_id = ?)",
+            )
+            .bind(&artifact_id)
+            .bind(&approval_id)
+            .bind(now)
+            .bind(params.planning_result_summary)
+            .bind(params.planning_usage)
+            .bind(run_id)
+            .bind(params.task_session_id)
+            .bind(params.user_id)
+            .execute(&mut *tx)
+            .await?;
+            if completed.rows_affected() != 1 {
+                return Err(DbError::Conflict("Planning run is no longer running".into()));
+            }
+            let artifact_payload = serde_json::json!({
+                "artifact_id": artifact_id,
+                "artifact_hash": params.content_hash,
+                "kind": params.kind,
+                "version": version
+            })
+            .to_string();
+            append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                run_id,
+                "artifact.created",
+                now,
+                &artifact_payload,
+            )
+            .await?;
+            let approval_payload = serde_json::json!({
+                "approval_id": approval_id,
+                "artifact_id": artifact_id,
+                "artifact_hash": params.content_hash,
+                "status": "pending"
+            })
+            .to_string();
+            append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                run_id,
+                "approval.requested",
+                now,
+                &approval_payload,
+            )
+            .await?;
+            append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                run_id,
+                "planning.completed",
+                now,
+                &artifact_payload,
+            )
+            .await?;
+            let terminal = append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                run_id,
+                "run.completed",
+                now,
+                r#"{"result_summary":"Automatic plan submitted for approval"}"#,
+            )
+            .await?;
+            let checkpoint_id = aionui_common::generate_prefixed_id("checkpoint");
+            sqlx::query(
+                "INSERT INTO task_checkpoints \
+                 (id, task_session_id, run_id, checkpoint_type, sequence, artifact_id, state, created_at) \
+                 VALUES (?, ?, ?, 'plan_submitted', ?, ?, ?, ?)",
+            )
+            .bind(checkpoint_id)
+            .bind(params.task_session_id)
+            .bind(run_id)
+            .bind(terminal.sequence)
+            .bind(&artifact_id)
+            .bind(&artifact_payload)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
 
         let artifact = self
@@ -379,6 +580,37 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
             .bind(params.user_id)
             .execute(&mut *tx)
             .await?;
+        let planning_run_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM task_runs WHERE task_session_id = ? AND run_kind = 'planning' \
+             AND plan_artifact_id = ? ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(params.task_session_id)
+        .bind(params.artifact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(run_id) = planning_run_id {
+            let event_type = if params.status == "approved" {
+                "approval.approved"
+            } else {
+                "approval.rejected"
+            };
+            append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                &run_id,
+                event_type,
+                params.resolved_at,
+                &serde_json::json!({
+                    "approval_id": params.approval_id,
+                    "artifact_id": params.artifact_id,
+                    "artifact_hash": params.artifact_hash,
+                    "status": params.status,
+                    "resolved_by": params.resolved_by
+                })
+                .to_string(),
+            )
+            .await?;
+        }
         tx.commit().await?;
         self.get_approval(params.user_id, params.task_session_id, params.approval_id)
             .await?
@@ -422,8 +654,9 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         }
         sqlx::query(
             "INSERT INTO task_runs \
-             (id, task_session_id, conversation_id, plan_artifact_id, goal_artifact_id, approval_id, status, started_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
+             (id, task_session_id, conversation_id, plan_artifact_id, goal_artifact_id, approval_id, status, started_at, \
+              agent_id, agent_runtime, model, mode, planning_isolation) \
+             VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
         )
         .bind(&run_id)
         .bind(params.task_session_id)
@@ -432,6 +665,11 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .bind(params.goal_artifact_id)
         .bind(params.approval_id)
         .bind(params.started_at)
+        .bind(params.agent_id)
+        .bind(params.agent_runtime)
+        .bind(params.model)
+        .bind(params.mode)
+        .bind(params.planning_isolation)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE task_sessions SET status = 'running', updated_at = ? WHERE id = ? AND user_id = ?")
@@ -440,6 +678,75 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
             .bind(params.user_id)
             .execute(&mut *tx)
             .await?;
+        let task_payload = serde_json::json!({ "mode": params.mode, "agent_id": params.agent_id }).to_string();
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "task.created",
+            params.started_at,
+            &task_payload,
+        )
+        .await?;
+        let artifact_payload = serde_json::json!({
+            "artifact_id": params.plan_artifact_id,
+            "artifact_hash": params.artifact_hash,
+            "kind": "plan"
+        })
+        .to_string();
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "artifact.created",
+            params.started_at,
+            &artifact_payload,
+        )
+        .await?;
+        let approval_payload = serde_json::json!({
+            "approval_id": params.approval_id,
+            "artifact_id": params.plan_artifact_id,
+            "artifact_hash": params.artifact_hash,
+            "status": "approved"
+        })
+        .to_string();
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "approval.approved",
+            params.started_at,
+            &approval_payload,
+        )
+        .await?;
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "run.started",
+            params.started_at,
+            "{}",
+        )
+        .await?;
+        let checkpoint_id = aionui_common::generate_prefixed_id("checkpoint");
+        let checkpoint_sequence: i64 = sqlx::query_scalar("SELECT next_trace_sequence FROM task_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO task_checkpoints \
+             (id, task_session_id, run_id, checkpoint_type, sequence, artifact_id, state, created_at) \
+             VALUES (?, ?, ?, 'before_execution', ?, ?, ?, ?)",
+        )
+        .bind(checkpoint_id)
+        .bind(params.task_session_id)
+        .bind(&run_id)
+        .bind(checkpoint_sequence)
+        .bind(params.plan_artifact_id)
+        .bind(&artifact_payload)
+        .bind(params.started_at)
+        .execute(&mut *tx)
+        .await?;
         let row = sqlx::query_as::<_, TaskRunRow>("SELECT * FROM task_runs WHERE id = ?")
             .bind(&run_id)
             .fetch_one(&mut *tx)
@@ -451,13 +758,15 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
     async fn finish_run(&self, params: &FinishTaskRunParams<'_>) -> Result<TaskRunRow, DbError> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE task_runs SET status = ?, finished_at = ?, error_message = ? \
+            "UPDATE task_runs SET status = ?, finished_at = ?, error_message = ?, result_summary = ?, usage = ? \
              WHERE id = ? AND task_session_id = ? AND status = 'running' \
              AND task_session_id IN (SELECT id FROM task_sessions WHERE user_id = ?)",
         )
         .bind(params.run_status)
         .bind(params.finished_at)
         .bind(params.error_message)
+        .bind(params.result_summary)
+        .bind(params.usage)
         .bind(params.run_id)
         .bind(params.task_session_id)
         .bind(params.user_id)
@@ -473,6 +782,40 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
             .bind(params.user_id)
             .execute(&mut *tx)
             .await?;
+        let event_type = match params.run_status {
+            "completed" => "run.completed",
+            "cancelled" => "run.cancelled",
+            _ => "run.failed",
+        };
+        let payload = serde_json::json!({
+            "status": params.run_status,
+            "result_summary": params.result_summary,
+            "error": params.error_message
+        })
+        .to_string();
+        let terminal = append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            params.run_id,
+            event_type,
+            params.finished_at,
+            &payload,
+        )
+        .await?;
+        let checkpoint_id = aionui_common::generate_prefixed_id("checkpoint");
+        sqlx::query(
+            "INSERT INTO task_checkpoints \
+             (id, task_session_id, run_id, checkpoint_type, sequence, state, created_at) \
+             VALUES (?, ?, ?, 'before_completion', ?, ?, ?)",
+        )
+        .bind(checkpoint_id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .bind(terminal.sequence)
+        .bind(&payload)
+        .bind(params.finished_at)
+        .execute(&mut *tx)
+        .await?;
         let row = sqlx::query_as::<_, TaskRunRow>("SELECT * FROM task_runs WHERE id = ?")
             .bind(params.run_id)
             .fetch_one(&mut *tx)
@@ -488,6 +831,186 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         )
         .bind(user_id)
         .bind(task_session_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn get_run(&self, user_id: &str, task_session_id: &str, run_id: &str) -> Result<Option<TaskRunRow>, DbError> {
+        Ok(sqlx::query_as::<_, TaskRunRow>(
+            "SELECT task_run.* FROM task_runs task_run JOIN task_sessions task ON task.id = task_run.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND task_run.id = ?",
+        )
+        .bind(user_id)
+        .bind(task_session_id)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn append_trace_event(&self, params: &AppendTaskTraceEventParams<'_>) -> Result<TaskTraceEventRow, DbError> {
+        let owned: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM task_runs run JOIN task_sessions task ON task.id = run.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND run.id = ?",
+        )
+        .bind(params.user_id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !owned {
+            return Err(DbError::NotFound(format!("Task run '{}' not found", params.run_id)));
+        }
+        // Begin the transaction immediately before the first write. A read in
+        // the same deferred transaction would require a lock upgrade and can
+        // fail with SQLITE_BUSY when multiple connections append together.
+        let mut tx = self.pool.begin().await?;
+        let event = append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            params.run_id,
+            params.event_type,
+            params.timestamp,
+            params.payload,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(event)
+    }
+
+    async fn list_trace_events(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskTraceEventRow>, DbError> {
+        Ok(sqlx::query_as::<_, TaskTraceEventRow>(
+            "SELECT event.* FROM task_trace_events event \
+             JOIN task_sessions task ON task.id = event.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND event.run_id = ? ORDER BY event.sequence",
+        )
+        .bind(user_id)
+        .bind(task_session_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn create_checkpoint(&self, params: &CreateTaskCheckpointParams<'_>) -> Result<TaskCheckpointRow, DbError> {
+        let owned: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM task_sessions task JOIN task_runs run ON run.task_session_id = task.id \
+             WHERE task.user_id = ? AND task.id = ? AND run.id = ?",
+        )
+        .bind(params.user_id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !owned {
+            return Err(DbError::NotFound(format!("Task run '{}' not found", params.run_id)));
+        }
+        let mut tx = self.pool.begin().await?;
+        let payload = serde_json::json!({ "checkpoint_type": params.checkpoint_type }).to_string();
+        let event = append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            params.run_id,
+            "checkpoint.created",
+            params.created_at,
+            &payload,
+        )
+        .await?;
+        let id = aionui_common::generate_prefixed_id("checkpoint");
+        sqlx::query(
+            "INSERT INTO task_checkpoints \
+             (id, task_session_id, run_id, checkpoint_type, sequence, artifact_id, state, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .bind(params.checkpoint_type)
+        .bind(event.sequence)
+        .bind(params.artifact_id)
+        .bind(params.state)
+        .bind(params.created_at)
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query_as::<_, TaskCheckpointRow>("SELECT * FROM task_checkpoints WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    async fn list_checkpoints(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskCheckpointRow>, DbError> {
+        Ok(sqlx::query_as::<_, TaskCheckpointRow>(
+            "SELECT checkpoint.* FROM task_checkpoints checkpoint \
+             JOIN task_sessions task ON task.id = checkpoint.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND checkpoint.run_id = ? ORDER BY checkpoint.sequence",
+        )
+        .bind(user_id)
+        .bind(task_session_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn create_evidence(&self, params: &CreateTaskEvidenceParams<'_>) -> Result<TaskEvidenceRow, DbError> {
+        let id = aionui_common::generate_prefixed_id("evidence");
+        let result = sqlx::query(
+            "INSERT INTO task_evidence \
+             (id, task_session_id, run_id, trace_event_id, criterion_id, kind, summary, reference, metadata, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (\
+                 SELECT 1 FROM task_sessions task JOIN task_runs run ON run.task_session_id = task.id \
+                 WHERE task.user_id = ? AND task.id = ? AND run.id = ?\
+             )",
+        )
+        .bind(&id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .bind(params.trace_event_id)
+        .bind(params.criterion_id)
+        .bind(params.kind)
+        .bind(params.summary)
+        .bind(params.reference)
+        .bind(params.metadata)
+        .bind(params.created_at)
+        .bind(params.user_id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::NotFound(format!("Task run '{}' not found", params.run_id)));
+        }
+        Ok(
+            sqlx::query_as::<_, TaskEvidenceRow>("SELECT * FROM task_evidence WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn list_evidence(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskEvidenceRow>, DbError> {
+        Ok(sqlx::query_as::<_, TaskEvidenceRow>(
+            "SELECT evidence.* FROM task_evidence evidence \
+             JOIN task_sessions task ON task.id = evidence.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND evidence.run_id = ? ORDER BY evidence.created_at, evidence.id",
+        )
+        .bind(user_id)
+        .bind(task_session_id)
+        .bind(run_id)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -512,6 +1035,7 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         &self,
         params: &UpdateAcceptanceCriterionParams<'_>,
     ) -> Result<TaskAcceptanceCriterionRow, DbError> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE task_acceptance_criteria SET status = ?, evidence = ?, verified_at = ? \
              WHERE id = ? AND task_session_id = ? AND task_session_id IN \
@@ -525,7 +1049,7 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .bind(params.criterion_id)
         .bind(params.task_session_id)
         .bind(params.user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
             return Err(DbError::NotFound(format!(
@@ -533,20 +1057,139 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
                 params.criterion_id
             )));
         }
-        Ok(
+        let row =
             sqlx::query_as::<_, TaskAcceptanceCriterionRow>("SELECT * FROM task_acceptance_criteria WHERE id = ?")
                 .bind(params.criterion_id)
-                .fetch_one(&self.pool)
-                .await?,
+                .fetch_one(&mut *tx)
+                .await?;
+        let run_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM task_runs WHERE task_session_id = ? AND goal_artifact_id = ? \
+             AND run_kind = 'execution' AND status = 'completed' ORDER BY started_at DESC LIMIT 1",
         )
+        .bind(params.task_session_id)
+        .bind(&row.goal_artifact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(run_id) = run_id {
+            let started = append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                &run_id,
+                "verification.started",
+                params.verified_at,
+                &serde_json::json!({ "criterion_id": params.criterion_id }).to_string(),
+            )
+            .await?;
+            let checkpoint_id = aionui_common::generate_prefixed_id("checkpoint");
+            sqlx::query(
+                "INSERT INTO task_checkpoints \
+                 (id, task_session_id, run_id, checkpoint_type, sequence, artifact_id, state, created_at) \
+                 VALUES (?, ?, ?, 'before_verification', ?, ?, ?, ?)",
+            )
+            .bind(checkpoint_id)
+            .bind(params.task_session_id)
+            .bind(&run_id)
+            .bind(started.sequence)
+            .bind(&row.goal_artifact_id)
+            .bind(serde_json::json!({ "criterion_id": params.criterion_id }).to_string())
+            .bind(params.verified_at)
+            .execute(&mut *tx)
+            .await?;
+            let criterion_event_type = match params.status {
+                "passed" => "criterion.passed",
+                "failed" => "criterion.failed",
+                _ => "criterion.needs_verification",
+            };
+            let criterion_payload = serde_json::json!({
+                "criterion_id": params.criterion_id,
+                "status": params.status,
+                "evidence": serde_json::from_str::<serde_json::Value>(params.evidence).unwrap_or_default()
+            })
+            .to_string();
+            let criterion_event = append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                &run_id,
+                criterion_event_type,
+                params.verified_at,
+                &criterion_payload,
+            )
+            .await?;
+            if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(params.evidence) {
+                for item in items {
+                    let source_kind = item
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("user_confirmation");
+                    let kind = match source_kind {
+                        "test_result" => "test",
+                        "command_result" => "command",
+                        "file_diff" => "diff",
+                        "artifact" => "artifact",
+                        _ => "user",
+                    };
+                    let summary = item
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Verification evidence");
+                    let reference = item.get("reference").and_then(serde_json::Value::as_str);
+                    sqlx::query(
+                        "INSERT INTO task_evidence \
+                         (id, task_session_id, run_id, trace_event_id, criterion_id, kind, summary, reference, metadata, created_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(aionui_common::generate_prefixed_id("evidence"))
+                    .bind(params.task_session_id)
+                    .bind(&run_id)
+                    .bind(&criterion_event.id)
+                    .bind(params.criterion_id)
+                    .bind(kind)
+                    .bind(summary)
+                    .bind(reference)
+                    .bind(item.to_string())
+                    .bind(params.verified_at)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            append_trace_event_tx(
+                &mut tx,
+                params.task_session_id,
+                &run_id,
+                "verification.completed",
+                params.verified_at,
+                &serde_json::json!({ "criterion_id": params.criterion_id, "status": params.status }).to_string(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(row)
     }
 
     async fn pause_incomplete_runs(&self, updated_at: TimestampMs) -> Result<u64, DbError> {
-        let result = sqlx::query("UPDATE task_runs SET status = 'paused', finished_at = ? WHERE status = 'running'")
-            .bind(updated_at)
-            .execute(&self.pool)
+        let mut tx = self.pool.begin().await?;
+        let runs: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, task_session_id FROM task_runs WHERE status = 'running'")
+                .fetch_all(&mut *tx)
+                .await?;
+        for (run_id, task_session_id) in &runs {
+            sqlx::query("UPDATE task_runs SET status = 'paused', finished_at = ? WHERE id = ? AND status = 'running'")
+                .bind(updated_at)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            append_trace_event_tx(
+                &mut tx,
+                task_session_id,
+                run_id,
+                "run.interrupted",
+                updated_at,
+                r#"{"reason":"application_restart"}"#,
+            )
             .await?;
-        Ok(result.rows_affected())
+        }
+        tx.commit().await?;
+        Ok(runs.len() as u64)
     }
 }
 
@@ -554,8 +1197,8 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
 mod tests {
     use super::*;
     use crate::repository::task_session::{
-        CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, ResolveTaskApprovalParams,
-        UpdateTaskSessionParams,
+        CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
+        ResolveTaskApprovalParams, UpdateTaskSessionParams,
     };
     use crate::{ITaskSessionRepository, init_database_memory, init_database_staged};
 
@@ -604,6 +1247,55 @@ mod tests {
         let reloaded = repo.get(USER, &created.id).await.unwrap().unwrap();
         assert_eq!(reloaded.status, "ready");
         assert_eq!(reloaded.agent_session_id.as_deref(), Some("agent-session-1"));
+    }
+
+    #[tokio::test]
+    async fn failed_and_cancelled_runs_keep_terminal_review_records() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+             VALUES ('terminal-review', ?, 'Terminal review', 'aionrs', 1, 1)",
+        )
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo = SqliteTaskSessionRepository::new(db.pool().clone());
+
+        for (index, status) in ["failed", "cancelled"].into_iter().enumerate() {
+            let task = repo.create(&create_params("running")).await.unwrap();
+            let run_id = format!("terminal-run-{index}");
+            sqlx::query(
+                "INSERT INTO task_runs \
+                 (id, task_session_id, conversation_id, run_kind, status, started_at, mode) \
+                 VALUES (?, ?, 'terminal-review', 'planning', 'running', 2, 'plan')",
+            )
+            .bind(&run_id)
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            let finished = repo
+                .finish_run(&FinishTaskRunParams {
+                    user_id: USER,
+                    task_session_id: &task.id,
+                    run_id: &run_id,
+                    run_status: status,
+                    task_status: status,
+                    finished_at: 3,
+                    error_message: (status == "failed").then_some("tool failed"),
+                    result_summary: None,
+                    usage: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(finished.status, status);
+            let trace = repo.list_trace_events(USER, &task.id, &run_id).await.unwrap();
+            assert_eq!(trace.last().unwrap().event_type, format!("run.{status}"));
+            let checkpoints = repo.list_checkpoints(USER, &task.id, &run_id).await.unwrap();
+            assert_eq!(checkpoints.last().unwrap().checkpoint_type, "before_completion");
+        }
     }
 
     #[tokio::test]
@@ -701,6 +1393,9 @@ mod tests {
                 content: "Inspect, test, then release.",
                 content_hash: "hash-v1",
                 acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await
             .unwrap();
@@ -773,6 +1468,9 @@ mod tests {
                 content: "v1",
                 content_hash: "hash-v1",
                 acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await
             .unwrap();
@@ -784,6 +1482,9 @@ mod tests {
                 content: "v2",
                 content_hash: "hash-v2",
                 acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await
             .unwrap();
@@ -823,6 +1524,9 @@ mod tests {
                 content: "Ship safely",
                 content_hash: "goal-hash",
                 acceptance_criteria: &criteria,
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await
             .unwrap();
@@ -860,6 +1564,9 @@ mod tests {
                 content: "approved content",
                 content_hash: "approved-hash",
                 acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await
             .unwrap();
@@ -887,6 +1594,11 @@ mod tests {
                 approval_id: &approval.id,
                 artifact_hash: "wrong-hash",
                 started_at: 3,
+                agent_id: "aionrs",
+                agent_runtime: Some("aionrs"),
+                model: None,
+                mode: "plan",
+                planning_isolation: Some("guaranteed"),
             })
             .await;
         assert!(matches!(wrong_hash, Err(DbError::Conflict(_))));
@@ -901,6 +1613,11 @@ mod tests {
                 approval_id: &approval.id,
                 artifact_hash: &artifact.content_hash,
                 started_at: 4,
+                agent_id: "aionrs",
+                agent_runtime: Some("aionrs"),
+                model: None,
+                mode: "plan",
+                planning_isolation: Some("guaranteed"),
             })
             .await
             .unwrap();
@@ -914,6 +1631,11 @@ mod tests {
                 approval_id: &approval.id,
                 artifact_hash: &artifact.content_hash,
                 started_at: 5,
+                agent_id: "aionrs",
+                agent_runtime: Some("aionrs"),
+                model: None,
+                mode: "plan",
+                planning_isolation: Some("guaranteed"),
             })
             .await;
         assert!(matches!(duplicate, Err(DbError::Conflict(_))));
@@ -924,6 +1646,9 @@ mod tests {
         assert_eq!(recovered[0].id, run.id);
         assert_eq!(recovered[0].status, "paused");
         assert_eq!(recovered.len(), 1, "startup recovery must not create or replay a run");
+        let trace = repo.list_trace_events(USER, &task.id, &run.id).await.unwrap();
+        assert_eq!(trace.last().unwrap().event_type, "run.interrupted");
+        assert_eq!(trace.last().unwrap().sequence, 5);
     }
 
     #[tokio::test]
@@ -939,6 +1664,9 @@ mod tests {
                 content: "review once",
                 content_hash: "approval-race-hash",
                 acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await
             .unwrap();
@@ -997,6 +1725,9 @@ mod tests {
                 content: "execute once",
                 content_hash: "execution-race-hash",
                 acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
             })
             .await
             .unwrap();
@@ -1022,6 +1753,11 @@ mod tests {
             approval_id: &approval.id,
             artifact_hash: &artifact.content_hash,
             started_at: 21,
+            agent_id: "aionrs",
+            agent_runtime: Some("aionrs"),
+            model: None,
+            mode: "plan",
+            planning_isolation: Some("guaranteed"),
         };
 
         let left_params = params();
@@ -1038,5 +1774,108 @@ mod tests {
         };
         assert!(matches!(rejected, DbError::Conflict(_)), "unexpected error: {rejected}");
         assert_eq!(repo.list_runs(USER, &task.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_trace_appends_allocate_unique_sequences_and_survive_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("task-trace-concurrency.db");
+        let db = init_database_staged(&path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+             VALUES ('conversation-trace', ?, 'Trace', 'aionrs', 1, 1)",
+        )
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo = SqliteTaskSessionRepository::new(db.pool().clone());
+        let mut task_params = create_params("ready");
+        task_params.conversation_id = Some("conversation-trace");
+        let task = repo.create(&task_params).await.unwrap();
+        let (artifact, approval, _) = repo
+            .create_artifact_with_approval(&CreateTaskArtifactParams {
+                user_id: USER,
+                task_session_id: &task.id,
+                kind: "plan",
+                content: "trace this run",
+                content_hash: "trace-hash",
+                acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
+            })
+            .await
+            .unwrap();
+        repo.resolve_approval(&ResolveTaskApprovalParams {
+            user_id: USER,
+            task_session_id: &task.id,
+            approval_id: &approval.id,
+            artifact_id: &artifact.id,
+            artifact_hash: &artifact.content_hash,
+            status: "approved",
+            resolved_by: USER,
+            comment: None,
+            resolved_at: 2,
+        })
+        .await
+        .unwrap();
+        let run = repo
+            .create_run(&CreateTaskRunParams {
+                user_id: USER,
+                task_session_id: &task.id,
+                conversation_id: "conversation-trace",
+                plan_artifact_id: &artifact.id,
+                goal_artifact_id: None,
+                approval_id: &approval.id,
+                artifact_hash: &artifact.content_hash,
+                started_at: 3,
+                agent_id: "aionrs",
+                agent_runtime: Some("aionrs"),
+                model: Some("test-model"),
+                mode: "plan",
+                planning_isolation: Some("guaranteed"),
+            })
+            .await
+            .unwrap();
+
+        let mut joins = tokio::task::JoinSet::new();
+        for index in 0..24 {
+            let repo = repo.clone();
+            let task_id = task.id.clone();
+            let run_id = run.id.clone();
+            joins.spawn(async move {
+                let payload = format!(r#"{{"index":{index}}}"#);
+                repo.append_trace_event(&AppendTaskTraceEventParams {
+                    user_id: USER,
+                    task_session_id: &task_id,
+                    run_id: &run_id,
+                    event_type: "tool.completed",
+                    timestamp: 10 + index,
+                    payload: &payload,
+                })
+                .await
+                .unwrap()
+            });
+        }
+        while let Some(result) = joins.join_next().await {
+            result.unwrap();
+        }
+
+        let trace = repo.list_trace_events(USER, &task.id, &run.id).await.unwrap();
+        assert_eq!(trace.len(), 28);
+        assert_eq!(
+            trace.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            (1..=28).collect::<Vec<_>>()
+        );
+
+        db.pool().close().await;
+        drop(repo);
+        drop(db);
+        let reopened = init_database_staged(&path).await.unwrap();
+        let reopened_repo = SqliteTaskSessionRepository::new(reopened.pool().clone());
+        let persisted = reopened_repo.list_trace_events(USER, &task.id, &run.id).await.unwrap();
+        assert_eq!(persisted.len(), 28);
+        assert_eq!(persisted.last().unwrap().sequence, 28);
     }
 }

@@ -137,6 +137,9 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
             status: match outcome.status {
                 ConversationAgentTurnStatus::Completed => AgentTurnStatus::Completed,
                 ConversationAgentTurnStatus::Failed => AgentTurnStatus::Failed,
+                // Team turns predate the richer task-run terminal states. Preserve
+                // their existing neutral cancellation semantics at this boundary.
+                ConversationAgentTurnStatus::Cancelled => AgentTurnStatus::Completed,
             },
             runtime: Some(outcome.runtime),
         })

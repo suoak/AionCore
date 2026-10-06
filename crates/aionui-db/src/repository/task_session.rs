@@ -1,7 +1,10 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskRunRow, TaskSessionRow};
+use crate::models::{
+    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
+    TaskSessionRow, TaskTraceEventRow,
+};
 
 #[async_trait::async_trait]
 pub trait ITaskSessionRepository: Send + Sync {
@@ -16,6 +19,7 @@ pub trait ITaskSessionRepository: Send + Sync {
     ) -> Result<TaskSessionRow, DbError>;
     async fn claim_automatic_planning(&self, user_id: &str, id: &str, updated_at: TimestampMs)
     -> Result<bool, DbError>;
+    async fn create_planning_run(&self, params: &CreatePlanningTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
     async fn pause_incomplete(&self, updated_at: TimestampMs) -> Result<u64, DbError>;
     async fn create_artifact_with_approval(
         &self,
@@ -39,6 +43,28 @@ pub trait ITaskSessionRepository: Send + Sync {
     async fn create_run(&self, params: &CreateTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
     async fn finish_run(&self, params: &FinishTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
     async fn list_runs(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskRunRow>, DbError>;
+    async fn get_run(&self, user_id: &str, task_session_id: &str, run_id: &str) -> Result<Option<TaskRunRow>, DbError>;
+    async fn append_trace_event(&self, params: &AppendTaskTraceEventParams<'_>) -> Result<TaskTraceEventRow, DbError>;
+    async fn list_trace_events(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskTraceEventRow>, DbError>;
+    async fn create_checkpoint(&self, params: &CreateTaskCheckpointParams<'_>) -> Result<TaskCheckpointRow, DbError>;
+    async fn list_checkpoints(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskCheckpointRow>, DbError>;
+    async fn create_evidence(&self, params: &CreateTaskEvidenceParams<'_>) -> Result<TaskEvidenceRow, DbError>;
+    async fn list_evidence(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<TaskEvidenceRow>, DbError>;
     async fn list_acceptance_criteria(
         &self,
         user_id: &str,
@@ -84,6 +110,20 @@ pub struct CreateTaskArtifactParams<'a> {
     pub content: &'a str,
     pub content_hash: &'a str,
     pub acceptance_criteria: &'a [String],
+    pub planning_run_id: Option<&'a str>,
+    pub planning_result_summary: Option<&'a str>,
+    pub planning_usage: Option<&'a str>,
+}
+
+pub struct CreatePlanningTaskRunParams<'a> {
+    pub user_id: &'a str,
+    pub task_session_id: &'a str,
+    pub conversation_id: &'a str,
+    pub agent_id: &'a str,
+    pub agent_runtime: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub planning_isolation: &'a str,
+    pub started_at: TimestampMs,
 }
 
 pub struct ResolveTaskApprovalParams<'a> {
@@ -107,6 +147,11 @@ pub struct CreateTaskRunParams<'a> {
     pub approval_id: &'a str,
     pub artifact_hash: &'a str,
     pub started_at: TimestampMs,
+    pub agent_id: &'a str,
+    pub agent_runtime: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub mode: &'a str,
+    pub planning_isolation: Option<&'a str>,
 }
 
 pub struct FinishTaskRunParams<'a> {
@@ -117,6 +162,40 @@ pub struct FinishTaskRunParams<'a> {
     pub task_status: &'a str,
     pub finished_at: TimestampMs,
     pub error_message: Option<&'a str>,
+    pub result_summary: Option<&'a str>,
+    pub usage: Option<&'a str>,
+}
+
+pub struct AppendTaskTraceEventParams<'a> {
+    pub user_id: &'a str,
+    pub task_session_id: &'a str,
+    pub run_id: &'a str,
+    pub event_type: &'a str,
+    pub timestamp: TimestampMs,
+    pub payload: &'a str,
+}
+
+pub struct CreateTaskCheckpointParams<'a> {
+    pub user_id: &'a str,
+    pub task_session_id: &'a str,
+    pub run_id: &'a str,
+    pub checkpoint_type: &'a str,
+    pub artifact_id: Option<&'a str>,
+    pub state: &'a str,
+    pub created_at: TimestampMs,
+}
+
+pub struct CreateTaskEvidenceParams<'a> {
+    pub user_id: &'a str,
+    pub task_session_id: &'a str,
+    pub run_id: &'a str,
+    pub trace_event_id: Option<&'a str>,
+    pub criterion_id: Option<&'a str>,
+    pub kind: &'a str,
+    pub summary: &'a str,
+    pub reference: Option<&'a str>,
+    pub metadata: &'a str,
+    pub created_at: TimestampMs,
 }
 
 pub struct UpdateAcceptanceCriterionParams<'a> {

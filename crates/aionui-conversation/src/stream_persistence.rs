@@ -98,6 +98,45 @@ impl OutputRetentionPolicy {
         }))
     }
 
+    pub(crate) async fn retain_evidence(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        output: &str,
+    ) -> Result<RetainedOutput, std::io::Error> {
+        let user_scope = stable_scope(user_id);
+        let conversation_scope = stable_scope(conversation_id);
+        let sha256 = hex::encode(Sha256::digest(output.as_bytes()));
+        let directory = self.root.join(&user_scope).join(&conversation_scope);
+        let target = directory.join(format!("{sha256}.txt"));
+        ensure_contained(&self.root, &target)?;
+        tokio::fs::create_dir_all(&directory).await?;
+        if !target.is_file() {
+            let staging = directory.join(format!(
+                ".{sha256}-{}-{}.tmp",
+                std::process::id(),
+                SPILL_STAGING_COUNTER.fetch_add(1, Ordering::Relaxed),
+            ));
+            ensure_contained(&self.root, &staging)?;
+            tokio::fs::write(&staging, output.as_bytes()).await?;
+            match tokio::fs::rename(&staging, &target).await {
+                Ok(()) => {}
+                Err(error) if target.is_file() => {
+                    let _ = tokio::fs::remove_file(staging).await;
+                    drop(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let preview_end = output.floor_char_boundary(self.preview_bytes.min(output.len()));
+        Ok(RetainedOutput {
+            reference: format!("v1_{user_scope}_{conversation_scope}_{sha256}"),
+            sha256,
+            size: output.len() as u64,
+            preview: output[..preview_end].to_owned(),
+        })
+    }
+
     pub async fn read(
         &self,
         user_id: &str,
