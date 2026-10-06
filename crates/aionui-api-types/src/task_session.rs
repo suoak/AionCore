@@ -498,7 +498,7 @@ pub struct TaskReviewSummary {
     pub criteria_total: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskReviewResponse {
     pub task: TaskSessionResponse,
     pub run: TaskRunResponse,
