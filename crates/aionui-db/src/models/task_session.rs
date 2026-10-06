@@ -108,6 +108,28 @@ pub struct TaskEvidenceRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct ContextSnapshotRow {
+    pub id: String,
+    pub task_session_id: String,
+    pub run_id: String,
+    pub provider: String,
+    pub query: String,
+    pub scope: String,
+    pub purpose: String,
+    pub result_refs: String,
+    pub snapshot_hash: String,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct ContextSnapshotArtifactRow {
+    pub task_session_id: String,
+    pub snapshot_id: String,
+    pub artifact_id: String,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct TaskAcceptanceCriterionRow {
     pub id: String,
     pub task_session_id: String,

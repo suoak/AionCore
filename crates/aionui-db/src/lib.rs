@@ -27,13 +27,14 @@ pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
     AgentMetadataRow, AgentWorkflowRunRow, AssistantAgentCenterRow, AssistantDefinitionRevisionRow,
     AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow, ConversationInputRow,
-    CreateAgentWorkflowRunParams, CreateAssistantDefinitionRevisionParams, CreateAssistantParams,
-    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection,
-    FolderRow, JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow,
-    Role, SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillImportRecordRow, SkillRegistryInstallRow,
-    SkillRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow,
-    TaskRunRow, TaskSessionRow, TaskTraceEventRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+    ContextSnapshotArtifactRow, ContextSnapshotRow, ConversationArtifactRow, ConversationAssistantSnapshotRow,
+    ConversationCapabilitySnapshotRow, ConversationInputRow, CreateAgentWorkflowRunParams,
+    CreateAssistantDefinitionRevisionParams, CreateAssistantParams, CreateExperienceArticleParams,
+    CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection, FolderRow,
+    JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
+    SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillImportRecordRow, SkillRegistryInstallRow, SkillRow,
+    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
+    TaskSessionRow, TaskTraceEventRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
     UpdateAssistantParams, UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams,
     UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
@@ -55,9 +56,10 @@ pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
 pub use repository::task_session::{
-    AppendTaskTraceEventParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams, CreateTaskCheckpointParams,
-    CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
-    ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
+    AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams,
+    CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams,
+    FinishTaskRunParams, LinkContextSnapshotArtifactParams, ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams,
+    UpdateTaskSessionParams,
 };
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{

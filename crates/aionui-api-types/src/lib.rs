@@ -119,7 +119,7 @@ pub use connection_test::TestBedrockConnectionRequest;
 pub use context::{
     ContextAuthorization, ContextAuthorizationRequest, ContextDiscoveryRequest, ContextDocument, ContextFetchRequest,
     ContextHit, ContextProvenance, ContextProviderCapabilities, ContextProviderIdentity, ContextPurpose, ContextQuery,
-    ContextResourceRef, ContextScope, ContextSource,
+    ContextResourceRef, ContextScope, ContextSnapshot, ContextSource,
 };
 pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,

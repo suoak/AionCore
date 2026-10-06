@@ -178,3 +178,46 @@ async fn migration_062_preserves_execution_runs_and_adds_trace_storage() {
     .unwrap();
     assert_eq!(tables, ["task_checkpoints", "task_evidence", "task_trace_events"]);
 }
+
+#[tokio::test]
+async fn migration_063_adds_restart_persistent_context_snapshots_and_artifact_links() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL);
+         CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL UNIQUE);
+         CREATE TABLE conversations (id TEXT PRIMARY KEY NOT NULL);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/060_task_sessions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/061_task_execution_contracts.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/062_task_execution_trace.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/063_context_snapshots.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table'
+         AND name IN ('context_snapshots', 'context_snapshot_artifacts') ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tables, ["context_snapshot_artifacts", "context_snapshots"]);
+}

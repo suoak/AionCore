@@ -2,8 +2,8 @@ use aionui_common::TimestampMs;
 
 use crate::error::DbError;
 use crate::models::{
-    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
-    TaskSessionRow, TaskTraceEventRow,
+    ContextSnapshotArtifactRow, ContextSnapshotRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow,
+    TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow, TaskTraceEventRow,
 };
 
 #[async_trait::async_trait]
@@ -65,6 +65,26 @@ pub trait ITaskSessionRepository: Send + Sync {
         task_session_id: &str,
         run_id: &str,
     ) -> Result<Vec<TaskEvidenceRow>, DbError>;
+    async fn create_context_snapshot(
+        &self,
+        params: &CreateContextSnapshotParams<'_>,
+    ) -> Result<ContextSnapshotRow, DbError>;
+    async fn list_context_snapshots(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<ContextSnapshotRow>, DbError>;
+    async fn link_context_snapshot_artifact(
+        &self,
+        params: &LinkContextSnapshotArtifactParams<'_>,
+    ) -> Result<ContextSnapshotArtifactRow, DbError>;
+    async fn list_context_snapshots_for_artifact(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        artifact_id: &str,
+    ) -> Result<Vec<ContextSnapshotRow>, DbError>;
     async fn list_acceptance_criteria(
         &self,
         user_id: &str,
@@ -195,6 +215,27 @@ pub struct CreateTaskEvidenceParams<'a> {
     pub summary: &'a str,
     pub reference: Option<&'a str>,
     pub metadata: &'a str,
+    pub created_at: TimestampMs,
+}
+
+pub struct CreateContextSnapshotParams<'a> {
+    pub user_id: &'a str,
+    pub task_session_id: &'a str,
+    pub run_id: &'a str,
+    pub provider: &'a str,
+    pub query: &'a str,
+    pub scope: &'a str,
+    pub purpose: &'a str,
+    pub result_refs: &'a str,
+    pub snapshot_hash: &'a str,
+    pub created_at: TimestampMs,
+}
+
+pub struct LinkContextSnapshotArtifactParams<'a> {
+    pub user_id: &'a str,
+    pub task_session_id: &'a str,
+    pub snapshot_id: &'a str,
+    pub artifact_id: &'a str,
     pub created_at: TimestampMs,
 }
 

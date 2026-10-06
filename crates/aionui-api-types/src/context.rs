@@ -150,3 +150,17 @@ pub struct ContextDocument {
     pub retrieved_at: i64,
     pub provenance: ContextProvenance,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextSnapshot {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub provider: String,
+    pub query: String,
+    pub scope: ContextScope,
+    pub purpose: ContextPurpose,
+    pub result_refs: Vec<ContextHit>,
+    pub created_at: i64,
+    pub snapshot_hash: String,
+}

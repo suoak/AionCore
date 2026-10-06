@@ -3,13 +3,14 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::DbError;
 use crate::models::{
-    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
-    TaskSessionRow, TaskTraceEventRow,
+    ContextSnapshotArtifactRow, ContextSnapshotRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow,
+    TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow, TaskTraceEventRow,
 };
 use crate::repository::task_session::{
-    AppendTaskTraceEventParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams, CreateTaskCheckpointParams,
-    CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
-    ITaskSessionRepository, ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
+    AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams,
+    CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams,
+    FinishTaskRunParams, ITaskSessionRepository, LinkContextSnapshotArtifactParams, ResolveTaskApprovalParams,
+    UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
 };
 
 async fn append_trace_event_tx(
@@ -1015,6 +1016,122 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .await?)
     }
 
+    async fn create_context_snapshot(
+        &self,
+        params: &CreateContextSnapshotParams<'_>,
+    ) -> Result<ContextSnapshotRow, DbError> {
+        let id = aionui_common::generate_prefixed_id("context_snapshot");
+        let result = sqlx::query(
+            "INSERT INTO context_snapshots \
+             (id, task_session_id, run_id, provider, query, scope, purpose, result_refs, snapshot_hash, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (\
+                 SELECT 1 FROM task_sessions task JOIN task_runs run ON run.task_session_id = task.id \
+                 WHERE task.user_id = ? AND task.id = ? AND run.id = ?\
+             )",
+        )
+        .bind(&id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .bind(params.provider)
+        .bind(params.query)
+        .bind(params.scope)
+        .bind(params.purpose)
+        .bind(params.result_refs)
+        .bind(params.snapshot_hash)
+        .bind(params.created_at)
+        .bind(params.user_id)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::NotFound(format!("Task run '{}' not found", params.run_id)));
+        }
+        Ok(
+            sqlx::query_as::<_, ContextSnapshotRow>("SELECT * FROM context_snapshots WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn list_context_snapshots(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<ContextSnapshotRow>, DbError> {
+        Ok(sqlx::query_as::<_, ContextSnapshotRow>(
+            "SELECT snapshot.* FROM context_snapshots snapshot \
+             JOIN task_sessions task ON task.id = snapshot.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND snapshot.run_id = ? \
+             ORDER BY snapshot.created_at, snapshot.id",
+        )
+        .bind(user_id)
+        .bind(task_session_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn link_context_snapshot_artifact(
+        &self,
+        params: &LinkContextSnapshotArtifactParams<'_>,
+    ) -> Result<ContextSnapshotArtifactRow, DbError> {
+        let result = sqlx::query(
+            "INSERT INTO context_snapshot_artifacts (task_session_id, snapshot_id, artifact_id, created_at) \
+             SELECT ?, ?, ?, ? WHERE EXISTS (\
+                 SELECT 1 FROM task_sessions task \
+                 JOIN context_snapshots snapshot ON snapshot.task_session_id = task.id \
+                 JOIN task_artifacts artifact ON artifact.task_session_id = task.id \
+                 WHERE task.user_id = ? AND task.id = ? AND snapshot.id = ? AND artifact.id = ?\
+             )",
+        )
+        .bind(params.task_session_id)
+        .bind(params.snapshot_id)
+        .bind(params.artifact_id)
+        .bind(params.created_at)
+        .bind(params.user_id)
+        .bind(params.task_session_id)
+        .bind(params.snapshot_id)
+        .bind(params.artifact_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::NotFound(format!(
+                "Context snapshot '{}' or task artifact '{}' not found",
+                params.snapshot_id, params.artifact_id
+            )));
+        }
+        Ok(sqlx::query_as::<_, ContextSnapshotArtifactRow>(
+            "SELECT * FROM context_snapshot_artifacts WHERE snapshot_id = ? AND artifact_id = ?",
+        )
+        .bind(params.snapshot_id)
+        .bind(params.artifact_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn list_context_snapshots_for_artifact(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        artifact_id: &str,
+    ) -> Result<Vec<ContextSnapshotRow>, DbError> {
+        Ok(sqlx::query_as::<_, ContextSnapshotRow>(
+            "SELECT snapshot.* FROM context_snapshots snapshot \
+             JOIN context_snapshot_artifacts link ON link.snapshot_id = snapshot.id \
+             JOIN task_sessions task ON task.id = snapshot.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND link.task_session_id = task.id AND link.artifact_id = ? \
+             ORDER BY snapshot.created_at, snapshot.id",
+        )
+        .bind(user_id)
+        .bind(task_session_id)
+        .bind(artifact_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn list_acceptance_criteria(
         &self,
         user_id: &str,
@@ -1197,8 +1314,8 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
 mod tests {
     use super::*;
     use crate::repository::task_session::{
-        CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams, FinishTaskRunParams,
-        ResolveTaskApprovalParams, UpdateTaskSessionParams,
+        CreateContextSnapshotParams, CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams,
+        FinishTaskRunParams, LinkContextSnapshotArtifactParams, ResolveTaskApprovalParams, UpdateTaskSessionParams,
     };
     use crate::{ITaskSessionRepository, init_database_memory, init_database_staged};
 
@@ -1336,6 +1453,85 @@ mod tests {
         let created = repo.create(&create_params("draft")).await.unwrap();
 
         assert!(repo.get("other-user", &created.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn context_snapshots_persist_and_link_to_artifacts_with_owner_scope() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+             VALUES ('context-conversation', ?, 'Context', 'aionrs', 1, 1)",
+        )
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo = SqliteTaskSessionRepository::new(db.pool().clone());
+        let task = repo.create(&create_params("running")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO task_runs \
+             (id, task_session_id, conversation_id, run_kind, status, started_at) \
+             VALUES ('context-run', ?, 'context-conversation', 'planning', 'running', 2)",
+        )
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO task_artifacts \
+             (id, task_session_id, kind, version, content, content_hash, status, created_at, updated_at) \
+             VALUES ('context-plan', ?, 'plan', 1, 'plan', 'plan-hash', 'submitted', 3, 3)",
+        )
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let snapshot = repo
+            .create_context_snapshot(&CreateContextSnapshotParams {
+                user_id: USER,
+                task_session_id: &task.id,
+                run_id: "context-run",
+                provider: "test",
+                query: "release requirements",
+                scope: r#"{"kind":"all_accessible"}"#,
+                purpose: "planning",
+                result_refs: r#"[{"source_id":"doc-1","snippet":"bounded"}]"#,
+                snapshot_hash: "snapshot-hash",
+                created_at: 4,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.run_id, "context-run");
+        assert_eq!(snapshot.snapshot_hash, "snapshot-hash");
+        assert_eq!(
+            repo.list_context_snapshots(USER, &task.id, "context-run")
+                .await
+                .unwrap(),
+            [snapshot.clone()]
+        );
+        assert!(
+            repo.list_context_snapshots("other-user", &task.id, "context-run")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        repo.link_context_snapshot_artifact(&LinkContextSnapshotArtifactParams {
+            user_id: USER,
+            task_session_id: &task.id,
+            snapshot_id: &snapshot.id,
+            artifact_id: "context-plan",
+            created_at: 5,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.list_context_snapshots_for_artifact(USER, &task.id, "context-plan")
+                .await
+                .unwrap(),
+            [snapshot]
+        );
     }
 
     #[tokio::test]

@@ -54,8 +54,8 @@ pub use skill_evolution::{
 };
 pub use system_settings::SystemSettings;
 pub use task_session::{
-    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
-    TaskSessionRow, TaskTraceEventRow,
+    ContextSnapshotArtifactRow, ContextSnapshotRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow,
+    TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow, TaskTraceEventRow,
 };
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use usage_event::UsageEventRow;
