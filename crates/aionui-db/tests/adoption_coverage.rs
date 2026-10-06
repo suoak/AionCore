@@ -41,7 +41,10 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("task_acceptance_criteria", "task_session_id", "task_sessions"),
     ("task_approvals", "task_session_id", "task_sessions"),
     ("task_artifacts", "task_session_id", "task_sessions"),
+    ("task_checkpoints", "task_session_id", "task_sessions"),
+    ("task_evidence", "task_session_id", "task_sessions"),
     ("task_runs", "task_session_id", "task_sessions"),
+    ("task_trace_events", "task_session_id", "task_sessions"),
     ("team_tasks", "team_id", "teams"),
 ];
 
