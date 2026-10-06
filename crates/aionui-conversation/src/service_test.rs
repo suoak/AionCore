@@ -7,7 +7,10 @@ use std::sync::{
 use std::time::Duration;
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+use aionui_ai_agent::protocol::events::tool_call::{
+    AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallKind, AcpToolCallSessionUpdateKind, AcpToolCallStatus,
+    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus,
+};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{
     AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, AIONUI_RUNTIME_TOKEN_ENV, AionrsRuntimeToolPolicy, BuildTaskOptions,
@@ -19,14 +22,16 @@ use aionui_ai_agent::{
 };
 
 use aionui_api_types::{
+    AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind, CloneConversationRequest,
+    CreateConversationRequest, CreateTaskSessionRequest, DecideTaskApprovalRequest, ExecuteApprovedPlanRequest,
+    ListConversationsQuery, SearchMessagesQuery, SendMessageRequest, StartAutomaticPlanningRequest,
+    SubmitTaskArtifactRequest, TaskApprovalDecision, TaskArtifactKind, TaskSessionMode, TaskSessionStatus,
+    UpdateConversationRequest, VerifyAcceptanceCriterionRequest, WebSocketMessage,
+};
+use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
     ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
     SetConfigOptionRequest, SetConfigOptionResponse,
-};
-use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, CreateTaskSessionRequest, ListConversationsQuery,
-    SearchMessagesQuery, SendMessageRequest, StartAutomaticPlanningRequest, TaskSessionMode, TaskSessionStatus,
-    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, ConversationTurnSettlement,
@@ -4368,6 +4373,26 @@ async fn automatic_planning_uses_strict_aion_runtime_and_creates_pending_plan() 
         ScriptedAgent::new(
             "placeholder",
             vec![vec![
+                AgentStreamEvent::ToolCall(ToolCallEventData {
+                    call_id: "strict-write".into(),
+                    name: "Write".into(),
+                    args: json!({ "file_path": sentinel.clone(), "authorization": "Bearer planning-secret" }),
+                    status: ToolCallStatus::Running,
+                    input: None,
+                    output: None,
+                    description: None,
+                    parent_call_id: None,
+                }),
+                AgentStreamEvent::ToolCall(ToolCallEventData {
+                    call_id: "strict-write".into(),
+                    name: "Write".into(),
+                    args: serde_json::Value::Null,
+                    status: ToolCallStatus::Error,
+                    input: None,
+                    output: Some("authorization=Bearer planning-secret".into()),
+                    description: None,
+                    parent_call_id: None,
+                }),
                 AgentStreamEvent::Text(TextEventData {
                     content: "1. Inspect the current behavior.\n2. Add focused tests.".into(),
                 }),
@@ -4457,6 +4482,30 @@ async fn automatic_planning_uses_strict_aion_runtime_and_creates_pending_plan() 
     assert!(sent[0].contains("Modify sentinel.txt, then write a plan"));
     assert!(sent[0].contains("Do not execute changes"));
     assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
+    let runs = service.list_task_runs("user_1", &task.id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_kind, "planning");
+    assert_eq!(runs[0].status, aionui_api_types::TaskRunStatus::Completed);
+    let review = service
+        .get_task_run_review("user_1", &task.id, &runs[0].id)
+        .await
+        .unwrap();
+    assert!(review.trace.iter().any(|event| event.event_type == "planning.started"));
+    assert!(
+        review
+            .trace
+            .iter()
+            .any(|event| event.event_type == "planning.completed")
+    );
+    assert!(review.trace.iter().any(|event| event.event_type == "tool.denied"));
+    assert!(
+        review
+            .trace
+            .iter()
+            .any(|event| event.event_type == "approval.requested")
+    );
+    assert_eq!(review.summary.denied_decisions, 1);
+    assert!(!serde_json::to_string(&review).unwrap().contains("planning-secret"));
 }
 
 #[tokio::test]
@@ -4508,6 +4557,207 @@ async fn automatic_planning_rejects_aion_identity_on_non_aion_conversation() {
             .await,
         Err(ConversationError::Forbidden { .. })
     ));
+}
+
+#[tokio::test]
+async fn approved_goal_execution_review_links_changes_approval_and_verification() {
+    let workspace = unique_test_workspace_path("execution-review");
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![
+                AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+                    session_id: "review-session".into(),
+                    update: AcpToolCallUpdateData {
+                        session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
+                        tool_call_id: "edit-review".into(),
+                        status: Some(AcpToolCallStatus::Completed),
+                        title: Some("Edit src/auth.ts".into()),
+                        kind: Some(AcpToolCallKind::Edit),
+                        raw_input: None,
+                        raw_output: None,
+                        content: Some(vec![AcpToolCallContentItem::Diff {
+                            path: "src/auth.ts".into(),
+                            old_text: Some("before".into()),
+                            new_text: "after".into(),
+                        }]),
+                        locations: None,
+                    },
+                    meta: None,
+                }),
+                AgentStreamEvent::Text(TextEventData {
+                    content: "Implemented and verified.".into(),
+                }),
+                AgentStreamEvent::Finish(FinishEventData::default()),
+            ]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        scripted_agent,
+    )]));
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr,
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let task_repo = Arc::new(SqliteTaskSessionRepository::new(db.pool().clone()));
+    service.with_task_session_repo(task_repo);
+    let conversation = service
+        .create(
+            "user_1",
+            serde_json::from_value(json!({
+                "type": "aionrs",
+                "extra": { "workspace": workspace },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, 'user_1', 'Execution review', 'aionrs', 1, 1)",
+    )
+    .bind(&conversation.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let task = service
+        .create_task_session(
+            "user_1",
+            CreateTaskSessionRequest {
+                title: "Review execution".into(),
+                project_id: None,
+                conversation_id: Some(conversation.id),
+                mode: TaskSessionMode::Goal,
+                objective: "Update authentication".into(),
+                acceptance_criteria: vec!["Tests pass".into()],
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let goal = service
+        .submit_task_artifact(
+            "user_1",
+            &task.id,
+            SubmitTaskArtifactRequest {
+                kind: TaskArtifactKind::Goal,
+                content: "Update authentication".into(),
+                acceptance_criteria: vec!["Tests pass".into()],
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .decide_task_approval(
+            "user_1",
+            &task.id,
+            &goal.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: goal.artifact.id.clone(),
+                artifact_hash: goal.artifact.content_hash.clone(),
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    let plan = service
+        .submit_task_artifact(
+            "user_1",
+            &task.id,
+            SubmitTaskArtifactRequest {
+                kind: TaskArtifactKind::Plan,
+                content: "Edit src/auth.ts and run tests".into(),
+                acceptance_criteria: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .decide_task_approval(
+            "user_1",
+            &task.id,
+            &plan.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: plan.artifact.id.clone(),
+                artifact_hash: plan.artifact.content_hash.clone(),
+                comment: Some("Approved exact plan".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let run = service
+        .execute_approved_plan(
+            "user_1",
+            &task.id,
+            ExecuteApprovedPlanRequest {
+                approval_id: plan.approval.id.clone(),
+                artifact_id: plan.artifact.id.clone(),
+                artifact_hash: plan.artifact.content_hash.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.status, aionui_api_types::TaskRunStatus::Completed);
+
+    let before_verification = service.get_task_run_review("user_1", &task.id, &run.id).await.unwrap();
+    assert_eq!(before_verification.summary.files_changed, 1);
+    assert!(
+        before_verification
+            .trace
+            .iter()
+            .any(|event| event.event_type == "file.changed")
+    );
+    assert!(
+        before_verification
+            .trace
+            .iter()
+            .any(|event| event.event_type == "tool.allowed")
+    );
+    assert_eq!(
+        before_verification.approvals[0].artifact_hash,
+        plan.artifact.content_hash
+    );
+    assert_eq!(before_verification.acceptance_criteria.len(), 1);
+
+    let criterion = &before_verification.acceptance_criteria[0];
+    service
+        .verify_acceptance_criterion(
+            "user_1",
+            &task.id,
+            &criterion.id,
+            VerifyAcceptanceCriterionRequest {
+                status: AcceptanceCriterionStatus::Passed,
+                evidence: vec![AcceptanceEvidence {
+                    kind: AcceptanceEvidenceKind::CommandResult,
+                    summary: "cargo test passed".into(),
+                    reference: Some("exit_code=0".into()),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let reviewed = service.get_task_run_review("user_1", &task.id, &run.id).await.unwrap();
+    assert_eq!(reviewed.summary.criteria_passed, 1);
+    assert!(
+        reviewed
+            .trace
+            .iter()
+            .any(|event| event.event_type == "criterion.passed")
+    );
+    assert!(reviewed.evidence.iter().any(|item| item.kind == "command"));
 }
 
 #[tokio::test]
