@@ -42,9 +42,51 @@ pub struct ContextDiscoveryRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(default)]
     pub hints: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextProviderSelection {
+    pub instance_id: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextResolutionRequest {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub providers: Vec<ContextProviderSelection>,
+    #[serde(default)]
+    pub hints: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextSourceRecommendation {
+    pub provider: String,
+    pub provider_instance_id: String,
+    pub source: ContextSource,
+    pub requires_user_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextResolutionWarning {
+    pub provider_instance_id: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextResolutionOutcome {
+    pub recommendations: Vec<ContextSourceRecommendation>,
+    pub warnings: Vec<ContextResolutionWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

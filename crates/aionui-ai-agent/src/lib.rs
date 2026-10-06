@@ -51,6 +51,7 @@ pub use capability::context_provider::{
     ContextProvider, ContextProviderError, MAX_CONTEXT_QUERY_HITS, search_context, search_context_with_policy,
     validate_context_query,
 };
+pub use capability::context_resolver::{MAX_CONTEXT_RECOMMENDATIONS, resolve_context_sources};
 pub use capability::planning_policy::{
     AION_STRICT_PLANNING_ALLOWED_TOOLS, AionToolClassification, PlanningPolicy, PolicyContext,
     RuntimeEnforcementCapabilities, ToolPolicyRequest, audited_aion_strict_runtime_capabilities,
