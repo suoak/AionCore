@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use aionui_api_types::{
-    AgentIntegrationMode, PlanningIsolationLevel, PlanningIsolationResponse, PolicyDecision, PolicyDecisionKind,
-    TaskSessionMode, ToolCapability,
+    AgentIntegrationMode, ContextProviderCapabilities, PlanningIsolationLevel, PlanningIsolationResponse,
+    PolicyDecision, PolicyDecisionKind, TaskSessionMode, ToolCapability,
 };
 
 pub const AION_STRICT_PLANNING_ALLOWED_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "ViewImage"];
@@ -176,6 +176,7 @@ impl PlanningPolicy {
             Some(ToolCapability::GitWrite) => deny("planning.git.write"),
             Some(ToolCapability::McpRead) => allow("planning.mcp.read"),
             Some(ToolCapability::McpWrite) => deny("planning.mcp.write"),
+            Some(ToolCapability::KnowledgeRead) => allow("planning.knowledge.read"),
             Some(ToolCapability::NetworkInternal) => decision(
                 self.internal_network_decision,
                 "planning.network.internal",
@@ -310,6 +311,14 @@ pub fn classify_mcp_capability(trusted_metadata: bool, declared: Option<ToolCapa
     }
 }
 
+pub fn classify_context_capability(
+    trusted_provider: bool,
+    capabilities: ContextProviderCapabilities,
+) -> Option<ToolCapability> {
+    (trusted_provider && capabilities.permission_aware && capabilities.provenance)
+        .then_some(ToolCapability::KnowledgeRead)
+}
+
 fn contains_shell_control(value: &str) -> bool {
     value
         .chars()
@@ -370,6 +379,7 @@ mod tests {
             ToolCapability::ShellReadonly,
             ToolCapability::GitRead,
             ToolCapability::McpRead,
+            ToolCapability::KnowledgeRead,
         ] {
             assert_eq!(
                 policy.evaluate(&context(), &request(Some(capability))).decision,
@@ -529,6 +539,34 @@ mod tests {
         );
         assert_eq!(
             classify_mcp_capability(true, Some(ToolCapability::FilesystemRead)),
+            None
+        );
+    }
+
+    #[test]
+    fn context_requires_a_trusted_permission_aware_provenance_provider() {
+        let complete = ContextProviderCapabilities {
+            single_scope: true,
+            multi_scope: false,
+            all_accessible: false,
+            provenance: true,
+            permission_aware: true,
+            freshness: false,
+            content_fetch: false,
+        };
+        assert_eq!(
+            classify_context_capability(true, complete),
+            Some(ToolCapability::KnowledgeRead)
+        );
+        assert_eq!(classify_context_capability(false, complete), None);
+        assert_eq!(
+            classify_context_capability(
+                true,
+                ContextProviderCapabilities {
+                    provenance: false,
+                    ..complete
+                }
+            ),
             None
         );
     }

@@ -20,7 +20,8 @@ use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence,
     AgentIntegrationMode, ApprovalCheckResponse, AssistantConversationOverridesRequest, AssistantMcpBindingChanged,
     CancelConversationResponse, CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConfirmationListResponse, ContextHit, ContextPurpose, ContextQuery, ContextScope, ContextSnapshot,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
@@ -46,9 +47,9 @@ use aionui_common::{
 #[cfg(test)]
 use aionui_db::models::McpServerRow;
 use aionui_db::models::{
-    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow, TaskAcceptanceCriterionRow,
-    TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow,
-    TaskTraceEventRow,
+    AssistantDefinitionRow, ContextSnapshotRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
+    TaskSessionRow, TaskTraceEventRow,
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
@@ -385,6 +386,31 @@ fn task_evidence_response(row: TaskEvidenceRow) -> Result<TaskEvidenceResponse, 
         reference: row.reference,
         metadata: crate::trace_redaction::sanitize_json(&metadata),
         created_at: row.created_at,
+    })
+}
+
+fn context_snapshot_response(row: ContextSnapshotRow) -> Result<ContextSnapshot, ConversationError> {
+    let scope: ContextScope = serde_json::from_str(&row.scope)
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted context snapshot scope: {error}")))?;
+    let purpose: ContextPurpose = serde_json::from_value(serde_json::Value::String(row.purpose))
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted context snapshot purpose: {error}")))?;
+    let result_refs = serde_json::from_str::<serde_json::Value>(&row.result_refs)
+        .map(|value| crate::trace_redaction::sanitize_json(&value))
+        .and_then(serde_json::from_value)
+        .map_err(|error: serde_json::Error| {
+            ConversationError::internal(format!("Invalid persisted context snapshot result refs: {error}"))
+        })?;
+    Ok(ContextSnapshot {
+        id: row.id,
+        task_id: row.task_session_id,
+        run_id: row.run_id,
+        provider: row.provider,
+        query: crate::trace_redaction::redact_and_bound(&row.query),
+        scope,
+        purpose,
+        result_refs,
+        created_at: row.created_at,
+        snapshot_hash: row.snapshot_hash,
     })
 }
 
@@ -743,6 +769,15 @@ pub struct ConversationAgentTurnRequest {
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
+}
+
+pub struct RecordTaskContextSnapshotRequest<'a> {
+    pub task_session_id: &'a str,
+    pub run_id: &'a str,
+    pub provider: &'a str,
+    pub query: &'a ContextQuery,
+    pub hits: &'a [ContextHit],
+    pub artifact_id: Option<&'a str>,
 }
 
 pub type ConversationAgentTurnStartedCallback =
@@ -1451,6 +1486,51 @@ impl ConversationService {
             .collect()
     }
 
+    pub async fn record_task_context_snapshot(
+        &self,
+        user_id: &str,
+        request: RecordTaskContextSnapshotRequest<'_>,
+    ) -> Result<ContextSnapshot, ConversationError> {
+        if request.query.task_id != request.task_session_id {
+            return Err(ConversationError::bad_request(
+                "Context query task_id must match the target TaskSession",
+            ));
+        }
+        if request.provider.trim().is_empty() || request.hits.iter().any(|hit| hit.provider != request.provider) {
+            return Err(ConversationError::bad_request(
+                "Context snapshot provider must be non-empty and match every hit",
+            ));
+        }
+        let repo = self.task_session_repo()?;
+        let run = repo
+            .get_run(user_id, request.task_session_id, request.run_id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task run '{}' not found", request.run_id)))?;
+        let policy = match run.run_kind.as_str() {
+            "planning" => crate::task_trace::TaskTracePolicy::StrictPlanning,
+            "execution" => crate::task_trace::TaskTracePolicy::ApprovedExecution,
+            other => {
+                return Err(ConversationError::internal(format!(
+                    "Invalid persisted task run kind: {other}"
+                )));
+            }
+        };
+        let trace = crate::task_trace::TaskTraceContext::new(
+            user_id.to_owned(),
+            request.task_session_id.to_owned(),
+            request.run_id.to_owned(),
+            run.conversation_id,
+            policy,
+            repo,
+            self.output_retention_policy(),
+        );
+        context_snapshot_response(
+            trace
+                .record_context_snapshot(request.provider, request.query, request.hits, request.artifact_id)
+                .await?,
+        )
+    }
+
     pub async fn get_task_run_review(
         &self,
         user_id: &str,
@@ -1511,6 +1591,12 @@ impl ConversationService {
             .into_iter()
             .map(task_evidence_response)
             .collect::<Result<Vec<_>, _>>()?;
+        let context_snapshots = repo
+            .list_context_snapshots(user_id, task_session_id, run_id)
+            .await?
+            .into_iter()
+            .map(context_snapshot_response)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let files_changed = evidence
             .iter()
@@ -1543,6 +1629,7 @@ impl ConversationService {
             trace,
             checkpoints,
             evidence,
+            context_snapshots,
             summary: TaskReviewSummary {
                 status,
                 files_changed,

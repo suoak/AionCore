@@ -47,11 +47,15 @@ pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashC
 // conversation whose agent task is not currently live.
 pub use aionui_session::backend_supports_midturn_delivery;
 pub use aionui_session::effective_agent_capabilities;
+pub use capability::context_provider::{
+    ContextProvider, ContextProviderError, MAX_CONTEXT_QUERY_HITS, search_context, search_context_with_policy,
+    validate_context_query,
+};
 pub use capability::planning_policy::{
     AION_STRICT_PLANNING_ALLOWED_TOOLS, AionToolClassification, PlanningPolicy, PolicyContext,
     RuntimeEnforcementCapabilities, ToolPolicyRequest, audited_aion_strict_runtime_capabilities,
-    audited_runtime_capabilities, classify_aion_registered_tool, classify_mcp_capability, classify_shell_argv,
-    resolve_planning_isolation,
+    audited_runtime_capabilities, classify_aion_registered_tool, classify_context_capability, classify_mcp_capability,
+    classify_shell_argv, resolve_planning_isolation,
 };
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,
