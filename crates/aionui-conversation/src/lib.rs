@@ -52,6 +52,7 @@ pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
+    RecordTaskContextSnapshotRequest,
 };
 pub use state::ConversationRouterState;
 

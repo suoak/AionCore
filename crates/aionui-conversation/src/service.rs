@@ -396,7 +396,7 @@ fn context_snapshot_response(row: ContextSnapshotRow) -> Result<ContextSnapshot,
         .map_err(|error| ConversationError::internal(format!("Invalid persisted context snapshot purpose: {error}")))?;
     let result_refs = serde_json::from_str::<serde_json::Value>(&row.result_refs)
         .map(|value| crate::trace_redaction::sanitize_json(&value))
-        .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+        .and_then(serde_json::from_value)
         .map_err(|error: serde_json::Error| {
             ConversationError::internal(format!("Invalid persisted context snapshot result refs: {error}"))
         })?;
@@ -769,6 +769,15 @@ pub struct ConversationAgentTurnRequest {
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
+}
+
+pub struct RecordTaskContextSnapshotRequest<'a> {
+    pub task_session_id: &'a str,
+    pub run_id: &'a str,
+    pub provider: &'a str,
+    pub query: &'a ContextQuery,
+    pub hits: &'a [ContextHit],
+    pub artifact_id: Option<&'a str>,
 }
 
 pub type ConversationAgentTurnStartedCallback =
@@ -1480,28 +1489,23 @@ impl ConversationService {
     pub async fn record_task_context_snapshot(
         &self,
         user_id: &str,
-        task_session_id: &str,
-        run_id: &str,
-        provider: &str,
-        query: &ContextQuery,
-        hits: &[ContextHit],
-        artifact_id: Option<&str>,
+        request: RecordTaskContextSnapshotRequest<'_>,
     ) -> Result<ContextSnapshot, ConversationError> {
-        if query.task_id != task_session_id {
+        if request.query.task_id != request.task_session_id {
             return Err(ConversationError::bad_request(
                 "Context query task_id must match the target TaskSession",
             ));
         }
-        if provider.trim().is_empty() || hits.iter().any(|hit| hit.provider != provider) {
+        if request.provider.trim().is_empty() || request.hits.iter().any(|hit| hit.provider != request.provider) {
             return Err(ConversationError::bad_request(
                 "Context snapshot provider must be non-empty and match every hit",
             ));
         }
         let repo = self.task_session_repo()?;
         let run = repo
-            .get_run(user_id, task_session_id, run_id)
+            .get_run(user_id, request.task_session_id, request.run_id)
             .await?
-            .ok_or_else(|| ConversationError::not_found_reason(format!("Task run '{run_id}' not found")))?;
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task run '{}' not found", request.run_id)))?;
         let policy = match run.run_kind.as_str() {
             "planning" => crate::task_trace::TaskTracePolicy::StrictPlanning,
             "execution" => crate::task_trace::TaskTracePolicy::ApprovedExecution,
@@ -1513,8 +1517,8 @@ impl ConversationService {
         };
         let trace = crate::task_trace::TaskTraceContext::new(
             user_id.to_owned(),
-            task_session_id.to_owned(),
-            run_id.to_owned(),
+            request.task_session_id.to_owned(),
+            request.run_id.to_owned(),
             run.conversation_id,
             policy,
             repo,
@@ -1522,7 +1526,7 @@ impl ConversationService {
         );
         context_snapshot_response(
             trace
-                .record_context_snapshot(provider, query, hits, artifact_id)
+                .record_context_snapshot(request.provider, request.query, request.hits, request.artifact_id)
                 .await?,
         )
     }
