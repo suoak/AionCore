@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.15](https://github.com/suoak/AionCore/compare/v0.2.14...v0.2.15) (2026-10-06)
+
+
+### Features
+
+* **trace:** persist execution review provenance ([#132](https://github.com/suoak/AionCore/issues/132)) ([bd5460a](https://github.com/suoak/AionCore/commit/bd5460aa68e92517e83304df09787e49e26e0500))
+
 ## [0.2.14](https://github.com/suoak/AionCore/compare/v0.2.13...v0.2.14) (2026-10-05)
 
 
