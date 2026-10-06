@@ -394,7 +394,7 @@ fn context_snapshot_response(row: ContextSnapshotRow) -> Result<ContextSnapshot,
     let purpose: ContextPurpose = serde_json::from_value(serde_json::Value::String(row.purpose))
         .map_err(|error| ConversationError::internal(format!("Invalid persisted context snapshot purpose: {error}")))?;
     let result_refs = serde_json::from_str::<serde_json::Value>(&row.result_refs)
-        .map(crate::trace_redaction::sanitize_json)
+        .map(|value| crate::trace_redaction::sanitize_json(&value))
         .and_then(|value| serde_json::from_value(value).map_err(Into::into))
         .map_err(|error: serde_json::Error| {
             ConversationError::internal(format!("Invalid persisted context snapshot result refs: {error}"))
