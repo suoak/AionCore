@@ -72,6 +72,23 @@ pub struct ContextQuery {
     pub purpose: ContextPurpose,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub max_hits: usize,
+    pub max_snippet_chars: usize,
+    pub max_total_snippet_chars: usize,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            max_hits: 20,
+            max_snippet_chars: 2_000,
+            max_total_snippet_chars: 12_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextResourceRef {
     pub id: String,

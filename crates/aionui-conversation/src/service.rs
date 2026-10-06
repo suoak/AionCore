@@ -20,20 +20,20 @@ use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence,
     AgentIntegrationMode, ApprovalCheckResponse, AssistantConversationOverridesRequest, AssistantMcpBindingChanged,
     CancelConversationResponse, CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
-    ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
-    MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationLevel, PlanningIsolationResponse,
-    PromptCapabilityView, RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SessionMcpServer, SessionMcpTransport, StartAutomaticPlanningRequest,
-    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME, TaskApprovalDecision,
-    TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskCheckpointResponse,
-    TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse, TaskRunStatus, TaskSessionMode,
-    TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, TeamMcpSelection, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
-    VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
+    ConfirmationListResponse, ContextPurpose, ContextScope, ContextSnapshot, ConversationArtifactKind,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
+    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
+    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, CreateTaskSessionRequest,
+    DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest, ForkCapabilityView,
+    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
+    MessageResponse, MessageSearchResponse, PlanningIsolationLevel, PlanningIsolationResponse, PromptCapabilityView,
+    RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
+    SessionMcpTransport, StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse,
+    TEAM_MCP_SERVER_NAME, TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind,
+    TaskArtifactResponse, TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary,
+    TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse,
+    TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
@@ -46,9 +46,9 @@ use aionui_common::{
 #[cfg(test)]
 use aionui_db::models::McpServerRow;
 use aionui_db::models::{
-    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow, TaskAcceptanceCriterionRow,
-    TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow,
-    TaskTraceEventRow,
+    AssistantDefinitionRow, ContextSnapshotRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
+    TaskSessionRow, TaskTraceEventRow,
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
@@ -385,6 +385,31 @@ fn task_evidence_response(row: TaskEvidenceRow) -> Result<TaskEvidenceResponse, 
         reference: row.reference,
         metadata: crate::trace_redaction::sanitize_json(&metadata),
         created_at: row.created_at,
+    })
+}
+
+fn context_snapshot_response(row: ContextSnapshotRow) -> Result<ContextSnapshot, ConversationError> {
+    let scope: ContextScope = serde_json::from_str(&row.scope)
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted context snapshot scope: {error}")))?;
+    let purpose: ContextPurpose = serde_json::from_value(serde_json::Value::String(row.purpose))
+        .map_err(|error| ConversationError::internal(format!("Invalid persisted context snapshot purpose: {error}")))?;
+    let result_refs = serde_json::from_str::<serde_json::Value>(&row.result_refs)
+        .map(crate::trace_redaction::sanitize_json)
+        .and_then(|value| serde_json::from_value(value).map_err(Into::into))
+        .map_err(|error: serde_json::Error| {
+            ConversationError::internal(format!("Invalid persisted context snapshot result refs: {error}"))
+        })?;
+    Ok(ContextSnapshot {
+        id: row.id,
+        task_id: row.task_session_id,
+        run_id: row.run_id,
+        provider: row.provider,
+        query: crate::trace_redaction::redact_and_bound(&row.query),
+        scope,
+        purpose,
+        result_refs,
+        created_at: row.created_at,
+        snapshot_hash: row.snapshot_hash,
     })
 }
 
@@ -1511,6 +1536,12 @@ impl ConversationService {
             .into_iter()
             .map(task_evidence_response)
             .collect::<Result<Vec<_>, _>>()?;
+        let context_snapshots = repo
+            .list_context_snapshots(user_id, task_session_id, run_id)
+            .await?
+            .into_iter()
+            .map(context_snapshot_response)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let files_changed = evidence
             .iter()
@@ -1543,6 +1574,7 @@ impl ConversationService {
             trace,
             checkpoints,
             evidence,
+            context_snapshots,
             summary: TaskReviewSummary {
                 status,
                 files_changed,

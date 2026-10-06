@@ -3,9 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::AgentStreamEvent;
 use aionui_ai_agent::protocol::events::tool_call::{AcpToolCallContentItem, AcpToolCallStatus, ToolCallStatus};
+use aionui_api_types::{ContextHit, ContextQuery};
 use aionui_common::now_ms;
 use aionui_db::{
-    AppendTaskTraceEventParams, CreateTaskCheckpointParams, CreateTaskEvidenceParams, DbError, ITaskSessionRepository,
+    AppendTaskTraceEventParams, ContextSnapshotRow, CreateContextSnapshotParams, CreateTaskCheckpointParams,
+    CreateTaskEvidenceParams, DbError, ITaskSessionRepository, LinkContextSnapshotArtifactParams,
 };
 use sha2::{Digest, Sha256};
 
@@ -92,6 +94,101 @@ impl TaskTraceContext {
             })
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn record_context_snapshot(
+        &self,
+        provider: &str,
+        query: &ContextQuery,
+        hits: &[ContextHit],
+        artifact_id: Option<&str>,
+    ) -> Result<ContextSnapshotRow, DbError> {
+        let query_text = crate::trace_redaction::redact_and_bound(&query.query);
+        let scope_value = sanitize_json(
+            &serde_json::to_value(&query.scope)
+                .map_err(|error| DbError::Init(format!("Failed to serialize context scope: {error}")))?,
+        );
+        let scope = scope_value.to_string();
+        let result_refs = sanitize_json(
+            &serde_json::to_value(hits)
+                .map_err(|error| DbError::Init(format!("Failed to serialize context hits: {error}")))?,
+        );
+        let purpose = serde_json::to_value(query.purpose)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| DbError::Init("Failed to serialize context purpose".to_owned()))?;
+        let hash_payload = serde_json::json!({
+            "provider": provider,
+            "query": query_text,
+            "scope": scope_value,
+            "purpose": purpose,
+            "result_refs": result_refs
+        });
+        let snapshot_hash = sha256(&hash_payload.to_string());
+        let result_refs = result_refs.to_string();
+        let created_at = now_ms();
+        let snapshot = self
+            .repo
+            .create_context_snapshot(&CreateContextSnapshotParams {
+                user_id: &self.user_id,
+                task_session_id: &self.task_id,
+                run_id: &self.run_id,
+                provider,
+                query: &query_text,
+                scope: &scope,
+                purpose: &purpose,
+                result_refs: &result_refs,
+                snapshot_hash: &snapshot_hash,
+                created_at,
+            })
+            .await?;
+        if let Some(artifact_id) = artifact_id {
+            self.repo
+                .link_context_snapshot_artifact(&LinkContextSnapshotArtifactParams {
+                    user_id: &self.user_id,
+                    task_session_id: &self.task_id,
+                    snapshot_id: &snapshot.id,
+                    artifact_id,
+                    created_at,
+                })
+                .await?;
+        }
+
+        let event_id = self
+            .event(
+                "context.used",
+                serde_json::json!({
+                    "snapshot_id": snapshot.id,
+                    "snapshot_hash": snapshot.snapshot_hash,
+                    "provider": provider,
+                    "purpose": purpose,
+                    "scope": query.scope,
+                    "hit_count": hits.len()
+                }),
+            )
+            .await?;
+        for hit in hits {
+            self.evidence(
+                Some(&event_id),
+                "knowledge",
+                &format!("Knowledge used: {}", hit.title),
+                Some(&hit.source_id),
+                serde_json::json!({
+                    "snapshot_id": snapshot.id,
+                    "provider": hit.provider,
+                    "source_id": hit.source_id,
+                    "query": query_text,
+                    "snippet": hit.snippet,
+                    "content_hash": hit.content_hash,
+                    "version_or_updated_at": hit.version_or_updated_at,
+                    "retrieved_at": hit.retrieved_at,
+                    "permission_scope": hit.permission_scope,
+                    "provenance": hit.provenance
+                }),
+            )
+            .await?;
+        }
+        Ok(snapshot)
     }
 
     fn observed_decision(&self, call_id: &str) -> Option<bool> {
@@ -366,6 +463,7 @@ mod tests {
     use aionui_ai_agent::protocol::events::tool_call::{
         AcpToolCallEventData, AcpToolCallKind, AcpToolCallSessionUpdateKind, AcpToolCallUpdateData, ToolCallEventData,
     };
+    use aionui_api_types::{ContextProvenance, ContextPurpose, ContextResourceRef, ContextScope};
     use aionui_db::{SqliteTaskSessionRepository, init_database_memory};
 
     #[tokio::test]
@@ -414,6 +512,51 @@ mod tests {
             }))
             .await
             .unwrap();
+        strict
+            .record_context_snapshot(
+                "knowhub-test",
+                &ContextQuery {
+                    task_id: "trace-task".into(),
+                    project_id: None,
+                    query: "release password=hunter2".into(),
+                    scope: ContextScope::AllAccessible,
+                    limit: 5,
+                    filters: Default::default(),
+                    purpose: ContextPurpose::Planning,
+                },
+                &[ContextHit {
+                    provider: "knowhub-test".into(),
+                    source_id: "doc-1".into(),
+                    title: "Release policy".into(),
+                    snippet: "password=hunter2 must not persist".into(),
+                    score: Some(1.0),
+                    permission_scope: "read".into(),
+                    version_or_updated_at: Some("v3".into()),
+                    retrieved_at: 3,
+                    content_hash: Some("content-hash".into()),
+                    provenance: ContextProvenance {
+                        provider: "knowhub-test".into(),
+                        source_id: "doc-1".into(),
+                        tenant: None,
+                        space: Some(ContextResourceRef {
+                            id: "space-1".into(),
+                            name: Some("Engineering".into()),
+                        }),
+                        knowledge_base: None,
+                        document: Some(ContextResourceRef {
+                            id: "doc-1".into(),
+                            name: Some("Release policy".into()),
+                        }),
+                        provider_data: serde_json::from_value(serde_json::json!({
+                            "authorization": "Bearer do-not-store"
+                        }))
+                        .unwrap(),
+                    },
+                }],
+                Some("trace-artifact"),
+            )
+            .await
+            .unwrap();
 
         let approved = TaskTraceContext::new(
             "system_default_user".into(),
@@ -454,6 +597,7 @@ mod tests {
         assert!(events.iter().any(|event| event.event_type == "tool.denied"));
         assert!(events.iter().any(|event| event.event_type == "tool.allowed"));
         assert!(events.iter().any(|event| event.event_type == "file.changed"));
+        assert!(events.iter().any(|event| event.event_type == "context.used"));
         assert!(!events.iter().any(|event| event.payload.contains("do-not-store")));
 
         let evidence = repo
@@ -462,12 +606,28 @@ mod tests {
             .unwrap();
         assert!(evidence.iter().any(|item| item.kind == "file"));
         assert!(evidence.iter().any(|item| item.kind == "diff"));
+        assert!(evidence.iter().any(|item| item.kind == "knowledge"));
         let file_metadata = &evidence.iter().find(|item| item.kind == "file").unwrap().metadata;
         assert!(file_metadata.contains(r#""added_lines":1"#));
         assert!(file_metadata.contains(r#""deleted_lines":1"#));
         assert!(
             !evidence.iter().any(|item| item.metadata.contains("do-not-store")),
             "persisted evidence leaked a secret: {evidence:?}"
+        );
+        let snapshots = repo
+            .list_context_snapshots("system_default_user", "trace-task", "trace-run")
+            .await
+            .unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert!(!snapshots[0].query.contains("hunter2"));
+        assert!(!snapshots[0].result_refs.contains("hunter2"));
+        assert!(!snapshots[0].result_refs.contains("do-not-store"));
+        assert_eq!(
+            repo.list_context_snapshots_for_artifact("system_default_user", "trace-task", "trace-artifact")
+                .await
+                .unwrap()
+                .len(),
+            1
         );
         let diff_reference = evidence
             .iter()

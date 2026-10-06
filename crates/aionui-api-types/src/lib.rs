@@ -117,9 +117,9 @@ pub use chat_file::{
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use context::{
-    ContextAuthorization, ContextAuthorizationRequest, ContextDiscoveryRequest, ContextDocument, ContextFetchRequest,
-    ContextHit, ContextProvenance, ContextProviderCapabilities, ContextProviderIdentity, ContextPurpose, ContextQuery,
-    ContextResourceRef, ContextScope, ContextSnapshot, ContextSource,
+    ContextAuthorization, ContextAuthorizationRequest, ContextBudget, ContextDiscoveryRequest, ContextDocument,
+    ContextFetchRequest, ContextHit, ContextProvenance, ContextProviderCapabilities, ContextProviderIdentity,
+    ContextPurpose, ContextQuery, ContextResourceRef, ContextScope, ContextSnapshot, ContextSource,
 };
 pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,

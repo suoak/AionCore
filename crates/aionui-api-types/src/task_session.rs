@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::context::ContextSnapshot;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCapability {
@@ -11,6 +13,7 @@ pub enum ToolCapability {
     GitWrite,
     McpRead,
     McpWrite,
+    KnowledgeRead,
     NetworkInternal,
     NetworkExternal,
 }
@@ -505,6 +508,7 @@ pub struct TaskReviewResponse {
     pub trace: Vec<TaskTraceEventResponse>,
     pub checkpoints: Vec<TaskCheckpointResponse>,
     pub evidence: Vec<TaskEvidenceResponse>,
+    pub context_snapshots: Vec<ContextSnapshot>,
     pub summary: TaskReviewSummary,
 }
 
