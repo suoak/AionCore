@@ -20,20 +20,21 @@ use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence,
     AgentIntegrationMode, ApprovalCheckResponse, AssistantConversationOverridesRequest, AssistantMcpBindingChanged,
     CancelConversationResponse, CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ContextPurpose, ContextScope, ContextSnapshot, ConversationArtifactKind,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
-    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, CreateTaskSessionRequest,
-    DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest, ForkCapabilityView,
-    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
-    MessageResponse, MessageSearchResponse, PlanningIsolationLevel, PlanningIsolationResponse, PromptCapabilityView,
-    RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse,
-    TEAM_MCP_SERVER_NAME, TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind,
-    TaskArtifactResponse, TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary,
-    TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse,
-    TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
+    ConfirmationListResponse, ContextHit, ContextPurpose, ContextQuery, ContextScope, ContextSnapshot,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
+    CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
+    ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
+    MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationLevel, PlanningIsolationResponse,
+    PromptCapabilityView, RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SessionMcpServer, SessionMcpTransport, StartAutomaticPlanningRequest,
+    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME, TaskApprovalDecision,
+    TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskCheckpointResponse,
+    TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse, TaskRunStatus, TaskSessionMode,
+    TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, TeamMcpSelection, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
@@ -1474,6 +1475,56 @@ impl ConversationService {
             .into_iter()
             .map(task_evidence_response)
             .collect()
+    }
+
+    pub async fn record_task_context_snapshot(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+        provider: &str,
+        query: &ContextQuery,
+        hits: &[ContextHit],
+        artifact_id: Option<&str>,
+    ) -> Result<ContextSnapshot, ConversationError> {
+        if query.task_id != task_session_id {
+            return Err(ConversationError::bad_request(
+                "Context query task_id must match the target TaskSession",
+            ));
+        }
+        if provider.trim().is_empty() || hits.iter().any(|hit| hit.provider != provider) {
+            return Err(ConversationError::bad_request(
+                "Context snapshot provider must be non-empty and match every hit",
+            ));
+        }
+        let repo = self.task_session_repo()?;
+        let run = repo
+            .get_run(user_id, task_session_id, run_id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task run '{run_id}' not found")))?;
+        let policy = match run.run_kind.as_str() {
+            "planning" => crate::task_trace::TaskTracePolicy::StrictPlanning,
+            "execution" => crate::task_trace::TaskTracePolicy::ApprovedExecution,
+            other => {
+                return Err(ConversationError::internal(format!(
+                    "Invalid persisted task run kind: {other}"
+                )));
+            }
+        };
+        let trace = crate::task_trace::TaskTraceContext::new(
+            user_id.to_owned(),
+            task_session_id.to_owned(),
+            run_id.to_owned(),
+            run.conversation_id,
+            policy,
+            repo,
+            self.output_retention_policy(),
+        );
+        context_snapshot_response(
+            trace
+                .record_context_snapshot(provider, query, hits, artifact_id)
+                .await?,
+        )
     }
 
     pub async fn get_task_run_review(
