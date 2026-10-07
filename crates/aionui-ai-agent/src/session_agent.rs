@@ -6866,21 +6866,19 @@ mod persist_tests {
     #[tokio::test]
     async fn runtime_usage_snapshot_replaces_cumulative_values_and_thread_identity() {
         let (repo, _db) = seeded_repo().await;
-        let snapshot = |thread: &str, turn: &str, total: u64, last: u64| {
-            SessionEvent::RuntimeUsageSnapshot {
-                runtime_type: "codex".into(),
-                thread_id: thread.into(),
-                turn_id: turn.into(),
-                total: aionui_session::TokenUsageCounters {
-                    total_tokens: total,
-                    ..Default::default()
-                },
-                last: aionui_session::TokenUsageCounters {
-                    total_tokens: last,
-                    ..Default::default()
-                },
-                model_context_window: Some(200_000),
-            }
+        let snapshot = |thread: &str, turn: &str, total: u64, last: u64| SessionEvent::RuntimeUsageSnapshot {
+            runtime_type: "codex".into(),
+            thread_id: thread.into(),
+            turn_id: turn.into(),
+            total: aionui_session::TokenUsageCounters {
+                total_tokens: total,
+                ..Default::default()
+            },
+            last: aionui_session::TokenUsageCounters {
+                total_tokens: last,
+                ..Default::default()
+            },
+            model_context_window: Some(200_000),
         };
         persist_side_effects(
             repo.as_ref(),
@@ -6889,13 +6887,7 @@ mod persist_tests {
             &snapshot("thread-a", "turn-1", 100, 20),
         )
         .await;
-        persist_side_effects(
-            repo.as_ref(),
-            "user-1",
-            "conv-1",
-            &snapshot("thread-b", "turn-2", 7, 7),
-        )
-        .await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &snapshot("thread-b", "turn-2", 7, 7)).await;
 
         let stored = stored_usage(repo.as_ref()).await;
         let runtime = &stored["runtime_usage"];

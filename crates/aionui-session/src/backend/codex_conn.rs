@@ -5863,9 +5863,7 @@ mod tests {
             match tokio::time::timeout(std::time::Duration::from_millis(150), events.next()).await {
                 Ok(Some(env)) => {
                     if let SessionEvent::TurnResult {
-                        is_error,
-                        result_text,
-                        ..
+                        is_error, result_text, ..
                     } = env.event
                     {
                         terminals.push((is_error, result_text));
