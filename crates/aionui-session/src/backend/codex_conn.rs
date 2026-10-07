@@ -822,6 +822,9 @@ pub struct CodexSessionBackend {
     /// or pre-seeded on Resume). All `turn/*` + `thread/*` client requests need
     /// it. Two-id (§4.1): the backend threadId never escapes upward.
     thread_binding: Arc<Mutex<Option<String>>>,
+    /// Thread id proven resumable by a prior persisted binding or the first
+    /// `turn/started`; fresh zero-turn candidates never appear here.
+    durable_thread_binding: Arc<Mutex<Option<String>>>,
     /// The rpc id of the in-flight `thread/resume` (Resume handshakes only). The
     /// reader claims the response: an ERROR means the pre-seeded binding points at
     /// a thread this codex cannot restore ("no rollout found for thread id …",
@@ -998,6 +1001,7 @@ struct CodexReaderState {
     turn_gen: Arc<AtomicU64>,
     event_tx: broadcast::Sender<SessionEnvelope>,
     thread_binding: Arc<Mutex<Option<String>>>,
+    durable_thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -1036,6 +1040,7 @@ fn start_codex_reader(
             state.turn_gen,
             state.event_tx,
             state.thread_binding,
+            state.durable_thread_binding,
             state.active_turn_id,
             state.pending_auth_id,
             state.pending_tool_approvals,
@@ -1160,7 +1165,9 @@ impl CodexSessionBackend {
     /// suspend→wake path with a known resume anchor.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn seed_thread_binding_for_test(&self, thread_id: impl Into<String>) {
-        *self.thread_binding.lock().await = Some(thread_id.into());
+        let thread_id = thread_id.into();
+        *self.thread_binding.lock().await = Some(thread_id.clone());
+        *self.durable_thread_binding.lock().await = Some(thread_id);
     }
 
     /// Test-support seam: mark a turn in flight WITHOUT a bound active_turn_id —
@@ -1246,6 +1253,7 @@ impl CodexSessionBackend {
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let turn_gen = Arc::new(AtomicU64::new(0));
         let thread_binding = Arc::new(Mutex::new(None));
+        let durable_thread_binding = Arc::new(Mutex::new(None));
         let active_turn_id = Arc::new(Mutex::new(None));
         let pending_auth_id = Arc::new(Mutex::new(None));
         let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -1272,6 +1280,7 @@ impl CodexSessionBackend {
             turn_gen: turn_gen.clone(),
             event_tx: event_tx.clone(),
             thread_binding: thread_binding.clone(),
+            durable_thread_binding: durable_thread_binding.clone(),
             active_turn_id: active_turn_id.clone(),
             pending_auth_id: pending_auth_id.clone(),
             pending_tool_approvals: pending_tool_approvals.clone(),
@@ -1330,6 +1339,7 @@ impl CodexSessionBackend {
             reader_state,
             turn_in_flight,
             thread_binding,
+            durable_thread_binding,
             active_turn_id,
             pending_auth_id,
             pending_tool_approvals,
@@ -1445,6 +1455,7 @@ impl CodexSessionBackend {
         match mode {
             HandshakeMode::Resume(tid) => {
                 *self.thread_binding.lock().await = Some(tid.to_string());
+                *self.durable_thread_binding.lock().await = Some(tid.to_string());
                 // Resume re-sends the full thread/start override surface — a bare
                 // {threadId} resume silently drops the user's MCP servers and
                 // resets approvalPolicy to its default (LIVE 0.144.1, see
@@ -1586,6 +1597,7 @@ async fn reader_task(
     turn_gen: Arc<AtomicU64>,
     event_tx: broadcast::Sender<SessionEnvelope>,
     thread_binding: Arc<Mutex<Option<String>>>,
+    durable_thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -1747,6 +1759,7 @@ async fn reader_task(
                                 durable_thread_id = thread_binding.lock().await.clone();
                             }
                             if let Some(tid) = durable_thread_id {
+                                *durable_thread_binding.lock().await = Some(tid.clone());
                                 emit(
                                     &event_tx,
                                     &session_id,
@@ -1930,6 +1943,7 @@ async fn reader_task(
                                     "codex thread/resume rejected — clearing poisoned thread binding (dead resume anchor)"
                                 );
                                 *thread_binding.lock().await = None;
+                                *durable_thread_binding.lock().await = None;
                                 *resume_poison.lock().await = Some(format!("codex thread/resume failed: {msg}"));
                                 continue;
                             }
@@ -4562,7 +4576,7 @@ impl SessionBackend for CodexSessionBackend {
         // held only for point writes/reads; on contention we just skip the
         // preface (the caller is racing the live event, which it will get).
         let preface: Vec<SessionEnvelope> = self
-            .thread_binding
+            .durable_thread_binding
             .try_lock()
             .ok()
             .and_then(|guard| guard.clone())
@@ -9839,7 +9853,7 @@ mod tests {
         assert_eq!(bound.as_deref(), Some("turn-7"), "turn/started lowers codex's turn id");
     }
 
-    /// Late-subscriber self-heal: `thread/started` can land BEFORE the
+    /// Late-subscriber self-heal: the first `turn/started` can land BEFORE the
     /// orchestration layer subscribes (codex answers thread/start in
     /// single-digit ms), which used to lose BackendBound forever — the
     /// conversation never persisted its resume anchor and the fork API
@@ -9849,8 +9863,9 @@ mod tests {
     async fn events_replays_binding_to_late_subscribers() {
         use futures_util::StreamExt as _;
         let prefix = format!(
-            "{}\n",
-            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-late-bind"}}}"#
+            "{}\n{}\n",
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-late-bind"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th-late-bind","turn":{"id":"turn-late"}}}"#
         )
         .into_bytes();
         let fake = FakeAgentIo::never_exits(prefix);
@@ -9862,6 +9877,11 @@ mod tests {
             backend.thread_binding.lock().await.as_deref(),
             Some("th-late-bind"),
             "precondition: the reader already bound the thread"
+        );
+        assert_eq!(
+            backend.durable_thread_binding.lock().await.as_deref(),
+            Some("th-late-bind"),
+            "the first turn made the thread durable"
         );
 
         let mut events = backend.events();
@@ -9876,6 +9896,29 @@ mod tests {
             ),
             "a late subscriber's first event is the replayed binding, got {:?}",
             first.event
+        );
+    }
+
+    #[tokio::test]
+    async fn events_does_not_replay_zero_turn_binding_to_late_subscribers() {
+        use futures_util::StreamExt as _;
+        let prefix = format!(
+            "{}\n",
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-zero-late"}}}"#
+        )
+        .into_bytes();
+        let fake = FakeAgentIo::never_exits(prefix);
+        let backend = CodexSessionBackend::build_with_io("codex-zero-late", Box::new(fake)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(backend.thread_binding.lock().await.as_deref(), Some("th-zero-late"));
+        assert!(backend.durable_thread_binding.lock().await.is_none());
+
+        let mut events = backend.events();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(80), events.next())
+                .await
+                .is_err(),
+            "late subscribers must not receive a durable preface for a zero-turn thread"
         );
     }
 }
