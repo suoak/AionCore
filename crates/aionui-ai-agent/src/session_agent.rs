@@ -32,7 +32,7 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::{PromptMediaCaps, SendMessageData};
-use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
+use aionui_api_types::{AcpBuildExtra, AgentErrorCode, AgentErrorOwnership, TEAM_MCP_SERVER_NAME};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
@@ -1430,9 +1430,21 @@ impl IAgentTask for SessionAgentTask {
                 // `UserAgentSessionNotFound` (retryable) so `TurnRecoveryPolicy`
                 // auto-replays once — with the anchor cleared above, the replay
                 // opens Fresh and recovers transparently.
-                Err(AgentSendError::from_agent_error(AgentError::not_found(format!(
-                    "Session not found: {detail}"
-                ))))
+                if is_codex_resume {
+                    Err(AgentSendError::new(
+                        "The Codex runtime session was not found",
+                        AgentErrorCode::RuntimeSessionNotFound,
+                        AgentErrorOwnership::UserAgent,
+                        Some(detail),
+                        false,
+                        false,
+                        None,
+                    ))
+                } else {
+                    Err(AgentSendError::from_agent_error(AgentError::not_found(format!(
+                        "Session not found: {detail}"
+                    ))))
+                }
             }
             Err(e) => Err(AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string()))),
         }
@@ -6661,6 +6673,12 @@ mod persist_tests {
             Some("bsid-abc"),
             "BackendBound must write the resume anchor build_session_instance reads back"
         );
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .expect("runtime state");
+        assert_eq!(state.binding_state.as_deref(), Some("bound"));
     }
 
     #[tokio::test]
@@ -6780,11 +6798,9 @@ mod persist_tests {
         }
     }
 
-    // ELECTRON-3Q0 fix B2: a DISPATCH-time dead-session error never becomes a
-    // `TurnResult` on the event pump, so the stream-side self-heal
-    // (`is_dead_resume_anchor`) cannot clear the anchor for it. send_message must
-    // clear it directly and classify the failure as the retryable
-    // UserAgentSessionNotFound so the turn orchestrator auto-replays (Fresh).
+    // A DISPATCH-time Codex resume error never becomes a TurnResult. It must
+    // retain the native thread id, mark the binding failed, and surface the
+    // normalized classification without replaying the turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn codex_resume_failure_keeps_anchor_and_classifies() {
         let (repo, _db) = seeded_repo().await;
@@ -6817,7 +6833,7 @@ mod persist_tests {
 
         assert_eq!(
             err.code(),
-            Some(aionui_api_types::AgentErrorCode::UserAgentSessionNotFound),
+            Some(aionui_api_types::AgentErrorCode::RuntimeSessionNotFound),
             "classified as session-not-found without exposing raw protocol errors to the UI"
         );
         let row = repo
@@ -6830,6 +6846,12 @@ mod persist_tests {
             Some("dead-anchor"),
             "Codex must retain the failed binding until an explicit new-session action"
         );
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .expect("runtime state");
+        assert_eq!(state.binding_state.as_deref(), Some("resume_failed"));
     }
 
     // A backend that advertises per-model reasoning efforts (claude `supportedEffortLevels`),

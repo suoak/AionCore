@@ -569,20 +569,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_first_bind_has_one_winner_and_is_idempotent() {
-        let (repo, _db) = setup().await;
-        insert_conversation(&repo, "user-1", "conv-1").await;
-        repo.create(&create_params("conv-1")).await.unwrap();
-        let left = repo.clone();
-        let right = repo.clone();
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding-race.db");
+        let db = crate::init_database(&path).await.unwrap();
+        let second_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(false)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        let left = SqliteAcpSessionRepository::new(db.pool().clone());
+        let right = SqliteAcpSessionRepository::new(second_pool);
+        insert_conversation(&left, "user-1", "conv-1").await;
+        left.create(&create_params("conv-1")).await.unwrap();
         let (a, b) = tokio::join!(
             left.bind_session_id_for_user("user-1", "conv-1", "thread-a"),
             right.bind_session_id_for_user("user-1", "conv-1", "thread-b")
         );
         assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1);
-        let winner = repo.get_for_user("user-1", "conv-1").await.unwrap().unwrap();
+        let winner = left.get_for_user("user-1", "conv-1").await.unwrap().unwrap();
         let winner_id = winner.session_id.expect("one binding persisted");
         assert!(
-            repo.bind_session_id_for_user("user-1", "conv-1", &winner_id)
+            left.bind_session_id_for_user("user-1", "conv-1", &winner_id)
                 .await
                 .unwrap()
         );
