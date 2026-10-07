@@ -13,6 +13,7 @@ mod assistant;
 mod auth;
 mod channel;
 mod chat_file;
+mod codex_account;
 mod confirmation;
 mod connection_test;
 mod context;
@@ -113,6 +114,10 @@ pub use channel::{
 };
 pub use chat_file::{
     ChatFileRef, PromptAttachmentDelivery, PromptAttachmentMediaType, PromptAttachmentSource, PromptAttachmentV1,
+};
+pub use codex_account::{
+    CodexAccountErrorCode, CodexAccountSnapshot, CodexAccountView, CodexAccountWarning, CodexAuthState,
+    CodexLoginAttempt, CodexLoginAttemptState, CodexLoginStartResponse,
 };
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
