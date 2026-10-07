@@ -4437,7 +4437,27 @@ impl ConversationService {
             }
         }
 
-        let had_active_turn = self.runtime_state.mark_deleting(id);
+        // Reserve deletion atomically against new turns. This is not a stop
+        // operation: an active runtime or M4 task must be stopped first.
+        self.runtime_state.try_mark_deleting(id)?;
+        if let Some(task_repo) = self.task_session_repo_optional() {
+            let tasks = match task_repo.list(user_id, Some(id)).await {
+                Ok(tasks) => tasks,
+                Err(error) => {
+                    self.runtime_state.clear_deleting(id);
+                    return Err(error.into());
+                }
+            };
+            if tasks
+                .iter()
+                .any(|task| matches!(task.status.as_str(), "running" | "waiting_approval"))
+            {
+                self.runtime_state.clear_deleting(id);
+                return Err(ConversationError::Busy {
+                    reason: "CONVERSATION_ACTIVE: stop the active task before deleting this conversation".into(),
+                });
+            }
+        }
 
         // Snapshot the hook list under the read lock, then drop the guard
         // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
@@ -4457,9 +4477,7 @@ impl ConversationService {
             self.runtime_state.clear_deleting(id);
             return Err(err.into());
         }
-        if !had_active_turn {
-            self.runtime_state.clear_deleting(id);
-        }
+        self.runtime_state.clear_deleting(id);
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
         // cheap to cover) still drop their orphaned session row.

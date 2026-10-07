@@ -260,6 +260,37 @@ impl ConversationRuntimeStateService {
         }
     }
 
+    /// Reserve an idle conversation for permanent deletion.
+    ///
+    /// The check and reservation share one lock so a new turn cannot slip in
+    /// between them. Deletion is deliberately fail-closed: it never doubles as
+    /// cancellation and it also refuses tool, cancellation, or restart work
+    /// that is still draining.
+    pub fn try_mark_deleting(&self, conversation_id: &str) -> Result<(), ConversationError> {
+        let mut state = self.state.lock().map_err(|_| {
+            warn!(
+                conversation_id,
+                "conversation runtime state lock poisoned while reserving delete"
+            );
+            ConversationError::internal("conversation runtime state lock poisoned")
+        })?;
+        let active = state.active_turns.contains_key(conversation_id)
+            || state
+                .active_tool_executions
+                .get(conversation_id)
+                .is_some_and(|ids| !ids.is_empty())
+            || state.cancelling_conversations.contains(conversation_id)
+            || state.restarting_conversations.contains(conversation_id);
+        if active {
+            return Err(ConversationError::Busy {
+                reason: "CONVERSATION_ACTIVE: stop the active task before deleting this conversation".into(),
+            });
+        }
+        state.deleting_conversations.insert(conversation_id.to_owned());
+        info!(conversation_id, "idle conversation reserved for deletion");
+        Ok(())
+    }
+
     pub fn clear_deleting(&self, conversation_id: &str) {
         match self.state.lock() {
             Ok(mut state) => {
@@ -812,6 +843,25 @@ mod tests {
             .try_claim_turn("conv-1", "turn-1")
             .expect_err("deleting conversation should reject new turns");
         assert!(err.to_string().contains("being deleted"));
+    }
+
+    #[test]
+    fn delete_reservation_rejects_an_active_turn_without_marking_delete() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state.try_claim_turn("conv-1", "turn-1").unwrap();
+
+        let error = state.try_mark_deleting("conv-1").unwrap_err();
+
+        assert!(matches!(error, ConversationError::Busy { .. }));
+        assert!(!state.is_deleting("conv-1"));
+    }
+
+    #[test]
+    fn delete_reservation_blocks_a_new_turn() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        state.try_mark_deleting("conv-1").unwrap();
+
+        assert!(state.try_claim_turn("conv-1", "turn-1").is_err());
     }
 
     #[test]

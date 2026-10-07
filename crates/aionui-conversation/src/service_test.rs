@@ -2725,6 +2725,31 @@ async fn delete_not_found() {
 }
 
 #[tokio::test]
+async fn delete_rejects_an_active_runtime_without_deleting_or_invoking_hooks() {
+    use aionui_common::OnConversationDelete;
+
+    struct RecordingHook(Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl OnConversationDelete for RecordingHook {
+        async fn on_conversation_deleted(&self, _user_id: &str, conversation_id: &str) {
+            self.0.lock().unwrap().push(conversation_id.to_owned());
+        }
+    }
+
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let hook = Arc::new(RecordingHook(Mutex::new(vec![])));
+    svc.with_delete_hook(hook.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-active").unwrap();
+
+    let error = svc.delete("user_1", &conv.id).await.unwrap_err();
+
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(repo.get("user_1", &conv.id).await.unwrap().is_some());
+    assert!(hook.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn delete_invokes_registered_hook() {
     use aionui_common::OnConversationDelete;
 
