@@ -1420,6 +1420,7 @@ async fn handle_open_response(
                 name,
                 description,
                 reasoning_efforts: Vec::new(),
+                codex: None,
             })
             .collect();
         if disc.current_model.is_none() {
@@ -1509,6 +1510,7 @@ fn parse_models(models: &Value) -> Vec<ModelInfo> {
                         name: m.get("name").and_then(Value::as_str).unwrap_or(id).to_string(),
                         description: m.get("description").and_then(Value::as_str).map(str::to_string),
                         reasoning_efforts: Vec::new(),
+                        codex: None,
                     })
                 })
                 .collect()

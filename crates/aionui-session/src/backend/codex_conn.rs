@@ -22,7 +22,7 @@
 //! `emit`) are now production-reachable via `open_session`'s live spawn (R4) and
 //! independently contract-tested via the `build_with_io` seam.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -785,13 +785,17 @@ fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
 /// §6.2); 5s is orders of magnitude of headroom while keeping a wedged pipe
 /// from blocking the send path indefinitely.
 const STEER_ACK_TIMEOUT_MS: u64 = 5_000;
+const MODEL_LIST_PAGE_SIZE: u64 = 100;
+const MODEL_LIST_MAX_PAGES: usize = 100;
+const CODEX_AUTO_MODEL_VALUE: &str = "__workmate_codex_auto__";
+const CODEX_AUTO_EFFORT_VALUE: &str = "__workmate_codex_auto_effort__";
 
 /// Per-session codex handle. `&self`-concurrent (stdin write behind a Mutex).
 pub struct CodexSessionBackend {
     session_id: String,
     capabilities: Capabilities,
     /// JSON-RPC request id counter (outbound client requests).
-    rpc_id: AtomicU64,
+    rpc_id: Arc<AtomicU64>,
     /// Live turn epoch (set on dispatch(Send), read by the reader to stamp).
     turn_gen: Arc<AtomicU64>,
     /// stdin shared with the reader task: dispatch writes client requests; the
@@ -953,14 +957,22 @@ struct PendingSend {
 /// receipt (G3 up-leg — the post-rollback history-end the orchestrator rehydrates
 /// to / the conversation forks from, T17). All four are query/command responses
 /// the reader claims by rpc id; none touches the FSM.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DiscoveryKind {
-    Models,
+    Models(ModelDiscovery),
     /// codex's mode axis: filled from `permissionProfile/list` and mapped to the fixed
     /// permission-tier enum (feature 012). codex sends no `collaborationMode/list`.
     Permissions,
     Checkpoints,
     Rewind,
+}
+
+#[derive(Clone, Default)]
+struct ModelDiscovery {
+    models: Vec<crate::capability::ModelInfo>,
+    model_ids: HashSet<String>,
+    seen_cursors: HashSet<String>,
+    pages: usize,
 }
 
 /// Per-session handshake-discovered capability lists (B-CODEX-MODEL-LIST).
@@ -1013,7 +1025,9 @@ struct CodexReaderState {
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
+    current_model: Arc<Mutex<Option<String>>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
+    rpc_id: Arc<AtomicU64>,
     /// F-4 turn-active flag: set on dispatch(Send), cleared by the reader at a turn
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
     /// is never suspended mid-flight.
@@ -1052,7 +1066,9 @@ fn start_codex_reader(
             state.resume_poison,
             state.pending_fork,
             state.discovered,
+            state.current_model,
             state.stdin,
+            state.rpc_id,
             state.turn_in_flight,
             state.title_gen,
         )
@@ -1067,6 +1083,28 @@ fn idle_check_interval_ms(idle_ttl_ms: Option<i64>) -> u64 {
         Some(ttl) => ((ttl / 4).clamp(1_000, 30_000)) as u64,
         None => 30_000,
     }
+}
+
+async fn write_json_frame(
+    stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
+    frame: &Value,
+) -> Result<(), BackendError> {
+    let mut guard = stdin.lock().await;
+    let writer = guard
+        .as_mut()
+        .ok_or_else(|| BackendError::Transport("codex stdin unavailable".into()))?;
+    let mut line = serde_json::to_vec(frame).map_err(|error| BackendError::Transport(error.to_string()))?;
+    line.push(b'\n');
+    use tokio::io::AsyncWriteExt;
+    writer
+        .write_all(&line)
+        .await
+        .map_err(|error| BackendError::Transport(error.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| BackendError::Transport(error.to_string()))?;
+    Ok(())
 }
 
 impl CodexSessionBackend {
@@ -1196,7 +1234,7 @@ impl CodexSessionBackend {
         self.pending_discovery
             .lock()
             .await
-            .insert(rpc_id, DiscoveryKind::Models);
+            .insert(rpc_id, DiscoveryKind::Models(ModelDiscovery::default()));
     }
 
     /// Test-support seam: register a pending `thread/settings/update`
@@ -1275,6 +1313,7 @@ impl CodexSessionBackend {
         };
         let stdin = Arc::new(Mutex::new(stdin));
 
+        let rpc_id = Arc::new(AtomicU64::new(0));
         let reader_state = CodexReaderState {
             session_id: session_id.clone(),
             turn_gen: turn_gen.clone(),
@@ -1292,7 +1331,9 @@ impl CodexSessionBackend {
             resume_poison: resume_poison.clone(),
             pending_fork: pending_fork.clone(),
             discovered: discovered.clone(),
+            current_model: current_model.clone(),
             stdin: stdin.clone(),
+            rpc_id: rpc_id.clone(),
             turn_in_flight: turn_in_flight.clone(),
             title_gen: title_gen.clone(),
         };
@@ -1329,7 +1370,7 @@ impl CodexSessionBackend {
         Self {
             session_id,
             capabilities: codex_capabilities(),
-            rpc_id: AtomicU64::new(0),
+            rpc_id,
             turn_gen,
             stdin,
             event_tx,
@@ -1358,26 +1399,32 @@ impl CodexSessionBackend {
 
     /// Write one JSON-RPC frame (request or response) to stdin as a single line.
     async fn write_frame(&self, frame: Value) -> Result<(), BackendError> {
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard
-            .as_mut()
-            .ok_or_else(|| BackendError::Transport("codex stdin unavailable".into()))?;
-        let mut line = serde_json::to_vec(&frame).map_err(|e| BackendError::Transport(e.to_string()))?;
-        line.push(b'\n');
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(&line)
-            .await
-            .map_err(|e| BackendError::Transport(e.to_string()))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| BackendError::Transport(e.to_string()))?;
-        Ok(())
+        write_json_frame(&self.stdin, &frame).await
     }
 
     fn next_rpc_id(&self) -> u64 {
         self.rpc_id.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    async fn request_model_catalog(&self) -> Result<(), BackendError> {
+        let id = self.next_rpc_id();
+        self.pending_discovery
+            .lock()
+            .await
+            .insert(id, DiscoveryKind::Models(ModelDiscovery::default()));
+        if let Err(error) = self
+            .write_frame(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "model/list",
+                "params": { "cursor": null, "limit": MODEL_LIST_PAGE_SIZE, "includeHidden": false }
+            }))
+            .await
+        {
+            self.pending_discovery.lock().await.remove(&id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Resolve the bound backend threadId, waiting briefly for the async
@@ -1499,16 +1546,7 @@ impl CodexSessionBackend {
         }
         // Discovery (B-CODEX-MODEL-LIST): fire-and-forget; the reader claims the
         // responses by rpc id and fills `discovered`.
-        let model_list_id = self.next_rpc_id();
-        self.pending_discovery
-            .lock()
-            .await
-            .insert(model_list_id, DiscoveryKind::Models);
-        self.write_frame(json!({
-            "jsonrpc": "2.0", "id": model_list_id, "method": "model/list",
-            "params": { "includeHidden": false }
-        }))
-        .await?;
+        self.request_model_catalog().await?;
         // feature 012: codex's mode selector IS its permission axis, so we discover
         // `permissionProfile/list` (mapped to the fixed mode enum in `fill_discovery`)
         // and do NOT send `collaborationMode/list` (plan/default has no UI entry,
@@ -1609,7 +1647,9 @@ async fn reader_task(
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
+    current_model: Arc<Mutex<Option<String>>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
+    rpc_id: Arc<AtomicU64>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     title_gen: Arc<TitleGen>,
 ) {
@@ -1740,6 +1780,18 @@ async fn reader_task(
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
                                 *thread_binding.lock().await = Some(tid.to_string());
+                            }
+                        }
+                        if m == "thread/tokenUsage/updated" {
+                            let notification_thread = params.get("threadId").and_then(Value::as_str);
+                            let current_thread = thread_binding.lock().await.clone();
+                            if notification_thread.is_none() || current_thread.as_deref() != notification_thread {
+                                tracing::debug!(
+                                    notification_thread,
+                                    current_thread,
+                                    "ignoring token usage for a stale or unknown Codex thread"
+                                );
+                                continue;
                             }
                         }
                         if m == "turn/started" {
@@ -1874,8 +1926,9 @@ async fn reader_task(
                         // (no double terminal). `willRetry:true` is a transient retry →
                         // still falls through to map_notification → Heartbeat (NOT a
                         // terminal). See protocols/design/aioncore-codex-turn-no-terminal-hang-prompt.md.
+                        let rate_limited = m == "error" && codex_error_is_rate_limited(params);
                         if m == "error"
-                            && params.get("willRetry").and_then(Value::as_bool) != Some(true)
+                            && (params.get("willRetry").and_then(Value::as_bool) != Some(true) || rate_limited)
                             && turn_in_flight.load(Ordering::SeqCst)
                         {
                             if !terminated {
@@ -1884,11 +1937,14 @@ async fn reader_task(
                                 system_error_deadline = None;
                                 *active_turn_id.lock().await = None;
                                 turn_in_flight.store(false, Ordering::SeqCst);
-                                let message = params
+                                let mut message = params
                                     .get("error")
                                     .and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
                                     .unwrap_or("codex reported a fatal error")
                                     .to_string();
+                                if rate_limited {
+                                    message = format!("RATE_LIMITED: {message}");
+                                }
                                 tracing::warn!(
                                     conversation_id = %session_id,
                                     turn_gen = cur,
@@ -1913,6 +1969,13 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            if let Some(model) = frame
+                                .get("result")
+                                .and_then(|result| result.get("model"))
+                                .and_then(Value::as_str)
+                            {
+                                *current_model.lock().await = Some(model.to_string());
+                            }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -2063,11 +2126,128 @@ async fn reader_task(
                             // (next_cursor) is ignored — first page bounds the N2
                             // unbounded-catalog risk (we don't chase the cursor).
                             let disc_kind = pending_discovery.lock().await.remove(&rid);
+                            if matches!(&disc_kind, Some(DiscoveryKind::Models(_)))
+                                && let Some(error) = frame.get("error")
+                            {
+                                let code = error.get("code").and_then(Value::as_i64);
+                                let upstream_message = error.get("message").and_then(Value::as_str).unwrap_or_default();
+                                let normalized = upstream_message.to_ascii_lowercase();
+                                let restart_required = code == Some(-32600)
+                                    && (normalized.contains("restart") || normalized.contains("model provider"));
+                                let stale = !discovered
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .models
+                                    .is_empty();
+                                let message = if restart_required {
+                                    "Codex model catalog needs runtime restart."
+                                } else if stale {
+                                    "Unable to refresh Codex models. Showing the previously loaded catalog."
+                                } else {
+                                    "Unable to load Codex models."
+                                };
+                                tracing::warn!(
+                                    conversation_id = %session_id,
+                                    code = code.unwrap_or_default(),
+                                    stale,
+                                    restart_required,
+                                    "codex model catalog request failed"
+                                );
+                                emit(
+                                    &event_tx,
+                                    &session_id,
+                                    turn_gen.load(Ordering::SeqCst),
+                                    SessionEvent::Notice {
+                                        level: crate::event::NoticeLevel::Warning,
+                                        message: message.into(),
+                                        localized: None,
+                                        supersedes_key: Some("codex-model-catalog".into()),
+                                    },
+                                );
+                                continue;
+                            }
                             if let Some(kind) = disc_kind
                                 && let Some(result) = frame.get("result")
                             {
                                 match kind {
-                                    DiscoveryKind::Models | DiscoveryKind::Permissions => {
+                                    DiscoveryKind::Models(mut discovery) => {
+                                        discovery.pages += 1;
+                                        for model in parse_model_page(result) {
+                                            if discovery.model_ids.insert(model.id.clone()) {
+                                                discovery.models.push(model);
+                                            }
+                                        }
+                                        let next_cursor = result
+                                            .get("nextCursor")
+                                            .and_then(Value::as_str)
+                                            .filter(|cursor| !cursor.is_empty())
+                                            .map(str::to_string);
+                                        let should_continue = next_cursor.as_ref().is_some_and(|cursor| {
+                                            discovery.pages < MODEL_LIST_MAX_PAGES
+                                                && discovery.seen_cursors.insert(cursor.clone())
+                                        });
+                                        if should_continue {
+                                            let cursor = next_cursor.expect("checked above");
+                                            let next_id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+                                            pending_discovery
+                                                .lock()
+                                                .await
+                                                .insert(next_id, DiscoveryKind::Models(discovery.clone()));
+                                            if let Err(error) = write_json_frame(
+                                                &stdin,
+                                                &json!({
+                                                    "jsonrpc": "2.0",
+                                                    "id": next_id,
+                                                    "method": "model/list",
+                                                    "params": {
+                                                        "cursor": cursor,
+                                                        "limit": MODEL_LIST_PAGE_SIZE,
+                                                        "includeHidden": false
+                                                    }
+                                                }),
+                                            )
+                                            .await
+                                            {
+                                                pending_discovery.lock().await.remove(&next_id);
+                                                tracing::warn!(
+                                                    conversation_id = %session_id,
+                                                    page = discovery.pages + 1,
+                                                    "codex model/list pagination write failed: {error}"
+                                                );
+                                            } else {
+                                                continue;
+                                            }
+                                        } else if next_cursor.is_some() {
+                                            tracing::warn!(
+                                                conversation_id = %session_id,
+                                                pages = discovery.pages,
+                                                "codex model/list pagination stopped at repeated cursor or safety bound"
+                                            );
+                                        }
+                                        if discovery.models.is_empty() {
+                                            tracing::warn!(
+                                                conversation_id = %session_id,
+                                                pages = discovery.pages,
+                                                "codex model/list completed with no visible models"
+                                            );
+                                        }
+                                        discovered.lock().unwrap_or_else(|e| e.into_inner()).models = discovery.models;
+                                        let (models, modes) = {
+                                            let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+                                            (disc.models.clone(), disc.modes.clone())
+                                        };
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                            SessionEvent::CatalogUpdated {
+                                                models,
+                                                modes,
+                                                slash_commands: builtin_slash_commands(),
+                                            },
+                                        );
+                                    }
+                                    DiscoveryKind::Permissions => {
                                         fill_discovery(kind, result, &discovered);
                                         // Signal the async catalog arrival so the conversation
                                         // re-projects the model/mode picker (the ACP
@@ -2412,8 +2592,92 @@ mod codex_perm {
 /// A genuinely empty list after a successful response means the wire shape drifted
 /// again — `warn!` so it is diagnosable (it must never silently degrade to empty
 /// like the original bug did).
+fn parse_model_page(result: &Value) -> Vec<crate::capability::ModelInfo> {
+    use crate::capability::{CodexModelMetadata, CodexModelUpgrade, CodexServiceTier, ModelInfo};
+
+    result
+        .get("data")
+        .or_else(|| result.get("models"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| !model.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+        .filter_map(|model| {
+            let id = model.get("id").and_then(Value::as_str)?.to_string();
+            let upgrade = model.get("upgradeInfo").and_then(Value::as_object).and_then(|info| {
+                Some(CodexModelUpgrade {
+                    replacement_model: info.get("model")?.as_str()?.to_string(),
+                    retirement_at: info.get("retirementAt").and_then(Value::as_i64),
+                    message: info
+                        .get("upgradeCopy")
+                        .and_then(Value::as_str)
+                        .or_else(|| model.get("upgrade").and_then(Value::as_str))
+                        .map(str::to_string),
+                })
+            });
+            let service_tiers = model
+                .get("serviceTiers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tier| {
+                    let id = tier.get("id")?.as_str()?.to_string();
+                    Some(CodexServiceTier {
+                        name: tier.get("name").and_then(Value::as_str).unwrap_or(&id).to_string(),
+                        id,
+                        description: tier.get("description").and_then(Value::as_str).map(str::to_string),
+                    })
+                })
+                .collect();
+            Some(ModelInfo {
+                id,
+                name: model
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                description: model.get("description").and_then(Value::as_str).map(str::to_string),
+                reasoning_efforts: model
+                    .get("supportedReasoningEfforts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| {
+                        value
+                            .get("reasoningEffort")
+                            .and_then(Value::as_str)
+                            .or_else(|| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                codex: Some(CodexModelMetadata {
+                    visible: !model.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+                    is_default: model.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
+                    default_reasoning_effort: model
+                        .get("defaultReasoningEffort")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    service_tiers,
+                    default_service_tier: model
+                        .get("defaultServiceTier")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    upgrade,
+                    multi_agent_capability: model
+                        .get("multiAgentVersion")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    context_window: None,
+                    max_context_window: None,
+                    raw_capabilities_version: None,
+                }),
+            })
+        })
+        .collect()
+}
+
 fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::sync::Mutex<Discovered>>) {
-    use crate::capability::{ModeInfo, ModelInfo};
+    use crate::capability::ModeInfo;
     // The real wire wraps both lists in `data`; `models`/`modes` is the legacy/guessed
     // key kept only as a cross-version fallback.
     let list = |primary: &str, legacy: &str| -> Option<Vec<Value>> {
@@ -2424,43 +2688,8 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
             .cloned()
     };
     match kind {
-        DiscoveryKind::Models => {
-            let arr = list("data", "models");
-            let present = arr.is_some();
-            let models = arr
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            let id = m.get("id").and_then(Value::as_str)?.to_string();
-                            Some(ModelInfo {
-                                id,
-                                name: m.get("displayName").and_then(Value::as_str).unwrap_or("").to_string(),
-                                description: m.get("description").and_then(Value::as_str).map(str::to_string),
-                                reasoning_efforts: m
-                                    .get("supportedReasoningEfforts")
-                                    .and_then(Value::as_array)
-                                    .map(|e| {
-                                        e.iter()
-                                            // real wire: object {reasoningEffort, description};
-                                            // legacy/guess: bare string. Accept either.
-                                            .filter_map(|v| {
-                                                v.get("reasoningEffort")
-                                                    .and_then(Value::as_str)
-                                                    .or_else(|| v.as_str())
-                                                    .map(str::to_string)
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if present && models.is_empty() {
-                tracing::warn!("codex model/list parsed to empty (wire shape may have drifted from result.data[])");
-            }
-            discovered.lock().unwrap_or_else(|e| e.into_inner()).models = models;
+        DiscoveryKind::Models(_) => {
+            discovered.lock().unwrap_or_else(|e| e.into_inner()).models = parse_model_page(result);
         }
         DiscoveryKind::Permissions => {
             // codex's mode axis IS the permission axis. This is the DISCOVERY half of the
@@ -3459,8 +3688,9 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
 fn map_usage(params: &Value) -> Vec<SessionEvent> {
     let usage = params.get("tokenUsage").unwrap_or(&Value::Null);
     let last = usage.get("last").unwrap_or(&Value::Null);
+    let total = usage.get("total").unwrap_or(&Value::Null);
     let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
-    vec![SessionEvent::UsageDelta {
+    let mut events = vec![SessionEvent::UsageDelta {
         input_tokens: g("inputTokens"),
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),
@@ -3493,7 +3723,33 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
             cached_write_tokens: g("cacheWriteInputTokens"),
             thought_tokens: g("reasoningOutputTokens"),
         },
-    }]
+    }];
+    if let (Some(thread_id), Some(turn_id)) = (
+        params.get("threadId").and_then(Value::as_str),
+        params.get("turnId").and_then(Value::as_str),
+    ) {
+        events.push(SessionEvent::RuntimeUsageSnapshot {
+            runtime_type: "codex".into(),
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            total: token_usage_counters(total),
+            last: token_usage_counters(last),
+            model_context_window: usage.get("modelContextWindow").and_then(Value::as_u64),
+        });
+    }
+    events
+}
+
+fn token_usage_counters(value: &Value) -> crate::event::TokenUsageCounters {
+    let get = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    crate::event::TokenUsageCounters {
+        input_tokens: get("inputTokens"),
+        cached_input_tokens: get("cachedInputTokens"),
+        cache_write_input_tokens: get("cacheWriteInputTokens"),
+        output_tokens: get("outputTokens"),
+        reasoning_output_tokens: get("reasoningOutputTokens"),
+        total_tokens: get("totalTokens"),
+    }
 }
 
 #[cfg(test)]
@@ -3520,7 +3776,7 @@ mod usage_window_tests {
         let events = map_usage(&params);
         assert!(
             matches!(
-                events.as_slice(),
+                &events[..1],
                 [SessionEvent::UsageDelta {
                     input_tokens: 11024,
                     output_tokens: 6,
@@ -3556,6 +3812,27 @@ mod usage_window_tests {
         assert_eq!(b.thought_tokens, 242, "reasoningOutputTokens is the thinking count");
     }
 
+    #[test]
+    fn exact_thread_snapshot_keeps_total_and_last_separate_without_summing() {
+        let params = json!({
+            "threadId":"thread-current","turnId":"turn-2",
+            "tokenUsage":{
+                "modelContextWindow":200000,
+                "last":{"inputTokens":8,"cachedInputTokens":3,"cacheWriteInputTokens":1,"outputTokens":2,"reasoningOutputTokens":1,"totalTokens":10},
+                "total":{"inputTokens":108,"cachedInputTokens":33,"cacheWriteInputTokens":4,"outputTokens":22,"reasoningOutputTokens":9,"totalTokens":130}
+            }
+        });
+        let events = map_usage(&params);
+        assert!(matches!(
+            &events[1],
+            SessionEvent::RuntimeUsageSnapshot { thread_id, turn_id, total, last, model_context_window: Some(200000), .. }
+                if thread_id == "thread-current"
+                    && turn_id == "turn-2"
+                    && total.total_tokens == 130
+                    && last.total_tokens == 10
+        ));
+    }
+
     /// `modelContextWindow` is `int|null` in the schema — a null (or absent) field
     /// must degrade to `None`, never to 0, which would render a 0-sized bar.
     #[test]
@@ -3567,7 +3844,7 @@ mod usage_window_tests {
             let params: Value = serde_json::from_str(raw).unwrap();
             assert!(
                 matches!(
-                    map_usage(&params).as_slice(),
+                    &map_usage(&params)[..1],
                     [SessionEvent::UsageDelta {
                         context_window: None,
                         total_tokens: 5,
@@ -3577,6 +3854,19 @@ mod usage_window_tests {
                 "expected no window for {raw}"
             );
         }
+    }
+
+    #[test]
+    fn structured_and_text_rate_limit_errors_are_terminal_classes() {
+        assert!(codex_error_is_rate_limited(&json!({
+            "error":{"message":"limit", "codexErrorInfo":"usageLimitExceeded"}, "willRetry":true
+        })));
+        assert!(codex_error_is_rate_limited(&json!({
+            "error":{"message":"Usage limit reached"}, "willRetry":false
+        })));
+        assert!(!codex_error_is_rate_limited(&json!({
+            "error":{"message":"temporary network failure"}, "willRetry":true
+        })));
     }
 }
 
@@ -3750,6 +4040,24 @@ fn synth_error_terminal(message: String) -> SessionEvent {
         epoch: 0,
         outcome: TurnOutcome::Failed,
     }
+}
+
+fn codex_error_is_rate_limited(params: &Value) -> bool {
+    let error = params.get("error").unwrap_or(&Value::Null);
+    let structured = error.get("codexErrorInfo");
+    if matches!(
+        structured.and_then(Value::as_str),
+        Some("usageLimitExceeded" | "rateLimitExceeded")
+    ) {
+        return true;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    message.contains("usage limit") || message.contains("rate limit") || message.contains("quota exceeded")
 }
 
 /// turn/completed → TurnResult, mapping turn.status → outcome (§C2/O3):
@@ -3983,6 +4291,27 @@ impl SessionBackend for CodexSessionBackend {
                         "jsonrpc": "2.0", "id": id, "method": "account/logout", "params": Value::Null
                     });
                     self.write_frame(frame).await?;
+                    self.discovered
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .models
+                        .clear();
+                    let modes = self
+                        .discovered
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .modes
+                        .clone();
+                    emit(
+                        &self.event_tx,
+                        &self.session_id,
+                        self.turn_gen.load(Ordering::SeqCst),
+                        SessionEvent::CatalogUpdated {
+                            models: Vec::new(),
+                            modes,
+                            slash_commands: builtin_slash_commands(),
+                        },
+                    );
                     emit(
                         &self.event_tx,
                         &self.session_id,
@@ -4060,7 +4389,7 @@ impl SessionBackend for CodexSessionBackend {
                 // All three turn-flavored routes run a REAL wire turn on the thread
                 // (turn/started → items → turn/completed; verified live 0.144.1, files
                 // above), so the existing reader/FSM lifecycle applies unchanged.
-                let (method, params) = match route {
+                let (method, mut params) = match route {
                     None => ("turn/start", json!({ "threadId": tid, "input": build_input(&content) })),
                     // /init → the bridge's canned AGENTS.md prompt as a normal turn
                     // (bridge: Op::UserInput{INIT_COMMAND_PROMPT}).
@@ -4075,6 +4404,17 @@ impl SessionBackend for CodexSessionBackend {
                     Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
                     Some(SlashRoute::Logout) => unreachable!("handled above"),
                 };
+                if method == "turn/start" {
+                    if let Some(model) = metadata.model {
+                        params["model"] = Value::String(model);
+                    }
+                    if let Some(effort) = metadata.reasoning_effort {
+                        params["effort"] = Value::String(effort);
+                    }
+                    if let Some(service_tier) = metadata.service_tier {
+                        params["serviceTier"] = Value::String(service_tier);
+                    }
+                }
                 let frame = json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -4301,37 +4641,32 @@ impl SessionBackend for CodexSessionBackend {
                 })
             }
             Command::SetModel { model } => {
-                // F-4: between-turn config write → wake a suspended session first.
-                self.suspend
-                    .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
-                    .await?;
-                // codex `thread/settings/update{threadId, model}` (verified frame:
-                // {"threadId":..,"model":"gpt-5.5"}). Applies to subsequent turns.
-                // Track it so a subsequent SetMode can build collaborationMode (M1).
-                let tid = self.bound_thread().await?;
-                *self.current_model.lock().await = Some(model.clone());
-                // Keep the title latch on the model the user is actually talking
-                // to — a title run started after a switch must not use the stale
-                // open-time model.
-                self.reader_state.title_gen.set_model(Some(model.clone()));
-                let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC
-                // error (codex rejected the model) surfaces as a Notice instead of
-                // being dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("model\u{2192}{model}"));
-                let frame = json!({
-                    "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
-                    "params": { "threadId": tid, "model": model }
-                });
-                self.write_frame(frame).await?;
-                Ok(CommandReceipt {
+                if self.turn_in_flight.load(Ordering::SeqCst) || self.active_turn_id.lock().await.is_some() {
+                    return Err(BackendError::Transport(
+                        "model can only be changed while the Codex session is idle".into(),
+                    ));
+                }
+                let known = model == CODEX_AUTO_MODEL_VALUE
+                    || self
+                        .discovered
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .models
+                        .iter()
+                        .any(|entry| entry.id == model);
+                if !known {
+                    return Err(BackendError::Transport(format!(
+                        "model '{model}' is not in the current Codex model catalog"
+                    )));
+                }
+                let selected = (model != CODEX_AUTO_MODEL_VALUE).then_some(model.clone());
+                *self.current_model.lock().await = selected.clone();
+                self.reader_state.title_gen.set_model(selected);
+                return Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
-                })
+                });
             }
             // codex has no AskUserQuestion (its MCP elicitation degrades to a
             // Permission with ELICIT_PREFIX); Ask is never raised here.
@@ -4525,31 +4860,47 @@ impl SessionBackend for CodexSessionBackend {
             // on the response, matching SetModel/SetMode). Any OTHER config option has no
             // codex wire and still rejects.
             Command::SetConfigOption { option_id, value }
-                if matches!(option_id.as_str(), "effort" | "reasoning_effort" | "thought_level") =>
+                if option_id == "model_catalog_refresh" && value == "refresh" =>
             {
-                // F-4: between-turn config write → wake a suspended session first.
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
-                let tid = self.bound_thread().await?;
-                let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC error
-                // (codex rejected the effort) surfaces as a Notice instead of being
-                // dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("effort\u{2192}{value}"));
-                let frame = json!({
-                    "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
-                    "params": { "threadId": tid, "effort": value }
-                });
-                self.write_frame(frame).await?;
+                self.request_model_catalog().await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
+            }
+            Command::SetConfigOption { option_id, value }
+                if matches!(option_id.as_str(), "effort" | "reasoning_effort" | "thought_level") =>
+            {
+                if self.turn_in_flight.load(Ordering::SeqCst) || self.active_turn_id.lock().await.is_some() {
+                    return Err(BackendError::Transport(
+                        "reasoning effort can only be changed while the Codex session is idle".into(),
+                    ));
+                }
+                let selected_model = self.current_model.lock().await.clone();
+                let valid = value == CODEX_AUTO_EFFORT_VALUE
+                    || selected_model.as_deref().is_some_and(|model_id| {
+                        self.discovered
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .models
+                            .iter()
+                            .find(|entry| entry.id == model_id)
+                            .is_some_and(|entry| entry.reasoning_efforts.contains(&value))
+                    });
+                if !valid {
+                    return Err(BackendError::Transport(format!(
+                        "reasoning effort '{value}' is not supported by the selected Codex model"
+                    )));
+                }
+                return Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                });
             }
             Command::SetConfigOption { .. } => Err(BackendError::CommandNotSupported {
                 command: "set_config_option",
@@ -5483,6 +5834,60 @@ mod tests {
             "the fatal error message rides result_text, got {:?}",
             tr.1
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_error_wins_over_retry_flag_and_trailing_completion() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(
+            concat!(
+                r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th1"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"th1","turnId":"t1","willRetry":true,"error":{"message":"usage limit reached","codexErrorInfo":"usageLimitExceeded"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed"}}}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let releaser = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-rate-limit", Box::new(fake)).await;
+        backend.mark_turn_in_flight_for_test();
+        let mut events = backend.events();
+        releaser();
+
+        let mut terminals = Vec::new();
+        for _ in 0..12 {
+            match tokio::time::timeout(std::time::Duration::from_millis(150), events.next()).await {
+                Ok(Some(env)) => {
+                    if let SessionEvent::TurnResult {
+                        is_error, result_text, ..
+                    } = env.event
+                    {
+                        terminals.push((is_error, result_text));
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(terminals.len(), 1, "the trailing completion must be absorbed");
+        assert!(terminals[0].0);
+        assert!(terminals[0].1.starts_with("RATE_LIMITED:"));
+    }
+
+    #[tokio::test]
+    async fn token_usage_for_previous_thread_is_ignored() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-current"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-old","turnId":"turn-old","tokenUsage":{"last":{"inputTokens":8,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":10},"total":{"inputTokens":8,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":10}}}}"#,
+        ])
+        .await;
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionEvent::UsageDelta { .. } | SessionEvent::RuntimeUsageSnapshot { .. }
+        )));
     }
 
     /// thread/status/changed → systemError with NO follow-up before EOF: the
@@ -6520,7 +6925,12 @@ mod tests {
         let receipt = backend
             .dispatch(Command::Send {
                 content: vec![ContentBlock::Text("do it".into())],
-                metadata: super::super::types::CommandMeta::default(),
+                metadata: super::super::types::CommandMeta {
+                    model: Some("gpt-5.5".into()),
+                    reasoning_effort: Some("high".into()),
+                    service_tier: Some("fast".into()),
+                    ..Default::default()
+                },
             })
             .await
             .expect("accepted");
@@ -6539,6 +6949,9 @@ mod tests {
             written.contains("do it"),
             "frame carries the prompt text, got: {written}"
         );
+        assert!(written.contains(r#""model":"gpt-5.5""#), "got: {written}");
+        assert!(written.contains(r#""effort":"high""#), "got: {written}");
+        assert!(written.contains(r#""serviceTier":"fast""#), "got: {written}");
         assert!(
             !written.contains("sendUserTurn"),
             "must NOT use the fictional sendUserTurn method"
@@ -7464,11 +7877,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_set_model_writes_thread_settings_update() {
-        // R6 SetModel → `thread/settings/update{threadId, model}` (verified frame).
+    async fn dispatch_set_model_updates_next_turn_selection_without_settings_rpc() {
         let fake = fake_with_binding("th-5", None);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend.discovered.lock().unwrap().models = parse_model_page(&json!({
+            "data": [{"id":"gpt-5.5","displayName":"GPT-5.5"}]
+        }));
         backend
             .dispatch(Command::SetModel {
                 model: "gpt-5.5".into(),
@@ -7477,29 +7892,26 @@ mod tests {
             .expect("accepted");
         let written = captured_str(&captured).await;
         assert!(
-            written.contains(r#""method":"thread/settings/update""#),
-            "wrote thread/settings/update, got: {written}"
+            !written.contains(r#""method":"thread/settings/update""#),
+            "model selection must not use thread/settings/update, got: {written}"
         );
-        assert!(
-            written.contains(r#""model":"gpt-5.5""#),
-            "carries the model, got: {written}"
-        );
-        assert!(
-            written.contains(r#""threadId":"th-5""#),
-            "carries threadId, got: {written}"
-        );
+        assert_eq!(backend.current_model.lock().await.as_deref(), Some("gpt-5.5"));
     }
 
     #[tokio::test]
-    async fn dispatch_set_config_option_effort_writes_thread_settings_update() {
-        // codex's reasoning effort is a first-class `thread/settings/update{threadId,
-        // effort}` field (schema: ThreadSettingsUpdateParams.effort → ReasoningEffort),
-        // so SetConfigOption{effort} routes through the same wire as SetModel/SetMode —
-        // NOT a CommandNotSupported reject. Each effort alias id maps to the `effort` key.
+    async fn dispatch_set_config_option_effort_validates_without_settings_rpc() {
         for option_id in ["effort", "reasoning_effort", "thought_level"] {
             let fake = fake_with_binding("th-7", None);
             let captured = fake.captured_stdin();
             let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            backend.discovered.lock().unwrap().models = parse_model_page(&json!({
+                "data": [{
+                    "id":"gpt-5.5",
+                    "displayName":"GPT-5.5",
+                    "supportedReasoningEfforts":[{"reasoningEffort":"high"}]
+                }]
+            }));
+            *backend.current_model.lock().await = Some("gpt-5.5".into());
             backend
                 .dispatch(Command::SetConfigOption {
                     option_id: option_id.into(),
@@ -7509,16 +7921,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("effort id `{option_id}` must be accepted, got: {e:?}"));
             let written = captured_str(&captured).await;
             assert!(
-                written.contains(r#""method":"thread/settings/update""#),
-                "id `{option_id}` wrote thread/settings/update, got: {written}"
-            );
-            assert!(
-                written.contains(r#""effort":"high""#),
-                "id `{option_id}` carries the effort value, got: {written}"
-            );
-            assert!(
-                written.contains(r#""threadId":"th-7""#),
-                "id `{option_id}` carries threadId, got: {written}"
+                !written.contains(r#""method":"thread/settings/update""#),
+                "id `{option_id}` must not write thread/settings/update, got: {written}"
             );
         }
     }
@@ -8415,7 +8819,7 @@ mod tests {
         // this after the handshake; build_with_io skips the handshake).
         {
             let mut pd = backend.pending_discovery.lock().await;
-            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(50, DiscoveryKind::Models(ModelDiscovery::default()));
             pd.insert(51, DiscoveryKind::Permissions);
         }
         // Subscribe to drive the reader; it consumes the two responses → fill_discovery.
@@ -8464,6 +8868,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn model_list_follows_all_pages_deduplicates_and_excludes_hidden() {
+        let first = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"model-a","displayName":"A"},{"id":"hidden","displayName":"Hidden","hidden":true}],"nextCursor":"page-2"}}"#;
+        let second = r#"{"jsonrpc":"2.0","id":1,"result":{"data":[{"id":"model-a","displayName":"Duplicate"},{"id":"model-b","displayName":"B"}],"nextCursor":"page-3"}}"#;
+        let third =
+            r#"{"jsonrpc":"2.0","id":2,"result":{"data":[{"id":"model-c","displayName":"C"}],"nextCursor":null}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{first}\n{second}\n{third}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-pages", Box::new(fake)).await;
+        backend
+            .pending_discovery
+            .lock()
+            .await
+            .insert(50, DiscoveryKind::Models(ModelDiscovery::default()));
+        let _events = backend.events();
+        for _ in 0..40 {
+            if backend.capabilities().available_models.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let caps = backend.capabilities();
+        assert_eq!(
+            caps.available_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model-a", "model-b", "model-c"]
+        );
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""cursor":"page-2""#), "got: {written}");
+        assert!(written.contains(r#""cursor":"page-3""#), "got: {written}");
+        assert!(written.contains(r#""includeHidden":false"#), "got: {written}");
+    }
+
     /// The FIX (async catalog-arrival signal): each `model/list` /
     /// `collaborationMode/list` RESPONSE must BROADCAST a `CatalogUpdated` carrying the
     /// current `discovered` snapshot — before this the parser silently filled the cache
@@ -8484,7 +8923,7 @@ mod tests {
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         {
             let mut pd = backend.pending_discovery.lock().await;
-            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(50, DiscoveryKind::Models(ModelDiscovery::default()));
             pd.insert(51, DiscoveryKind::Permissions);
         }
         let mut events = backend.events();
@@ -8524,7 +8963,11 @@ mod tests {
             r#"{"models":[{"id":"legacy-1","displayName":"Legacy","supportedReasoningEfforts":["low","high"]}]}"#,
         )
         .unwrap();
-        fill_discovery(DiscoveryKind::Models, &model_result, &discovered);
+        fill_discovery(
+            DiscoveryKind::Models(ModelDiscovery::default()),
+            &model_result,
+            &discovered,
+        );
         let d = discovered.lock().unwrap();
         assert_eq!(d.models.len(), 1, "legacy result.models[] still parses");
         assert_eq!(
@@ -8682,7 +9125,7 @@ mod tests {
         let backend = CodexSessionBackend::build_with_io("codex-perm", Box::new(fake)).await;
         {
             let mut pd = backend.pending_discovery.lock().await;
-            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(50, DiscoveryKind::Models(ModelDiscovery::default()));
             pd.insert(52, DiscoveryKind::Permissions);
         }
         let mut events = backend.events();
@@ -8722,7 +9165,11 @@ mod tests {
         let fake = FakeAgentIo::never_exits(bytes);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-rec", Box::new(fake)).await;
-        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        backend
+            .pending_discovery
+            .lock()
+            .await
+            .insert(50, DiscoveryKind::Models(ModelDiscovery::default()));
         // Drive the reader so it binds the thread + fills the catalog.
         let _events = backend.events();
         for _ in 0..40 {
@@ -8741,23 +9188,18 @@ mod tests {
         (Arc::new(backend), captured)
     }
 
-    /// A requested model that IS in the discovered catalog is applied via a real
-    /// `thread/settings/update{model}` (the validated apply) — the same wire a manual
-    /// SetModel uses. This is the codex analogue of ACP's reconcile issuing `set_model`
-    /// only for a desire that survived `clear_invalid_desired_model`.
+    /// A catalog-valid request is retained for the next turn without mutating the
+    /// thread through the deprecated settings RPC.
     #[tokio::test]
     async fn codex_model_reconcile_applies_valid_model() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
         reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
         let written = captured_str(&captured).await;
         assert!(
-            written.contains(r#""method":"thread/settings/update""#),
-            "a catalog-valid model is applied via thread/settings/update, got: {written}"
+            !written.contains(r#""method":"thread/settings/update""#),
+            "got: {written}"
         );
-        assert!(
-            written.contains(r#""model":"openai.gpt-5.4""#),
-            "carries the requested (valid) model, got: {written}"
-        );
+        assert_eq!(backend.current_model.lock().await.as_deref(), Some("openai.gpt-5.4"));
     }
 
     /// A requested model that is NOT in the catalog (a stale frontend picker default the
@@ -9141,7 +9583,7 @@ mod tests {
     /// pre-seeded binding intact and sets no poison.
     #[tokio::test]
     async fn thread_resume_success_leaves_binding_intact() {
-        let ok_resp = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let ok_resp = r#"{"jsonrpc":"2.0","id":7,"result":{"model":"runtime-model"}}"#;
         let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(format!("{ok_resp}\n").into_bytes());
         let release = fake.stdout_releaser();
         let backend = CodexSessionBackend::build_with_io("codex-resume-ok", Box::new(fake)).await;
@@ -9158,6 +9600,11 @@ mod tests {
         assert!(
             backend.resume_poison.lock().await.is_none(),
             "a successful resume must not poison the bound-thread wait"
+        );
+        assert_eq!(
+            backend.current_model.lock().await.as_deref(),
+            Some("runtime-model"),
+            "resume response model is authoritative runtime state"
         );
     }
 

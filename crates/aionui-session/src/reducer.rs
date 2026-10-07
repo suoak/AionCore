@@ -400,6 +400,7 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // ==================================================================
         SessionEvent::PromptAccepted { .. }
         | SessionEvent::UsageDelta { .. }
+        | SessionEvent::RuntimeUsageSnapshot { .. }
         // LC-8a: Plan is a to-do SNAPSHOT — content within a Running turn, NOT a
         // state (cross-protocol verified). The reducer never reads it; only the
         // conversation layer projects it to the UI panel. Pure no-op here.

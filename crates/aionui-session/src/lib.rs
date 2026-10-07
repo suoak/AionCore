@@ -65,16 +65,17 @@ pub use backend::{
     slash_command_name, version_drift,
 };
 pub use capability::{
-    BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModeSwitchEffect, ModelInfo, PromptAcceptedSource,
-    SignalSet, SlashCommandInfo, backend_supports_midturn_delivery, block_kind_name,
+    BlockSet, Capabilities, CapabilityTier, CodexModelMetadata, CodexModelUpgrade, CodexServiceTier, CommandSet,
+    ModeInfo, ModeSwitchEffect, ModelInfo, PromptAcceptedSource, SignalSet, SlashCommandInfo,
+    backend_supports_midturn_delivery, block_kind_name,
 };
 pub use error::SessionError;
 pub use event::UsageBreakdown;
 pub use event::{
     CancelReason, CheckpointEntry, EventClass, ExitStatusLite, FinalizedMessage, ItemKind, MessageLifecyclePhase,
     NoticeLevel, Outcome, PermissionKind, PersistTier, PlanEntry, PlanPriority, PlanStatus, ProvisioningPhase,
-    SessionEvent, StopReason, SubagentKind, SubagentStatus, SubagentTaskKind, ToolResultContent, TruncationInfo,
-    TruncationKind, TurnOutcome, classify, persist_tier,
+    SessionEvent, StopReason, SubagentKind, SubagentStatus, SubagentTaskKind, TokenUsageCounters, ToolResultContent,
+    TruncationInfo, TruncationKind, TurnOutcome, classify, persist_tier,
 };
 pub use reducer::{Transition, crash_outcome, step};
 pub use state::{
