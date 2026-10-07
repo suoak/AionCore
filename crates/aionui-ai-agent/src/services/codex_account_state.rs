@@ -10,6 +10,7 @@ use serde_json::Value;
 pub(crate) struct CodexAccountStateMachine {
     snapshot: CodexAccountSnapshot,
     identity: Option<String>,
+    authoritative_read: bool,
 }
 
 impl CodexAccountStateMachine {
@@ -58,13 +59,15 @@ impl CodexAccountStateMachine {
 
     /// Apply the authoritative `account/read` response. Notification payloads
     /// never enter this method directly.
-    pub(crate) fn apply_account_read(&mut self, response: &Value, now_ms: i64) {
+    pub(crate) fn apply_account_read(&mut self, response: &Value, now_ms: i64) -> bool {
         let account = response.get("account").filter(|value| !value.is_null());
         let next_identity = account.map(account_identity);
+        let identity_changed = self.authoritative_read && next_identity != self.identity;
         if next_identity != self.identity {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
             self.identity = next_identity;
         }
+        self.authoritative_read = true;
 
         self.snapshot.requires_openai_auth = response
             .get("requiresOpenaiAuth")
@@ -94,6 +97,7 @@ impl CodexAccountStateMachine {
             }
         }
         self.touch(now_ms);
+        identity_changed
     }
 
     pub(crate) fn account_read_failed(&mut self, now_ms: i64) {
@@ -182,13 +186,13 @@ mod tests {
     fn repeated_read_is_monotonic_and_identity_change_advances_generation() {
         let mut state = CodexAccountStateMachine::default();
         let first = json!({"account": {"type":"chatgpt", "email":"a@example.com", "planType":"plus"}});
-        state.apply_account_read(&first, 10);
-        state.apply_account_read(&first, 11);
+        assert!(!state.apply_account_read(&first, 10));
+        assert!(!state.apply_account_read(&first, 11));
         assert_eq!(state.snapshot().generation, 1);
-        state.apply_account_read(
+        assert!(state.apply_account_read(
             &json!({"account": {"type":"chatgpt", "email":"b@example.com", "planType":"team"}}),
             12,
-        );
+        ));
         assert_eq!(state.snapshot().generation, 2);
     }
 

@@ -65,6 +65,7 @@ impl CloseReason {
                 Some(AgentKillReason::RuntimeCapabilityChanged) => {
                     "Agent killed: runtime capability changed".to_owned()
                 }
+                Some(AgentKillReason::AccountChanged) => "Agent killed: account changed".to_owned(),
                 Some(AgentKillReason::ModelChanged) => "Agent killed: model changed".to_owned(),
                 Some(AgentKillReason::SessionRevoked) => "Agent killed: session revoked".to_owned(),
                 Some(AgentKillReason::Archived) => "Agent killed: archived".to_owned(),

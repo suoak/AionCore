@@ -284,6 +284,9 @@ pub enum AgentKillReason {
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
+    /// The effective vendor account changed, so an existing process must not
+    /// continue under credentials different from those it started with.
+    AccountChanged,
     /// A connection-scoped agent requires model changes to take effect by
     /// rebuilding its process and opening a fresh vendor session.
     ModelChanged,
