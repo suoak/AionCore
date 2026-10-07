@@ -414,16 +414,43 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let active_tasks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_sessions \
+             WHERE user_id = ? AND conversation_id = ? AND status IN ('running', 'waiting_approval')",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_tasks > 0 {
+            return Err(DbError::Conflict(
+                "CONVERSATION_ACTIVE: stop the active task before deleting this conversation".into(),
+            ));
+        }
+
+        // A permanent conversation delete owns its WorkMate task aggregate.
+        // Removing the task-session root cascades runs, traces, checkpoints,
+        // evidence, approvals, artifacts, criteria, and context snapshots. It
+        // also removes the RESTRICT references from task_runs before the
+        // conversation row is deleted.
+        sqlx::query("DELETE FROM task_sessions WHERE user_id = ? AND conversation_id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
         }
 
+        tx.commit().await?;
         Ok(())
     }
 

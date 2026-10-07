@@ -46,6 +46,9 @@ impl From<ConversationError> for ApiError {
             ConversationError::Busy { reason } if reason.starts_with("CROSS_ACCOUNT_REFERENCE:") => {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", reason, None)
             }
+            ConversationError::Busy { reason } if reason.starts_with("CONVERSATION_ACTIVE:") => {
+                ApiError::coded(StatusCode::CONFLICT, "CONVERSATION_ACTIVE", reason, None)
+            }
             ConversationError::Busy { reason } => ApiError::Conflict(reason),
             ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
             ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
@@ -930,6 +933,16 @@ mod error_mapping_tests {
 
         assert_eq!(app.status_code(), StatusCode::CONFLICT);
         assert_eq!(app.error_code(), "CROSS_ACCOUNT_REFERENCE");
+    }
+
+    #[test]
+    fn active_conversation_maps_to_stable_conflict_code() {
+        let app = ApiError::from(ConversationError::Busy {
+            reason: "CONVERSATION_ACTIVE: stop the active task before deleting this conversation".into(),
+        });
+
+        assert_eq!(app.status_code(), StatusCode::CONFLICT);
+        assert_eq!(app.error_code(), "CONVERSATION_ACTIVE");
     }
 
     #[test]

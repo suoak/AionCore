@@ -155,6 +155,126 @@ async fn delete_conversation_cascades_messages() {
     assert_eq!(remaining, 0);
 }
 
+async fn insert_task_audit_graph(db: &aionui_db::Database, conversation_id: &str, status: &str) {
+    sqlx::query(
+        "INSERT INTO task_sessions \
+         (id, user_id, title, conversation_id, mode, objective, acceptance_criteria, status, agent_type, created_at, updated_at) \
+         VALUES ('task-delete', ?, 'Delete audit', ?, 'agent', '', '[]', ?, 'codex', 1, 1)",
+    )
+    .bind(USER_ID)
+    .bind(conversation_id)
+    .bind(status)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    if status == "running" {
+        return;
+    }
+    sqlx::query(
+        "INSERT INTO task_artifacts \
+         (id, task_session_id, kind, version, content, content_hash, status, created_at, updated_at) \
+         VALUES ('artifact-delete', 'task-delete', 'plan', 1, '{}', 'hash', 'approved', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_approvals \
+         (id, task_session_id, approval_type, artifact_id, artifact_hash, status, requested_at) \
+         VALUES ('approval-delete', 'task-delete', 'plan', 'artifact-delete', 'hash', 'approved', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_runs \
+         (id, task_session_id, conversation_id, run_kind, plan_artifact_id, approval_id, status, started_at) \
+         VALUES ('run-delete', 'task-delete', ?, 'execution', 'artifact-delete', 'approval-delete', 'completed', 1)",
+    )
+    .bind(conversation_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_trace_events \
+         (id, task_session_id, run_id, sequence, event_type, timestamp, payload) \
+         VALUES ('trace-delete', 'task-delete', 'run-delete', 1, 'run.completed', 1, '{}')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_checkpoints \
+         (id, task_session_id, run_id, checkpoint_type, sequence, state, created_at) \
+         VALUES ('checkpoint-delete', 'task-delete', 'run-delete', 'before_completion', 1, '{}', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_evidence \
+         (id, task_session_id, run_id, kind, summary, metadata, created_at) \
+         VALUES ('evidence-delete', 'task-delete', 'run-delete', 'test', 'passed', '{}', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO context_snapshots \
+         (id, task_session_id, run_id, provider, query, scope, purpose, result_refs, snapshot_hash, created_at) \
+         VALUES ('snapshot-delete', 'task-delete', 'run-delete', 'test', 'q', '{}', 'verification', '[]', 'snapshot-hash', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn delete_conversation_cascades_completed_task_audit_graph() {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("task-cascade");
+    repo.create(&conv).await.unwrap();
+    insert_task_audit_graph(&db, &conv.id, "completed").await;
+
+    repo.delete(USER_ID, &conv.id).await.unwrap();
+
+    for table in [
+        "task_sessions",
+        "task_artifacts",
+        "task_approvals",
+        "task_runs",
+        "task_trace_events",
+        "task_checkpoints",
+        "task_evidence",
+        "context_snapshots",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table} must not retain an orphan");
+    }
+}
+
+#[tokio::test]
+async fn delete_conversation_rejects_an_active_task_without_partial_cleanup() {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("active-task");
+    repo.create(&conv).await.unwrap();
+    insert_task_audit_graph(&db, &conv.id, "running").await;
+
+    let error = repo.delete(USER_ID, &conv.id).await.unwrap_err();
+
+    assert!(matches!(error, DbError::Conflict(message) if message.starts_with("CONVERSATION_ACTIVE:")));
+    assert!(repo.get(USER_ID, &conv.id).await.unwrap().is_some());
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_sessions WHERE conversation_id = ?")
+        .bind(&conv.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(task_count, 1);
+}
+
 // ── Cursor pagination ───────────────────────────────────────────────
 
 #[tokio::test]
