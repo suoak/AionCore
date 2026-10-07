@@ -65,8 +65,9 @@ pub use backend::{
     slash_command_name, version_drift,
 };
 pub use capability::{
-    BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModeSwitchEffect, ModelInfo, PromptAcceptedSource,
-    SignalSet, SlashCommandInfo, backend_supports_midturn_delivery, block_kind_name,
+    BlockSet, Capabilities, CapabilityTier, CodexModelMetadata, CodexModelUpgrade, CodexServiceTier, CommandSet,
+    ModeInfo, ModeSwitchEffect, ModelInfo, PromptAcceptedSource, SignalSet, SlashCommandInfo,
+    backend_supports_midturn_delivery, block_kind_name,
 };
 pub use error::SessionError;
 pub use event::UsageBreakdown;

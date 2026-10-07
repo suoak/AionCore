@@ -213,6 +213,44 @@ pub struct ModelInfo {
     pub name: String,
     pub description: Option<String>,
     pub reasoning_efforts: Vec<String>,
+    /// Codex-only stable projection of the subset of `model/list` metadata that
+    /// WorkMate consumes. Other backends leave this `None`; unknown upstream
+    /// fields are deliberately not copied into the application contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexModelMetadata>,
+}
+
+/// Stable WorkMate projection of Codex model-catalog metadata.
+///
+/// Verified against codex-cli 0.160.1 generated
+/// `schema-full/v2/ModelListResponse.json`. Every field that the schema does not
+/// guarantee for all versions remains optional.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CodexModelMetadata {
+    pub visible: bool,
+    pub is_default: bool,
+    pub default_reasoning_effort: Option<String>,
+    pub service_tiers: Vec<CodexServiceTier>,
+    pub default_service_tier: Option<String>,
+    pub upgrade: Option<CodexModelUpgrade>,
+    pub multi_agent_capability: Option<String>,
+    pub context_window: Option<u64>,
+    pub max_context_window: Option<u64>,
+    pub raw_capabilities_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CodexServiceTier {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CodexModelUpgrade {
+    pub replacement_model: String,
+    pub retirement_at: Option<i64>,
+    pub message: Option<String>,
 }
 
 /// 007 §9.10: an advertised mode (discovery, open set).

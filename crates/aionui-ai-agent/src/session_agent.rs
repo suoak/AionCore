@@ -41,6 +41,8 @@ use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStatePar
 use aionui_realtime::EventBroadcaster;
 
 const EVENT_CHANNEL_CAPACITY: usize = 512;
+const CODEX_AUTO_MODEL_VALUE: &str = "__workmate_codex_auto__";
+const CODEX_AUTO_EFFORT_VALUE: &str = "__workmate_codex_auto_effort__";
 
 // Option ids for the generic tool-approval card. `confirm()` maps the incoming
 // `data` string against these to pick the PermissionDecision; anything else is
@@ -56,6 +58,7 @@ const PERM_REJECT: &str = "reject";
 /// control_request). The three accepted incoming option ids (`effort`/`reasoning_effort`/
 /// `thought_level`) all normalize to this one storage key.
 const EFFORT_CONFIG_KEY: &str = "effort";
+const CODEX_MODEL_CONFIG_KEY: &str = "codex_requested_model";
 
 /// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
 /// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
@@ -188,6 +191,11 @@ impl SessionRuntime {
     fn effort_override(&self) -> Option<String> {
         self.effort_override.lock().ok().and_then(|g| g.clone())
     }
+    fn clear_effort_override(&self) {
+        if let Ok(mut guard) = self.effort_override.lock() {
+            *guard = None;
+        }
+    }
     fn set_last_catalog(&self, modes: Vec<ModeInfo>, models: Vec<ModelInfo>) {
         if let Ok(mut g) = self.last_catalog.lock() {
             *g = Some((modes, models));
@@ -267,6 +275,22 @@ fn efforts_for_model(available_models: Option<&serde_json::Value>, model_id: &st
         .unwrap_or_default()
 }
 
+fn codex_metadata_for_model(
+    available_models: Option<&serde_json::Value>,
+    model_id: &str,
+) -> Option<aionui_session::CodexModelMetadata> {
+    available_models
+        .and_then(|value| value.get("available_models"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|entry| entry.get("id").and_then(serde_json::Value::as_str) == Some(model_id))
+        })
+        .and_then(|entry| entry.get("codex"))
+        .and_then(|metadata| serde_json::from_value(metadata.clone()).ok())
+}
+
 impl CatalogPreload {
     /// Parse the persisted handshake's `available_models` / `available_modes`
     /// columns into the live-capabilities shape. Reuses the ACP path's
@@ -297,6 +321,7 @@ impl CatalogPreload {
                             handshake.available_models.as_ref(),
                             &m.model_id.to_string(),
                         ),
+                        codex: codex_metadata_for_model(handshake.available_models.as_ref(), &m.model_id.to_string()),
                     })
                     .collect::<Vec<_>>();
                 let current = state.current_model_id.to_string();
@@ -963,6 +988,7 @@ impl SessionAgentTask {
         // Live catalog wins; cold-start resume falls back to the persisted-handshake
         // preload (per-axis) so the picker renders before the initialize round-trip lands.
         let (models, current_model, modes, current_mode) = self.effective_catalog();
+        let is_codex = models.iter().any(|model| model.codex.is_some());
         // The effort catalog depends on the EFFECTIVE current model (override wins over the
         // snapshot's current_model), resolved before the model option consumes it below.
         let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
@@ -1007,6 +1033,26 @@ impl SessionAgentTask {
             });
         }
         if !models.is_empty() {
+            let mut model_options = models
+                .iter()
+                .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: m.id.clone(),
+                    name: Some(m.name.clone()),
+                    label: None,
+                    description: m.description.clone(),
+                })
+                .collect::<Vec<_>>();
+            if is_codex {
+                model_options.insert(
+                    0,
+                    aionui_api_types::AcpConfigSelectOptionDto {
+                        value: CODEX_AUTO_MODEL_VALUE.into(),
+                        name: Some("Auto (Codex default)".into()),
+                        label: None,
+                        description: Some("Let Codex choose its current default model.".into()),
+                    },
+                );
+            }
             config_options.push(aionui_api_types::AcpConfigOptionDto {
                 id: "model".into(),
                 name: Some("Model".into()),
@@ -1014,16 +1060,12 @@ impl SessionAgentTask {
                 description: None,
                 category: Some("model".into()),
                 option_type: "select".into(),
-                current_value: self.runtime.model_override().or(current_model),
-                options: models
-                    .iter()
-                    .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
-                        value: m.id.clone(),
-                        name: Some(m.name.clone()),
-                        label: None,
-                        description: m.description.clone(),
-                    })
-                    .collect(),
+                current_value: self
+                    .runtime
+                    .model_override()
+                    .or_else(|| is_codex.then(|| CODEX_AUTO_MODEL_VALUE.to_string()))
+                    .or(current_model),
+                options: model_options,
             });
         }
         // Reasoning-effort ("thought level") axis — the direct-CLI analogue of the ACP
@@ -1034,8 +1076,32 @@ impl SessionAgentTask {
         // efforts. `current_value` prefers the optimistic override (claude emits no echo
         // for effort) then the backend's synchronously-seeded `current_effort`.
         let caps = self.backend.capabilities();
-        let efforts = resolve_current_model_efforts(&models, effective_model.as_deref());
-        if !efforts.is_empty() {
+        let efforts = if is_codex && effective_model.as_deref() == Some(CODEX_AUTO_MODEL_VALUE) {
+            Vec::new()
+        } else {
+            resolve_current_model_efforts(&models, effective_model.as_deref())
+        };
+        if is_codex || !efforts.is_empty() {
+            let mut effort_options = efforts
+                .iter()
+                .map(|effort| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: effort.clone(),
+                    name: Some(effort.clone()),
+                    label: None,
+                    description: None,
+                })
+                .collect::<Vec<_>>();
+            if is_codex {
+                effort_options.insert(
+                    0,
+                    aionui_api_types::AcpConfigSelectOptionDto {
+                        value: CODEX_AUTO_EFFORT_VALUE.into(),
+                        name: Some("Auto".into()),
+                        label: None,
+                        description: Some("Use the model's default reasoning effort.".into()),
+                    },
+                );
+            }
             config_options.push(aionui_api_types::AcpConfigOptionDto {
                 id: "reasoning_effort".into(),
                 name: Some("Thinking".into()),
@@ -1043,16 +1109,29 @@ impl SessionAgentTask {
                 description: None,
                 category: Some("thought_level".into()),
                 option_type: "select".into(),
-                current_value: self.runtime.effort_override().or(caps.current_effort),
-                options: efforts
-                    .iter()
-                    .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
-                        value: e.clone(),
-                        name: Some(e.clone()),
-                        label: None,
-                        description: None,
-                    })
-                    .collect(),
+                current_value: self
+                    .runtime
+                    .effort_override()
+                    .or_else(|| is_codex.then(|| CODEX_AUTO_EFFORT_VALUE.to_string()))
+                    .or(caps.current_effort),
+                options: effort_options,
+            });
+        }
+        if is_codex {
+            config_options.push(aionui_api_types::AcpConfigOptionDto {
+                id: "service_tier".into(),
+                name: Some("Service tier".into()),
+                label: None,
+                description: Some("Codex chooses the available service tier automatically.".into()),
+                category: Some("service_tier".into()),
+                option_type: "select".into(),
+                current_value: Some("auto".into()),
+                options: vec![aionui_api_types::AcpConfigSelectOptionDto {
+                    value: "auto".into(),
+                    name: Some("Auto".into()),
+                    label: None,
+                    description: None,
+                }],
             });
         }
         Ok(aionui_api_types::GetConfigOptionsResponse { config_options })
@@ -1089,7 +1168,8 @@ impl SessionAgentTask {
             }
             "model"
                 if invalid(
-                    caps.available_models.iter().any(|m| m.id == value),
+                    caps.available_models.iter().any(|m| m.id == value)
+                        || (value == CODEX_AUTO_MODEL_VALUE && caps.available_models.iter().any(|m| m.codex.is_some())),
                     caps.available_models.is_empty(),
                 ) =>
             {
@@ -1098,6 +1178,15 @@ impl SessionAgentTask {
                 )));
             }
             _ => {}
+        }
+        if option_id == "service_tier"
+            && value == "auto"
+            && caps.available_models.iter().any(|model| model.codex.is_some())
+        {
+            return Ok(aionui_api_types::SetConfigOptionResponse {
+                confirmation: aionui_api_types::ConfigOptionConfirmation::Observed,
+                config_options: Some(self.get_config_options().await?.config_options),
+            });
         }
         let cmd = match option_id {
             "mode" => Command::SetMode {
@@ -1148,7 +1237,28 @@ impl SessionAgentTask {
                     self.runtime.set_mode_override(value.to_string());
                 }
             }
-            "model" => self.runtime.set_model_override(value.to_string()),
+            "model" => {
+                self.runtime.set_model_override(value.to_string());
+                if caps.available_models.iter().any(|model| model.codex.is_some()) {
+                    let selected = (value != CODEX_AUTO_MODEL_VALUE).then_some(value);
+                    let selected_model =
+                        selected.and_then(|model_id| caps.available_models.iter().find(|model| model.id == model_id));
+                    let current_effort = self.runtime.effort_override();
+                    let effort_is_valid = current_effort.as_ref().is_some_and(|effort| {
+                        selected_model.is_some_and(|model| model.reasoning_efforts.contains(effort))
+                    });
+                    if !effort_is_valid {
+                        self.runtime.clear_effort_override();
+                        if let Some(default_effort) = selected_model
+                            .and_then(|model| model.codex.as_ref())
+                            .and_then(|metadata| metadata.default_reasoning_effort.clone())
+                        {
+                            self.runtime.set_effort_override(default_effort);
+                        }
+                    }
+                    self.persist_codex_model(selected).await;
+                }
+            }
             "effort" | "reasoning_effort" | "thought_level" => {
                 // Optimistic highlight: claude emits no effort echo, so the streaming
                 // catalog push reads the current level from this override.
@@ -1243,6 +1353,50 @@ impl SessionAgentTask {
             .await
         {
             tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: save_runtime_state failed");
+        }
+    }
+
+    async fn persist_codex_model(&self, model: Option<&str>) {
+        let Some(repo) = self.session_repo.as_ref() else {
+            return;
+        };
+        let mut selections: std::collections::HashMap<String, String> = repo
+            .load_runtime_state_for_user(&self.user_id, &self.conversation_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|state| state.config_selections_json)
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        selections.insert(
+            CODEX_MODEL_CONFIG_KEY.to_owned(),
+            model.unwrap_or(CODEX_AUTO_MODEL_VALUE).to_owned(),
+        );
+        let selections_json = match serde_json::to_string(&selections) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id = %self.conversation_id,
+                    error = %error,
+                    "persist_codex_model: encode config selections failed"
+                );
+                return;
+            }
+        };
+        let params = SaveRuntimeStateParams {
+            current_model_id: Some(model),
+            config_selections_json: Some(Some(&selections_json)),
+            ..Default::default()
+        };
+        if let Err(error) = repo
+            .save_runtime_state_for_user(&self.user_id, &self.conversation_id, &params)
+            .await
+        {
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                error = %error,
+                "persist_codex_model: save_runtime_state failed"
+            );
         }
     }
 
@@ -1358,6 +1512,44 @@ impl IAgentTask for SessionAgentTask {
         // Command::Send. No-op / best-effort — never affects the dispatch.
         self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
 
+        let (catalog_models, _, _, _) = self.effective_catalog();
+        let is_codex = catalog_models.iter().any(|entry| entry.codex.is_some());
+        let requested_model = self.runtime.model_override();
+        let model = requested_model
+            .as_deref()
+            .filter(|value| *value != CODEX_AUTO_MODEL_VALUE)
+            .map(str::to_string);
+        let requested_effort = self
+            .runtime
+            .effort_override()
+            .filter(|effort| effort != CODEX_AUTO_EFFORT_VALUE);
+        let reasoning_effort = if is_codex {
+            model
+                .as_deref()
+                .and_then(|model_id| catalog_models.iter().find(|entry| entry.id == model_id))
+                .and_then(|entry| {
+                    requested_effort
+                        .clone()
+                        .filter(|effort| entry.reasoning_efforts.contains(effort))
+                })
+        } else {
+            None
+        };
+        if is_codex && requested_effort.is_some() && reasoning_effort.is_none() {
+            self.runtime.clear_effort_override();
+            tracing::warn!(
+                conversation_id = %self.conversation_id,
+                model = model.as_deref().unwrap_or("auto"),
+                "stored Codex reasoning effort is unsupported; falling back to model default"
+            );
+            let _ = self.runtime.tx.send(AgentStreamEvent::Tips(TipsEventData {
+                content: "The saved reasoning effort is unavailable for this model. Codex will use its default.".into(),
+                tip_type: TipType::Warning,
+                code: Some("CODEX_REASONING_EFFORT_UNSUPPORTED".into()),
+                params: None,
+                supersedes_key: Some("codex-reasoning-effort".into()),
+            }));
+        }
         let cmd = Command::Send {
             content,
             metadata: CommandMeta {
@@ -1365,8 +1557,24 @@ impl IAgentTask for SessionAgentTask {
                 cwd: None,
                 extra_args: Vec::new(),
                 client_msg_id: Some(data.msg_id),
+                model: is_codex.then_some(model.clone()).flatten(),
+                reasoning_effort: reasoning_effort.clone(),
+                service_tier: None,
             },
         };
+        if is_codex {
+            let requested_model = requested_model
+                .clone()
+                .unwrap_or_else(|| CODEX_AUTO_MODEL_VALUE.to_string());
+            let effective_model = model.clone().or_else(|| self.backend.capabilities().current_model);
+            let _ = self.runtime.tx.send(AgentStreamEvent::System(serde_json::json!({
+                "event": "runtime_model_selected",
+                "requested_model": requested_model,
+                "effective_model": effective_model,
+                "reasoning_effort": reasoning_effort,
+                "service_tier": "auto"
+            })));
+        }
         // Emit the turn-start lifecycle frame BEFORE dispatch, exactly like the ACP
         // path (agent_session_flow.rs emits Start{session_id} right before prompt()).
         // The backend's own turn-start signal (claude/codex PromptAccepted) arrives
@@ -1731,14 +1939,25 @@ fn spec_mode_model(
     // `result{is_error:true}`). Dropping it here turns that into a silent fall back to
     // the agent's default, which is the difference between "my old pick quietly stopped
     // applying" and "every message errors".
-    let model = clear_stale_model(
-        metadata,
-        session_snapshot
-            .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
-            .or_else(|| config.current_model_id.clone())
-            .filter(|s| !s.is_empty()),
-        conversation_id,
-    );
+    let requested_model = session_snapshot.and_then(|snapshot| {
+        snapshot
+            .config_selections
+            .iter()
+            .find(|(key, _)| key.as_str() == CODEX_MODEL_CONFIG_KEY)
+            .map(|(_, value)| value.as_str().to_owned())
+    });
+    let model = if requested_model.as_deref() == Some(CODEX_AUTO_MODEL_VALUE) {
+        None
+    } else {
+        clear_stale_model(
+            metadata,
+            requested_model
+                .or_else(|| session_snapshot.and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned())))
+                .or_else(|| config.current_model_id.clone())
+                .filter(|s| !s.is_empty()),
+            conversation_id,
+        )
+    };
     (spec, mode, model)
 }
 
@@ -1953,6 +2172,7 @@ pub async fn build_session_instance(
     // snapshot-wins precedence). Extracted so it is unit-testable in isolation, the
     // exact sibling of clean-slate's `spec_and_config`.
     let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+    let requested_model = model.clone();
 
     // GAP #3 — MCP init surface: resolve user-configured servers to the neutral
     // spec (clean-slate resolve_session_init), fold in the inline snapshot, then
@@ -2189,7 +2409,9 @@ pub async fn build_session_instance(
     // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
     // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
     // not fail the open (the session is usable; only the persisted effort is lost).
-    if let Some(effort) = persisted_effort {
+    if backend_label != "codex"
+        && let Some(effort) = persisted_effort.as_ref()
+    {
         if let Err(e) = backend
             .dispatch(Command::SetConfigOption {
                 option_id: EFFORT_CONFIG_KEY.to_owned(),
@@ -2229,6 +2451,14 @@ pub async fn build_session_instance(
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
     );
+    if backend_label == "codex" {
+        if let Some(model) = requested_model {
+            task.runtime.set_model_override(model);
+        }
+        if let Some(effort) = persisted_effort {
+            task.runtime.set_effort_override(effort);
+        }
+    }
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 
@@ -2573,6 +2803,9 @@ fn catalog_partial_from_caps(caps: &aionui_session::Capabilities) -> Option<aion
                 // axis (agy folds effort into the model id; codex has none).
                 if !m.reasoning_efforts.is_empty() {
                     entry["reasoning_efforts"] = serde_json::json!(m.reasoning_efforts);
+                }
+                if let Some(metadata) = m.codex.as_ref() {
+                    entry["codex"] = serde_json::json!(metadata);
                 }
                 entry
             }).collect::<Vec<_>>(),
@@ -5526,6 +5759,7 @@ mod build_mapping_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                codex: None,
             }],
             current_model: Some("opus".into()),
             slash_commands: vec![SlashCommandInfo {
@@ -6903,12 +7137,14 @@ mod persist_tests {
                         name: "Opus".into(),
                         description: None,
                         reasoning_efforts: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+                        codex: None,
                     },
                     ModelInfo {
                         id: "haiku".into(),
                         name: "Haiku".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        codex: None,
                     },
                 ],
                 current_model: Some("opus".into()),
@@ -6977,6 +7213,7 @@ mod persist_tests {
                         name: "Haiku".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        codex: None,
                     }],
                     current_model: Some("haiku".into()),
                     ..Default::default()
@@ -7922,12 +8159,14 @@ mod pump_tests {
                     name: "Default".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    codex: None,
                 },
                 ModelInfo {
                     id: "opus".into(),
                     name: "Opus".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    codex: None,
                 },
             ],
             modes: vec![ModeInfo {
@@ -8002,6 +8241,7 @@ mod pump_tests {
                     name: "Opus".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    codex: None,
                 }],
                 modes: vec![
                     ModeInfo {
@@ -8114,6 +8354,7 @@ mod pump_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                codex: None,
             }],
             modes: Vec::new(),
             slash_commands: Vec::new(),
@@ -9784,12 +10025,14 @@ mod pump_tests {
                         name: "Opus".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        codex: None,
                     },
                     ModelInfo {
                         id: "sonnet".into(),
                         name: "Sonnet".into(),
                         description: None,
                         reasoning_efforts: vec![],
+                        codex: None,
                     },
                 ],
                 current_model: Some("opus".into()),
@@ -9853,6 +10096,7 @@ mod pump_tests {
                     name: "Opus".into(),
                     description: None,
                     reasoning_efforts: vec!["low".into(), "high".into()],
+                    codex: None,
                 }],
                 current_model: Some("opus".into()),
                 // The user never picked this explicitly — it is what the CLI reported.
@@ -9986,6 +10230,7 @@ mod pump_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                codex: None,
             }],
         );
         emit_config_options_snapshot(
@@ -9999,6 +10244,7 @@ mod pump_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                codex: None,
             }],
             task.runtime_for_test(),
         );
@@ -10748,6 +10994,7 @@ mod cold_start_effort_tests {
                 name: "Opus".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                codex: None,
             }],
             current_model: Some("opus".into()),
             ..Default::default()
@@ -10780,6 +11027,7 @@ mod cold_start_effort_tests {
                 name: "GPT-5.6-Sol".into(),
                 description: None,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                codex: None,
             }],
             current_model: Some("gpt-5.6-sol".into()),
             current_effort: Some("high".into()),
@@ -10813,6 +11061,7 @@ mod cold_start_effort_tests {
                 name: "gemini-3.6-flash-low".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                codex: None,
             }],
             ..Default::default()
         };
@@ -10840,6 +11089,7 @@ mod cold_start_effort_tests {
                 name: "gemini-3.6-flash-low".into(),
                 description: None,
                 reasoning_efforts: Vec::new(),
+                codex: None,
             }],
             ..Default::default()
         };
@@ -10908,6 +11158,7 @@ mod catalog_writeback_tests {
                     name: "gemini-3.6-flash-high".into(),
                     description: None,
                     reasoning_efforts: Vec::new(),
+                    codex: None,
                 }]
             } else {
                 Vec::new()

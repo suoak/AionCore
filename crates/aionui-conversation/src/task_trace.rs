@@ -254,6 +254,21 @@ impl TaskTraceContext {
 
     pub(crate) async fn observe(&self, event: &AgentStreamEvent) -> Result<(), DbError> {
         match event {
+            AgentStreamEvent::System(payload)
+                if payload.get("event").and_then(serde_json::Value::as_str) == Some("runtime_model_selected") =>
+            {
+                self.event(
+                    "runtime.model.selected",
+                    serde_json::json!({
+                        "runtime_type": "codex",
+                        "requested_model": payload.get("requested_model"),
+                        "effective_model": payload.get("effective_model"),
+                        "reasoning_effort": payload.get("reasoning_effort"),
+                        "service_tier": payload.get("service_tier")
+                    }),
+                )
+                .await?;
+            }
             AgentStreamEvent::BackendTurnBound(turn_id) => {
                 self.event(
                     "runtime.turn.bound",
@@ -611,6 +626,16 @@ mod tests {
             }))
             .await
             .unwrap();
+        approved
+            .observe(&AgentStreamEvent::System(serde_json::json!({
+                "event": "runtime_model_selected",
+                "requested_model": "model-a",
+                "effective_model": "model-a",
+                "reasoning_effort": "high",
+                "service_tier": "auto"
+            })))
+            .await
+            .unwrap();
 
         let events = repo
             .list_trace_events("system_default_user", "trace-task", "trace-run")
@@ -620,6 +645,11 @@ mod tests {
         assert!(events.iter().any(|event| event.event_type == "tool.allowed"));
         assert!(events.iter().any(|event| event.event_type == "file.changed"));
         assert!(events.iter().any(|event| event.event_type == "context.used"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "runtime.model.selected"
+                && event.payload.contains("model-a")
+                && event.payload.contains("high")
+        }));
         assert!(!events.iter().any(|event| event.payload.contains("do-not-store")));
 
         let evidence = repo

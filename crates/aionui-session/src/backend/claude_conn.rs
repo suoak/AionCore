@@ -2522,6 +2522,7 @@ fn sniff_control_initialize(
                         description: m.get("description").and_then(Value::as_str).map(str::to_string),
                         reasoning_efforts,
                         id,
+                        codex: None,
                     })
                 })
                 .collect()

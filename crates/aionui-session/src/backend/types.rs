@@ -203,6 +203,12 @@ pub struct CommandMeta {
     pub cwd: Option<String>,
     pub extra_args: Vec<String>,
     pub client_msg_id: Option<String>,
+    /// Requested model for this turn. `None` delegates model choice to the backend.
+    pub model: Option<String>,
+    /// Requested reasoning effort for this turn, validated against the model catalog.
+    pub reasoning_effort: Option<String>,
+    /// Requested service tier for this turn. `None` is the backend's automatic tier.
+    pub service_tier: Option<String>,
 }
 
 // ==========================================================================
