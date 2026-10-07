@@ -1389,7 +1389,28 @@ impl IAgentTask for SessionAgentTask {
             // (`is_dead_resume_anchor`) cannot cover this path: a dispatch error
             // never becomes a `TurnResult` on the event pump.
             Err(BackendError::SessionNotFound(detail)) => {
-                if let Some(repo) = self.session_repo.as_ref() {
+                // Codex native resume is fail-closed. Clearing its durable
+                // thread id here would make recovery silently open a new thread
+                // and replay the user's turn. Keep the dead binding until the
+                // user explicitly starts a new runtime session.
+                let is_codex_resume = detail.starts_with("codex thread/resume failed:");
+                if is_codex_resume && let Some(repo) = self.session_repo.as_ref() {
+                    let params = SaveRuntimeStateParams {
+                        binding_state: Some(Some("resume_failed")),
+                        ..Default::default()
+                    };
+                    if let Err(err) = repo
+                        .save_runtime_state_for_user(&self.user_id, &self.conversation_id, &params)
+                        .await
+                    {
+                        tracing::warn!(
+                            conversation_id = %self.conversation_id,
+                            error = %err,
+                            "send: failed to mark Codex resume binding as failed"
+                        );
+                    }
+                }
+                if !is_codex_resume && let Some(repo) = self.session_repo.as_ref() {
                     match repo
                         .clear_session_id_for_user(&self.user_id, &self.conversation_id)
                         .await
@@ -3559,8 +3580,19 @@ async fn persist_side_effects(
         SessionEvent::BackendBound {
             backend_session_id: Some(bid),
         } => {
-            if let Err(err) = repo.update_session_id_for_user(user_id, conversation_id, bid).await {
+            if let Err(err) = repo.bind_session_id_for_user(user_id, conversation_id, bid).await {
                 tracing::warn!(conversation_id, error = %err, "session-sync: update_session_id failed");
+            } else {
+                let params = SaveRuntimeStateParams {
+                    binding_state: Some(Some("bound")),
+                    ..Default::default()
+                };
+                if let Err(err) = repo
+                    .save_runtime_state_for_user(user_id, conversation_id, &params)
+                    .await
+                {
+                    tracing::warn!(conversation_id, error = %err, "session-sync: save binding state failed");
+                }
             }
         }
         // A confirmed mode/model switch → persist so the next respawn/resume seeds
@@ -3571,6 +3603,7 @@ async fn persist_side_effects(
                 current_model_id: model.as_ref().map(|m| Some(m.as_str())),
                 config_selections_json: None,
                 context_usage_json: None,
+                ..Default::default()
             };
             if let Err(err) = repo
                 .save_runtime_state_for_user(user_id, conversation_id, &params)
@@ -6753,7 +6786,7 @@ mod persist_tests {
     // clear it directly and classify the failure as the retryable
     // UserAgentSessionNotFound so the turn orchestrator auto-replays (Fresh).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn send_dispatch_session_not_found_clears_anchor_and_classifies() {
+    async fn codex_resume_failure_keeps_anchor_and_classifies() {
         let (repo, _db) = seeded_repo().await;
         repo.update_session_id_for_user("user-1", "conv-1", "dead-anchor")
             .await
@@ -6785,16 +6818,17 @@ mod persist_tests {
         assert_eq!(
             err.code(),
             Some(aionui_api_types::AgentErrorCode::UserAgentSessionNotFound),
-            "classified as the retryable session-not-found so TurnRecoveryPolicy replays once"
+            "classified as session-not-found without exposing raw protocol errors to the UI"
         );
         let row = repo
             .get_for_user("user-1", "conv-1")
             .await
             .unwrap()
             .expect("row exists");
-        assert!(
-            row.session_id.is_none(),
-            "a dispatch-time dead session must clear the resume anchor — the replay/next send opens Fresh"
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("dead-anchor"),
+            "Codex must retain the failed binding until an explicit new-session action"
         );
     }
 

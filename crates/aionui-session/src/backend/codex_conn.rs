@@ -1728,18 +1728,6 @@ async fn reader_task(
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
                                 *thread_binding.lock().await = Some(tid.to_string());
-                                // Addendum 9: lower the binding downstream so the
-                                // conversation persists backend_session_id (the
-                                // resume/rewind anchor). This covers fresh + fork +
-                                // resume re-attach (all surface a thread/started).
-                                emit(
-                                    &event_tx,
-                                    &session_id,
-                                    cur,
-                                    SessionEvent::BackendBound {
-                                        backend_session_id: Some(tid.to_string()),
-                                    },
-                                );
                             }
                         }
                         if m == "turn/started" {
@@ -1747,6 +1735,27 @@ async fn reader_task(
                             idle_pending = false; // and a fresh turn has no deferred idle
                             system_error_pending = false; // nor a deferred systemError
                             system_error_deadline = None;
+                            // Codex 0.160.1 does not persist a zero-turn thread:
+                            // thread/start followed by an app-server restart makes
+                            // thread/resume fail with "no rollout found". Keep the
+                            // transport binding in memory at thread/started, but only
+                            // publish the durable resume anchor once a real turn has
+                            // started and Codex has materialized the rollout.
+                            let mut durable_thread_id =
+                                params.get("threadId").and_then(Value::as_str).map(str::to_owned);
+                            if durable_thread_id.is_none() {
+                                durable_thread_id = thread_binding.lock().await.clone();
+                            }
+                            if let Some(tid) = durable_thread_id {
+                                emit(
+                                    &event_tx,
+                                    &session_id,
+                                    cur,
+                                    SessionEvent::BackendBound {
+                                        backend_session_id: Some(tid),
+                                    },
+                                );
+                            }
                             // Capture the active turn id (optimistic token needed by
                             // turn/interrupt{turnId} + turn/steer{expectedTurnId}).
                             if let Some(tid) = params.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -5111,14 +5120,13 @@ mod tests {
     // ===== Addendum 9: BackendBound (backend_session_id → conversation) =====
 
     #[tokio::test]
-    async fn thread_started_lowers_backend_bound_with_thread_id() {
-        // Addendum 9: on thread/started the adapter binds the threadId AND lowers
-        // BackendBound{Some(threadId)} so the conversation can persist it as the
-        // resume anchor. (The threadId still NEVER appears in any other envelope —
-        // SessionEnvelope.session_id stays the logical id; BackendBound is the one
-        // explicit channel.)
+    async fn first_turn_started_lowers_durable_backend_bound_with_thread_id() {
+        // Codex 0.160.1 cannot resume a zero-turn thread. Keep thread/started as
+        // an in-memory transport binding and publish the durable anchor only
+        // when turn/started proves the rollout has been materialized.
         let events = drive_codex(&[
             r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-resume-anchor"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th-resume-anchor","turn":{"id":"turn-1"}}}"#,
         ])
         .await;
         assert!(
@@ -5126,7 +5134,23 @@ mod tests {
                 e,
                 SessionEvent::BackendBound { backend_session_id: Some(tid) } if tid == "th-resume-anchor"
             )),
-            "thread/started lowers BackendBound{{Some(threadId)}}, got {events:?}"
+            "turn/started lowers BackendBound{{Some(threadId)}}, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_turn_thread_is_not_published_as_a_durable_resume_anchor() {
+        let events =
+            drive_codex(&[r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-zero-turn"}}}"#])
+                .await;
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                SessionEvent::BackendBound {
+                    backend_session_id: Some(_)
+                }
+            )),
+            "a zero-turn thread must not be advertised as resumable: {events:?}"
         );
     }
 
@@ -5136,7 +5160,8 @@ mod tests {
         // clears its stale anchor (resuming a dead thread would fail).
         let events =
             drive_codex(&[r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-1"}}}"#]).await; // drive_codex EOFs after the scripted lines → reader runs the lost-binding path
-        // Both a Some (on started) then a None (on EOF) must appear, in order.
+        // No durable Some is published before a real turn. EOF only reports the
+        // now-lost in-memory transport binding.
         let bounds: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -5146,8 +5171,8 @@ mod tests {
             .collect();
         assert_eq!(
             bounds,
-            vec![Some("th-1".to_string()), None],
-            "BackendBound Some(on started) then None(on EOF/lost), got {bounds:?}"
+            vec![None],
+            "zero-turn EOF must not publish a resumable anchor, got {bounds:?}"
         );
     }
 

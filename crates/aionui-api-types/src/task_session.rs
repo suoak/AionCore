@@ -81,6 +81,33 @@ pub enum TaskSessionStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBindingState {
+    Bound,
+    NotResumable,
+    ResumeFailed,
+    RevalidationRequired,
+    Unavailable,
+    Broken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeBindingResponse {
+    pub runtime_type: String,
+    pub integration_mode: String,
+    pub runtime_session_id: String,
+    pub state: RuntimeBindingState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<i64>,
+}
+
 impl TaskSessionStatus {
     pub fn can_transition_to(self, next: Self) -> bool {
         if self == next {
@@ -177,6 +204,8 @@ pub struct TaskSessionResponse {
     pub agent_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_binding: Option<RuntimeBindingResponse>,
     pub created_at: i64,
     pub updated_at: i64,
 }

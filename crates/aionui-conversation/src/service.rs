@@ -27,13 +27,13 @@ use aionui_api_types::{
     CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
     ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
     MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationLevel, PlanningIsolationResponse,
-    PromptCapabilityView, RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SessionMcpServer, SessionMcpTransport, StartAutomaticPlanningRequest,
-    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME, TaskApprovalDecision,
-    TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskCheckpointResponse,
-    TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse, TaskRunStatus, TaskSessionMode,
-    TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, TeamMcpSelection, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    PromptCapabilityView, RETIRED_DEEPSEEK_HARNESS_BACKEND, RuntimeBindingResponse, RuntimeBindingState,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME,
+    TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse,
+    TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse,
+    TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, TeamMcpSelection,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
     VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
@@ -144,6 +144,7 @@ fn task_session_response(row: TaskSessionRow) -> Result<TaskSessionResponse, Con
         status,
         agent_type: row.agent_type,
         agent_session_id: row.agent_session_id,
+        runtime_binding: None,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -809,6 +810,62 @@ pub struct ConversationAgentTurnOutcome {
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
+    async fn task_session_response_with_runtime(
+        &self,
+        user_id: &str,
+        row: TaskSessionRow,
+    ) -> Result<TaskSessionResponse, ConversationError> {
+        let conversation_id = row.conversation_id.clone();
+        let mut response = task_session_response(row)?;
+        let Some(conversation_id) = conversation_id else {
+            return Ok(response);
+        };
+        let Some(conversation) = self.conversation_repo.get(user_id, &conversation_id).await? else {
+            return Ok(response);
+        };
+        if extra_backend(&conversation).as_deref() != Some("codex") {
+            return Ok(response);
+        }
+        let Some(runtime_row) = self.acp_session_repo.get_for_user(user_id, &conversation_id).await? else {
+            return Ok(response);
+        };
+        let Some(runtime_session_id) = runtime_row.session_id else {
+            return Ok(response);
+        };
+        let runtime_state = self
+            .acp_session_repo
+            .load_runtime_state_for_user(user_id, &conversation_id)
+            .await?
+            .unwrap_or_default();
+        let state = match runtime_state.binding_state.as_deref() {
+            Some("not_resumable") => RuntimeBindingState::NotResumable,
+            Some("resume_failed") => RuntimeBindingState::ResumeFailed,
+            Some("revalidation_required") => RuntimeBindingState::RevalidationRequired,
+            Some("unavailable") => RuntimeBindingState::Unavailable,
+            Some("broken") => RuntimeBindingState::Broken,
+            _ => RuntimeBindingState::Bound,
+        };
+        let workspace_path = serde_json::from_str::<serde_json::Value>(&conversation.extra)
+            .ok()
+            .and_then(|extra| {
+                extra
+                    .get("workspace")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            });
+        response.runtime_binding = Some(RuntimeBindingResponse {
+            runtime_type: "codex".to_owned(),
+            integration_mode: "app_server".to_owned(),
+            runtime_session_id,
+            state,
+            workspace_path,
+            runtime_version: runtime_state.runtime_version,
+            account_generation: runtime_state.account_generation,
+            last_observed_at: runtime_row.last_active_at,
+        });
+        Ok(response)
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -941,7 +998,7 @@ impl ConversationService {
             })
             .await?;
         info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, "task session created");
-        task_session_response(row)
+        self.task_session_response_with_runtime(user_id, row).await
     }
 
     pub async fn list_task_sessions(
@@ -949,12 +1006,12 @@ impl ConversationService {
         user_id: &str,
         conversation_id: Option<&str>,
     ) -> Result<Vec<TaskSessionResponse>, ConversationError> {
-        self.task_session_repo()?
-            .list(user_id, conversation_id)
-            .await?
-            .into_iter()
-            .map(task_session_response)
-            .collect()
+        let rows = self.task_session_repo()?.list(user_id, conversation_id).await?;
+        let mut responses = Vec::with_capacity(rows.len());
+        for row in rows {
+            responses.push(self.task_session_response_with_runtime(user_id, row).await?);
+        }
+        Ok(responses)
     }
 
     pub async fn get_task_session(&self, user_id: &str, id: &str) -> Result<TaskSessionResponse, ConversationError> {
@@ -963,7 +1020,7 @@ impl ConversationService {
             .get(user_id, id)
             .await?
             .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
-        task_session_response(row)
+        self.task_session_response_with_runtime(user_id, row).await
     }
 
     pub async fn get_task_planning_isolation(
@@ -1284,7 +1341,7 @@ impl ConversationService {
             )
             .await?;
         info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, "task session updated");
-        task_session_response(row)
+        self.task_session_response_with_runtime(user_id, row).await
     }
 
     pub async fn recover_task_sessions(&self) -> Result<u64, ConversationError> {
@@ -1621,7 +1678,7 @@ impl ConversationService {
         let status = run.status;
 
         Ok(TaskReviewResponse {
-            task: task_session_response(task_row)?,
+            task: self.task_session_response_with_runtime(user_id, task_row).await?,
             run,
             artifacts,
             approvals,
@@ -3383,6 +3440,7 @@ impl ConversationService {
                 current_model_id: model.map(Some),
                 config_selections_json: None,
                 context_usage_json: None,
+                ..Default::default()
             };
             self.acp_session_repo
                 .save_runtime_state_for_user(user_id, conversation_id, &params)
@@ -4714,6 +4772,7 @@ impl ConversationService {
                     current_model_id: state.current_model_id.as_deref().map(Some),
                     config_selections_json: None,
                     context_usage_json: None,
+                    ..Default::default()
                 };
                 if (seed.current_mode_id.is_some() || seed.current_model_id.is_some())
                     && let Err(err) = self
