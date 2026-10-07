@@ -71,7 +71,10 @@ jobs:
           prefix-key: v1-rust
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
-      - run: cargo test --workspace
+      # nextest already runs the workspace unit and integration suites. Keep the
+      # cargo test pass for the one class nextest intentionally does not run,
+      # without executing every unit test a second time in one shared harness.
+      - run: cargo test --workspace --doc
 
   changes:
     name: Detect dependency changes
