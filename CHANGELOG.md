@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.16](https://github.com/suoak/AionCore/compare/v0.2.15...v0.2.16) (2026-10-07)
+
+
+### Features
+
+* **codex:** add managed ChatGPT account authentication ([#136](https://github.com/suoak/AionCore/issues/136)) ([60e38d4](https://github.com/suoak/AionCore/commit/60e38d4886e19349c780d625e46e34f2e54b4773))
+* **codex:** M6.3 model discovery and selection ([#138](https://github.com/suoak/AionCore/issues/138)) ([4537950](https://github.com/suoak/AionCore/commit/45379501ad1efa736ccbf75a6c85ea78e9847e0b))
+* **codex:** persist resumable thread bindings ([#137](https://github.com/suoak/AionCore/issues/137)) ([ebcb741](https://github.com/suoak/AionCore/commit/ebcb7411d5b023fdbad2ac137b47b05b8469f103))
+* **context:** add deterministic context resolver ([034bcdf](https://github.com/suoak/AionCore/commit/034bcdfaf8fecdb1e5382492a36cd83d854e5d9d))
+* **context:** add provider-neutral enterprise context foundation ([205dea9](https://github.com/suoak/AionCore/commit/205dea9e0aa131f33421d80926c22101b4a94c93))
+
 ## [0.2.15](https://github.com/suoak/AionCore/compare/v0.2.14...v0.2.15) (2026-10-06)
 
 
