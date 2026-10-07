@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.17](https://github.com/suoak/AionCore/compare/v0.2.16...v0.2.17) (2026-10-07)
+
+
+### Bug Fixes
+
+* fail closed when deleting active conversations ([#141](https://github.com/suoak/AionCore/issues/141)) ([b3cfa64](https://github.com/suoak/AionCore/commit/b3cfa6479d4ddbd7847319ec91eb034948d844ee))
+
 ## [0.2.16](https://github.com/suoak/AionCore/compare/v0.2.15...v0.2.16) (2026-10-07)
 
 
