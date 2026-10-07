@@ -5265,6 +5265,7 @@ async fn save_acp_runtime_mode_updates_runtime_mode_config_selection() {
             .to_string(),
         ),
         context_usage_json: None,
+        ..Default::default()
     }));
     let (svc, _, repo, _) = make_service_with_resolver_and_acp_session_repo(
         Arc::new(FixedSkillResolver { names: vec![] }),

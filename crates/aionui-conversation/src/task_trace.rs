@@ -254,6 +254,28 @@ impl TaskTraceContext {
 
     pub(crate) async fn observe(&self, event: &AgentStreamEvent) -> Result<(), DbError> {
         match event {
+            AgentStreamEvent::BackendTurnBound(turn_id) => {
+                self.event(
+                    "runtime.turn.bound",
+                    serde_json::json!({
+                        "runtime_type": "codex",
+                        "integration_mode": "app_server",
+                        "turn_id": turn_id
+                    }),
+                )
+                .await?;
+            }
+            AgentStreamEvent::Finish(data) if data.session_id.is_some() => {
+                self.event(
+                    "runtime.session.observed",
+                    serde_json::json!({
+                        "runtime_type": "codex",
+                        "integration_mode": "app_server",
+                        "runtime_session_id": data.session_id
+                    }),
+                )
+                .await?;
+            }
             AgentStreamEvent::ToolCall(data) => {
                 let capability = capability_for_tool(&data.name);
                 let (allowed, first) = self.record_start(&data.call_id, &data.name, capability).await?;

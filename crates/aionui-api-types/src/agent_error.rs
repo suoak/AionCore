@@ -30,6 +30,7 @@ pub enum AgentErrorCode {
     UserAgentDisconnected,
     UserAgentAuthRequired,
     UserAgentSessionNotFound,
+    RuntimeSessionNotFound,
     UserAgentNoPreviousSession,
     UserAgentProtocolParseError,
     UserAgentInvalidRequest,

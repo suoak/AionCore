@@ -39,6 +39,12 @@ impl TurnRecoveryPolicy {
 
         let decision = if lifecycle == RuntimeLifecycleState::Active
             && agent_type == AgentType::Acp
+            // A Codex turn may already have performed a mutation before its
+            // app-server connection fails, even when no visible output or tool
+            // event reached WorkMate. Re-attaching the thread is safe; replaying
+            // the interrupted turn is not. Keep Codex fail-closed and require a
+            // new user turn after recovery.
+            && backend != Some("codex")
             && session_lifetime != SessionLifetime::ConnectionScoped
             && outcome.terminal.is_error()
             && retryable == Some(true)
@@ -146,12 +152,12 @@ mod tests {
     }
 
     #[test]
-    fn retryable_clean_acp_error_auto_replays_once() {
+    fn retryable_clean_non_codex_acp_error_auto_replays_once() {
         let outcome = retryable_clean_error();
 
         let decision = TurnRecoveryPolicy::decide(
             AgentType::Acp,
-            Some("codex"),
+            Some("claude"),
             SessionLifetime::Persistent,
             &outcome,
             RuntimeLifecycleState::Active,
@@ -166,6 +172,22 @@ mod tests {
                 session_recovery_signal: None,
             }
         );
+    }
+
+    #[test]
+    fn codex_error_never_auto_replays_a_turn() {
+        let outcome = retryable_clean_error();
+
+        let decision = TurnRecoveryPolicy::decide(
+            AgentType::Acp,
+            Some("codex"),
+            SessionLifetime::Persistent,
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
+
+        assert_eq!(decision, TurnRecoveryDecision::None);
     }
 
     #[test]
@@ -229,14 +251,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            decision,
-            TurnRecoveryDecision::AutoReplayOnce {
-                reason: AgentKillReason::AgentErrorRecovery,
-                safe_to_auto_replay: true,
-                session_recovery_signal: Some(SessionRecoverySignal::CompactFailed),
-            }
-        );
+        assert_eq!(decision, TurnRecoveryDecision::None);
     }
 
     #[test]
@@ -293,14 +308,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            decision,
-            TurnRecoveryDecision::AutoReplayOnce {
-                reason: AgentKillReason::AgentErrorRecovery,
-                safe_to_auto_replay: true,
-                session_recovery_signal: Some(SessionRecoverySignal::ResumeFailed),
-            }
-        );
+        assert_eq!(decision, TurnRecoveryDecision::None);
     }
 
     #[test]

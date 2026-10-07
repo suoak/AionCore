@@ -124,6 +124,9 @@ fn decode_runtime_state(raw: &str) -> Result<PersistedSessionState, DbError> {
             .map(ToOwned::to_owned);
         state.config_selections_json = rt.get("config_selections").map(serde_json::Value::to_string);
         state.context_usage_json = rt.get("context_usage").map(serde_json::Value::to_string);
+        state.binding_state = rt.get("binding_state").and_then(Value::as_str).map(ToOwned::to_owned);
+        state.runtime_version = rt.get("runtime_version").and_then(Value::as_str).map(ToOwned::to_owned);
+        state.account_generation = rt.get("account_generation").and_then(Value::as_u64);
     }
     Ok(state)
 }
@@ -180,6 +183,36 @@ fn merge_runtime_state(raw: &str, params: &SaveRuntimeStateParams<'_>) -> Result
             }
             None => {
                 runtime.remove("context_usage");
+            }
+        }
+    }
+    if let Some(outer) = params.binding_state {
+        match outer {
+            Some(v) => {
+                runtime.insert("binding_state".into(), Value::String(v.to_owned()));
+            }
+            None => {
+                runtime.remove("binding_state");
+            }
+        }
+    }
+    if let Some(outer) = params.runtime_version {
+        match outer {
+            Some(v) => {
+                runtime.insert("runtime_version".into(), Value::String(v.to_owned()));
+            }
+            None => {
+                runtime.remove("runtime_version");
+            }
+        }
+    }
+    if let Some(outer) = params.account_generation {
+        match outer {
+            Some(v) => {
+                runtime.insert("account_generation".into(), Value::Number(v.into()));
+            }
+            None => {
+                runtime.remove("account_generation");
             }
         }
     }
@@ -278,6 +311,38 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn bind_session_id_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
+        let now = now_ms();
+        let result = sqlx::query(
+            "UPDATE acp_session SET session_id = ?, last_active_at = ? \
+             WHERE conversation_id = ? AND (session_id IS NULL OR session_id = ?) \
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+        )
+        .bind(session_id)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+        let existing = self.get_for_user(user_id, conversation_id).await?;
+        match existing {
+            Some(row) if row.session_id.as_deref() != Some(session_id) => Err(DbError::Conflict(format!(
+                "RUNTIME_BINDING_CONFLICT: conversation '{conversation_id}' is already bound"
+            ))),
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
     }
 
     async fn clear_session_id_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
@@ -502,6 +567,41 @@ mod tests {
         assert_eq!(fetched.session_id.as_deref(), Some("sess-owner"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_bind_has_one_winner_and_is_idempotent() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding-race.db");
+        let db = crate::init_database(&path).await.unwrap();
+        let second_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(false)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        let left = SqliteAcpSessionRepository::new(db.pool().clone());
+        let right = SqliteAcpSessionRepository::new(second_pool);
+        insert_conversation(&left, "user-1", "conv-1").await;
+        left.create(&create_params("conv-1")).await.unwrap();
+        let (a, b) = tokio::join!(
+            left.bind_session_id_for_user("user-1", "conv-1", "thread-a"),
+            right.bind_session_id_for_user("user-1", "conv-1", "thread-b")
+        );
+        assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1);
+        let winner = left.get_for_user("user-1", "conv-1").await.unwrap().unwrap();
+        let winner_id = winner.session_id.expect("one binding persisted");
+        assert!(
+            left.bind_session_id_for_user("user-1", "conv-1", &winner_id)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn clear_session_id_nulls_field_but_keeps_row() {
         let (repo, _db) = setup().await;
@@ -590,6 +690,9 @@ mod tests {
                     current_model_id: Some(Some("claude-sonnet-4")),
                     config_selections_json: Some(Some(r#"{"reasoning":"high"}"#)),
                     context_usage_json: Some(Some(r#"{"used":10,"total":100}"#)),
+                    binding_state: Some(Some("bound")),
+                    runtime_version: Some(Some("0.160.1")),
+                    account_generation: Some(Some(7)),
                 },
             )
             .await
@@ -599,6 +702,9 @@ mod tests {
         let state = repo.load_runtime_state_unscoped("conv-1").await.unwrap().unwrap();
         assert_eq!(state.current_mode_id.as_deref(), Some("code"));
         assert_eq!(state.current_model_id.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(state.binding_state.as_deref(), Some("bound"));
+        assert_eq!(state.runtime_version.as_deref(), Some("0.160.1"));
+        assert_eq!(state.account_generation, Some(7));
         // The stored JSON should parse back to the same payload
         // regardless of key order (serde_json::Map preserves insertion
         // order but the caller shouldn't depend on it here).

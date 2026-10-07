@@ -168,6 +168,7 @@ impl PendingUpdate {
             current_model_id: self.current_model_id.as_ref().map(Option::as_deref),
             config_selections_json: self.config_selections_json.as_ref().map(Option::as_deref),
             context_usage_json: self.context_usage_json.as_ref().map(Option::as_deref),
+            ..Default::default()
         }
     }
 
@@ -234,7 +235,7 @@ async fn domain_event_consumer(
             Some(event) => {
                 if let AcpSessionEvent::SessionAssigned { session_id } = &event {
                     match repo
-                        .update_session_id_for_user(&user_id, &conversation_id, session_id.as_str())
+                        .bind_session_id_for_user(&user_id, &conversation_id, session_id.as_str())
                         .await
                     {
                         Ok(true) => {}

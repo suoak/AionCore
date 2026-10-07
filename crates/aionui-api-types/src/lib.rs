@@ -259,11 +259,11 @@ pub use task_session::{
     AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,
     AgentIntegrationMode, CreateTaskSessionRequest, DecideTaskApprovalRequest, ExecuteApprovedPlanRequest,
     ListTaskSessionsQuery, PlanningIsolationLevel, PlanningIsolationResponse, PolicyDecision, PolicyDecisionKind,
-    StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalDecision,
-    TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskArtifactStatus,
-    TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse,
-    TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, ToolCapability,
-    UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
+    RuntimeBindingResponse, RuntimeBindingState, StartAutomaticPlanningRequest, SubmitTaskArtifactRequest,
+    SubmitTaskArtifactResponse, TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind,
+    TaskArtifactResponse, TaskArtifactStatus, TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse,
+    TaskReviewSummary, TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus,
+    TaskTraceEventResponse, ToolCapability, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,

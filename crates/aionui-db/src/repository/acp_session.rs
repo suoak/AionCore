@@ -42,6 +42,11 @@ pub struct PersistedSessionState {
     /// JSON-encoded `UsageUpdate`. Same rationale as
     /// `config_selections_json`.
     pub context_usage_json: Option<String>,
+    /// Stable WorkMate projection of the runtime continuation state. This is
+    /// metadata only; `session_id` remains the authoritative resume anchor.
+    pub binding_state: Option<String>,
+    pub runtime_version: Option<String>,
+    pub account_generation: Option<u64>,
 }
 
 /// Partial update for [`IAcpSessionRepository::save_runtime_state_for_user`].
@@ -54,6 +59,9 @@ pub struct SaveRuntimeStateParams<'a> {
     pub current_model_id: Option<Option<&'a str>>,
     pub config_selections_json: Option<Option<&'a str>>,
     pub context_usage_json: Option<Option<&'a str>>,
+    pub binding_state: Option<Option<&'a str>>,
+    pub runtime_version: Option<Option<&'a str>>,
+    pub account_generation: Option<Option<u64>>,
 }
 
 impl SaveRuntimeStateParams<'_> {
@@ -62,6 +70,9 @@ impl SaveRuntimeStateParams<'_> {
             && self.current_model_id.is_none()
             && self.config_selections_json.is_none()
             && self.context_usage_json.is_none()
+            && self.binding_state.is_none()
+            && self.runtime_version.is_none()
+            && self.account_generation.is_none()
     }
 }
 
@@ -84,6 +95,20 @@ pub trait IAcpSessionRepository: Send + Sync {
         conversation_id: &str,
         session_id: &str,
     ) -> Result<bool, DbError>;
+
+    /// Atomically bind the first backend continuation id. Repeating the same
+    /// value is idempotent; attempting to replace a live value is a conflict.
+    /// Implementations that cannot provide compare-and-set semantics fall back
+    /// to the legacy update operation.
+    async fn bind_session_id_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
+        self.update_session_id_for_user(user_id, conversation_id, session_id)
+            .await
+    }
 
     /// Null the stored `session_id`, dropping the resume anchor while keeping the
     /// row (config/runtime state) intact. Called on an unrecoverable resume error
