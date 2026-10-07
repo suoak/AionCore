@@ -32,7 +32,10 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::{PromptMediaCaps, SendMessageData};
-use aionui_api_types::{AcpBuildExtra, AgentErrorCode, AgentErrorOwnership, TEAM_MCP_SERVER_NAME};
+use aionui_api_types::{
+    AcpBuildExtra, AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind,
+    AgentErrorResolutionTarget, TEAM_MCP_SERVER_NAME,
+};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
@@ -1438,7 +1441,10 @@ impl IAgentTask for SessionAgentTask {
                         Some(detail),
                         false,
                         false,
-                        None,
+                        Some(AgentErrorResolution::new(
+                            AgentErrorResolutionKind::StartNewSession,
+                            Some(AgentErrorResolutionTarget::NewConversation),
+                        )),
                     ))
                 } else {
                     Err(AgentSendError::from_agent_error(AgentError::not_found(format!(
@@ -6835,6 +6841,14 @@ mod persist_tests {
             err.code(),
             Some(aionui_api_types::AgentErrorCode::RuntimeSessionNotFound),
             "classified as session-not-found without exposing raw protocol errors to the UI"
+        );
+        assert_eq!(
+            err.stream_error().resolution,
+            Some(AgentErrorResolution::new(
+                AgentErrorResolutionKind::StartNewSession,
+                Some(AgentErrorResolutionTarget::NewConversation),
+            )),
+            "the failure requires an explicit user action instead of replay"
         );
         let row = repo
             .get_for_user("user-1", "conv-1")
