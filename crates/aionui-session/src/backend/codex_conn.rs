@@ -9750,8 +9750,9 @@ mod tests {
             "Fork must NOT pre-seed the binding — the parent id is only the fork source"
         );
 
-        // Release the thread/started for the NEW thread: the reader binds it and
-        // lowers BackendBound{th-child} (the fork conversation's resume anchor).
+        // Release thread/started for the NEW zero-turn thread. It becomes the
+        // in-memory send target, but 0.160.1 cannot resume it until a turn creates
+        // a rollout, so it must not yet become a durable BackendBound anchor.
         release();
         let bound = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(env) = events.next().await {
@@ -9764,7 +9765,7 @@ mod tests {
         .await
         .ok()
         .flatten();
-        assert_eq!(bound.as_deref(), Some("th-child"), "the NEW thread id is lowered");
+        assert_eq!(bound, None, "a zero-turn fork must not publish a durable resume anchor");
         assert_eq!(
             backend.thread_binding.lock().await.as_deref(),
             Some("th-child"),
