@@ -82,6 +82,8 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
+    /// Shared registry-backed process boundary for direct CLI services.
+    pub(crate) session_spawner: Arc<dyn aionui_process::Spawner>,
     backend_binary_path: Arc<PathBuf>,
     runtime_helper_bin: String,
     runtime_base_url: String,
@@ -369,7 +371,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
-            session_spawner,
+            session_spawner: session_spawner.clone(),
             // agy cannot prompt for tool permission in headless mode, so AionUi
             // registers itself as its PreToolUse hook; the hook process calls
             // back here to raise the user's permission card.
@@ -461,6 +463,7 @@ impl AppServices {
             app_version,
             skill_paths,
             skill_repo,
+            session_spawner,
             backend_binary_path,
             runtime_helper_bin,
             runtime_base_url,

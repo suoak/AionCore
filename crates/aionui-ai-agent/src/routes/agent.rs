@@ -13,9 +13,10 @@ use axum::extract::{Extension, Json, Path, State};
 use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
-    AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, ApiResponse, CustomAgentUpsertRequest,
-    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
-    SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
+    AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, ApiResponse, CodexAccountView,
+    CodexLoginStartResponse, CustomAgentUpsertRequest, DeleteCustomAgentResponse, ProviderHealthCheckRequest,
+    ProviderHealthCheckResponse, SetAgentOverridesRequest, SetEnabledRequest, TryConnectCustomAgentRequest,
+    TryConnectCustomAgentResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -38,7 +39,65 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/custom", post(create_custom))
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
+        .route("/api/agents/codex/account", get(get_codex_account))
+        .route("/api/agents/codex/account/refresh", post(refresh_codex_account))
+        .route("/api/agents/codex/account/login", post(start_codex_login))
+        .route("/api/agents/codex/account/login/cancel", post(cancel_codex_login))
+        .route("/api/agents/codex/account/logout", post(logout_codex_account))
         .with_state(state)
+}
+
+async fn get_codex_account(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<CodexAccountView>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.codex_account.view().await.map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn refresh_codex_account(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<CodexAccountView>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.codex_account.refresh().await.map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn start_codex_login(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<CodexLoginStartResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .codex_account
+            .start_chatgpt_login()
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn cancel_codex_login(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<CodexAccountView>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .codex_account
+            .cancel_login()
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn logout_codex_account(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<CodexAccountView>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.codex_account.logout().await.map_err(agent_error_to_api_error)?,
+    )))
 }
 
 async fn list_agent_logos(

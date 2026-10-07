@@ -6,7 +6,9 @@
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
+use aionui_ai_agent::{
+    AgentRouterState, AgentService, CodexAccountService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService,
+};
 use aionui_assistant::{
     AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentCancellationOutcome,
     AgentWorkflowAgentExecutionCancellationPort, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
@@ -306,6 +308,28 @@ pub async fn build_module_states(
         .with_agent_availability_feedback(agent_service.availability_feedback_port());
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: agent service built");
 
+    let codex_program = aionui_runtime::resolve_command_path("codex").unwrap_or_else(|| "codex".into());
+    let codex_task_manager = services.worker_task_manager.clone();
+    let codex_account = CodexAccountService::new(
+        services.session_spawner.clone(),
+        codex_program,
+        services.event_bus.clone(),
+        Some(Arc::new(move || {
+            let killed = codex_task_manager.kill_backend("codex", Some(AgentKillReason::AccountChanged));
+            if killed > 0 {
+                tracing::info!(killed, "recycled Codex sessions after account identity change");
+            }
+        })),
+    );
+    let startup_account = codex_account.clone();
+    tokio::spawn(async move {
+        if let Err(error) = startup_account.initialize().await {
+            // Runtime installation and authentication are separate axes. A
+            // missing/old Codex must not prevent WorkMate from starting.
+            tracing::info!(error = %error, "codex account startup read unavailable");
+        }
+    });
+
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
@@ -349,6 +373,7 @@ pub async fn build_module_states(
         agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
             agent_registry: services.agent_registry.clone(),
             service: agent_service,
+            codex_account,
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,

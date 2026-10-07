@@ -68,6 +68,12 @@ pub trait IWorkerTaskManager: Send + Sync {
         Vec::new()
     }
 
+    /// Kill initialized tasks owned by one vendor backend. Account services
+    /// use this to fail closed across an identity change.
+    fn kill_backend(&self, _backend: &str, _reason: Option<AgentKillReason>) -> usize {
+        0
+    }
+
     /// Collect tasks eligible for idle cleanup.
     ///
     /// Returns conversation IDs of tasks that:
@@ -82,6 +88,7 @@ pub trait IWorkerTaskManager: Send + Sync {
 struct ManagedAgentTask {
     agent: AgentInstance,
     runtime_capabilities: RuntimeCapabilities,
+    backend: Option<String>,
 }
 
 /// Per-conversation slot: an [`OnceCell`] that the first concurrent caller
@@ -198,12 +205,18 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         // failure the cell stays empty so a later caller can retry.
         let factory = self.factory.clone();
         let runtime_capabilities = options.runtime_capabilities.clone();
+        let backend = match &options.context.kind {
+            crate::session_context::AgentSessionKind::Acp(context) => context.config.backend.clone(),
+            crate::session_context::AgentSessionKind::Antigravity(_) => Some("antigravity".into()),
+            crate::session_context::AgentSessionKind::Aionrs(_) => Some("aionrs".into()),
+        };
         let managed = slot
             .get_or_try_init(|| async move {
                 let agent = factory(options).await?;
                 Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
                     agent,
                     runtime_capabilities,
+                    backend,
                 })
             })
             .await?;
@@ -296,6 +309,26 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             .iter()
             .filter_map(|entry| entry.value().get().map(|_| entry.key().clone()))
             .collect()
+    }
+
+    fn kill_backend(&self, backend: &str, reason: Option<AgentKillReason>) -> usize {
+        let ids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .get()
+                    .filter(|managed| managed.backend.as_deref() == Some(backend))
+                    .map(|_| entry.key().clone())
+            })
+            .collect();
+        for id in &ids {
+            if let Err(error) = self.kill(id, reason) {
+                warn!(conversation_id = %id, backend, error = %ErrorChain(&error), "Failed to kill backend task");
+            }
+        }
+        ids.len()
     }
 
     fn collect_idle(&self, idle_threshold_ms: TimestampMs) -> Vec<String> {
@@ -549,6 +582,7 @@ mod tests {
         ManagedAgentTask {
             agent,
             runtime_capabilities: RuntimeCapabilities::default(),
+            backend: None,
         }
     }
 
@@ -628,6 +662,25 @@ mod tests {
         ids.sort();
 
         assert_eq!(ids, vec!["conv-1".to_owned(), "conv-2".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn kill_backend_only_recycles_matching_vendor_tasks() {
+        let mgr = make_manager();
+        let mut codex = make_options("codex-conv");
+        let mut claude = make_options("claude-conv");
+        if let AgentSessionKind::Acp(context) = &mut codex.context.kind {
+            context.config.backend = Some("codex".into());
+        }
+        if let AgentSessionKind::Acp(context) = &mut claude.context.kind {
+            context.config.backend = Some("claude".into());
+        }
+        mgr.get_or_build_task("codex-conv", codex).await.unwrap();
+        mgr.get_or_build_task("claude-conv", claude).await.unwrap();
+
+        assert_eq!(mgr.kill_backend("codex", Some(AgentKillReason::AccountChanged)), 1);
+        assert!(mgr.get_task("codex-conv").is_none());
+        assert!(mgr.get_task("claude-conv").is_some());
     }
 
     #[tokio::test]
