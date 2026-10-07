@@ -430,10 +430,18 @@ impl IConversationRepository for SqliteConversationRepository {
         }
 
         // A permanent conversation delete owns its WorkMate task aggregate.
-        // Removing the task-session root cascades runs, traces, checkpoints,
-        // evidence, approvals, artifacts, criteria, and context snapshots. It
-        // also removes the RESTRICT references from task_runs before the
-        // conversation row is deleted.
+        // Runs must go first because their immutable artifact/approval links
+        // are RESTRICT references. Run deletion cascades trace, checkpoint,
+        // evidence, and context rows; removing the task-session root then
+        // cascades approvals, artifacts, criteria, and remaining children.
+        sqlx::query(
+            "DELETE FROM task_runs WHERE task_session_id IN (\
+             SELECT id FROM task_sessions WHERE user_id = ? AND conversation_id = ?)",
+        )
+        .bind(user_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM task_sessions WHERE user_id = ? AND conversation_id = ?")
             .bind(user_id)
             .bind(id)
