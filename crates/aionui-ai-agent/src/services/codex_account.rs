@@ -1127,7 +1127,7 @@ mod tests {
         assert_eq!(projected.ordinary_usage_allowed, None);
         assert_eq!(projected.availability, CodexUsageAvailability::Unknown);
         assert_eq!(projected.buckets.len(), 2);
-        assert_eq!(projected.reset_credits.unwrap().available_count, 1);
+        assert_eq!(projected.reset_credits.as_ref().unwrap().available_count, 1);
         let json = serde_json::to_value(projected).unwrap().to_string();
         assert!(!json.contains("rateLimitUpsell") && !json.contains("unknown_future_field"));
     }
