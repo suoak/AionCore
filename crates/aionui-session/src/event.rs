@@ -39,6 +39,19 @@ pub struct UsageBreakdown {
     pub thought_tokens: u64,
 }
 
+/// Exact provider-reported token counters. Unlike `UsageDelta`, this snapshot
+/// preserves cumulative (`total`) and latest-turn (`last`) domains separately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsageCounters {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
+}
+
 impl UsageBreakdown {
     /// Whether anything was reported. A fully zeroed breakdown is indistinguishable
     /// from "this backend tells us nothing", so it is omitted rather than rendered
@@ -340,6 +353,18 @@ pub enum SessionEvent {
         /// `tokenUsage.modelContextWindow`, which is nullable). Renders as the
         /// denominator of the usage indicator; `None` leaves it a bare counter.
         context_window: Option<u64>,
+    },
+
+    /// Exact Codex `thread/tokenUsage/updated` snapshot. Consumers replace the
+    /// previous snapshot for this thread; cumulative notifications are never
+    /// summed. It is retained separately from account activity and allowance.
+    RuntimeUsageSnapshot {
+        runtime_type: String,
+        thread_id: String,
+        turn_id: String,
+        total: TokenUsageCounters,
+        last: TokenUsageCounters,
+        model_context_window: Option<u64>,
     },
 
     /// MCP / tool provisioning as a LIVE event (Addendum 5 / U16). Reducer no-op.
@@ -972,6 +997,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | AskResolved { .. }
         | PromptAccepted { .. }
         | UsageDelta { .. }
+        | RuntimeUsageSnapshot { .. }
         | Provisioning { .. }
         | Rewound { .. }
         | ConfigChanged { .. }
@@ -1017,6 +1043,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             // record is the completed ToolResult (full aggregatedOutput / per-file diff).
             ToolOutputDelta { .. } | TurnDiffUpdated { .. } => PersistTier::Ephemeral,
             ItemStarted { .. } | ItemCompleted { .. } => PersistTier::Ephemeral, // lifecycle brackets
+            RuntimeUsageSnapshot { .. } => PersistTier::Ephemeral, // latest snapshot is bounded runtime state
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)

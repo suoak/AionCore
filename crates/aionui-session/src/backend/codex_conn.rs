@@ -1782,6 +1782,18 @@ async fn reader_task(
                                 *thread_binding.lock().await = Some(tid.to_string());
                             }
                         }
+                        if m == "thread/tokenUsage/updated" {
+                            let notification_thread = params.get("threadId").and_then(Value::as_str);
+                            let current_thread = thread_binding.lock().await.clone();
+                            if notification_thread.is_none() || current_thread.as_deref() != notification_thread {
+                                tracing::debug!(
+                                    notification_thread,
+                                    current_thread,
+                                    "ignoring token usage for a stale or unknown Codex thread"
+                                );
+                                continue;
+                            }
+                        }
                         if m == "turn/started" {
                             terminated = false; // a new turn can terminate once (R8 reset)
                             idle_pending = false; // and a fresh turn has no deferred idle
@@ -1914,8 +1926,9 @@ async fn reader_task(
                         // (no double terminal). `willRetry:true` is a transient retry →
                         // still falls through to map_notification → Heartbeat (NOT a
                         // terminal). See protocols/design/aioncore-codex-turn-no-terminal-hang-prompt.md.
+                        let rate_limited = m == "error" && codex_error_is_rate_limited(params);
                         if m == "error"
-                            && params.get("willRetry").and_then(Value::as_bool) != Some(true)
+                            && (params.get("willRetry").and_then(Value::as_bool) != Some(true) || rate_limited)
                             && turn_in_flight.load(Ordering::SeqCst)
                         {
                             if !terminated {
@@ -1924,11 +1937,14 @@ async fn reader_task(
                                 system_error_deadline = None;
                                 *active_turn_id.lock().await = None;
                                 turn_in_flight.store(false, Ordering::SeqCst);
-                                let message = params
+                                let mut message = params
                                     .get("error")
                                     .and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
                                     .unwrap_or("codex reported a fatal error")
                                     .to_string();
+                                if rate_limited {
+                                    message = format!("RATE_LIMITED: {message}");
+                                }
                                 tracing::warn!(
                                     conversation_id = %session_id,
                                     turn_gen = cur,
@@ -3672,8 +3688,9 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
 fn map_usage(params: &Value) -> Vec<SessionEvent> {
     let usage = params.get("tokenUsage").unwrap_or(&Value::Null);
     let last = usage.get("last").unwrap_or(&Value::Null);
+    let total = usage.get("total").unwrap_or(&Value::Null);
     let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
-    vec![SessionEvent::UsageDelta {
+    let mut events = vec![SessionEvent::UsageDelta {
         input_tokens: g("inputTokens"),
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),
@@ -3706,7 +3723,33 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
             cached_write_tokens: g("cacheWriteInputTokens"),
             thought_tokens: g("reasoningOutputTokens"),
         },
-    }]
+    }];
+    if let (Some(thread_id), Some(turn_id)) = (
+        params.get("threadId").and_then(Value::as_str),
+        params.get("turnId").and_then(Value::as_str),
+    ) {
+        events.push(SessionEvent::RuntimeUsageSnapshot {
+            runtime_type: "codex".into(),
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            total: token_usage_counters(total),
+            last: token_usage_counters(last),
+            model_context_window: usage.get("modelContextWindow").and_then(Value::as_u64),
+        });
+    }
+    events
+}
+
+fn token_usage_counters(value: &Value) -> crate::event::TokenUsageCounters {
+    let get = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    crate::event::TokenUsageCounters {
+        input_tokens: get("inputTokens"),
+        cached_input_tokens: get("cachedInputTokens"),
+        cache_write_input_tokens: get("cacheWriteInputTokens"),
+        output_tokens: get("outputTokens"),
+        reasoning_output_tokens: get("reasoningOutputTokens"),
+        total_tokens: get("totalTokens"),
+    }
 }
 
 #[cfg(test)]
@@ -3733,7 +3776,7 @@ mod usage_window_tests {
         let events = map_usage(&params);
         assert!(
             matches!(
-                events.as_slice(),
+                &events[..1],
                 [SessionEvent::UsageDelta {
                     input_tokens: 11024,
                     output_tokens: 6,
@@ -3769,6 +3812,27 @@ mod usage_window_tests {
         assert_eq!(b.thought_tokens, 242, "reasoningOutputTokens is the thinking count");
     }
 
+    #[test]
+    fn exact_thread_snapshot_keeps_total_and_last_separate_without_summing() {
+        let params = json!({
+            "threadId":"thread-current","turnId":"turn-2",
+            "tokenUsage":{
+                "modelContextWindow":200000,
+                "last":{"inputTokens":8,"cachedInputTokens":3,"cacheWriteInputTokens":1,"outputTokens":2,"reasoningOutputTokens":1,"totalTokens":10},
+                "total":{"inputTokens":108,"cachedInputTokens":33,"cacheWriteInputTokens":4,"outputTokens":22,"reasoningOutputTokens":9,"totalTokens":130}
+            }
+        });
+        let events = map_usage(&params);
+        assert!(matches!(
+            &events[1],
+            SessionEvent::RuntimeUsageSnapshot { thread_id, turn_id, total, last, model_context_window: Some(200000), .. }
+                if thread_id == "thread-current"
+                    && turn_id == "turn-2"
+                    && total.total_tokens == 130
+                    && last.total_tokens == 10
+        ));
+    }
+
     /// `modelContextWindow` is `int|null` in the schema — a null (or absent) field
     /// must degrade to `None`, never to 0, which would render a 0-sized bar.
     #[test]
@@ -3780,7 +3844,7 @@ mod usage_window_tests {
             let params: Value = serde_json::from_str(raw).unwrap();
             assert!(
                 matches!(
-                    map_usage(&params).as_slice(),
+                    &map_usage(&params)[..1],
                     [SessionEvent::UsageDelta {
                         context_window: None,
                         total_tokens: 5,
@@ -3790,6 +3854,19 @@ mod usage_window_tests {
                 "expected no window for {raw}"
             );
         }
+    }
+
+    #[test]
+    fn structured_and_text_rate_limit_errors_are_terminal_classes() {
+        assert!(codex_error_is_rate_limited(&json!({
+            "error":{"message":"limit", "codexErrorInfo":"usageLimitExceeded"}, "willRetry":true
+        })));
+        assert!(codex_error_is_rate_limited(&json!({
+            "error":{"message":"Usage limit reached"}, "willRetry":false
+        })));
+        assert!(!codex_error_is_rate_limited(&json!({
+            "error":{"message":"temporary network failure"}, "willRetry":true
+        })));
     }
 }
 
@@ -3963,6 +4040,24 @@ fn synth_error_terminal(message: String) -> SessionEvent {
         epoch: 0,
         outcome: TurnOutcome::Failed,
     }
+}
+
+fn codex_error_is_rate_limited(params: &Value) -> bool {
+    let error = params.get("error").unwrap_or(&Value::Null);
+    let structured = error.get("codexErrorInfo");
+    if matches!(
+        structured.and_then(Value::as_str),
+        Some("usageLimitExceeded" | "rateLimitExceeded")
+    ) {
+        return true;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    message.contains("usage limit") || message.contains("rate limit") || message.contains("quota exceeded")
 }
 
 /// turn/completed → TurnResult, mapping turn.status → outcome (§C2/O3):
@@ -5739,6 +5834,60 @@ mod tests {
             "the fatal error message rides result_text, got {:?}",
             tr.1
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_error_wins_over_retry_flag_and_trailing_completion() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(
+            concat!(
+                r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th1"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"th1","turnId":"t1","willRetry":true,"error":{"message":"usage limit reached","codexErrorInfo":"usageLimitExceeded"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed"}}}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let releaser = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-rate-limit", Box::new(fake)).await;
+        backend.mark_turn_in_flight_for_test();
+        let mut events = backend.events();
+        releaser();
+
+        let mut terminals = Vec::new();
+        for _ in 0..12 {
+            match tokio::time::timeout(std::time::Duration::from_millis(150), events.next()).await {
+                Ok(Some(env)) => {
+                    if let SessionEvent::TurnResult {
+                        is_error, result_text, ..
+                    } = env.event
+                    {
+                        terminals.push((is_error, result_text));
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(terminals.len(), 1, "the trailing completion must be absorbed");
+        assert!(terminals[0].0);
+        assert!(terminals[0].1.starts_with("RATE_LIMITED:"));
+    }
+
+    #[tokio::test]
+    async fn token_usage_for_previous_thread_is_ignored() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-current"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thread-old","turnId":"turn-old","tokenUsage":{"last":{"inputTokens":8,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":10},"total":{"inputTokens":8,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0,"totalTokens":10}}}}"#,
+        ])
+        .await;
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionEvent::UsageDelta { .. } | SessionEvent::RuntimeUsageSnapshot { .. }
+        )));
     }
 
     /// thread/status/changed → systemError with NO follow-up before EOF: the

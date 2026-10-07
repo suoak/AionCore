@@ -2891,6 +2891,7 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
         SessionEvent::Ask { .. } => "Ask",
         SessionEvent::AskResolved { .. } => "AskResolved",
         SessionEvent::UsageDelta { .. } => "UsageDelta",
+        SessionEvent::RuntimeUsageSnapshot { .. } => "RuntimeUsageSnapshot",
         SessionEvent::ConfigChanged { .. } => "ConfigChanged",
         SessionEvent::BackendBound { .. } => "BackendBound",
         SessionEvent::PromptAccepted { .. } => "PromptAccepted",
@@ -3863,6 +3864,9 @@ async fn persist_side_effects(
                 tracing::warn!(conversation_id, error = %err, "session-sync: save_runtime_state failed");
             }
         }
+        SessionEvent::RuntimeUsageSnapshot { .. } => {
+            persist_runtime_usage_snapshot(repo, user_id, conversation_id, event).await;
+        }
         // Token usage → the `context_usage` runtime snapshot the usage indicator
         // reads back. This is the ONLY durable sink for direct-CLI usage: the pump
         // is session-scoped and outlives the per-turn `StreamRelay`, so it still
@@ -4036,6 +4040,66 @@ async fn persist_context_usage(
         .await
     {
         tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
+    }
+}
+
+/// Replace the exact current-thread snapshot in the same bounded runtime state
+/// used by TaskRun boundary capture. Notifications are cumulative snapshots,
+/// never deltas, so replacement is the only correct operation.
+async fn persist_runtime_usage_snapshot(
+    repo: &dyn IAcpSessionRepository,
+    user_id: &str,
+    conversation_id: &str,
+    event: &SessionEvent,
+) {
+    let SessionEvent::RuntimeUsageSnapshot {
+        runtime_type,
+        thread_id,
+        turn_id,
+        total,
+        last,
+        model_context_window,
+    } = event
+    else {
+        return;
+    };
+    let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
+        Ok(Some(state)) => state
+            .context_usage_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        Ok(None) => serde_json::Map::new(),
+        Err(error) => {
+            tracing::warn!(conversation_id, error = %error, "session-sync: load runtime usage failed");
+            return;
+        }
+    };
+    usage.insert(
+        "runtime_usage".into(),
+        serde_json::json!({
+            "runtime_type": runtime_type,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "total": total,
+            "last": last,
+            "model_context_window": model_context_window,
+            "snapshot_semantics": "replace"
+        }),
+    );
+    let Ok(json) = serde_json::to_string(&usage) else {
+        return;
+    };
+    let params = SaveRuntimeStateParams {
+        context_usage_json: Some(Some(&json)),
+        ..Default::default()
+    };
+    if let Err(error) = repo
+        .save_runtime_state_for_user(user_id, conversation_id, &params)
+        .await
+    {
+        tracing::warn!(conversation_id, error = %error, "session-sync: save runtime usage failed");
     }
 }
 
@@ -4875,6 +4939,10 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             usage["output_tokens"] = serde_json::json!(output_tokens);
             vec![AgentStreamEvent::AcpContextUsage(usage)]
         }
+        // Persisted into the bounded runtime snapshot for TaskRun/Review. The
+        // existing context indicator consumes UsageDelta and must not confuse
+        // cumulative `total` with latest-turn `last`.
+        SessionEvent::RuntimeUsageSnapshot { .. } => Vec::new(),
         // Nothing HERE, because this function is stateless: the current-value highlight
         // lives in the runtime's overrides, so all `translate_event` could build is a
         // mode-only frame — and the frontend REPLACES its whole snapshot on
@@ -6793,6 +6861,41 @@ mod persist_tests {
             stored["cost"]["amount"], 0.5,
             "a costless update must not blank the cost"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_usage_snapshot_replaces_cumulative_values_and_thread_identity() {
+        let (repo, _db) = seeded_repo().await;
+        let snapshot = |thread: &str, turn: &str, total: u64, last: u64| SessionEvent::RuntimeUsageSnapshot {
+            runtime_type: "codex".into(),
+            thread_id: thread.into(),
+            turn_id: turn.into(),
+            total: aionui_session::TokenUsageCounters {
+                total_tokens: total,
+                ..Default::default()
+            },
+            last: aionui_session::TokenUsageCounters {
+                total_tokens: last,
+                ..Default::default()
+            },
+            model_context_window: Some(200_000),
+        };
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &snapshot("thread-a", "turn-1", 100, 20),
+        )
+        .await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &snapshot("thread-b", "turn-2", 7, 7)).await;
+
+        let stored = stored_usage(repo.as_ref()).await;
+        let runtime = &stored["runtime_usage"];
+        assert_eq!(runtime["thread_id"], "thread-b");
+        assert_eq!(runtime["turn_id"], "turn-2");
+        assert_eq!(runtime["total"]["total_tokens"], 7);
+        assert_eq!(runtime["last"]["total_tokens"], 7);
+        assert_eq!(runtime["snapshot_semantics"], "replace");
     }
 
     /// A `/compact` turn ends with an all-zero `usage` object (live-captured on
