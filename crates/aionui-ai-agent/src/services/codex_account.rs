@@ -5,15 +5,18 @@
 //! Wire evidence: Codex CLI 0.160.1 generated schemas under
 //! `~/aion/protocols/samples/codex-cli/0.160.1/schema-full/`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aionui_api_types::{
-    CodexAccountErrorCode, CodexAccountView, CodexAccountWarning, CodexAuthState, CodexLoginStartResponse,
-    WebSocketMessage,
+    CodexAccountErrorCode, CodexAccountUsageSummary, CodexAccountUsageView, CodexAccountView, CodexAccountWarning,
+    CodexAuthState, CodexCreditsSnapshot, CodexDailyUsageBucket, CodexDiagnosticCheck, CodexDiagnosticStatus,
+    CodexDiagnosticsView, CodexLoginStartResponse, CodexRateLimitBucket, CodexRateLimitWindow, CodexRateLimitsView,
+    CodexResetCredit, CodexResetCreditSummary, CodexSnapshotFreshness, CodexSnapshotSource, CodexSpendControlSnapshot,
+    CodexUsageAvailability, WebSocketMessage,
 };
 use aionui_common::{CommandSpec, now_ms};
 use aionui_process::{ManagedProcess, Spawner};
@@ -206,8 +209,10 @@ pub struct CodexAccountService {
     broadcaster: Arc<dyn EventBroadcaster>,
     rpc: Mutex<Option<Arc<dyn CodexAccountRpc>>>,
     state: Mutex<CodexAccountStateMachine>,
-    rate_limits: RwLock<Option<Value>>,
-    token_usage: RwLock<Option<Value>>,
+    raw_rate_limits: RwLock<Option<Value>>,
+    rate_limits: RwLock<Option<CodexRateLimitsView>>,
+    usage: RwLock<Option<CodexAccountUsageView>>,
+    diagnostics: RwLock<CodexDiagnosticsView>,
     installed_version: RwLock<Option<String>>,
     warnings: RwLock<Vec<CodexAccountWarning>>,
     refresh_gate: Mutex<()>,
@@ -228,8 +233,10 @@ impl CodexAccountService {
             broadcaster,
             rpc: Mutex::new(None),
             state: Mutex::new(CodexAccountStateMachine::default()),
+            raw_rate_limits: RwLock::new(None),
             rate_limits: RwLock::new(None),
-            token_usage: RwLock::new(None),
+            usage: RwLock::new(None),
+            diagnostics: RwLock::new(empty_diagnostics()),
             installed_version: RwLock::new(None),
             warnings: RwLock::new(Vec::new()),
             refresh_gate: Mutex::new(()),
@@ -286,18 +293,31 @@ impl CodexAccountService {
             callback();
         }
 
+        // Account identity is the cache generation boundary. Never show the
+        // previous account's optional snapshots if a new account's read fails.
+        if identity_changed {
+            *self.raw_rate_limits.write().await = None;
+            *self.rate_limits.write().await = None;
+            *self.usage.write().await = None;
+        }
+
         let signed_in = self.state.lock().await.snapshot().auth_state == CodexAuthState::SignedIn;
         self.warnings.write().await.clear();
         if signed_in {
-            let (rates, usage) = tokio::join!(
+            let (rates, usage, diagnostics) = tokio::join!(
                 rpc.call("account/rateLimits/read", Value::Null),
                 rpc.call("account/usage/read", Value::Null),
+                rpc.call("server/diagnostics", json!({})),
             );
             self.apply_optional_snapshot(rates, true).await;
             self.apply_optional_snapshot(usage, false).await;
+            self.apply_diagnostics(diagnostics).await;
         } else {
+            *self.raw_rate_limits.write().await = None;
             *self.rate_limits.write().await = None;
-            *self.token_usage.write().await = None;
+            *self.usage.write().await = None;
+            self.apply_diagnostics(rpc.call("server/diagnostics", json!({})).await)
+                .await;
         }
         let view = self.current_view().await;
         self.broadcast(&view);
@@ -356,7 +376,8 @@ impl CodexAccountService {
             .await
             .map_err(|_| AgentError::bad_gateway("LOGOUT_FAILED: Codex logout failed"))?;
         *self.rate_limits.write().await = None;
-        *self.token_usage.write().await = None;
+        *self.raw_rate_limits.write().await = None;
+        *self.usage.write().await = None;
         self.refresh().await
     }
 
@@ -364,9 +385,15 @@ impl CodexAccountService {
         match result {
             Ok(value) => {
                 if rate_limits {
-                    *self.rate_limits.write().await = Some(value);
+                    *self.raw_rate_limits.write().await = Some(value.clone());
+                    *self.rate_limits.write().await = Some(project_rate_limits(
+                        &value,
+                        now_ms(),
+                        CodexSnapshotSource::Read,
+                        CodexSnapshotFreshness::Fresh,
+                    ));
                 } else {
-                    *self.token_usage.write().await = Some(value);
+                    *self.usage.write().await = Some(project_account_usage(&value, now_ms()));
                 }
             }
             Err(_) => {
@@ -385,8 +412,132 @@ impl CodexAccountService {
                     code,
                     message: message.into(),
                 });
+                if rate_limits {
+                    let mut snapshot = self.rate_limits.write().await;
+                    if snapshot.is_some() {
+                        mark_rate_freshness(&mut snapshot, CodexSnapshotFreshness::Stale);
+                    } else {
+                        *snapshot = Some(CodexRateLimitsView {
+                            ordinary_usage_allowed: None,
+                            availability: CodexUsageAvailability::Unknown,
+                            buckets: Vec::new(),
+                            reset_credits: None,
+                            fetched_at: now_ms(),
+                            source: CodexSnapshotSource::Read,
+                            freshness: CodexSnapshotFreshness::Unavailable,
+                        });
+                    }
+                } else {
+                    let mut snapshot = self.usage.write().await;
+                    if snapshot.is_some() {
+                        mark_usage_freshness(&mut snapshot, CodexSnapshotFreshness::Stale);
+                    } else {
+                        *snapshot = Some(CodexAccountUsageView {
+                            summary: CodexAccountUsageSummary::default(),
+                            daily_buckets: Vec::new(),
+                            fetched_at: now_ms(),
+                            source: CodexSnapshotSource::Read,
+                            freshness: CodexSnapshotFreshness::Unavailable,
+                        });
+                    }
+                }
             }
         }
+    }
+
+    async fn apply_diagnostics(&self, result: Result<Value, CodexRpcError>) {
+        let now = now_ms();
+        let account = self.state.lock().await.snapshot();
+        let warnings = self.warnings.read().await.clone();
+        let mut checks = vec![CodexDiagnosticCheck {
+            id: "runtime.version".into(),
+            status: if self.installed_version.read().await.is_some() {
+                CodexDiagnosticStatus::Pass
+            } else {
+                CodexDiagnosticStatus::Warn
+            },
+            summary: "Codex runtime version probe".into(),
+            remediation: self
+                .installed_version
+                .read()
+                .await
+                .is_none()
+                .then(|| "Verify that the configured Codex executable is runnable".into()),
+        }];
+        checks.push(CodexDiagnosticCheck {
+            id: "account.authentication".into(),
+            status: match account.auth_state {
+                CodexAuthState::SignedIn => CodexDiagnosticStatus::Pass,
+                CodexAuthState::SignedOut => CodexDiagnosticStatus::NotApplicable,
+                CodexAuthState::Authenticating | CodexAuthState::Unknown => CodexDiagnosticStatus::Warn,
+                CodexAuthState::Error => CodexDiagnosticStatus::Fail,
+            },
+            summary: "Codex-managed account authentication".into(),
+            remediation: (account.auth_state == CodexAuthState::Error)
+                .then(|| "Refresh the account or sign in again through Codex".into()),
+        });
+        for (id, warning_code, summary) in [
+            (
+                "account.rate_limits",
+                CodexAccountErrorCode::RateLimitReadFailed,
+                "Rate-limit snapshot",
+            ),
+            (
+                "account.usage",
+                CodexAccountErrorCode::UsageReadFailed,
+                "Account usage snapshot",
+            ),
+        ] {
+            let failed = warnings.iter().any(|warning| warning.code == warning_code);
+            checks.push(CodexDiagnosticCheck {
+                id: id.into(),
+                status: if account.auth_state != CodexAuthState::SignedIn {
+                    CodexDiagnosticStatus::NotApplicable
+                } else if failed {
+                    CodexDiagnosticStatus::Warn
+                } else {
+                    CodexDiagnosticStatus::Pass
+                },
+                summary: summary.into(),
+                remediation: failed.then(|| "Refresh after checking account connectivity".into()),
+            });
+        }
+        let (server_status, remediation) = match result {
+            Ok(value)
+                if value
+                    .get("process")
+                    .and_then(|v| v.get("id"))
+                    .and_then(Value::as_u64)
+                    .is_some() =>
+            {
+                (CodexDiagnosticStatus::Pass, None)
+            }
+            _ => (
+                CodexDiagnosticStatus::Warn,
+                Some("Update Codex or retry the read-only diagnostic".into()),
+            ),
+        };
+        checks.push(CodexDiagnosticCheck {
+            id: "server.process".into(),
+            status: server_status,
+            summary: "Content-free app-server diagnostics".into(),
+            remediation,
+        });
+        if server_status != CodexDiagnosticStatus::Pass {
+            self.warnings.write().await.push(CodexAccountWarning {
+                code: CodexAccountErrorCode::DiagnosticFailed,
+                message: "Codex diagnostics are unavailable".into(),
+            });
+        }
+        *self.diagnostics.write().await = CodexDiagnosticsView {
+            checks,
+            fetched_at: now,
+            freshness: if server_status == CodexDiagnosticStatus::Pass {
+                CodexSnapshotFreshness::Fresh
+            } else {
+                CodexSnapshotFreshness::Unavailable
+            },
+        };
     }
 
     async fn handle_notification(self: Arc<Self>, notification: RpcNotification) {
@@ -411,12 +562,31 @@ impl CodexAccountService {
                     tracing::debug!(login_id, "ignoring stale Codex login completion");
                 }
             }
-            "account/updated" | "account/rateLimits/updated" => self.schedule_refresh(),
+            "account/updated" => self.schedule_refresh(),
+            "account/rateLimits/updated" => {
+                self.merge_rate_limit_notification(&notification.params).await;
+                self.schedule_refresh();
+            }
             _ => {}
         }
     }
 
     fn schedule_refresh(self: &Arc<Self>) {
+        let weak_refresh = Arc::downgrade(self);
+        tokio::spawn(async move {
+            if let Some(service) = weak_refresh.upgrade() {
+                {
+                    let mut snapshot = service.rate_limits.write().await;
+                    mark_rate_freshness(&mut snapshot, CodexSnapshotFreshness::Refreshing);
+                }
+                {
+                    let mut snapshot = service.usage.write().await;
+                    mark_usage_freshness(&mut snapshot, CodexSnapshotFreshness::Refreshing);
+                }
+                let view = service.current_view().await;
+                service.broadcast(&view);
+            }
+        });
         let generation = self.invalidation_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -431,11 +601,31 @@ impl CodexAccountService {
         });
     }
 
+    async fn merge_rate_limit_notification(&self, params: &Value) {
+        let Some(update) = params.get("rateLimits").and_then(Value::as_object) else {
+            return;
+        };
+        let mut raw = self.raw_rate_limits.write().await;
+        let Some(root) = raw.as_mut().and_then(Value::as_object_mut) else {
+            return;
+        };
+        let bucket = root.entry("rateLimits").or_insert_with(|| json!({}));
+        merge_sparse_json(bucket, &Value::Object(update.clone()));
+        let merged = Value::Object(root.clone());
+        *self.rate_limits.write().await = Some(project_rate_limits(
+            &merged,
+            now_ms(),
+            CodexSnapshotSource::NotificationMerge,
+            CodexSnapshotFreshness::Refreshing,
+        ));
+    }
+
     async fn current_view(&self) -> CodexAccountView {
         CodexAccountView {
             account: self.state.lock().await.snapshot(),
             rate_limits: self.rate_limits.read().await.clone(),
-            token_usage: self.token_usage.read().await.clone(),
+            usage: self.usage.read().await.clone(),
+            diagnostics: self.diagnostics.read().await.clone(),
             warnings: self.warnings.read().await.clone(),
             installed_version: self.installed_version.read().await.clone(),
             required_version: aionui_session::VERIFIED_CODEX_VERSION.into(),
@@ -448,6 +638,193 @@ impl CodexAccountService {
                 .broadcast(WebSocketMessage::new(CODEX_ACCOUNT_UPDATED_EVENT, payload));
         }
     }
+}
+
+fn empty_diagnostics() -> CodexDiagnosticsView {
+    CodexDiagnosticsView {
+        checks: Vec::new(),
+        fetched_at: 0,
+        freshness: CodexSnapshotFreshness::Unavailable,
+    }
+}
+
+fn merge_sparse_json(target: &mut Value, update: &Value) {
+    if let (Some(target), Some(update)) = (target.as_object_mut(), update.as_object()) {
+        for (key, value) in update {
+            if value.is_null() {
+                continue;
+            }
+            match target.get_mut(key) {
+                Some(existing) if existing.is_object() && value.is_object() => merge_sparse_json(existing, value),
+                _ => {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    } else if !update.is_null() {
+        *target = update.clone();
+    }
+}
+
+fn mark_rate_freshness(snapshot: &mut Option<CodexRateLimitsView>, freshness: CodexSnapshotFreshness) {
+    if let Some(snapshot) = snapshot {
+        snapshot.freshness = freshness;
+    }
+}
+
+fn mark_usage_freshness(snapshot: &mut Option<CodexAccountUsageView>, freshness: CodexSnapshotFreshness) {
+    if let Some(snapshot) = snapshot {
+        snapshot.freshness = freshness;
+    }
+}
+
+fn project_rate_limits(
+    value: &Value,
+    fetched_at: i64,
+    source: CodexSnapshotSource,
+    freshness: CodexSnapshotFreshness,
+) -> CodexRateLimitsView {
+    let ordinary_usage_allowed = value.get("ordinaryUsageAllowed").and_then(Value::as_bool);
+    let mut buckets = BTreeMap::<String, CodexRateLimitBucket>::new();
+    if let Some(by_id) = value.get("rateLimitsByLimitId").and_then(Value::as_object) {
+        for (key, raw) in by_id {
+            let bucket = project_rate_bucket(key, raw);
+            buckets.insert(key.clone(), bucket);
+        }
+    }
+    if let Some(raw) = value.get("rateLimits").filter(|value| value.is_object()) {
+        let inferred_key = raw
+            .get("limitId")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .unwrap_or("default");
+        buckets
+            .entry(inferred_key.to_owned())
+            .or_insert_with(|| project_rate_bucket(inferred_key, raw));
+    }
+    let buckets: Vec<_> = buckets.into_values().collect();
+    let explicitly_blocked = buckets
+        .iter()
+        .any(|bucket| bucket.rate_limit_reached_type.is_some() || bucket.spend_control_reached == Some(true));
+    let saturated = buckets.iter().any(|bucket| {
+        bucket.primary.as_ref().is_some_and(|window| window.used_percent >= 100)
+            || bucket
+                .secondary
+                .as_ref()
+                .is_some_and(|window| window.used_percent >= 100)
+    });
+    let availability = if ordinary_usage_allowed == Some(false) || explicitly_blocked {
+        CodexUsageAvailability::Blocked
+    } else if ordinary_usage_allowed == Some(true) && saturated {
+        CodexUsageAvailability::Limited
+    } else if ordinary_usage_allowed == Some(true) {
+        CodexUsageAvailability::Available
+    } else {
+        CodexUsageAvailability::Unknown
+    };
+    CodexRateLimitsView {
+        ordinary_usage_allowed,
+        availability,
+        buckets,
+        reset_credits: value.get("rateLimitResetCredits").and_then(project_reset_credits),
+        fetched_at,
+        source,
+        freshness,
+    }
+}
+
+fn project_rate_bucket(key: &str, value: &Value) -> CodexRateLimitBucket {
+    CodexRateLimitBucket {
+        key: key.to_owned(),
+        limit_id: string_field(value, "limitId"),
+        limit_name: string_field(value, "limitName"),
+        normal_model_slug: string_field(value, "normalModelSlug"),
+        plan_type: string_field(value, "planType"),
+        primary: value.get("primary").and_then(project_rate_window),
+        secondary: value.get("secondary").and_then(project_rate_window),
+        credits: value.get("credits").and_then(|credits| {
+            Some(CodexCreditsSnapshot {
+                has_credits: credits.get("hasCredits")?.as_bool()?,
+                unlimited: credits.get("unlimited")?.as_bool()?,
+                balance: string_field(credits, "balance"),
+            })
+        }),
+        individual_limit: value.get("individualLimit").and_then(|limit| {
+            Some(CodexSpendControlSnapshot {
+                limit: limit.get("limit")?.as_str()?.to_owned(),
+                used: limit.get("used")?.as_str()?.to_owned(),
+                remaining_percent: limit.get("remainingPercent")?.as_i64()?,
+                resets_at: limit.get("resetsAt")?.as_i64()?,
+            })
+        }),
+        rate_limit_reached_type: string_field(value, "rateLimitReachedType"),
+        spend_control_reached: value.get("spendControlReached").and_then(Value::as_bool),
+    }
+}
+
+fn project_rate_window(value: &Value) -> Option<CodexRateLimitWindow> {
+    Some(CodexRateLimitWindow {
+        used_percent: value.get("usedPercent")?.as_i64()?,
+        resets_at: value.get("resetsAt").and_then(Value::as_i64),
+        window_duration_mins: value.get("windowDurationMins").and_then(Value::as_i64),
+    })
+}
+
+fn project_reset_credits(value: &Value) -> Option<CodexResetCreditSummary> {
+    let credits = value
+        .get("credits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|credit| {
+            Some(CodexResetCredit {
+                id: credit.get("id")?.as_str()?.to_owned(),
+                status: credit.get("status")?.as_str()?.to_owned(),
+                reset_type: credit.get("resetType")?.as_str()?.to_owned(),
+                granted_at: credit.get("grantedAt")?.as_i64()?,
+                expires_at: credit.get("expiresAt").and_then(Value::as_i64),
+                title: string_field(credit, "title"),
+                description: string_field(credit, "description"),
+            })
+        })
+        .collect();
+    Some(CodexResetCreditSummary {
+        available_count: value.get("availableCount")?.as_i64()?,
+        credits,
+    })
+}
+
+fn project_account_usage(value: &Value, fetched_at: i64) -> CodexAccountUsageView {
+    let summary = value.get("summary").unwrap_or(&Value::Null);
+    let daily_buckets = value
+        .get("dailyUsageBuckets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|bucket| {
+            Some(CodexDailyUsageBucket {
+                start_date: bucket.get("startDate")?.as_str()?.to_owned(),
+                tokens: bucket.get("tokens")?.as_i64()?,
+            })
+        })
+        .collect();
+    CodexAccountUsageView {
+        summary: CodexAccountUsageSummary {
+            lifetime_tokens: summary.get("lifetimeTokens").and_then(Value::as_i64),
+            peak_daily_tokens: summary.get("peakDailyTokens").and_then(Value::as_i64),
+            longest_running_turn_sec: summary.get("longestRunningTurnSec").and_then(Value::as_i64),
+            current_streak_days: summary.get("currentStreakDays").and_then(Value::as_i64),
+            longest_streak_days: summary.get("longestStreakDays").and_then(Value::as_i64),
+        },
+        daily_buckets,
+        fetched_at,
+        source: CodexSnapshotSource::Read,
+        freshness: CodexSnapshotFreshness::Fresh,
+    }
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+    value.get(field).and_then(Value::as_str).map(ToOwned::to_owned)
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String, AgentError> {
@@ -597,8 +974,10 @@ mod tests {
             broadcaster: Arc::new(NoopBroadcaster),
             rpc: Mutex::new(Some(fake)),
             state: Mutex::new(CodexAccountStateMachine::default()),
+            raw_rate_limits: RwLock::new(None),
             rate_limits: RwLock::new(None),
-            token_usage: RwLock::new(None),
+            usage: RwLock::new(None),
+            diagnostics: RwLock::new(empty_diagnostics()),
             installed_version: RwLock::new(Some("0.160.1".into())),
             warnings: RwLock::new(Vec::new()),
             refresh_gate: Mutex::new(()),
@@ -651,14 +1030,20 @@ mod tests {
             CodexAuthState::SignedOut
         );
 
-        *service.rate_limits.write().await = Some(json!({"stale":true}));
-        *service.token_usage.write().await = Some(json!({"stale":true}));
+        *service.raw_rate_limits.write().await = Some(json!({"rateLimits":{}}));
+        *service.rate_limits.write().await = Some(project_rate_limits(
+            &json!({"rateLimits":{}}),
+            1,
+            CodexSnapshotSource::Read,
+            CodexSnapshotFreshness::Fresh,
+        ));
+        *service.usage.write().await = Some(project_account_usage(&json!({"summary":{}}), 1));
         fake.enqueue("account/logout", Ok(json!({}))).await;
         fake.enqueue("account/read", Ok(json!({"account":null,"requiresOpenaiAuth":true})))
             .await;
         let view = service.logout().await.unwrap();
         assert_eq!(view.account.auth_state, CodexAuthState::SignedOut);
-        assert!(view.rate_limits.is_none() && view.token_usage.is_none());
+        assert!(view.rate_limits.is_none() && view.usage.is_none());
     }
 
     #[tokio::test]
@@ -671,7 +1056,16 @@ mod tests {
         .await;
         let view = service(fake).refresh().await.unwrap();
         assert_eq!(view.account.auth_state, CodexAuthState::SignedIn);
-        assert_eq!(view.warnings.len(), 2);
+        assert!(
+            view.warnings
+                .iter()
+                .any(|warning| warning.code == CodexAccountErrorCode::RateLimitReadFailed)
+        );
+        assert!(
+            view.warnings
+                .iter()
+                .any(|warning| warning.code == CodexAccountErrorCode::UsageReadFailed)
+        );
     }
 
     #[tokio::test]
@@ -709,5 +1103,130 @@ mod tests {
         let service = service(fake);
         assert!(service.refresh().await.is_err());
         assert_eq!(service.view().await.unwrap().account.auth_state, CodexAuthState::Error);
+    }
+
+    #[test]
+    fn rate_limit_projection_supports_multiple_buckets_and_preserves_unknown_permission() {
+        let projected = project_rate_limits(
+            &json!({
+                "ordinaryUsageAllowed": null,
+                "rateLimits": {"limitId":"codex", "primary":{"usedPercent":10}},
+                "rateLimitsByLimitId": {
+                    "codex": {"limitId":"codex", "primary":{"usedPercent":10}},
+                    "luna": {"limitId":"luna", "secondary":{"usedPercent":100}}
+                },
+                "rateLimitResetCredits": {"availableCount":1,"credits":[{
+                    "id":"credit-1","status":"available","resetType":"codexRateLimits","grantedAt":7
+                }]},
+                "rateLimitUpsell": {"unknown_future_field":"ignored"}
+            }),
+            42,
+            CodexSnapshotSource::Read,
+            CodexSnapshotFreshness::Fresh,
+        );
+        assert_eq!(projected.ordinary_usage_allowed, None);
+        assert_eq!(projected.availability, CodexUsageAvailability::Unknown);
+        assert_eq!(projected.buckets.len(), 2);
+        assert_eq!(projected.reset_credits.unwrap().available_count, 1);
+        let json = serde_json::to_value(projected).unwrap().to_string();
+        assert!(!json.contains("rateLimitUpsell") && !json.contains("unknown_future_field"));
+    }
+
+    #[test]
+    fn explicit_provider_permission_controls_availability_without_percentage_inference() {
+        for (allowed, expected) in [
+            (Some(false), CodexUsageAvailability::Blocked),
+            (Some(true), CodexUsageAvailability::Limited),
+            (None, CodexUsageAvailability::Unknown),
+        ] {
+            let mut raw = json!({"rateLimits":{"primary":{"usedPercent":100}}});
+            raw["ordinaryUsageAllowed"] = allowed.map(Value::Bool).unwrap_or(Value::Null);
+            assert_eq!(
+                project_rate_limits(&raw, 1, CodexSnapshotSource::Read, CodexSnapshotFreshness::Fresh).availability,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_notification_merges_known_fields_then_debounced_read_is_bounded() {
+        let fake = FakeRpc::new();
+        fake.enqueue(
+            "account/read",
+            Ok(json!({"account":{"type":"chatgpt","email":"a@example.com","planType":"plus"}})),
+        )
+        .await;
+        fake.enqueue(
+            "account/rateLimits/read",
+            Ok(json!({"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","limitName":"Codex","primary":{"usedPercent":12}}})),
+        )
+        .await;
+        fake.enqueue("account/usage/read", Ok(json!({"summary":{}}))).await;
+        fake.enqueue("server/diagnostics", Ok(json!({"process":{"id":1},"gauges":[]})))
+            .await;
+        let service = service(fake.clone());
+        service.refresh().await.unwrap();
+
+        for used in 20..40 {
+            service
+                .clone()
+                .handle_notification(RpcNotification {
+                    method: "account/rateLimits/updated".into(),
+                    params: json!({"rateLimits":{"limitName":null,"primary":{"usedPercent":used}}}),
+                })
+                .await;
+        }
+        let merged = service.rate_limits.read().await.clone().unwrap();
+        assert_eq!(merged.source, CodexSnapshotSource::NotificationMerge);
+        assert_eq!(merged.buckets[0].limit_name.as_deref(), Some("Codex"));
+
+        fake.enqueue(
+            "account/read",
+            Ok(json!({"account":{"type":"chatgpt","email":"a@example.com","planType":"plus"}})),
+        )
+        .await;
+        fake.enqueue(
+            "account/rateLimits/read",
+            Ok(json!({"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","primary":{"usedPercent":39}}})),
+        )
+        .await;
+        fake.enqueue("account/usage/read", Ok(json!({"summary":{}}))).await;
+        fake.enqueue("server/diagnostics", Ok(json!({"process":{"id":1},"gauges":[]})))
+            .await;
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        let calls = fake.calls.lock().await;
+        assert_eq!(calls.iter().filter(|(method, _)| *method == "account/read").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn account_switch_invalidates_optional_snapshots_before_failed_reads() {
+        let fake = FakeRpc::new();
+        for email in ["a@example.com", "b@example.com"] {
+            fake.enqueue(
+                "account/read",
+                Ok(json!({"account":{"type":"chatgpt","email":email,"planType":"plus"}})),
+            )
+            .await;
+            if email.starts_with('a') {
+                fake.enqueue(
+                    "account/rateLimits/read",
+                    Ok(json!({"ordinaryUsageAllowed":true,"rateLimits":{}})),
+                )
+                .await;
+                fake.enqueue("account/usage/read", Ok(json!({"summary":{"lifetimeTokens":9}})))
+                    .await;
+            }
+            fake.enqueue("server/diagnostics", Ok(json!({"process":{"id":1},"gauges":[]})))
+                .await;
+        }
+        let service = service(fake);
+        assert!(service.refresh().await.unwrap().rate_limits.is_some());
+        let switched = service.refresh().await.unwrap();
+        assert_eq!(
+            switched.rate_limits.unwrap().freshness,
+            CodexSnapshotFreshness::Unavailable
+        );
+        assert_eq!(switched.usage.unwrap().freshness, CodexSnapshotFreshness::Unavailable);
+        assert_eq!(switched.account.auth_state, CodexAuthState::SignedIn);
     }
 }
