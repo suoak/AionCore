@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.19](https://github.com/suoak/AionCore/compare/v0.2.18...v0.2.19) (2026-10-21)
+
+
+### Bug Fixes
+
+* **security:** limit agent cross-session delivery to @@-selected targets (batch 2) ([#147](https://github.com/suoak/AionCore/issues/147)) ([efe0d22](https://github.com/suoak/AionCore/commit/efe0d226cfd4a9c2821f64526961972ac008dbe2))
+* **security:** require per-launch secret for local desktop API (batch 2) ([#145](https://github.com/suoak/AionCore/issues/145)) ([7f4da3e](https://github.com/suoak/AionCore/commit/7f4da3e0f66886f3e82f38b5fb2aa7d9c10af591))
+* **security:** scope agent runtime tokens and require user approval for config writes (batch 2) ([#146](https://github.com/suoak/AionCore/issues/146)) ([df22ec8](https://github.com/suoak/AionCore/commit/df22ec8ff4dcd294c0111f4408ca01a7ed8aa57c))
+
 ## [0.2.18](https://github.com/suoak/AionCore/compare/v0.2.17...v0.2.18) (2026-10-21)
 
 
