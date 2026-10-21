@@ -7,6 +7,7 @@ mod csrf;
 mod error;
 mod extract;
 mod jwt;
+pub mod local_secret;
 pub mod middleware;
 mod password;
 pub mod qr_token;
@@ -61,6 +62,9 @@ pub use security::security_headers_middleware;
 
 // CSRF protection
 pub use csrf::csrf_middleware;
+
+// Local (desktop) API secret
+pub use local_secret::{LOCAL_API_SECRET_HEADER, LOCAL_AUTH_STDIN_ENV, LocalApiSecret, LocalApiSecretError};
 
 // Auth middleware
 pub use middleware::{

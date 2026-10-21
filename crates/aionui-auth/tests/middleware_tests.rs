@@ -10,8 +10,8 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthState, CookieConfig, CurrentUser, IRuntimeTokenVerifier, JwtService, RateLimiter,
-    TokenPayload, api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware,
+    AuthIdentityMode, AuthState, CookieConfig, CurrentUser, IRuntimeTokenVerifier, JwtService, LocalApiSecret,
+    RateLimiter, TokenPayload, api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware,
     authenticated_action_rate_limit_middleware, csrf_middleware, security_headers_middleware,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, UserType, init_database_memory};
@@ -183,6 +183,7 @@ fn protected_auth_app_with_mode_and_verifier(
         user_repo,
         identity_mode,
         runtime_token_verifier,
+        local_secret: None,
     };
 
     Router::new()
@@ -203,6 +204,7 @@ fn identity_echo_app(
         user_repo,
         identity_mode,
         runtime_token_verifier,
+        local_secret: None,
     };
 
     Router::new()
@@ -858,4 +860,166 @@ async fn csrf_exempts_requests_bearing_runtime_token_header() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ============================================================
+// Local mode with a per-launch desktop secret
+// ============================================================
+
+const LOCAL_SECRET: &str = "desktop-launch-secret-0123456789-abcdefghijk";
+
+fn local_secret_echo_app(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    local_secret: Option<LocalApiSecret>,
+    runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+) -> Router {
+    let state = AuthState {
+        jwt_service,
+        user_repo,
+        identity_mode: AuthIdentityMode::Local,
+        runtime_token_verifier,
+        local_secret,
+    };
+    Router::new()
+        .route(
+            "/whoami",
+            get(|user: axum::Extension<CurrentUser>| async move { user.id.clone() }),
+        )
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+async fn body_text(resp: axum::response::Response) -> String {
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn local_mode_without_secret_keeps_legacy_default_user() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = local_secret_echo_app(jwt_service, repo, None, None);
+
+    let resp = app
+        .oneshot(Request::get("/whoami").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_text(resp).await, "system_default_user");
+}
+
+#[tokio::test]
+async fn local_mode_with_secret_rejects_anonymous_callers() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = local_secret_echo_app(
+        jwt_service,
+        repo,
+        Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
+        None,
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/whoami").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .oneshot(
+            Request::get("/whoami")
+                .header("x-aionui-local-secret", "desktop-launch-secret-0123456789-WRONGWRONG")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn local_mode_with_secret_accepts_desktop_header() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = local_secret_echo_app(
+        jwt_service,
+        repo,
+        Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
+        None,
+    );
+
+    let resp = app
+        .oneshot(
+            Request::get("/whoami")
+                .header("x-aionui-local-secret", LOCAL_SECRET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_text(resp).await, "system_default_user");
+}
+
+#[tokio::test]
+async fn local_mode_with_secret_still_accepts_webui_session_jwt() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let token = jwt_service
+        .sign_with_session_generation("system_default_user", "admin", 0)
+        .unwrap();
+    let app = local_secret_echo_app(
+        jwt_service,
+        repo,
+        Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
+        None,
+    );
+
+    let resp = app
+        .oneshot(
+            Request::get("/whoami")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_text(resp).await, "system_default_user");
+}
+
+#[tokio::test]
+async fn local_mode_with_secret_still_accepts_runtime_helper_token() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = local_secret_echo_app(
+        jwt_service,
+        repo,
+        Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
+        Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(helper_request(Some("tok-1"), "system_default_user", "conv-1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_text(resp).await, "system_default_user");
+
+    let resp = app
+        .oneshot(helper_request(Some("forged"), "system_default_user", "conv-1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

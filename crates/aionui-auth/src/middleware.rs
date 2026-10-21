@@ -12,6 +12,7 @@ use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
 use crate::extract::extract_token_from_headers;
+use crate::local_secret::LocalApiSecret;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthIdentityMode {
@@ -75,6 +76,11 @@ pub struct AuthState {
     /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
     /// `None` disables the channel (requests without a JWT are rejected).
     pub runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+    /// Per-launch desktop secret (local mode only). `None` keeps the legacy
+    /// behaviour where every local caller is the default user. When set, only
+    /// requests presenting the secret are the desktop user; all other callers
+    /// fall through to session-JWT and runtime-token authentication.
+    pub local_secret: Option<LocalApiSecret>,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -93,10 +99,19 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // In local mode, skip JWT verification and inject a fixed default user.
+    // In local mode the desktop app is the default user. With a per-launch
+    // secret configured, only callers presenting it get that identity; others
+    // (WebUI browsers via the desktop proxy, agent helper CLIs) must
+    // authenticate below like any non-local client.
     if state.identity_mode == AuthIdentityMode::Local {
-        request.extensions_mut().insert(CurrentUser::local_default());
-        return Ok(next.run(request).await);
+        let trusted = match state.local_secret.as_ref() {
+            None => true,
+            Some(secret) => secret.matches_headers(request.headers()),
+        };
+        if trusted {
+            request.extensions_mut().insert(CurrentUser::local_default());
+            return Ok(next.run(request).await);
+        }
     }
 
     let Some(token) = extract_token_from_headers(request.headers()) else {

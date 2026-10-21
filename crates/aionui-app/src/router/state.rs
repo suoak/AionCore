@@ -1437,7 +1437,9 @@ pub async fn build_extension_states(
 /// `router`. Callers supply the filesystem-monitor router in production and a
 /// no-op router for router-only/test assembly.
 pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) -> WsHandlerState {
-    if services.local {
+    if services.local && services.local_api_secret.is_none() {
+        // Legacy launcher without a per-launch secret: every local socket is
+        // the desktop user.
         return WsHandlerState {
             manager: services.ws_manager.clone(),
             router,
@@ -1447,15 +1449,35 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         };
     }
 
+    // With a local secret the desktop socket presents it as a header; any
+    // other socket (WebUI browser through the desktop proxy) needs a session
+    // JWT like non-local mode. The extractor maps a matching header to an
+    // unguessable per-process marker so a forged cookie can never equal it.
+    let local_marker: Option<Arc<str>> = services
+        .local_api_secret
+        .as_ref()
+        .map(|_| Arc::from(format!("local-desktop:{}", uuid::Uuid::new_v4()).as_str()));
+
     let jwt_service = services.jwt_service.clone();
-    let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
+    let validator_marker = local_marker.clone();
+    let token_validator = Arc::new(move |token: &str| {
+        if validator_marker.as_deref() == Some(token) {
+            return true;
+        }
+        jwt_service.verify(token).is_ok()
+    });
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
     let identity_mode = services.identity_mode;
+    let resolver_marker = local_marker.clone();
     let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
+        let is_local_desktop = resolver_marker.as_deref() == Some(token.as_str());
         Box::pin(async move {
+            if is_local_desktop {
+                return Some("system_default_user".to_owned());
+            }
             let payload = jwt_service.verify(&token).ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
             if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
@@ -1465,7 +1487,15 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         })
     });
 
-    let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
+    let local_secret = services.local_api_secret.clone();
+    let token_extractor = Arc::new(move |headers: &axum::http::HeaderMap| {
+        if let (Some(secret), Some(marker)) = (local_secret.as_ref(), local_marker.as_ref())
+            && secret.matches_headers(headers)
+        {
+            return Some(marker.to_string());
+        }
+        extract_token_from_ws_headers(headers)
+    });
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
@@ -1661,6 +1691,54 @@ mod tests {
 
         let resolved = (ws_state.token_user_resolver)(token).await;
         assert_eq!(resolved, None);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_local_secret_requires_header_or_session() {
+        const SECRET: &str = "ws-local-secret-0123456789-abcdefghijklmnop";
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            local: true,
+            identity_mode: IdentityMode::Local,
+            local_api_secret: Some(aionui_auth::LocalApiSecret::parse(SECRET).unwrap()),
+            ..AppConfig::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
+
+        // No credentials: nothing to authenticate with.
+        let empty = axum::http::HeaderMap::new();
+        assert_eq!((ws_state.token_extractor)(&empty), None);
+
+        // Desktop header resolves to the default user.
+        let mut desktop = axum::http::HeaderMap::new();
+        desktop.insert(aionui_auth::LOCAL_API_SECRET_HEADER, SECRET.parse().unwrap());
+        let token = (ws_state.token_extractor)(&desktop).expect("desktop marker");
+        assert!(!token.contains(SECRET), "marker must not echo the secret");
+        assert!((ws_state.token_validator)(&token));
+        assert_eq!(
+            (ws_state.token_user_resolver)(token).await.as_deref(),
+            Some("system_default_user")
+        );
+
+        // A forged cookie that looks like a marker is just an invalid JWT.
+        let mut forged = axum::http::HeaderMap::new();
+        forged.insert(axum::http::header::COOKIE, "aionui-session=local".parse().unwrap());
+        let forged_token = (ws_state.token_extractor)(&forged).unwrap();
+        assert!(!(ws_state.token_validator)(&forged_token));
+
+        // WebUI session JWT still works.
+        let jwt = services
+            .jwt_service
+            .sign_with_session_generation("system_default_user", "admin", 0)
+            .unwrap();
+        assert!((ws_state.token_validator)(&jwt));
+        assert_eq!(
+            (ws_state.token_user_resolver)(jwt).await.as_deref(),
+            Some("system_default_user")
+        );
 
         services.database.close().await;
     }

@@ -25,6 +25,7 @@ use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
 use crate::extract::{extract_cookie_value, extract_token_from_headers};
+use crate::local_secret::{LocalApiSecret, constant_time_eq};
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
@@ -91,6 +92,9 @@ pub struct AuthRouterState {
     pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     pub local: bool,
     pub aionpro_mode: bool,
+    /// Per-launch desktop secret. When set (local mode), the local-only
+    /// internal/WebUI-admin endpoints require it in addition to `local`.
+    pub local_api_secret: Option<LocalApiSecret>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,17 +195,6 @@ fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Resu
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for idx in 0..max_len {
-        let l = left.get(idx).copied().unwrap_or(0);
-        let r = right.get(idx).copied().unwrap_or(0);
-        diff |= usize::from(l ^ r);
-    }
-    diff == 0
-}
-
 fn provision_error_to_api_error(err: ProvisionError) -> ApiError {
     match err {
         ProvisionError::UnsupportedUserType => ApiError::BadRequest("Unsupported external user type".into()),
@@ -230,6 +223,28 @@ fn user_context_required() -> ApiError {
         "User context required.",
         None,
     )
+}
+
+/// Reject local-only endpoint calls that lack the per-launch desktop secret.
+///
+/// A no-op when no secret is configured (legacy launcher / non-local modes,
+/// where the handlers' own `ensure_local_mode` check decides).
+async fn local_secret_guard(
+    State(secret): State<Option<LocalApiSecret>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, ApiError> {
+    if let Some(secret) = secret.as_ref()
+        && !secret.matches_headers(request.headers())
+    {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "LOCAL_SECRET_REQUIRED",
+            "This endpoint is only available to the desktop app.",
+            None,
+        ));
+    }
+    Ok(next.run(request).await)
 }
 
 /// Build the auth router with all endpoints and middleware layers.
@@ -270,6 +285,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         // Auth endpoints manage sessions themselves; the helper CLI never
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
+        local_secret: None,
     };
 
     // Auth rate limited routes (login, qr-login)
@@ -294,6 +310,14 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
             "/api/auth/internal/external-sessions/revoke",
             post(revoke_external_session_handler),
         )
+        .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
+        .with_state(state.clone());
+
+    // Local-only internal + WebUI admin credential endpoints. `local` is
+    // enforced inside each handler; when the desktop launcher configured a
+    // per-launch secret, the caller must also present it (these endpoints can
+    // reset the WebUI password or rotate JWT secrets).
+    let api_local_only = Router::new()
         .route(
             "/api/auth/internal/users",
             get(list_internal_users_handler).post(create_internal_user_handler),
@@ -324,11 +348,11 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
             "/api/auth/internal/users/{id}/last-login",
             post(update_user_last_login_handler),
         )
-        // WebUI admin credential endpoints — local-only, enforced inside each handler.
         .route("/api/webui/change-password", post(webui_change_password_handler))
         .route("/api/webui/change-username", post(webui_change_username_handler))
         .route("/api/webui/reset-password", post(webui_reset_password_handler))
         .route("/api/webui/generate-qr-token", post(webui_generate_qr_token_handler))
+        .route_layer(from_fn_with_state(state.local_api_secret.clone(), local_secret_guard))
         .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
         .with_state(state.clone());
 
@@ -363,6 +387,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     Router::new()
         .merge(auth_rate_limited)
         .merge(api_public)
+        .merge(api_local_only)
         .merge(authenticated)
         .merge(api_action_limited)
         .merge(static_routes)
