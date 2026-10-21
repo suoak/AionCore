@@ -76,6 +76,8 @@ pub struct AppServices {
     pub local: bool,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
+    /// Per-launch desktop API secret (local mode only); see `AppConfig`.
+    pub local_api_secret: Option<aionui_auth::LocalApiSecret>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -460,6 +462,7 @@ impl AppServices {
             local,
             identity_mode,
             bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
+            local_api_secret: if local { config.local_api_secret.clone() } else { None },
             app_version,
             skill_paths,
             skill_repo,

@@ -11,7 +11,7 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
@@ -268,6 +268,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         },
         local: services.local,
         aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
+        local_api_secret: services.local_api_secret.clone(),
     };
 
     let auth_mw_state = AuthState {
@@ -277,6 +278,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
             runtime_token_service: services.runtime_token_service.clone(),
         })),
+        local_secret: services.local_api_secret.clone(),
     };
 
     // System routes protected by auth middleware
@@ -465,8 +467,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     );
 
     if services.identity_mode.is_local() {
+        // Local (desktop) mode: only the app's own renderer origins may make
+        // cross-origin calls. The renderer is `file://` when packaged (some
+        // Chromium paths serialize it as the opaque `null`) and a loopback
+        // dev server in development. Authentication is the per-launch secret,
+        // so CORS is defense in depth against browser pages, not the gate.
         let cors = CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(AllowOrigin::predicate(|origin, _| {
+                is_local_app_origin(origin.as_bytes())
+            }))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -475,7 +484,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 Method::DELETE,
                 Method::OPTIONS,
             ])
-            .allow_headers(Any);
+            .allow_headers(AllowHeaders::mirror_request());
         router.layer(cors)
     } else {
         // Non-local (external identity) mode: the desktop renderer is a
@@ -541,6 +550,48 @@ impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
                 TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             )
             .is_ok()
+    }
+}
+
+/// Origins the desktop renderer may present in local mode.
+///
+/// `file://` / `null` cover the packaged app, `app://` a custom-protocol
+/// renderer, and loopback `http(s)://localhost|127.0.0.1|[::1]` (any port)
+/// the Vite dev server and WebUI-on-loopback. Everything else, including any
+/// LAN or internet origin, is rejected.
+fn is_local_app_origin(origin: &[u8]) -> bool {
+    let Ok(origin) = std::str::from_utf8(origin) else {
+        return false;
+    };
+    let origin = origin.trim().to_ascii_lowercase();
+    if origin == "null" || origin == "file://" || origin.starts_with("app://") {
+        return true;
+    }
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host = if let Some(v6) = rest.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((addr, tail)) if tail.is_empty() || tail.starts_with(':') => return addr == "::1" && port_ok(tail),
+            _ => return false,
+        }
+    } else {
+        rest
+    };
+    let (name, tail) = match host.split_once(':') {
+        Some((name, port)) => (name, format!(":{port}")),
+        None => (host, String::new()),
+    };
+    matches!(name, "localhost" | "127.0.0.1") && port_ok(&tail)
+}
+
+fn port_ok(tail: &str) -> bool {
+    match tail.strip_prefix(':') {
+        None => tail.is_empty(),
+        Some(port) => !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()),
     }
 }
 
@@ -623,10 +674,38 @@ mod tests {
 
     use super::{
         boundary_error_for_status, create_router_with_runtime, forward_event_bus_to_websocket,
-        is_global_websocket_event,
+        is_global_websocket_event, is_local_app_origin,
     };
     use crate::config::AppConfig;
     use crate::services::AppServices;
+
+    #[test]
+    fn local_cors_allows_only_desktop_origins() {
+        for ok in [
+            "file://",
+            "null",
+            "app://renderer",
+            "http://localhost:5173",
+            "http://127.0.0.1:25808",
+            "http://localhost",
+            "https://127.0.0.1:8443",
+            "http://[::1]:5173",
+        ] {
+            assert!(is_local_app_origin(ok.as_bytes()), "{ok} should be allowed");
+        }
+        for bad in [
+            "https://evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example:80",
+            "http://192.168.1.10:25808",
+            "http://localhost:abc",
+            "http://[::2]:5173",
+            "chrome-extension://abc",
+            "",
+        ] {
+            assert!(!is_local_app_origin(bad.as_bytes()), "{bad} should be rejected");
+        }
+    }
 
     #[test]
     fn boundary_error_for_status_covers_common_fallback_statuses() {

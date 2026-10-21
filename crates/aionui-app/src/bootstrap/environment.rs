@@ -75,6 +75,15 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         .filter(|secret| !secret.is_empty());
     validate_identity_environment(identity_mode, bootstrap_secret.as_deref())?;
 
+    let local_api_secret = if identity_mode.is_local() && cli.command.is_none() {
+        resolve_local_api_secret(std::env::var(aionui_auth::LOCAL_AUTH_STDIN_ENV).ok().as_deref(), || {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).map(|_| line)
+        })?
+    } else {
+        None
+    };
+
     let config = AppConfig {
         host: cli.host.clone(),
         port: cli.port,
@@ -84,6 +93,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         local: cli.local || identity_mode.is_local(),
         identity_mode,
         bootstrap_secret,
+        local_api_secret,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
@@ -95,12 +105,51 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
             "enabled"
         },
         bootstrap_secret_configured = config.bootstrap_secret.is_some(),
+        local_api_secret_configured = config.local_api_secret.is_some(),
         "startup: identity mode resolved"
     );
+    if config.identity_mode.is_local() && config.local_api_secret.is_none() && cli.command.is_none() {
+        warn!(
+            "local API authentication is disabled: launcher did not provide a per-launch secret \
+             (set {}=1 and write it to stdin); every loopback caller is treated as the desktop user",
+            aionui_auth::LOCAL_AUTH_STDIN_ENV
+        );
+    }
 
     Ok(ServerEnvironment {
         _log_guard: log_guard,
         config,
+    })
+}
+
+/// Resolve the per-launch local API secret.
+///
+/// The launcher opts in with `AIONUI_LOCAL_AUTH_STDIN=1` and writes the secret
+/// as the first stdin line, so it never appears on argv or in the environment
+/// inherited by agent subprocesses. Opting in without a valid secret fails
+/// startup closed rather than silently running unauthenticated.
+fn resolve_local_api_secret(
+    stdin_flag: Option<&str>,
+    read_line: impl FnOnce() -> std::io::Result<String>,
+) -> Result<Option<aionui_auth::LocalApiSecret>, BootstrapError> {
+    if stdin_flag.map(str::trim) != Some("1") {
+        return Ok(None);
+    }
+    let line = read_line().map_err(|error| {
+        BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.local_api_secret",
+            "failed to read the local API secret from stdin",
+        )
+        .with_source(error)
+    })?;
+    aionui_auth::LocalApiSecret::parse(&line).map(Some).map_err(|error| {
+        BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.local_api_secret",
+            "invalid local API secret on stdin",
+        )
+        .with_source(error)
     })
 }
 
@@ -281,5 +330,26 @@ mod tests {
             .expect("WebUI startup should not require bootstrap secret");
         validate_identity_environment(IdentityMode::Local, None)
             .expect("local startup should not require bootstrap secret");
+    }
+
+    #[test]
+    fn local_api_secret_is_opt_in_via_stdin_flag() {
+        let unread = || -> std::io::Result<String> { panic!("stdin must not be read without the flag") };
+        assert!(resolve_local_api_secret(None, unread).unwrap().is_none());
+        assert!(resolve_local_api_secret(Some("0"), unread).unwrap().is_none());
+
+        let secret = resolve_local_api_secret(Some("1"), || {
+            Ok("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG\n".to_owned())
+        })
+        .unwrap()
+        .expect("secret");
+        assert!(secret.matches("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"));
+    }
+
+    #[test]
+    fn local_api_secret_flag_without_valid_secret_fails_closed() {
+        assert!(resolve_local_api_secret(Some("1"), || Ok(String::new())).is_err());
+        assert!(resolve_local_api_secret(Some("1"), || Ok("short\n".to_owned())).is_err());
+        assert!(resolve_local_api_secret(Some("1"), || Err(std::io::Error::other("closed"))).is_err());
     }
 }

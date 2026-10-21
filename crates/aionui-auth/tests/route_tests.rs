@@ -13,8 +13,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, RefreshCoalescer, SessionRevokedHook,
-    auth_routes, hash_password,
+    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, LocalApiSecret, QrTokenStore, RefreshCoalescer,
+    SessionRevokedHook, auth_routes, hash_password,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, init_database_memory};
 
@@ -40,6 +40,16 @@ async fn test_app_with_options_and_hook(
     bootstrap_secret: Option<&str>,
     aionpro_mode: bool,
     session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+) -> (Router, TestContext) {
+    test_app_full(local, bootstrap_secret, aionpro_mode, session_revoked_hook, None).await
+}
+
+async fn test_app_full(
+    local: bool,
+    bootstrap_secret: Option<&str>,
+    aionpro_mode: bool,
+    session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+    local_api_secret: Option<&str>,
 ) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
@@ -68,6 +78,7 @@ async fn test_app_with_options_and_hook(
         session_revoked_hook,
         local,
         aionpro_mode,
+        local_api_secret: local_api_secret.map(|secret| LocalApiSecret::parse(secret).unwrap()),
     };
 
     let app = auth_routes(state);
@@ -1308,4 +1319,66 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     let renamed_json = body_json(renamed_resp).await;
     assert_eq!(renamed_json["data"]["id"], user_id);
     assert_eq!(renamed_json["data"]["username"], "renamed-admin");
+}
+
+// ---------------------------------------------------------------------------
+// Local-only endpoints require the per-launch desktop secret when configured
+// ---------------------------------------------------------------------------
+
+const ROUTE_LOCAL_SECRET: &str = "route-test-local-secret-0123456789-abcdefgh";
+
+#[tokio::test]
+async fn local_only_endpoints_require_desktop_secret_when_configured() {
+    let (app, _ctx) = test_app_full(true, None, false, None, Some(ROUTE_LOCAL_SECRET)).await;
+
+    for (method, uri) in [
+        ("GET", "/api/auth/internal/users/system"),
+        ("GET", "/api/auth/internal/users"),
+        ("POST", "/api/webui/reset-password"),
+        ("POST", "/api/webui/generate-qr-token"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().method(method).uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must require the secret"
+        );
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/auth/internal/users/system")
+                .header("x-aionui-local-secret", ROUTE_LOCAL_SECRET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Public status stays reachable for the WebUI login page.
+    let resp = app
+        .oneshot(Request::get("/api/auth/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn local_only_endpoints_without_configured_secret_keep_legacy_behaviour() {
+    let (app, _ctx) = test_app_full(true, None, false, None, None).await;
+    let resp = app
+        .oneshot(
+            Request::get("/api/auth/internal/users/system")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

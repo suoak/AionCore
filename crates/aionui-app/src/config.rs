@@ -37,6 +37,9 @@ pub struct AppConfig {
     pub local: bool,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<String>,
+    /// Per-launch desktop API secret (local mode), read from stdin when the
+    /// launcher sets `AIONUI_LOCAL_AUTH_STDIN=1`. `Debug` is redacted.
+    pub local_api_secret: Option<aionui_auth::LocalApiSecret>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
@@ -83,6 +86,7 @@ impl Default for AppConfig {
             local: false,
             identity_mode: IdentityMode::WebUi,
             bootstrap_secret: None,
+            local_api_secret: None,
             dump_prompts: false,
             recover_corrupted_database: false,
         }
