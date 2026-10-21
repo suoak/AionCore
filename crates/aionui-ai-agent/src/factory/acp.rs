@@ -433,7 +433,7 @@ async fn load_user_mcp_servers(
     capabilities: &AcpMcpCapabilities,
 ) -> Vec<McpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        Some(ids) => repo.list_active_by_ids(user_id, ids).await,
         None => repo.list(user_id).await,
     };
     let rows = match rows_result {

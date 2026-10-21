@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
 use aion_agent::tool_policy::ToolPolicy;
 use aion_config::compat::ProviderCompat;
-use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
+use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType, ToolsConfig};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
@@ -60,7 +61,29 @@ fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     config.compat.transport.default_max_tokens = default_transport.default_max_tokens;
     config.compat.transport.model_max_tokens = default_transport.model_max_tokens;
 
+    // CSBU WorkMate owns the embedded tool policy. Auto-approve, tool
+    // allowlists, skill permission rules, hooks and MCP servers must never be
+    // inherited from a standalone `.aionrs.toml` (global or workspace): a
+    // workspace file is attacker-controllable content, and honouring it would
+    // let an opened folder silently enable auto-approve or spawn processes.
+    // Only WorkMate-supplied MCP servers are added back by the caller.
+    config.tools = ToolsConfig {
+        auto_approve: cli_args.auto_approve,
+        ..ToolsConfig::default()
+    };
+    config.hooks = Default::default();
+    config.mcp.servers.clear();
+
     Ok(config)
+}
+
+/// Directory used as aionrs' "project dir" for config resolution.
+///
+/// aionrs reads `<project_dir>/.aionrs.toml`. The embedded runtime must never
+/// pick up a file from the user's workspace, so resolution is pointed at the
+/// WorkMate-owned session directory instead.
+fn embedded_config_project_dir(config_extra: &AionrsResolvedConfig) -> PathBuf {
+    config_extra.session_directory.clone()
 }
 
 fn apply_runtime_tool_policy(config: &mut Config, policy: AionrsRuntimeToolPolicy) -> ToolPolicy {
@@ -138,6 +161,10 @@ pub struct AionrsAgentManager {
     #[allow(dead_code)] // intentional: lifetime-extension only; see Drop impl
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
+    /// Session-wide auto-approve flag shared with the aionrs tool confirmer
+    /// and Skill permission checker. Flipped by `set_mode` so leaving YOLO
+    /// restores approval without rebuilding the session.
+    auto_approve: Arc<AtomicBool>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
     final_input_dump: Option<AionrsFinalInputDumpContext>,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
@@ -215,7 +242,7 @@ impl AionrsAgentManager {
             auto_approve: config_extra.session_mode.as_deref() == Some("yolo"),
             thinking: None,
             thinking_budget: None,
-            project_dir: Some(PathBuf::from(&workspace)),
+            project_dir: Some(embedded_config_project_dir(&config_extra)),
         };
 
         let mut config = resolve_aionui_config(&cli_args)?;
@@ -283,6 +310,7 @@ impl AionrsAgentManager {
         }
 
         let approval_manager = Arc::new(ToolApprovalManager::new());
+        let auto_approve = engine.auto_approve_handle();
 
         if let Some(mode_str) = &config_extra.session_mode {
             let mode = parse_session_mode(mode_str);
@@ -320,6 +348,7 @@ impl AionrsAgentManager {
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
+            auto_approve,
             confirmations,
             final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
@@ -680,7 +709,9 @@ impl AionrsAgentManager {
 
     pub async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
         let prev = self.approval_manager.current_mode();
-        self.approval_manager.set_mode(parse_session_mode(mode));
+        let parsed = parse_session_mode(mode);
+        self.auto_approve.store(parsed == SessionMode::Yolo, Ordering::SeqCst);
+        self.approval_manager.set_mode(parsed);
         info!(
             conversation_id = %self.runtime.conversation_id(),
             from = prev,

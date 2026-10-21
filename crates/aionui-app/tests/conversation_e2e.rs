@@ -969,8 +969,17 @@ async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads(
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     let id = json["data"]["id"].as_str().unwrap().to_owned();
+    // Client-supplied team binding is stripped at the HTTP boundary; bind it
+    // the way the team service does (internal `update_extra`).
+    assert!(json["data"]["extra"].get("teamId").is_none());
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let owner = repo.owner_user_id(&id).await.unwrap().unwrap();
+    services
+        .conversation_service
+        .update_extra(&owner, &id, json!({ "teamId": "team-1" }))
+        .await
+        .unwrap();
     let msg = aionui_db::models::MessageRow {
         id: "team-history-msg-1".into(),
         conversation_id: id.clone(),
@@ -1294,4 +1303,155 @@ async fn auto_workspaces_of_two_users_live_under_distinct_user_roots() {
     for ws in &workspaces {
         assert!(std::path::Path::new(ws).is_dir(), "workspace dir missing: {ws}");
     }
+}
+
+// ── Session tool exposure hardening (batch 1) ─────────────────────────
+
+#[tokio::test]
+async fn create_strips_client_supplied_team_binding_fields() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = create_body_with_extra(
+        "Injected",
+        json!({
+            "teamId": "team-attacker",
+            "slot_id": "slot-attacker",
+            "role": "lead",
+            "team_mcp_stdio_config": { "command": "/bin/sh", "args": ["-c", "id"] },
+        }),
+    );
+    let resp = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/conversations", body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    let extra = &json["data"]["extra"];
+    for key in ["teamId", "slot_id", "role", "team_mcp_stdio_config"] {
+        assert!(
+            extra.get(key).is_none(),
+            "{key} leaked into a client-created conversation: {extra}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn patch_rejects_team_binding_and_team_mcp_spawn_injection() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations",
+            create_body("Victim"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    let id = body_json(resp).await["data"]["id"].as_str().unwrap().to_owned();
+
+    for patch in [
+        json!({ "extra": { "teamId": "team-attacker" } }),
+        json!({ "extra": { "slot_id": "slot-attacker" } }),
+        json!({ "extra": { "team_mcp_stdio_config": { "command": "/bin/sh", "args": ["-c", "id"] } } }),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(json_with_token(
+                "PATCH",
+                &format!("/api/conversations/{id}"),
+                patch.clone(),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "patch accepted: {patch}");
+    }
+
+    // Ordinary extra keys keep working.
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{id}"),
+            json!({ "extra": { "sortOrder": 3 } }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(get_with_token(&format!("/api/conversations/{id}"), &token))
+        .await
+        .unwrap();
+    let extra = body_json(resp).await["data"]["extra"].clone();
+    assert!(extra.get("teamId").is_none());
+    assert!(extra.get("team_mcp_stdio_config").is_none());
+    assert_eq!(extra["sortOrder"], 3);
+}
+
+#[tokio::test]
+async fn create_never_snapshots_soft_deleted_mcp_servers() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let mut ids = Vec::new();
+    for name in ["kept-mcp", "deleted-mcp"] {
+        let resp = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/mcp/servers",
+                json!({ "name": name, "transport": { "type": "http", "url": "https://example.com/mcp" } }),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        ids.push(body_json(resp).await["data"]["id"].as_str().unwrap().to_owned());
+    }
+    let resp = app
+        .clone()
+        .oneshot(delete_with_token(
+            &format!("/api/mcp/servers/{}", ids[1]),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations",
+            json!({
+                "type": "aionrs",
+                "extra": { "selected_mcp_server_ids": [ids[1].clone(), ids[0].clone()] }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let extra = body_json(resp).await["data"]["extra"].clone();
+    assert_eq!(extra["mcp_server_ids"], json!([ids[0].clone()]), "{extra}");
+    assert!(
+        !extra["mcp_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "deleted-mcp"),
+        "{extra}"
+    );
 }

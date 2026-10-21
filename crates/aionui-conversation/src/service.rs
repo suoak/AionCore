@@ -4123,6 +4123,28 @@ impl ConversationService {
             });
         }
 
+        // Team binding and fixed permission seeds are host-owned. A client
+        // PATCH (UI, helper CLI, or an agent with a runtime token) must not
+        // re-bind a conversation into a team, inject a Team MCP stdio spawn
+        // spec, or escalate a fixed / team-governed permission mode.
+        if let Some(incoming) = &req.extra {
+            let existing_extra: serde_json::Value =
+                serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+            let session_mode_changes = protected_extra_value_changes(&existing_extra, incoming, "session_mode");
+            let permission_fixed = if session_mode_changes {
+                self.conversation_repo
+                    .get_assistant_snapshot(user_id, id)
+                    .await?
+                    .is_some_and(|snapshot| snapshot.default_permission_mode == "fixed")
+            } else {
+                false
+            };
+            if let Err(reason) = check_protected_extra_patch(&existing_extra, incoming, permission_fixed) {
+                warn!(conversation_id = %id, reason, "Rejected protected conversation.extra write");
+                return Err(ConversationError::BadRequest { reason: reason.into() });
+            }
+        }
+
         // Antigravity keeps its runtime mode/model in the same `acp_session`
         // snapshot ACP does, so `extra` is just as much a second source of
         // truth here — a client PATCH that set them would diverge from the
@@ -7332,7 +7354,7 @@ impl ConversationService {
         if let Some(repo) = repo {
             let rows = match selected_ids {
                 Some(ids) => repo
-                    .list_by_ids_any(user_id, ids)
+                    .list_active_by_ids(user_id, ids)
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?,
                 None => repo
@@ -7854,6 +7876,61 @@ fn resolve_effective_assistant_mcp_ids(
     }
 }
 
+/// `conversation.extra` keys that bind a conversation to a team. Only the
+/// team service writes them (via internal `create` / `update_extra`).
+pub(crate) const TEAM_BINDING_EXTRA_KEYS: [&str; 4] = ["teamId", "slot_id", "role", "team_mcp_stdio_config"];
+
+/// Whether `incoming` sets `key` to a value different from the stored one.
+/// Re-sending the stored value unchanged (clients that echo the full extra
+/// back) is not a change.
+fn protected_extra_value_changes(existing: &serde_json::Value, incoming: &serde_json::Value, key: &str) -> bool {
+    match incoming.get(key) {
+        Some(value) => existing.get(key) != Some(value),
+        None => false,
+    }
+}
+
+/// Validates a client `conversation.extra` patch against host-owned keys.
+pub(crate) fn check_protected_extra_patch(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+    permission_fixed: bool,
+) -> Result<(), &'static str> {
+    if TEAM_BINDING_EXTRA_KEYS
+        .iter()
+        .any(|key| protected_extra_value_changes(existing, incoming, key))
+    {
+        return Err(
+            "team binding fields (teamId, slot_id, role, team_mcp_stdio_config) are managed by the team service",
+        );
+    }
+    if protected_extra_value_changes(existing, incoming, "session_mode") {
+        let team_bound = existing
+            .get("teamId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if team_bound {
+            return Err("team session mode must be changed via the team session API");
+        }
+        if permission_fixed {
+            return Err("this assistant uses a fixed permission mode; extra.session_mode cannot be changed");
+        }
+    }
+    Ok(())
+}
+
+/// Removes host-owned team binding keys from a client create request.
+pub(crate) fn strip_client_team_binding(extra: &mut serde_json::Value) -> bool {
+    let Some(obj) = extra.as_object_mut() else {
+        return false;
+    };
+    let mut stripped = false;
+    for key in TEAM_BINDING_EXTRA_KEYS {
+        stripped |= obj.remove(key).is_some();
+    }
+    stripped
+}
+
 #[cfg(test)]
 fn assistant_mcp_row_is_injectable(row: &McpServerRow) -> bool {
     row.name != TEAM_MCP_SERVER_NAME
@@ -8287,6 +8364,65 @@ mod tests {
             updated_at: 0,
         };
         assert!(assistant_mcp_row_is_injectable(&row));
+    }
+
+    #[test]
+    fn protected_extra_patch_rejects_team_binding_injection() {
+        let existing = serde_json::json!({ "workspace": "/w" });
+        for key in TEAM_BINDING_EXTRA_KEYS {
+            let incoming = serde_json::json!({ key: "attacker" });
+            assert!(
+                check_protected_extra_patch(&existing, &incoming, false).is_err(),
+                "{key}"
+            );
+        }
+        let incoming = serde_json::json!({
+            "team_mcp_stdio_config": { "command": "/bin/sh", "args": ["-c", "id"] }
+        });
+        assert!(check_protected_extra_patch(&existing, &incoming, false).is_err());
+    }
+
+    #[test]
+    fn protected_extra_patch_rejects_unbinding_or_rebinding_a_team_conversation() {
+        let existing = serde_json::json!({ "teamId": "team-1", "slot_id": "s1", "session_mode": "default" });
+        assert!(check_protected_extra_patch(&existing, &serde_json::json!({ "teamId": null }), false).is_err());
+        assert!(check_protected_extra_patch(&existing, &serde_json::json!({ "teamId": "team-2" }), false).is_err());
+        assert!(check_protected_extra_patch(&existing, &serde_json::json!({ "session_mode": "yolo" }), false).is_err());
+    }
+
+    #[test]
+    fn protected_extra_patch_allows_echoing_unchanged_values_and_ordinary_keys() {
+        let existing = serde_json::json!({ "teamId": "team-1", "slot_id": "s1", "session_mode": "default" });
+        let echoed = serde_json::json!({
+            "teamId": "team-1",
+            "slot_id": "s1",
+            "session_mode": "default",
+            "last_token_usage": { "total_tokens": 3 },
+            "pinned": true,
+        });
+        assert!(check_protected_extra_patch(&existing, &echoed, true).is_ok());
+    }
+
+    #[test]
+    fn protected_extra_patch_gates_session_mode_on_fixed_permission() {
+        let existing = serde_json::json!({ "session_mode": "default" });
+        let incoming = serde_json::json!({ "session_mode": "yolo" });
+        assert!(check_protected_extra_patch(&existing, &incoming, true).is_err());
+        assert!(check_protected_extra_patch(&existing, &incoming, false).is_ok());
+    }
+
+    #[test]
+    fn strip_client_team_binding_removes_every_team_key() {
+        let mut extra = serde_json::json!({
+            "workspace": "/w",
+            "teamId": "t",
+            "slot_id": "s",
+            "role": "lead",
+            "team_mcp_stdio_config": { "command": "x" },
+        });
+        assert!(strip_client_team_binding(&mut extra));
+        assert_eq!(extra, serde_json::json!({ "workspace": "/w" }));
+        assert!(!strip_client_team_binding(&mut extra));
     }
 
     #[tokio::test]
