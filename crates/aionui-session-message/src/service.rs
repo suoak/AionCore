@@ -224,6 +224,20 @@ impl SessionMessageService {
         if team_id_from_extra_str(&target.extra).is_some() {
             return Err(SessionMessageError::TargetIsTeam { id: to.to_owned() });
         }
+        // Only targets the user picked with `@@` in this conversation (or the
+        // conversation that messaged it, for a reply). Checked after the row
+        // lookups so missing/team targets keep their specific codes.
+        let grants = self.deps.conversation_service.session_mention_grants();
+        if !grants.is_granted(user_id, from_conversation_id, to) {
+            warn!(
+                from_conversation_id,
+                to_conversation_id = to,
+                outcome = "rejected",
+                error_code = "target_not_selected",
+                "cross-session delivery refused"
+            );
+            return Err(SessionMessageError::TargetNotSelected { id: to.to_owned() });
+        }
 
         // 6
         let sender_workspace = workspace_from_extra(&sender.extra);
@@ -236,7 +250,7 @@ impl SessionMessageService {
         );
         let content = compose_delivery_content(&block, &req.message);
 
-        match self.deliver_now(user_id, to, content.clone()).await {
+        let outcome = match self.deliver_now(user_id, to, content.clone()).await {
             Ok(_sent) => {
                 info!(
                     from_conversation_id,
@@ -281,7 +295,12 @@ impl SessionMessageService {
                 })
             }
             Err(DeliverAttemptError::Hard(reason)) => Err(SessionMessageError::TransportUnavailable { reason }),
+        };
+        if outcome.is_ok() {
+            // The recipient may answer the conversation that messaged it.
+            grants.grant(user_id, to, from_conversation_id);
         }
+        outcome
     }
 
     /// `list` / `targets` / `mentionable` share the send path's two most global

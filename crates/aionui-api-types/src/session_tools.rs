@@ -133,6 +133,9 @@ pub enum SessionToolErrorCode {
     TargetIsTeam,
     SenderIsTeam,
     TargetIsSelf,
+    /// The user has not selected the target with `@@` in the sender
+    /// conversation (and it is not a reply to a message the target sent).
+    TargetNotSelected,
     QueueFull,
     RateLimited,
     FeatureDisabled,

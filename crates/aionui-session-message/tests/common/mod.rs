@@ -255,11 +255,24 @@ pub struct Ctx {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     /// Kept so the whole graph can be rebuilt for a drainer in a test.
     pub rate_limiter: Arc<RateLimiter>,
+    /// When set, every conversation created through the harness is granted as
+    /// an `@@` target to/from every other one of the same user, so delivery
+    /// semantics tests do not each have to model the picker. `setup_strict`
+    /// turns it off for the authorization tests.
+    pub auto_grant: bool,
+    created: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 /// `TestClock` for the queue/TTL and the rate window, so no test ever sleeps.
 pub async fn setup() -> Ctx {
     setup_with_clock(Arc::new(TestClock::new(1_000))).await
+}
+
+/// Like [`setup`], but no `@@` grants are created implicitly.
+pub async fn setup_strict() -> Ctx {
+    let mut ctx = setup().await;
+    ctx.auto_grant = false;
+    ctx
 }
 
 pub async fn setup_with_clock(clock: Arc<TestClock>) -> Ctx {
@@ -329,6 +342,8 @@ pub async fn setup_with_clock(clock: Arc<TestClock>) -> Ctx {
         notify,
         runtime_token_service: Arc::new(RuntimeTokenService::new()),
         rate_limiter,
+        auto_grant: true,
+        created: std::sync::Mutex::new(Vec::new()),
     }
 }
 
@@ -389,7 +404,21 @@ impl Ctx {
             name_source: None,
         };
         self.conversation_repo.create(&row).await.unwrap();
+        if self.auto_grant {
+            let grants = self.conversation_service.session_mention_grants();
+            let mut created = self.created.lock().unwrap();
+            for (owner, other) in created.iter().filter(|(owner, _)| owner == user_id) {
+                grants.grant(owner, other, id);
+                grants.grant(owner, id, other);
+            }
+            created.push((user_id.to_owned(), id.to_owned()));
+        }
         row
+    }
+
+    /// Record that the user picked `to` with `@@` in `from`.
+    pub fn select(&self, from: &str, to: &str) {
+        self.conversation_service.session_mention_grants().grant(USER, from, to);
     }
 
     pub async fn delete_conversation(&self, id: &str) {

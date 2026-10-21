@@ -9,7 +9,8 @@ use std::sync::Arc;
 use aionui_api_types::{SendMessageRequest, SessionDeliveryStatus, SessionSendMessageRequest};
 use aionui_conversation::ConversationError;
 use aionui_session_message::QueueClearingCancelHook;
-use common::{USER, setup};
+use aionui_session_message::SessionMessageError;
+use common::{USER, setup, setup_strict};
 
 fn request(to: &str, message: &str) -> SessionSendMessageRequest {
     SessionSendMessageRequest {
@@ -320,4 +321,64 @@ async fn a_delivery_aimed_at_another_users_conversation_is_refused_as_not_found(
         0,
         "nothing may be persisted into the other user's conversation"
     );
+}
+
+// ── `@@` authorization ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn delivery_to_a_target_the_user_never_selected_is_refused() {
+    let ctx = setup_strict().await;
+    let a = ctx.create_conversation("conv_a", "A", "/w/shared").await;
+    let b = ctx.create_conversation("conv_b", "B", "/w/shared").await;
+
+    let err = ctx.service.send(USER, &a.id, &request(&b.id, "hi")).await.unwrap_err();
+    assert!(matches!(err, SessionMessageError::TargetNotSelected { .. }), "{err:?}");
+    assert_eq!(err.http_status(), 403);
+    assert_eq!(ctx.user_message_count(&b.id).await, 0, "nothing may reach B");
+}
+
+#[tokio::test]
+async fn an_at_at_pick_authorizes_that_target_and_the_reply_edge_only() {
+    let ctx = setup_strict().await;
+    let a = ctx.create_conversation("conv_a", "A", "/w/shared").await;
+    let b = ctx.create_conversation("conv_b", "B", "/w/shared").await;
+    let c = ctx.create_conversation("conv_c", "C", "/w/shared").await;
+    ctx.select(&a.id, &b.id);
+
+    ctx.service.send(USER, &a.id, &request(&b.id, "hi")).await.unwrap();
+    // B may answer A …
+    ctx.service.send(USER, &b.id, &request(&a.id, "back")).await.unwrap();
+    // … but neither side gains a path to a third conversation.
+    for (from, to) in [(&a.id, &c.id), (&b.id, &c.id)] {
+        let err = ctx.service.send(USER, from, &request(to, "hop")).await.unwrap_err();
+        assert!(matches!(err, SessionMessageError::TargetNotSelected { .. }), "{err:?}");
+    }
+    assert_eq!(ctx.user_message_count(&c.id).await, 0);
+}
+
+#[tokio::test]
+async fn the_users_send_path_records_at_at_picks_for_that_conversation() {
+    let ctx = setup_strict().await;
+    let a = ctx.create_conversation("conv_a", "A", "/w/shared").await;
+    let b = ctx.create_conversation("conv_b", "B", "/w/shared").await;
+    let grants = ctx.conversation_service.session_mention_grants();
+    assert!(!grants.is_granted(USER, &a.id, &b.id));
+
+    let _ = ctx
+        .conversation_service
+        .send_message(
+            USER,
+            &a.id,
+            SendMessageRequest {
+                content: "ask B".to_owned(),
+                files: Vec::new(),
+                sessions: vec![aionui_api_types::SessionRef { id: b.id.clone() }],
+                inject_skills: Vec::new(),
+                hidden: false,
+            },
+            &ctx.task_manager,
+        )
+        .await;
+    assert!(grants.is_granted(USER, &a.id, &b.id));
+    assert!(!grants.is_granted(USER, &b.id, &a.id), "the pick is directional");
 }

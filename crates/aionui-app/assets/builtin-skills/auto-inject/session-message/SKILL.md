@@ -12,9 +12,11 @@ to reply.
 
 ## Rules
 
-1. Use this ONLY when the user selected a target conversation with `@@`, or
-   explicitly asked you to communicate with another conversation. Never deliver
-   a message on your own initiative.
+1. Use this ONLY when the user selected a target conversation with `@@` in
+   this conversation, or to reply to a conversation that messaged you. Never
+   deliver a message on your own initiative. Any other target is refused with
+   `target_not_selected`: ask the user to pick it with `@@` instead of
+   retrying.
 2. `to` must be a conversation id. Names are not addresses, and there is no
    broadcast — one `send-message` call reaches exactly one conversation.
 3. Never pass, inline, export, echo, or set any `AIONUI_...` environment variable.
