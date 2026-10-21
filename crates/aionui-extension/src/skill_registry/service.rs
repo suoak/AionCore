@@ -583,7 +583,7 @@ fn verify_archive(archive_path: &Path, expected_files: &[OfficialSkillFile]) -> 
         let entry = archive
             .by_index(index)
             .map_err(|_| SkillRegistryError::PackageInvalid)?;
-        let name = normalize_zip_path(entry.name())?;
+        let name = normalize_zip_path(&entry.name().map_err(|_| SkillRegistryError::PackageInvalid)?)?;
         let portable_path = portable_path_key(&name)?;
         if !archive_paths.insert(portable_path) {
             return Err(SkillRegistryError::PackageInvalid);
@@ -606,7 +606,7 @@ fn verify_archive(archive_path: &Path, expected_files: &[OfficialSkillFile]) -> 
         if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
             return Err(SkillRegistryError::PackageInvalid);
         }
-        let raw_name = normalize_zip_path(entry.name())?;
+        let raw_name = normalize_zip_path(&entry.name().map_err(|_| SkillRegistryError::PackageInvalid)?)?;
         let name = prefix
             .as_deref()
             .and_then(|prefix| raw_name.strip_prefix(prefix))
