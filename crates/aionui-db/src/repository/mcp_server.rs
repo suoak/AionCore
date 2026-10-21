@@ -41,6 +41,20 @@ pub trait IMcpServerRepository: Send + Sync {
         Ok(rows)
     }
 
+    /// Finds a set of MCP servers by ID, excluding soft-deleted rows.
+    ///
+    /// Use this for every runtime mount / snapshot path: a server the user
+    /// deleted must never be started again just because an older conversation
+    /// or assistant snapshot still references its id.
+    async fn list_active_by_ids(&self, user_id: &str, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+        Ok(self
+            .list_by_ids_any(user_id, ids)
+            .await?
+            .into_iter()
+            .filter(|row| row.deleted_at.is_none())
+            .collect())
+    }
+
     /// Creates a new MCP server and returns the inserted row.
     /// Returns `DbError::Conflict` if the name already exists.
     async fn create(&self, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError>;

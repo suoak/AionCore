@@ -455,7 +455,10 @@ async fn create(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let Json(mut req) = body.map_err(ApiError::from)?;
+    if crate::service::strip_client_team_binding(&mut req.extra) {
+        tracing::warn!("Stripped client-supplied team binding fields from conversation create");
+    }
     let conversation = state.service.create(&user.id, req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
@@ -474,7 +477,10 @@ async fn clone(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CloneConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let Json(mut req) = body.map_err(ApiError::from)?;
+    if crate::service::strip_client_team_binding(&mut req.conversation.extra) {
+        tracing::warn!("Stripped client-supplied team binding fields from conversation clone");
+    }
     let conversation = state
         .service
         .clone_create(&user.id, req)

@@ -41,7 +41,7 @@ pub async fn resolve_session_mcp_servers(
     _broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Vec<SessionMcpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        Some(ids) => repo.list_active_by_ids(user_id, ids).await,
         None => repo.list(user_id).await,
     };
     let rows = match rows_result {
@@ -322,6 +322,21 @@ mod tests {
             fail: false,
         };
         let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster()).await;
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "docs");
+    }
+
+    #[tokio::test]
+    async fn resolve_never_mounts_soft_deleted_rows_even_when_selected() {
+        let mut deleted = make_row("deleted", true);
+        deleted.deleted_at = Some(1);
+        let repo = MockRepo {
+            rows: vec![make_row("docs", true), deleted],
+            fail: false,
+        };
+        let selected = vec!["mcp_docs".to_owned(), "mcp_deleted".to_owned()];
+        let servers =
+            resolve_session_mcp_servers(&repo, TEST_USER_ID, Some(&selected), "conv-1", test_broadcaster()).await;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "docs");
     }

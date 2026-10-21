@@ -373,6 +373,22 @@ async fn list_by_ids_any_includes_soft_deleted_rows() {
     assert!(rows[1].deleted_at.is_none());
 }
 
+#[tokio::test]
+async fn list_active_by_ids_excludes_soft_deleted_rows() {
+    let (r, _db) = repo().await;
+    let active = r.create(stdio_params()).await.unwrap();
+    let deleted = r.create(http_params()).await.unwrap();
+    r.delete(USER_ID, &deleted.id).await.unwrap();
+
+    let rows = r
+        .list_active_by_ids(USER_ID, &[deleted.id.clone(), active.id.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, active.id);
+}
+
 // -- B-1/B-2/B-3: Batch upsert --
 
 #[tokio::test]
