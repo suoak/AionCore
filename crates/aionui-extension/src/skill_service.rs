@@ -2044,7 +2044,7 @@ fn extract_zip_archive_with_limits(
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(zip_error)?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name().map_err(zip_error)?.into_owned();
         reject_zip_symlink(&entry)?;
         let relative_path = safe_zip_entry_path(&entry_name)?;
         let output_path = destination.join(relative_path);
@@ -2104,11 +2104,13 @@ fn safe_zip_entry_path(name: &str) -> Result<PathBuf, ExtensionError> {
     Ok(safe_path)
 }
 
-fn reject_zip_symlink(entry: &zip::read::ZipFile<'_>) -> Result<(), ExtensionError> {
+fn reject_zip_symlink<R: std::io::Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> Result<(), ExtensionError> {
     if let Some(mode) = entry.unix_mode()
         && mode & 0o170000 == 0o120000
     {
-        return Err(ExtensionError::SkillImportSymlinkEntry(entry.name().to_string()));
+        return Err(ExtensionError::SkillImportSymlinkEntry(
+            String::from_utf8_lossy(entry.name_raw()).into_owned(),
+        ));
     }
     Ok(())
 }
