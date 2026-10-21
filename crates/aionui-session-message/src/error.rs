@@ -19,6 +19,9 @@ pub enum SessionMessageError {
     #[error("target conversation is the sender: {id}")]
     TargetIsSelf { id: String },
 
+    #[error("target conversation was not selected with @@ in this conversation: {id}")]
+    TargetNotSelected { id: String },
+
     #[error("pending-delivery queue is full")]
     QueueFull,
 
@@ -42,6 +45,7 @@ impl SessionMessageError {
             Self::TargetIsTeam { .. } => SessionToolErrorCode::TargetIsTeam,
             Self::SenderIsTeam { .. } => SessionToolErrorCode::SenderIsTeam,
             Self::TargetIsSelf { .. } => SessionToolErrorCode::TargetIsSelf,
+            Self::TargetNotSelected { .. } => SessionToolErrorCode::TargetNotSelected,
             Self::QueueFull => SessionToolErrorCode::QueueFull,
             Self::RateLimited => SessionToolErrorCode::RateLimited,
             Self::FeatureDisabled => SessionToolErrorCode::FeatureDisabled,
@@ -53,7 +57,10 @@ impl SessionMessageError {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::TargetNotFound { .. } => 404,
-            Self::TargetIsTeam { .. } | Self::SenderIsTeam { .. } | Self::FeatureDisabled => 403,
+            Self::TargetIsTeam { .. }
+            | Self::SenderIsTeam { .. }
+            | Self::TargetNotSelected { .. }
+            | Self::FeatureDisabled => 403,
             Self::TargetIsSelf { .. } | Self::SchemaValidation { .. } => 400,
             Self::QueueFull | Self::TransportUnavailable { .. } => 409,
             Self::RateLimited => 429,
@@ -89,6 +96,11 @@ mod tests {
                 SessionMessageError::TargetIsSelf { id: "c".into() },
                 SessionToolErrorCode::TargetIsSelf,
                 400,
+            ),
+            (
+                SessionMessageError::TargetNotSelected { id: "c".into() },
+                SessionToolErrorCode::TargetNotSelected,
+                403,
             ),
             (SessionMessageError::QueueFull, SessionToolErrorCode::QueueFull, 409),
             (SessionMessageError::RateLimited, SessionToolErrorCode::RateLimited, 429),

@@ -136,3 +136,104 @@ pub fn reject_unusable_target(
 #[cfg(test)]
 #[path = "session_mentions_test.rs"]
 mod session_mentions_test;
+
+/// Most targets one conversation may hold grants for; older grants beyond this
+/// are dropped first. Bounds memory for a conversation that `@@`s a lot.
+const MAX_GRANTS_PER_CONVERSATION: usize = 256;
+
+/// Which conversations an agent may deliver to from a given conversation.
+///
+/// Cross-session delivery (`session send-message`) is agent-initiated, so a
+/// prompt-injected agent could otherwise message ANY of the user's
+/// conversations and start a turn there. A grant is created only by:
+///
+/// - the user's own send path, for every conversation they picked with `@@`
+///   in that conversation (`ConversationService::send_message`);
+/// - a successful delivery A → B, which grants B the reply edge B → A (the
+///   user authorized that pair; it never extends to third conversations).
+///
+/// In memory only: after a restart the user re-selects targets with `@@`,
+/// which fails closed rather than trusting text an agent could have forged.
+#[derive(Debug, Default)]
+pub struct SessionMentionGrants {
+    inner: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<String>>>,
+}
+
+impl SessionMentionGrants {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<(String, String), Vec<String>>> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Allow `from` to deliver to `to` for `user_id`.
+    pub fn grant(&self, user_id: &str, from: &str, to: &str) {
+        if from == to || from.is_empty() || to.is_empty() {
+            return;
+        }
+        let mut map = self.lock();
+        let targets = map.entry((user_id.to_owned(), from.to_owned())).or_default();
+        targets.retain(|existing| existing != to);
+        targets.push(to.to_owned());
+        if targets.len() > MAX_GRANTS_PER_CONVERSATION {
+            let excess = targets.len() - MAX_GRANTS_PER_CONVERSATION;
+            targets.drain(..excess);
+        }
+    }
+
+    pub fn is_granted(&self, user_id: &str, from: &str, to: &str) -> bool {
+        self.lock()
+            .get(&(user_id.to_owned(), from.to_owned()))
+            .is_some_and(|targets| targets.iter().any(|target| target == to))
+    }
+
+    /// Drop every grant from or to a deleted conversation.
+    pub fn forget_conversation(&self, user_id: &str, conversation_id: &str) {
+        let mut map = self.lock();
+        map.remove(&(user_id.to_owned(), conversation_id.to_owned()));
+        for ((owner, _), targets) in map.iter_mut() {
+            if owner == user_id {
+                targets.retain(|target| target != conversation_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::SessionMentionGrants;
+
+    #[test]
+    fn grants_are_directional_and_scoped_per_user() {
+        let grants = SessionMentionGrants::new();
+        grants.grant("u1", "a", "b");
+        assert!(grants.is_granted("u1", "a", "b"));
+        assert!(!grants.is_granted("u1", "b", "a"));
+        assert!(!grants.is_granted("u2", "a", "b"));
+        assert!(!grants.is_granted("u1", "a", "c"));
+    }
+
+    #[test]
+    fn self_grants_are_ignored_and_deletion_revokes() {
+        let grants = SessionMentionGrants::new();
+        grants.grant("u1", "a", "a");
+        assert!(!grants.is_granted("u1", "a", "a"));
+        grants.grant("u1", "a", "b");
+        grants.grant("u1", "c", "b");
+        grants.forget_conversation("u1", "b");
+        assert!(!grants.is_granted("u1", "a", "b"));
+        assert!(!grants.is_granted("u1", "c", "b"));
+    }
+
+    #[test]
+    fn grants_are_bounded_per_conversation() {
+        let grants = SessionMentionGrants::new();
+        for index in 0..(super::MAX_GRANTS_PER_CONVERSATION + 5) {
+            grants.grant("u1", "a", &format!("t{index}"));
+        }
+        assert!(!grants.is_granted("u1", "a", "t0"));
+        assert!(grants.is_granted("u1", "a", &format!("t{}", super::MAX_GRANTS_PER_CONVERSATION + 4)));
+    }
+}

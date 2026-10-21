@@ -757,6 +757,8 @@ pub struct ConversationService {
     usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
     task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
     input_queue_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Cross-session delivery grants created by the user's `@@` picks.
+    session_mention_grants: Arc<session_mentions::SessionMentionGrants>,
 }
 
 #[derive(Clone)]
@@ -905,7 +907,13 @@ impl ConversationService {
             usage_event_repo: Arc::new(RwLock::new(None)),
             task_session_repo: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
+            session_mention_grants: Arc::new(session_mentions::SessionMentionGrants::new()),
         }
+    }
+
+    /// Shared `@@` delivery grants (see [`session_mentions::SessionMentionGrants`]).
+    pub fn session_mention_grants(&self) -> &Arc<session_mentions::SessionMentionGrants> {
+        &self.session_mention_grants
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -4500,6 +4508,7 @@ impl ConversationService {
             return Err(err.into());
         }
         self.runtime_state.clear_deleting(id);
+        self.session_mention_grants.forget_conversation(user_id, id);
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
         // cheap to cover) still drop their orphaned session row.
@@ -5794,8 +5803,16 @@ impl ConversationService {
             req.content.clone()
         } else {
             let sender_workspace = session_mentions::workspace_from_extra(&row.extra);
-            self.resolve_session_mentions(user_id, &req.content, &req.sessions, sender_workspace.as_deref())
-                .await?
+            let content = self
+                .resolve_session_mentions(user_id, &req.content, &req.sessions, sender_workspace.as_deref())
+                .await?;
+            // The user picked these targets with `@@` in this conversation:
+            // only now may this conversation's agent deliver to them.
+            for reference in &req.sessions {
+                self.session_mention_grants
+                    .grant(user_id, conversation_id, &reference.id);
+            }
+            content
         };
 
         // Resolve file attachments at the send boundary before any persist/claim
