@@ -11,8 +11,27 @@ use aionui_common::ApiError;
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
+use crate::agent_approval::{
+    AGENT_APPROVAL_ID_HEADER, AGENT_APPROVAL_REQUIRED_CODE, AgentActionApprovals, ApprovalCheck, request_fingerprint,
+};
+use crate::agent_scope::{AgentRouteDecision, classify_agent_request, is_rename_only_patch, redact_secrets};
 use crate::extract::extract_token_from_headers;
 use crate::local_secret::LocalApiSecret;
+
+/// Largest request body an agent token may send to a gated route (the body is
+/// buffered to fingerprint it for approval).
+const AGENT_REQUEST_BODY_LIMIT: usize = 8 * 1024 * 1024;
+/// Largest JSON response redacted for an agent token; larger ones are refused
+/// rather than passed through unredacted.
+const AGENT_RESPONSE_BODY_LIMIT: usize = 32 * 1024 * 1024;
+
+/// Marker inserted into request extensions when the caller authenticated with
+/// an agent (conversation-runtime) token rather than as the user.
+#[derive(Debug, Clone)]
+pub struct AgentPrincipal {
+    /// Conversation the agent token is bound to.
+    pub conversation_id: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthIdentityMode {
@@ -81,6 +100,9 @@ pub struct AuthState {
     /// requests presenting the secret are the desktop user; all other callers
     /// fall through to session-JWT and runtime-token authentication.
     pub local_secret: Option<LocalApiSecret>,
+    /// Approval store for configuration writes requested by agent tokens.
+    /// `None` denies such writes outright.
+    pub agent_approvals: Option<Arc<AgentActionApprovals>>,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -167,7 +189,7 @@ pub async fn auth_middleware(
 /// verifier enforces that binding, so a forged user or conversation header
 /// fails closed. On success the token's user is loaded and injected as
 /// [`CurrentUser`], making ordinary user-scoped handlers work unchanged.
-async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Next) -> Result<Response, ApiError> {
+async fn runtime_token_channel(state: &AuthState, request: Request, next: Next) -> Result<Response, ApiError> {
     let headers = request.headers();
     let header = |name: &str| {
         headers
@@ -209,6 +231,11 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         ));
     }
 
+    let mut request = enforce_agent_scope(state, request, &user.id, &conversation_id).await?;
+    let redact_response = request.method() == axum::http::Method::GET;
+    request.extensions_mut().insert(AgentPrincipal {
+        conversation_id: conversation_id.clone(),
+    });
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),
@@ -216,7 +243,137 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         status: user.status,
     });
 
-    Ok(next.run(request).await)
+    let response = next.run(request).await;
+    if redact_response {
+        redact_json_response(response).await
+    } else {
+        Ok(response)
+    }
+}
+
+fn scope_denied(message: &str) -> ApiError {
+    ApiError::coded(StatusCode::FORBIDDEN, "AGENT_SCOPE_DENIED", message, None)
+}
+
+async fn buffer_body(request: Request) -> Result<(Request, axum::body::Bytes), ApiError> {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, AGENT_REQUEST_BODY_LIMIT)
+        .await
+        .map_err(|_| ApiError::PayloadTooLarge("Request body too large".into()))?;
+    Ok((Request::from_parts(parts, axum::body::Body::from(bytes.clone())), bytes))
+}
+
+/// Apply the agent-token route scope (see [`crate::agent_scope`]).
+async fn enforce_agent_scope(
+    state: &AuthState,
+    request: Request,
+    user_id: &str,
+    conversation_id: &str,
+) -> Result<Request, ApiError> {
+    let method = request.method().clone();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+
+    match classify_agent_request(&method, request.uri().path(), conversation_id) {
+        AgentRouteDecision::Allow => Ok(request),
+        AgentRouteDecision::Deny => {
+            tracing::info!(method = %method, path = request.uri().path(), "agent token request outside scope");
+            Err(scope_denied("This route is not available to agent tokens."))
+        }
+        AgentRouteDecision::AllowOwnRename => {
+            let (request, body) = buffer_body(request).await?;
+            if is_rename_only_patch(&body) {
+                Ok(request)
+            } else {
+                Err(scope_denied("Agent tokens may only rename their own conversation."))
+            }
+        }
+        AgentRouteDecision::RequireApproval(kind) => {
+            let Some(store) = state.agent_approvals.as_ref() else {
+                return Err(scope_denied(
+                    "Configuration changes from agents are disabled; make the change in the app.",
+                ));
+            };
+            let approval_id = request
+                .headers()
+                .get(AGENT_APPROVAL_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let (request, body) = buffer_body(request).await?;
+            let fingerprint = request_fingerprint(method.as_str(), &path_and_query, &body);
+
+            if let Some(approval_id) = approval_id {
+                return match store.check_and_consume(&approval_id, user_id, conversation_id, &fingerprint) {
+                    ApprovalCheck::Granted => {
+                        tracing::info!(method = %method, path = request.uri().path(), "agent config write approved by user");
+                        Ok(request)
+                    }
+                    ApprovalCheck::Pending => Err(ApiError::coded(
+                        StatusCode::CONFLICT,
+                        "AGENT_ACTION_APPROVAL_PENDING",
+                        "Waiting for the user to approve this change in CSBU WorkMate.",
+                        serde_json::json!({ "approval_id": approval_id }),
+                    )),
+                    ApprovalCheck::Denied => Err(ApiError::coded(
+                        StatusCode::FORBIDDEN,
+                        "AGENT_ACTION_APPROVAL_DENIED",
+                        "The user denied this change.",
+                        serde_json::json!({ "approval_id": approval_id }),
+                    )),
+                    ApprovalCheck::Invalid => Err(ApiError::coded(
+                        StatusCode::FORBIDDEN,
+                        "AGENT_ACTION_APPROVAL_INVALID",
+                        "Approval is unknown, expired, already used, or does not match this request.",
+                        None,
+                    )),
+                };
+            }
+
+            let Some(record) = store.request(user_id, conversation_id, kind, method.as_str(), &path_and_query, &body)
+            else {
+                return Err(ApiError::RateLimited);
+            };
+            Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                AGENT_APPROVAL_REQUIRED_CODE,
+                "This change needs the user's approval in CSBU WorkMate.",
+                serde_json::json!({
+                    "approval_id": record.id,
+                    "kind": record.kind,
+                    "status_path": format!("/api/agent-approvals/{}", record.id),
+                    "expires_at": record.expires_at,
+                }),
+            ))
+        }
+    }
+}
+
+/// Redact secrets from a JSON response served to an agent token.
+async fn redact_json_response(response: Response) -> Result<Response, ApiError> {
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("json"));
+    if !is_json {
+        return Ok(response);
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, AGENT_RESPONSE_BODY_LIMIT)
+        .await
+        .map_err(|_| ApiError::PayloadTooLarge("Response too large for an agent token".into()))?;
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(Response::from_parts(parts, axum::body::Body::from(bytes)));
+    };
+    redact_secrets(&mut value);
+    let redacted = serde_json::to_vec(&value).map_err(|_| ApiError::Internal("Failed to encode response".into()))?;
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Ok(Response::from_parts(parts, axum::body::Body::from(redacted)))
 }
 
 /// Local-mode authentication middleware that skips JWT verification.

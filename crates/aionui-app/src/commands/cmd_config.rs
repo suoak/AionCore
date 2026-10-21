@@ -1383,16 +1383,22 @@ fn meta_from_map(extra: Map<String, Value>) -> Value {
     Value::Object(map)
 }
 
-async fn request_json(
+/// Backend error code for agent config writes that need the user's approval.
+const APPROVAL_REQUIRED_CODE: &str = "AGENT_ACTION_APPROVAL_REQUIRED";
+/// Header carrying an approved request's id on the replay.
+const APPROVAL_ID_HEADER: &str = "x-aionui-approval-id";
+const APPROVAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const APPROVAL_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+async fn send_config_request(
     client: &reqwest::Client,
     env: &ConfigEnv,
     method: Method,
     path: &str,
-    body: Option<Value>,
-    command: &str,
-) -> Result<Value, ConfigError> {
+    body: Option<&Value>,
+    approval_id: Option<&str>,
+) -> Result<reqwest::Response, reqwest::Error> {
     let url = format!("{}{}", env.base_url, path);
-    let method_label = method.as_str().to_owned();
     let mut request = client
         .request(method, &url)
         .header("content-type", "application/json")
@@ -1401,34 +1407,106 @@ async fn request_json(
     if let Some(runtime_token) = &env.runtime_token {
         request = request.header("x-aionui-runtime-token", runtime_token);
     }
-    if let Some(body) = body {
-        request = request.json(&body);
+    if let Some(approval_id) = approval_id {
+        request = request.header(APPROVAL_ID_HEADER, approval_id);
     }
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    request.send().await
+}
 
-    let response = request.send().await.map_err(|_| {
-        tracing::warn!(
-            command,
-            method = method_label.as_str(),
-            path,
-            "config CLI backend request failed"
-        );
-        ConfigError::new(
-            ConfigErrorCode::HttpRequestFailed,
-            command,
-            "failed to call CSBU WorkMate backend",
-        )
-        .field("path", path)
-    })?;
+/// Wait for the user to approve or deny a parked config write.
+/// Returns `Ok(true)` once approved, `Ok(false)` when denied/expired/timed out.
+async fn wait_for_approval(client: &reqwest::Client, env: &ConfigEnv, approval_id: &str, command: &str) -> bool {
+    eprintln!(
+        "{command}: waiting for the user to approve this change in CSBU WorkMate (approval {approval_id}, up to {}s)…",
+        APPROVAL_WAIT_LIMIT.as_secs()
+    );
+    let status_path = format!("/api/agent-approvals/{}", encode_path_segment(approval_id));
+    let deadline = std::time::Instant::now() + APPROVAL_WAIT_LIMIT;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(APPROVAL_POLL_INTERVAL).await;
+        let Ok(response) = send_config_request(client, env, Method::GET, &status_path, None, None).await else {
+            continue;
+        };
+        let Ok(value) = response.json::<Value>().await else {
+            continue;
+        };
+        match value.pointer("/data/status").and_then(Value::as_str) {
+            Some("approved") => return true,
+            Some("pending") => {}
+            _ => return false,
+        }
+    }
+    false
+}
 
-    let status = response.status();
-    let text = response.text().await.map_err(|_| {
-        ConfigError::new(
-            ConfigErrorCode::ResponseReadFailed,
-            command,
-            "failed to read CSBU WorkMate backend response",
-        )
-        .field("path", path)
-    })?;
+async fn request_json(
+    client: &reqwest::Client,
+    env: &ConfigEnv,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+    command: &str,
+) -> Result<Value, ConfigError> {
+    let method_label = method.as_str().to_owned();
+    let mut approval_id: Option<String> = None;
+    let (status, text) = loop {
+        let response = send_config_request(client, env, method.clone(), path, body.as_ref(), approval_id.as_deref())
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    command,
+                    method = method_label.as_str(),
+                    path,
+                    "config CLI backend request failed"
+                );
+                ConfigError::new(
+                    ConfigErrorCode::HttpRequestFailed,
+                    command,
+                    "failed to call CSBU WorkMate backend",
+                )
+                .field("path", path)
+            })?;
+
+        let status = response.status();
+        let text = response.text().await.map_err(|_| {
+            ConfigError::new(
+                ConfigErrorCode::ResponseReadFailed,
+                command,
+                "failed to read CSBU WorkMate backend response",
+            )
+            .field("path", path)
+        })?;
+
+        if approval_id.is_none() && status == reqwest::StatusCode::FORBIDDEN {
+            let parked = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+                (value.get("code").and_then(Value::as_str) == Some(APPROVAL_REQUIRED_CODE))
+                    .then(|| {
+                        value
+                            .pointer("/details/approval_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            });
+            if let Some(id) = parked {
+                if wait_for_approval(client, env, &id, command).await {
+                    approval_id = Some(id);
+                    continue;
+                }
+                return Err(ConfigError::new(
+                    ConfigErrorCode::HttpStatusError,
+                    command,
+                    "the user did not approve this change in CSBU WorkMate",
+                )
+                .field("path", path)
+                .field("approval_id", id));
+            }
+        }
+        break (status, text);
+    };
 
     if !status.is_success() {
         tracing::warn!(
@@ -1438,13 +1516,20 @@ async fn request_json(
             status = status.as_u16(),
             "config CLI backend returned error status"
         );
-        return Err(ConfigError::new(
+        let mut error = ConfigError::new(
             ConfigErrorCode::HttpStatusError,
             command,
             "CSBU WorkMate backend returned an error status",
         )
         .field("path", path)
-        .field("status", status.as_u16().to_string()));
+        .field("status", status.as_u16().to_string());
+        if let Some(code) = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|value| value.get("code").and_then(Value::as_str).map(str::to_owned))
+        {
+            error = error.field("backend_code", code);
+        }
+        return Err(error);
     }
 
     if text.trim().is_empty() {

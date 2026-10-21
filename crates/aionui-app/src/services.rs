@@ -78,6 +78,8 @@ pub struct AppServices {
     pub bootstrap_secret: Option<Arc<str>>,
     /// Per-launch desktop API secret (local mode only); see `AppConfig`.
     pub local_api_secret: Option<aionui_auth::LocalApiSecret>,
+    /// Pending user approvals for configuration writes requested by agents.
+    pub agent_approvals: Arc<aionui_auth::AgentActionApprovals>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -256,6 +258,19 @@ impl AppServices {
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
+        let agent_approvals = Arc::new(aionui_auth::AgentActionApprovals::new());
+        {
+            let event_bus = event_bus.clone();
+            agent_approvals.set_notifier(Arc::new(move |record| {
+                use aionui_realtime::EventBroadcaster;
+                if let Ok(data) = serde_json::to_value(record) {
+                    event_bus.broadcast(aionui_api_types::WebSocketMessage::new(
+                        aionui_auth::APPROVAL_EVENT,
+                        data,
+                    ));
+                }
+            }));
+        }
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -463,6 +478,7 @@ impl AppServices {
             identity_mode,
             bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
             local_api_secret: if local { config.local_api_secret.clone() } else { None },
+            agent_approvals,
             app_version,
             skill_paths,
             skill_repo,

@@ -286,6 +286,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
         local_secret: None,
+        agent_approvals: None,
     };
 
     // Auth rate limited routes (login, qr-login)

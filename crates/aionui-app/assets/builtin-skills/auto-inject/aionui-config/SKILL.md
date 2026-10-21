@@ -24,6 +24,8 @@ not call raw backend paths, and do not depend on tools outside the bundled
 11. Never reveal provider keys, MCP headers, environment values, or other secrets.
 12. If the CLI fails, report the stable `CONFIG_...` error from stderr in normal prose and do not claim the change was made.
 13. After assistant changes, explain both persistence and effect timing. Saving and read-back do not mean the current running conversation has reloaded the changed runtime behavior.
+14. Every configuration write (MCP servers, providers, settings, agents, assistants, skills, scheduled tasks) needs the user's approval in CSBU WorkMate. The CLI shows an approval card to the user and waits up to 3 minutes. Tell the user to check the card. If they deny it or it times out, the CLI fails; report that the change was not made and do not retry on your own.
+15. Reads return secrets as `[REDACTED]`. Never ask the user to paste a secret again just to "confirm" it, and never write `[REDACTED]` back as a value.
 
 ## Output
 

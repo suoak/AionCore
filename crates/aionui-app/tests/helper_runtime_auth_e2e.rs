@@ -243,24 +243,37 @@ async fn helper_write_request_is_exempt_from_csrf() {
         [RuntimeTokenScope::ConversationHelper],
     );
 
-    // Invalid payload on purpose: the request must get PAST auth + CSRF and be
-    // judged by the handler itself (a 4xx that is NOT CSRF/401 proves the
-    // channel works for state-changing calls without a CSRF cookie).
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/internal/conversation-cron/create")
-                .header("content-type", "application/json")
-                .header("x-aionui-user-id", &user_id)
-                .header("x-aionui-conversation-id", CONVERSATION_ID)
-                .header("x-aionui-runtime-token", &issue.token)
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // Invalid payload on purpose: the request must get PAST auth + CSRF. Agent
+    // config writes are parked for user approval (not rejected by CSRF/401);
+    // once the user approves, the identical replay reaches the handler, which
+    // judges it itself (a 4xx that is NOT CSRF/401/403).
+    let request = |approval_id: Option<&str>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/internal/conversation-cron/create")
+            .header("content-type", "application/json")
+            .header("x-aionui-user-id", &user_id)
+            .header("x-aionui-conversation-id", CONVERSATION_ID)
+            .header("x-aionui-runtime-token", &issue.token);
+        if let Some(id) = approval_id {
+            builder = builder.header("x-aionui-approval-id", id);
+        }
+        builder.body(Body::from("{}")).unwrap()
+    };
 
+    let resp = app.clone().oneshot(request(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "AGENT_ACTION_APPROVAL_REQUIRED");
+    assert_eq!(json["details"]["kind"], "cron");
+    let approval_id = json["details"]["approval_id"].as_str().unwrap().to_owned();
+
+    services
+        .agent_approvals
+        .resolve(&approval_id, &user_id, true)
+        .expect("pending approval");
+
+    let resp = app.oneshot(request(Some(&approval_id))).await.unwrap();
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(resp.status(), StatusCode::FORBIDDEN);
 
