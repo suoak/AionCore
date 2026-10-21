@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.18](https://github.com/suoak/AionCore/compare/v0.2.17...v0.2.18) (2026-10-21)
+
+
+### Bug Fixes
+
+* **security:** harden session tool exposure (batch 1) ([#143](https://github.com/suoak/AionCore/issues/143)) ([6d80331](https://github.com/suoak/AionCore/commit/6d80331655b0523fc97c5c4a272aa73a89ab0fec))
+
 ## [0.2.17](https://github.com/suoak/AionCore/compare/v0.2.16...v0.2.17) (2026-10-07)
 
 
