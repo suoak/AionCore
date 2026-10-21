@@ -279,7 +279,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             runtime_token_service: services.runtime_token_service.clone(),
         })),
         local_secret: services.local_api_secret.clone(),
+        agent_approvals: Some(services.agent_approvals.clone()),
     };
+
+    let agent_approvals_authenticated = aionui_auth::agent_approval_routes(services.agent_approvals.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // System routes protected by auth middleware
     let system_authenticated =
@@ -411,6 +415,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
         .merge(system_authenticated)
+        .merge(agent_approvals_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
         .merge(remote_agent_authenticated)

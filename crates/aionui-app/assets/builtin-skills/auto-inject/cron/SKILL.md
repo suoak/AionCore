@@ -19,6 +19,7 @@ agent-facing config CLI.
 7. Put `job_id` in the update JSON payload, not in a command flag.
 8. After a successful create or update, send one short final confirmation that a normal user can understand. Include the task name and schedule description. Do not show internal ids such as `cron_...`.
 9. If the CLI fails, report the failure from stderr/stdout in normal prose and do not claim the task was created.
+10. Creating, updating or deleting a task shows the user an approval card in CSBU WorkMate, and the CLI waits for it. Tell the user to approve the card. If it is denied or times out, the task was not changed; do not retry on your own.
 
 ## Workflow
 

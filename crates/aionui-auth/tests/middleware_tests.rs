@@ -184,6 +184,7 @@ fn protected_auth_app_with_mode_and_verifier(
         identity_mode,
         runtime_token_verifier,
         local_secret: None,
+        agent_approvals: None,
     };
 
     Router::new()
@@ -205,11 +206,12 @@ fn identity_echo_app(
         identity_mode,
         runtime_token_verifier,
         local_secret: None,
+        agent_approvals: None,
     };
 
     Router::new()
         .route(
-            "/whoami",
+            "/api/settings",
             get(|user: axum::Extension<CurrentUser>| async move { user.id.clone() }),
         )
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
@@ -632,7 +634,7 @@ impl IRuntimeTokenVerifier for MatchVerifier {
 }
 
 fn helper_request(token: Option<&str>, user_id: &str, conversation_id: &str) -> Request<Body> {
-    let mut builder = Request::get("/whoami")
+    let mut builder = Request::get("/api/settings")
         .header("x-aionui-user-id", user_id)
         .header("x-aionui-conversation-id", conversation_id);
     if let Some(token) = token {
@@ -880,10 +882,11 @@ fn local_secret_echo_app(
         identity_mode: AuthIdentityMode::Local,
         runtime_token_verifier,
         local_secret,
+        agent_approvals: None,
     };
     Router::new()
         .route(
-            "/whoami",
+            "/api/settings",
             get(|user: axum::Extension<CurrentUser>| async move { user.id.clone() }),
         )
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
@@ -902,7 +905,7 @@ async fn local_mode_without_secret_keeps_legacy_default_user() {
     let app = local_secret_echo_app(jwt_service, repo, None, None);
 
     let resp = app
-        .oneshot(Request::get("/whoami").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/api/settings").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -923,14 +926,14 @@ async fn local_mode_with_secret_rejects_anonymous_callers() {
 
     let resp = app
         .clone()
-        .oneshot(Request::get("/whoami").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/api/settings").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let resp = app
         .oneshot(
-            Request::get("/whoami")
+            Request::get("/api/settings")
                 .header("x-aionui-local-secret", "desktop-launch-secret-0123456789-WRONGWRONG")
                 .body(Body::empty())
                 .unwrap(),
@@ -954,7 +957,7 @@ async fn local_mode_with_secret_accepts_desktop_header() {
 
     let resp = app
         .oneshot(
-            Request::get("/whoami")
+            Request::get("/api/settings")
                 .header("x-aionui-local-secret", LOCAL_SECRET)
                 .body(Body::empty())
                 .unwrap(),
@@ -982,7 +985,7 @@ async fn local_mode_with_secret_still_accepts_webui_session_jwt() {
 
     let resp = app
         .oneshot(
-            Request::get("/whoami")
+            Request::get("/api/settings")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1022,4 +1025,212 @@ async fn local_mode_with_secret_still_accepts_runtime_helper_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ============================================================
+// Agent-token scope, approvals and redaction
+// ============================================================
+
+fn scoped_agent_app(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    approvals: Option<Arc<aionui_auth::AgentActionApprovals>>,
+) -> Router {
+    let state = AuthState {
+        jwt_service,
+        user_repo,
+        identity_mode: AuthIdentityMode::Local,
+        runtime_token_verifier: Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+        local_secret: Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
+        agent_approvals: approvals,
+    };
+    let ok_json = || async { axum::Json(serde_json::json!({"success": true, "data": "written"})) };
+    Router::new()
+        .route(
+            "/api/providers",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "success": true,
+                    "data": [{"id": "p1", "base_url": "https://api.example", "api_key": "sk-live-secret"}]
+                }))
+            })
+            .post(ok_json),
+        )
+        .route("/api/mcp/servers", post(ok_json))
+        .route("/api/conversations/{id}", axum::routing::patch(ok_json))
+        .route("/api/fs/write", post(ok_json))
+        .route("/api/webui/reset-password", post(ok_json))
+        .route("/api/agent-approvals/{id}/approve", post(ok_json))
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+fn agent_request(method: &str, path: &str, body: &str, approval_id: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("x-aionui-runtime-token", "tok-1")
+        .header("x-aionui-user-id", "system_default_user")
+        .header("x-aionui-conversation-id", "conv-1");
+    if let Some(id) = approval_id {
+        builder = builder.header("x-aionui-approval-id", id);
+    }
+    builder.body(Body::from(body.to_owned())).unwrap()
+}
+
+async fn agent_app_with_store() -> (Router, Arc<aionui_auth::AgentActionApprovals>) {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let store = Arc::new(aionui_auth::AgentActionApprovals::new());
+    (scoped_agent_app(jwt_service, repo, Some(store.clone())), store)
+}
+
+#[tokio::test]
+async fn agent_token_reads_are_redacted() {
+    let (app, _) = agent_app_with_store().await;
+    let resp = app
+        .oneshot(agent_request("GET", "/api/providers", "", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["data"][0]["api_key"], "[REDACTED]");
+    assert_eq!(json["data"][0]["base_url"], "https://api.example");
+}
+
+#[tokio::test]
+async fn desktop_reads_are_not_redacted() {
+    let (app, _) = agent_app_with_store().await;
+    let resp = app
+        .oneshot(
+            Request::get("/api/providers")
+                .header("x-aionui-local-secret", LOCAL_SECRET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["data"][0]["api_key"], "sk-live-secret");
+}
+
+#[tokio::test]
+async fn agent_token_is_denied_outside_scope() {
+    let (app, _) = agent_app_with_store().await;
+    for (method, path) in [
+        ("POST", "/api/fs/write"),
+        ("POST", "/api/webui/reset-password"),
+        ("POST", "/api/agent-approvals/apr_x/approve"),
+        ("PATCH", "/api/conversations/conv-other"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(agent_request(method, path, r#"{"name":"x"}"#, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        assert_eq!(json_body(resp).await["code"], "AGENT_SCOPE_DENIED", "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn agent_token_may_only_rename_its_own_conversation() {
+    let (app, _) = agent_app_with_store().await;
+    let resp = app
+        .clone()
+        .oneshot(agent_request(
+            "PATCH",
+            "/api/conversations/conv-1",
+            r#"{"name":"New"}"#,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .oneshot(agent_request(
+            "PATCH",
+            "/api/conversations/conv-1",
+            r#"{"name":"New","extra":{"auto_approve":true}}"#,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn agent_config_write_requires_user_approval_of_the_exact_request() {
+    let (app, store) = agent_app_with_store().await;
+    let body = r#"{"name":"gh","command":"npx","env":{"TOKEN":"t"}}"#;
+
+    let resp = app
+        .clone()
+        .oneshot(agent_request("POST", "/api/mcp/servers", body, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "AGENT_ACTION_APPROVAL_REQUIRED");
+    assert_eq!(json["details"]["kind"], "mcp");
+    let id = json["details"]["approval_id"].as_str().unwrap().to_owned();
+
+    let pending = store.list_pending("system_default_user");
+    assert_eq!(pending.len(), 1);
+    assert!(!pending[0].summary.contains("\"t\""));
+
+    // Still pending.
+    let resp = app
+        .clone()
+        .oneshot(agent_request("POST", "/api/mcp/servers", body, Some(&id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    store.resolve(&id, "system_default_user", true).unwrap();
+
+    // A different body cannot ride on the approval.
+    let resp = app
+        .clone()
+        .oneshot(agent_request(
+            "POST",
+            "/api/mcp/servers",
+            r#"{"name":"evil"}"#,
+            Some(&id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(agent_request("POST", "/api/mcp/servers", body, Some(&id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Single use.
+    let resp = app
+        .oneshot(agent_request("POST", "/api/mcp/servers", body, Some(&id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn agent_config_write_is_denied_without_an_approval_store() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = scoped_agent_app(jwt_service, repo, None);
+    let resp = app
+        .oneshot(agent_request("POST", "/api/providers", "{}", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["code"], "AGENT_SCOPE_DENIED");
 }

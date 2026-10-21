@@ -1456,7 +1456,7 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
     let local_marker: Option<Arc<str>> = services
         .local_api_secret
         .as_ref()
-        .map(|_| Arc::from(format!("local-desktop:{}", uuid::Uuid::new_v4()).as_str()));
+        .map(|_| Arc::from(format!("local-desktop:{}", aionui_auth::generate_random_secret_string()).as_str()));
 
     let jwt_service = services.jwt_service.clone();
     let validator_marker = local_marker.clone();

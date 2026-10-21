@@ -1115,3 +1115,107 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     assert!(cron.contains("\"$AIONUI_HELPER_BIN\" config cron current list"));
     assert!(cron.contains("\"job_id\""));
 }
+
+/// Records every provider-create attempt: (approval header, body).
+type ApprovalAttempts = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+async fn spawn_approval_probe_server(
+    attempts: ApprovalAttempts,
+    final_status: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new()
+        .route(
+            "/api/providers",
+            get(fake_provider_list).post(
+                move |State(attempts): State<ApprovalAttempts>,
+                      headers: HeaderMap,
+                      axum::Json(payload): axum::Json<serde_json::Value>| async move {
+                    let approval = header(&headers, "x-aionui-approval-id");
+                    attempts.lock().unwrap().push((approval.clone(), payload));
+                    if approval.is_empty() {
+                        return (
+                            axum::http::StatusCode::FORBIDDEN,
+                            axum::Json(json!({
+                                "success": false,
+                                "error": "needs approval",
+                                "code": "AGENT_ACTION_APPROVAL_REQUIRED",
+                                "details": {"approval_id": "apr_test", "kind": "provider"}
+                            })),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"success": true, "data": {"id": "provider-openai", "name": "OpenAI"}})),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/api/agent-approvals/{id}",
+            get(move |Path(id): Path<String>| async move {
+                axum::Json(json!({"success": true, "data": {"id": id, "status": final_status}}))
+            }),
+        )
+        .with_state(attempts);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+async fn run_provider_create(base_url: &str) -> std::process::Output {
+    let mut child = config_command()
+        .args(["providers", "create"])
+        .env("AIONUI_BASE_URL", base_url)
+        .env("AIONUI_CONVERSATION_ID", "conv-provider")
+        .env("AIONUI_USER_ID", "user-provider")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{ "name": "OpenAI", "api_key": "sk-input-secret" }"#)
+        .await
+        .unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().await.unwrap()
+}
+
+#[tokio::test]
+async fn config_write_waits_for_user_approval_then_replays_identical_request() {
+    let attempts: ApprovalAttempts = Arc::new(Mutex::new(Vec::new()));
+    let (base_url, handle) = spawn_approval_probe_server(attempts.clone(), "approved").await;
+    let output = run_provider_create(&base_url).await;
+    handle.abort();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("approve"));
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, "");
+    assert_eq!(attempts[1].0, "apr_test");
+    assert_eq!(attempts[0].1, attempts[1].1);
+}
+
+#[tokio::test]
+async fn config_write_fails_when_user_denies_approval() {
+    let attempts: ApprovalAttempts = Arc::new(Mutex::new(Vec::new()));
+    let (base_url, handle) = spawn_approval_probe_server(attempts.clone(), "denied").await;
+    let output = run_provider_create(&base_url).await;
+    handle.abort();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("did not approve"));
+    assert_eq!(attempts.lock().unwrap().len(), 1);
+}

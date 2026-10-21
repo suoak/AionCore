@@ -2,6 +2,8 @@
 
 //! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
 mod account;
+pub mod agent_approval;
+pub mod agent_scope;
 mod cookie;
 mod csrf;
 mod error;
@@ -67,8 +69,13 @@ pub use csrf::csrf_middleware;
 pub use local_secret::{LOCAL_API_SECRET_HEADER, LOCAL_AUTH_STDIN_ENV, LocalApiSecret, LocalApiSecretError};
 
 // Auth middleware
+pub use agent_approval::{
+    AGENT_APPROVAL_ID_HEADER, APPROVAL_EVENT, AgentActionApprovals, AgentApprovalRecord, ApprovalNotifier,
+    ApprovalStatus, agent_approval_routes,
+};
+pub use agent_scope::{AgentActionKind, AgentRouteDecision};
 pub use middleware::{
-    AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
+    AgentPrincipal, AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
     RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, local_auth_middleware,
 };
 
