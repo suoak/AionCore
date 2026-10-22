@@ -3165,19 +3165,32 @@ impl ConversationService {
             }
             None => None,
         };
+        let mut selected_mcp_server_ids = selected_mcp_server_ids;
         let selected_session_mcp_servers = match extra.as_object_mut() {
-            Some(obj) => match obj.remove("selected_session_mcp_servers").or_else(|| {
-                (is_team_conversation)
-                    .then(|| obj.remove("session_mcp_servers"))
-                    .flatten()
-            }) {
-                Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
-                    ConversationError::BadRequest {
-                        reason: format!("Invalid session MCP snapshot: {e}"),
-                    }
-                })?),
-                None => None,
-            },
+            Some(obj) => {
+                // Both keys are taken out for EVERY conversation: a raw
+                // `session_mcp_servers` left in a non-team `extra` would reach
+                // the factory unvalidated and be spawned as-is.
+                let selected = obj.remove("selected_session_mcp_servers");
+                let raw = obj.remove("session_mcp_servers");
+                match selected.or(raw) {
+                    Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
+                        ConversationError::BadRequest {
+                            reason: format!("Invalid session MCP snapshot: {e}"),
+                        }
+                    })?),
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        // B-12: a session MCP entry is only a REFERENCE to a builtin row. The
+        // client-supplied transport is discarded and re-derived server-side.
+        let selected_session_mcp_servers = match selected_session_mcp_servers {
+            Some(servers) => Some(
+                self.resolve_requested_session_mcp_servers(user_id, &servers, &mut selected_mcp_server_ids)
+                    .await?,
+            ),
             None => None,
         };
         let selected_mcp_statuses = if is_team_conversation {
@@ -7429,6 +7442,94 @@ impl ConversationService {
             mcp_servers,
             mcp_statuses,
         })
+    }
+
+    /// Validate create-time session MCP entries against the user's MCP rows (B-12).
+    ///
+    /// The create API used to accept arbitrary inline `SessionMcpServer`
+    /// transports, which let any caller holding the API (an agent's helper CLI
+    /// included) mount an arbitrary stdio command while bypassing the MCP
+    /// settings page. Now every entry must name an active row of THIS user:
+    ///
+    /// - a builtin row is re-derived from the row itself
+    ///   ([`row_to_session_mcp_server`]); the client's transport is ignored;
+    /// - a non-builtin row is not an inline server at all: it is folded into the
+    ///   id selection (the UI's assistant-default path sends those rows here
+    ///   too) and mounted from its row like any other selected id;
+    /// - anything else (unknown id, soft-deleted row, the reserved team bridge
+    ///   name) is rejected with 400.
+    async fn resolve_requested_session_mcp_servers(
+        &self,
+        user_id: &str,
+        requested: &[SessionMcpServer],
+        selected_ids: &mut Option<Vec<String>>,
+    ) -> Result<Vec<SessionMcpServer>, ConversationError> {
+        if requested.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(server) = requested.iter().find(|server| server.name == TEAM_MCP_SERVER_NAME) {
+            return Err(ConversationError::BadRequest {
+                reason: format!(
+                    "MCP server name `{}` is reserved for team coordination and cannot be supplied inline",
+                    server.name
+                ),
+            });
+        }
+        let repo = self
+            .mcp_server_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .ok_or_else(|| ConversationError::BadRequest {
+                reason: "inline MCP servers cannot be verified: MCP server repository is unavailable".into(),
+            })?;
+        let ids = requested.iter().map(|server| server.id.clone()).collect::<Vec<_>>();
+        let rows = repo
+            .list_active_by_ids(user_id, &ids)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
+        let rows_by_id = rows
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        let mut resolved = Vec::with_capacity(requested.len());
+        for server in requested {
+            let Some(row) = rows_by_id.get(&server.id) else {
+                return Err(ConversationError::BadRequest {
+                    reason: format!(
+                        "inline MCP server `{}` is not accepted: only builtin MCP server ids may be selected",
+                        server.name
+                    ),
+                });
+            };
+            if row.name == TEAM_MCP_SERVER_NAME {
+                return Err(ConversationError::BadRequest {
+                    reason: format!("MCP server `{}` is reserved for team coordination", row.name),
+                });
+            }
+            if !row.builtin {
+                // A configured user server referenced by id: mount it through
+                // the id path (from its row), never from the inline transport.
+                if let Some(ids) = selected_ids.as_mut()
+                    && !ids.iter().any(|id| id == &row.id)
+                {
+                    ids.push(row.id.clone());
+                }
+                continue;
+            }
+            match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(row).await {
+                Ok(server) => resolved.push(server),
+                Err(err) => warn!(
+                    user_id,
+                    server_id = %row.id,
+                    server_name = %row.name,
+                    error = %err,
+                    "user_mcp: malformed builtin row skipped from create-time session MCP selection"
+                ),
+            }
+        }
+        Ok(resolved)
     }
 
     /// Resolve the operator's globally enabled MCP servers into final snapshot
