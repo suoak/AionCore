@@ -983,3 +983,358 @@ async fn empty_isolated_skill_roots_never_fall_back_to_the_workspace() {
         "no workspace skill may execute: {results:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// aionrs 0.2.25: sub-agent approval, ToolSearch approval, MCP env scrubbing
+// ---------------------------------------------------------------------------
+
+/// Replays scripted turns in order, across the parent and any sub-agent (they
+/// share the provider), then answers with plain text.
+struct ScriptedProvider {
+    turns: std::sync::Mutex<std::collections::VecDeque<Vec<LlmEvent>>>,
+    tool_results: std::sync::Mutex<Vec<(bool, String)>>,
+}
+
+impl ScriptedProvider {
+    fn new(turns: Vec<Vec<LlmEvent>>) -> Self {
+        Self {
+            turns: std::sync::Mutex::new(turns.into()),
+            tool_results: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+                extra: None,
+            },
+            LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+        ]
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ScriptedProvider {
+    async fn stream(&self, request: &LlmRequest) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.tool_results.lock().unwrap().extend(
+            request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult { content, is_error, .. } => Some((*is_error, content.clone())),
+                    _ => None,
+                }),
+        );
+        let events = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| {
+            vec![
+                LlmEvent::TextDelta("done".into()),
+                LlmEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                },
+            ]
+        });
+        let (sender, receiver) = mpsc::channel(16);
+        tokio::spawn(async move {
+            for event in events {
+                let _ = sender.send(event).await;
+            }
+        });
+        Ok(receiver)
+    }
+}
+
+/// Records every protocol event (with its msg_id) and forwards it to the real
+/// `BackendProtocolSink`, exactly as the manager wires it.
+struct RecordingProtocolSink {
+    inner: BackendProtocolSink,
+    events: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+}
+
+impl aion_protocol::writer::ProtocolEmitter for RecordingProtocolSink {
+    fn emit(&self, event: &aion_protocol::events::ProtocolEvent) -> std::io::Result<()> {
+        use aion_protocol::events::ProtocolEvent;
+        let record = match event {
+            ProtocolEvent::ToolRequest { msg_id, call_id, .. } => Some(("request", msg_id, call_id)),
+            ProtocolEvent::ToolRunning { msg_id, call_id, .. } => Some(("running", msg_id, call_id)),
+            ProtocolEvent::ToolResult { msg_id, call_id, .. } => Some(("result", msg_id, call_id)),
+            _ => None,
+        };
+        if let Some((kind, msg_id, call_id)) = record {
+            self.events
+                .lock()
+                .unwrap()
+                .push((kind.to_owned(), msg_id.clone(), call_id.clone()));
+        }
+        self.inner.emit(event)
+    }
+}
+
+struct CoreWiredEngine {
+    engine: AgentEngine,
+    approval_manager: Arc<ToolApprovalManager>,
+    confirmations: Arc<RwLock<Vec<aionui_common::Confirmation>>>,
+    events: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    stream: broadcast::Receiver<AgentStreamEvent>,
+}
+
+/// Bootstrap an unrestricted engine the way `AionrsAgentManager::new` does
+/// (config resolution, ToolSearch allow-listing, MCP env passthrough, default
+/// session mode, host approval manager + protocol sink), with a scripted LLM.
+async fn core_wired_engine(workspace: &std::path::Path, provider: Arc<ScriptedProvider>) -> CoreWiredEngine {
+    let mut config = resolve_aionui_config(&make_cli_args(workspace.to_path_buf(), "openai", "gpt-test")).unwrap();
+    config.session.enabled = false;
+    let policy = apply_runtime_tool_policy(&mut config, AionrsRuntimeToolPolicy::Unrestricted);
+    allow_tool_search_without_approval(&mut config);
+    let mut engine = AgentBootstrap::new(config, workspace.to_string_lossy(), Arc::new(NullSink))
+        .provider(provider)
+        .mcp_env_passthrough(CORE_MCP_ENV_PASSTHROUGH.iter().map(|name| (*name).to_owned()).collect())
+        .tool_policy(policy)
+        .build()
+        .await
+        .unwrap()
+        .engine;
+    let approval_manager = Arc::new(ToolApprovalManager::new());
+    approval_manager.set_mode(parse_session_mode("default"));
+    let (tx, stream) = broadcast::channel(256);
+    let confirmations = Arc::new(RwLock::new(Vec::new()));
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    engine.set_approval_manager(approval_manager.clone());
+    engine.set_protocol_writer(Arc::new(RecordingProtocolSink {
+        inner: BackendProtocolSink::new(tx, confirmations.clone()),
+        events: events.clone(),
+    }));
+    CoreWiredEngine {
+        engine,
+        approval_manager,
+        confirmations,
+        events,
+        stream,
+    }
+}
+
+/// Approve every pending confirmation the way `AionrsAgentManager::confirm`
+/// does (`approve(call_id, Once)`), recording the call ids answered.
+fn approve_pending(
+    approval_manager: Arc<ToolApprovalManager>,
+    confirmations: Arc<RwLock<Vec<aionui_common::Confirmation>>>,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    tokio::spawn(async move {
+        let mut answered = Vec::new();
+        for _ in 0..200 {
+            let pending: Vec<String> = {
+                let mut confs = confirmations.write().unwrap();
+                let ids = confs.iter().map(|c| c.call_id.clone()).collect();
+                confs.clear();
+                ids
+            };
+            for call_id in pending {
+                approval_manager.approve(&call_id, ApprovalScope::Once);
+                answered.push(call_id);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        answered
+    })
+}
+
+#[tokio::test]
+async fn sub_agent_tool_requests_reach_core_approval_with_the_parent_msg_id() {
+    let workspace = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        // Parent: spawn one sub-agent.
+        ScriptedProvider::tool_use(
+            "parent-spawn",
+            "Spawn",
+            json!({ "tasks": [{ "name": "writer", "prompt": "create child.txt" }] }),
+        ),
+        // Child: run a command (Exec class -> needs approval in default mode).
+        ScriptedProvider::tool_use("child-exec", "ExecCommand", json!({ "cmd": "echo child > child.txt" })),
+    ]));
+    let mut wired = core_wired_engine(workspace.path(), provider.clone()).await;
+    let approver = approve_pending(wired.approval_manager.clone(), wired.confirmations.clone());
+
+    timeout(
+        Duration::from_secs(20),
+        wired.engine.run("spawn a helper", "parent-msg"),
+    )
+    .await
+    .expect("turn finished")
+    .unwrap();
+    approver.abort();
+
+    let events = wired.events.lock().unwrap().clone();
+    let requests: Vec<_> = events.iter().filter(|(kind, ..)| kind == "request").collect();
+    assert!(
+        requests.iter().any(|(_, _, call)| call == "parent-spawn"),
+        "parent Spawn must ask for approval in default mode: {events:?}"
+    );
+    assert!(
+        requests.iter().any(|(_, _, call)| call == "child-exec"),
+        "child ExecCommand must ask Core for approval instead of auto-approving: {events:?}"
+    );
+    assert!(
+        events.iter().all(|(_, msg_id, _)| msg_id == "parent-msg"),
+        "every child tool event must carry the parent's msg_id: {events:?}"
+    );
+    // Approved through Core's confirm path, the child actually ran, and its
+    // running/result events went to the same conversation stream.
+    assert!(workspace.path().join("child.txt").exists());
+    for kind in ["running", "result"] {
+        assert!(
+            events.iter().any(|(k, _, call)| k == kind && call == "child-exec"),
+            "missing child {kind} event: {events:?}"
+        );
+    }
+    let mut child_tool_calls = Vec::new();
+    while let Ok(event) = wired.stream.try_recv() {
+        if let AgentStreamEvent::ToolCall(data) = event
+            && data.call_id == "aionrs-child-exec"
+        {
+            child_tool_calls.push(data);
+        }
+    }
+    assert!(
+        !child_tool_calls.is_empty(),
+        "child tool calls must reach the UI stream"
+    );
+    assert!(
+        child_tool_calls.iter().all(|data| data.parent_call_id.is_none()),
+        "aionrs gives no parent linkage: child tool cards render flat under the parent message"
+    );
+}
+
+#[tokio::test]
+async fn denied_sub_agent_tool_never_runs() {
+    let workspace = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_use(
+            "parent-spawn",
+            "Spawn",
+            json!({ "tasks": [{ "name": "writer", "prompt": "create child.txt" }] }),
+        ),
+        ScriptedProvider::tool_use("child-exec", "ExecCommand", json!({ "cmd": "echo child > child.txt" })),
+    ]));
+    let mut wired = core_wired_engine(workspace.path(), provider).await;
+    let manager = wired.approval_manager.clone();
+    let confirmations = wired.confirmations.clone();
+    let answerer = tokio::spawn(async move {
+        for _ in 0..200 {
+            let pending: Vec<String> = {
+                let mut confs = confirmations.write().unwrap();
+                let ids = confs.iter().map(|c| c.call_id.clone()).collect();
+                confs.clear();
+                ids
+            };
+            for call_id in pending {
+                if call_id == "parent-spawn" {
+                    manager.approve(&call_id, ApprovalScope::Once);
+                } else {
+                    // Same call Core's `confirm` makes for "cancel".
+                    manager.resolve(
+                        &call_id,
+                        ToolApprovalResult::Denied {
+                            reason: "User denied the tool request".into(),
+                        },
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    timeout(
+        Duration::from_secs(20),
+        wired.engine.run("spawn a helper", "parent-msg"),
+    )
+    .await
+    .expect("turn finished")
+    .unwrap();
+    answerer.abort();
+
+    assert!(
+        wired
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(kind, msg_id, call)| kind == "request" && call == "child-exec" && msg_id == "parent-msg")
+    );
+    assert!(
+        !workspace.path().join("child.txt").exists(),
+        "a denied child tool must not run"
+    );
+}
+
+#[tokio::test]
+async fn tool_search_runs_without_an_approval_card_in_default_mode() {
+    let workspace = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::tool_use(
+        "search-1",
+        "ToolSearch",
+        json!({ "query": "spawn" }),
+    )]));
+    let mut wired = core_wired_engine(workspace.path(), provider.clone()).await;
+    assert!(
+        wired.engine.tool_names().iter().any(|name| name == "ToolSearch"),
+        "unrestricted runtimes defer Spawn/plan tools, so ToolSearch is registered"
+    );
+
+    timeout(Duration::from_secs(20), wired.engine.run("find a tool", "msg-search"))
+        .await
+        .expect("ToolSearch must not block on approval")
+        .unwrap();
+
+    assert!(
+        !wired.events.lock().unwrap().iter().any(|(kind, ..)| kind == "request"),
+        "ToolSearch is allow-listed: no approval request"
+    );
+    assert!(
+        provider
+            .tool_results
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(is_error, content)| !is_error && content.contains("Spawn")),
+        "ToolSearch must return the deferred Spawn schema"
+    );
+}
+
+#[test]
+fn mcp_env_drops_aionui_runtime_vars_but_keeps_team_bridge_env() {
+    let runtime_env: Vec<(String, String)> = [
+        crate::types::AIONUI_USER_ID_ENV,
+        crate::types::AIONUI_CONVERSATION_ID_ENV,
+        crate::types::AIONUI_HELPER_BIN_ENV,
+        crate::types::AIONUI_BASE_URL_ENV,
+        crate::types::AIONUI_RUNTIME_TOKEN_ENV,
+    ]
+    .iter()
+    .map(|name| ((*name).to_owned(), "secret".to_owned()))
+    .chain([("PATH".to_owned(), "/usr/bin".to_owned())])
+    .collect();
+    let team_env = HashMap::from([
+        ("TEAM_MCP_PORT".to_owned(), "9000".to_owned()),
+        ("TEAM_MCP_TOKEN".to_owned(), "tok".to_owned()),
+        ("TEAM_AGENT_SLOT_ID".to_owned(), "slot-1".to_owned()),
+    ]);
+    let passthrough: Vec<String> = CORE_MCP_ENV_PASSTHROUGH.iter().map(|name| (*name).to_owned()).collect();
+
+    let env = aion_agent::bootstrap::build_mcp_server_env(&runtime_env, Some(team_env.clone()), &passthrough);
+
+    assert!(
+        env.keys().all(|name| !name.starts_with("AIONUI_")),
+        "no AIONUI_* runtime variable may reach an MCP server: {env:?}"
+    );
+    for (name, value) in &team_env {
+        assert_eq!(env.get(name), Some(value), "team bridge env must be untouched");
+    }
+    assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+}
