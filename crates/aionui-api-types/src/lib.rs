@@ -141,11 +141,11 @@ pub use conversation::{
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
     ConversationRuntimeSummary, ConversationToolSurface, CreateConversationRequest, EnsureConversationRuntimeResponse,
     ForkCapabilityView, ForkConversationRequest, InputChangedEvent, ListConversationInputsQuery,
-    ListConversationsQuery, ListMessagesQuery, McpIsolation, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SessionRef, SubmitConversationInputRequest, ToolEnforcementLevel,
-    ToolSurfaceEntry, ToolSurfaceKind, ToolSurfaceMcpServer, ToolSurfaceSource, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, canonical_mcp_tool_name, normalize_aionrs_tools,
+    ListConversationsQuery, ListMessagesQuery, McpDiscovery, McpIsolation, McpRuntimeSnapshot, MessageListResponse,
+    MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef, SubmitConversationInputRequest,
+    ToolEnforcementLevel, ToolSurfaceEntry, ToolSurfaceKind, ToolSurfaceMcpServer, ToolSurfaceSource,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, canonical_mcp_tool_name, normalize_aionrs_tools,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

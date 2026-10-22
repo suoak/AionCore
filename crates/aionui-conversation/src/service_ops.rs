@@ -1651,6 +1651,7 @@ mod tool_enforcement_tests {
             entries: Vec::new(),
             tool_search_inert: false,
             external_mcp_servers: Vec::new(),
+            mcp_discovery: Default::default(),
         }
     }
 

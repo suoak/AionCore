@@ -425,6 +425,7 @@ impl AionrsAgentManager {
                 .collect(),
             mcp_isolation: aionui_api_types::McpIsolation::Strict,
             tool_policy: Some(aionrs_tool_policy_label(config_extra.tool_policy).to_owned()),
+            mcp_discovery: aionui_api_types::McpDiscovery::Reported,
         };
         let slash_commands = engine
             .slash_command_list()

@@ -2051,6 +2051,13 @@ pub(crate) fn tool_surface_from_inventory(
             external: is_external(name),
         })
         .collect();
+    // A launch-config inventory has no discovery wire: what it lists is only
+    // what WorkMate injected, so nothing can be flagged external and the
+    // ambient part (if any) is UNKNOWN rather than empty.
+    let mcp_discovery = match inventory.source {
+        aionui_session::ToolInventorySource::LaunchConfig => aionui_api_types::McpDiscovery::Unavailable,
+        _ => aionui_api_types::McpDiscovery::Reported,
+    };
     let external_mcp_servers = mcp_servers
         .iter()
         .filter(|server| server.external)
@@ -2060,6 +2067,7 @@ pub(crate) fn tool_surface_from_inventory(
         source: match inventory.source {
             aionui_session::ToolInventorySource::ClaudeInit => ToolSurfaceSource::ClaudeInit,
             aionui_session::ToolInventorySource::CodexMcpStatus => ToolSurfaceSource::CodexMcpStatus,
+            aionui_session::ToolInventorySource::LaunchConfig => ToolSurfaceSource::LaunchConfig,
         },
         tools: inventory.tools,
         mcp_servers,
@@ -2073,6 +2081,7 @@ pub(crate) fn tool_surface_from_inventory(
         // ToolSearch-over-empty-deferred (C-02) is an aionrs-only condition.
         tool_search_inert: false,
         external_mcp_servers,
+        mcp_discovery,
     }
 }
 
