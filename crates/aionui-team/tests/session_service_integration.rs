@@ -3273,12 +3273,13 @@ fn assert_frozen_preset_extra(extra: &serde_json::Value) {
     assert_eq!(extra["preset_context"], serde_json::json!("assistant rule body"));
     assert_eq!(extra["preset_rules"], serde_json::json!("assistant rule body"));
     assert_eq!(extra["skills"], serde_json::json!(["pdf", "cron"]));
-    // MCP is NOT part of the frozen preset surface: the explicit global
-    // selection (empty in this fixture) wins over `resolved_defaults.mcp_ids`,
-    // and no request-only `selected_*` fields are introduced.
-    assert_eq!(extra["mcp_server_ids"], serde_json::json!([]));
+    // B-10: an assistant-bound member carries its assistant's MCP allowlist
+    // (`resolved_defaults.mcp_ids`, `mcp-docs` in this fixture), resolved at
+    // provisioning time, so a later live change does not leak in; no
+    // request-only `selected_*` fields are introduced.
+    assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-docs"]));
     assert_eq!(extra["session_mcp_servers"], serde_json::json!([]));
-    assert_eq!(extra["mcp_servers"], serde_json::json!([]));
+    assert_eq!(extra["mcp_servers"], serde_json::json!(["mcp-docs"]));
     assert_eq!(extra["mcp_statuses"], serde_json::json!([]));
     assert!(extra.get("selected_mcp_server_ids").is_none());
     assert!(extra.get("selected_session_mcp_servers").is_none());
