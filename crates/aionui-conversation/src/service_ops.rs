@@ -1647,6 +1647,8 @@ mod tool_enforcement_tests {
             mcp_servers: Vec::new(),
             mcp_isolation: McpIsolation::Strict,
             tool_policy: Some(policy.into()),
+            entries: Vec::new(),
+            tool_search_inert: false,
         }
     }
 
