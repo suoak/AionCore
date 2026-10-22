@@ -282,6 +282,153 @@ pub struct ConversationToolSurface {
     /// `unrestricted`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_policy: Option<String>,
+    /// E2 (C-03/C-09): every tool / skill normalized to one canonical shape,
+    /// regardless of how the backend spells it (claude `mcp__srv__tool`, aionrs
+    /// bare `tool` or collision-prefixed `mcp__srv_tool`). Omitted when empty so
+    /// the pre-normalization wire shape is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ToolSurfaceEntry>,
+    /// C-02: `ToolSearch` is registered but no tool is deferred, so it can
+    /// only ever return nothing. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_search_inert: bool,
+}
+
+/// Where one normalized tool comes from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfaceKind {
+    Builtin,
+    Mcp,
+    Skill,
+}
+
+/// One normalized tool / skill of a live session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolSurfaceEntry {
+    /// The name exactly as the backend advertises it to the model.
+    pub name: String,
+    /// Backend-independent identity: builtin → its name; MCP →
+    /// `mcp__<server>__<tool>` with the REPORTED server name; skill →
+    /// `skill:<name>`.
+    pub canonical: String,
+    pub kind: ToolSurfaceKind,
+    /// MCP only: the owning server, as the backend reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// aionrs only: the schema is deferred behind `ToolSearch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<bool>,
+}
+
+/// Normalize an aionrs registry. aionrs registers an MCP tool under its bare
+/// name unless it collides (with a builtin or another server's tool), in which
+/// case it becomes `mcp__<server>_<tool>` (single underscore). `mcp_tools` is the
+/// `(server, tool)` list from the session's MCP managers, so both spellings
+/// resolve to the SAME canonical id without guessing at underscores.
+pub fn normalize_aionrs_tools(registry_names: &[String], mcp_tools: &[(String, String)]) -> Vec<ToolSurfaceEntry> {
+    registry_names
+        .iter()
+        .map(|name| {
+            let prefixed = mcp_tools
+                .iter()
+                .find(|(server, tool)| *name == format!("mcp__{server}_{tool}"));
+            let bare = || {
+                // A bare name is MCP only when aionrs did NOT prefix it (no
+                // collision); if the prefixed spelling exists, the bare one is the
+                // builtin it collided with.
+                let mut owners = mcp_tools.iter().filter(|(server, tool)| {
+                    tool == name && !registry_names.contains(&format!("mcp__{server}_{tool}"))
+                });
+                match (owners.next(), owners.next()) {
+                    (Some(owner), None) => Some(owner),
+                    _ => None,
+                }
+            };
+            match prefixed.or_else(bare) {
+                Some((server, tool)) => ToolSurfaceEntry::mcp(name, server, tool),
+                None => ToolSurfaceEntry::builtin(name),
+            }
+        })
+        .collect()
+}
+
+/// Canonical id of an MCP tool: `mcp__<server>__<tool>`.
+pub fn canonical_mcp_tool_name(server: &str, tool: &str) -> String {
+    format!("mcp__{server}__{tool}")
+}
+
+/// claude spells server names inside tool names with every character outside
+/// `[A-Za-z0-9_-]` replaced by `_`.
+fn claude_tool_server_token(server: &str) -> String {
+    server
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+impl ToolSurfaceEntry {
+    pub fn builtin(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            canonical: name.to_owned(),
+            kind: ToolSurfaceKind::Builtin,
+            server: None,
+            deferred: None,
+        }
+    }
+
+    pub fn mcp(name: &str, server: &str, tool: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            canonical: canonical_mcp_tool_name(server, tool),
+            kind: ToolSurfaceKind::Mcp,
+            server: Some(server.to_owned()),
+            deferred: None,
+        }
+    }
+
+    pub fn skill(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            canonical: format!("skill:{name}"),
+            kind: ToolSurfaceKind::Skill,
+            server: None,
+            deferred: None,
+        }
+    }
+
+    /// Classify one claude tool name. `mcp__<token>__<tool>` is MCP; the token is
+    /// matched back to a reported server (longest match wins, so a server named
+    /// `a__b` is not split early); an unmatched token is used verbatim.
+    pub fn from_claude_tool(name: &str, reported_servers: &[String]) -> Self {
+        let Some(rest) = name.strip_prefix("mcp__") else {
+            return Self::builtin(name);
+        };
+        let mut best: Option<(&str, &str)> = None;
+        for server in reported_servers {
+            let token = claude_tool_server_token(server);
+            if let Some(tool) = rest.strip_prefix(&token).and_then(|r| r.strip_prefix("__"))
+                && !tool.is_empty()
+                && best.is_none_or(|(s, _)| claude_tool_server_token(s).len() < token.len())
+            {
+                best = Some((server.as_str(), tool));
+            }
+        }
+        match best {
+            Some((server, tool)) => Self::mcp(name, server, tool),
+            None => match rest.split_once("__") {
+                Some((server, tool)) if !server.is_empty() && !tool.is_empty() => Self::mcp(name, server, tool),
+                _ => Self::builtin(name),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -632,6 +779,81 @@ pub struct MessageSearchItem {
 
 /// Paginated search results for messages.
 pub type MessageSearchResponse = PaginatedResult<MessageSearchItem>;
+
+#[cfg(test)]
+mod tool_surface_tests {
+    use super::*;
+
+    #[test]
+    fn claude_and_aionrs_spellings_share_one_canonical_id() {
+        let claude = ToolSurfaceEntry::from_claude_tool("mcp__docs__search", &["docs".into()]);
+        let aionrs_bare = normalize_aionrs_tools(&["search".into()], &[("docs".into(), "search".into())]);
+        let aionrs_prefixed = normalize_aionrs_tools(&["mcp__docs_search".into()], &[("docs".into(), "search".into())]);
+        assert_eq!(claude.canonical, "mcp__docs__search");
+        assert_eq!(aionrs_bare[0].canonical, claude.canonical);
+        assert_eq!(aionrs_prefixed[0].canonical, claude.canonical);
+        for e in [&claude, &aionrs_bare[0], &aionrs_prefixed[0]] {
+            assert_eq!(e.kind, ToolSurfaceKind::Mcp);
+            assert_eq!(e.server.as_deref(), Some("docs"));
+        }
+        assert_eq!(aionrs_prefixed[0].name, "mcp__docs_search", "raw name kept verbatim");
+    }
+
+    #[test]
+    fn claude_server_with_dots_and_double_underscores_maps_back() {
+        let servers = vec!["my.server".to_string(), "a".to_string(), "a__b".to_string()];
+        let dotted = ToolSurfaceEntry::from_claude_tool("mcp__my_server__get", &servers);
+        assert_eq!(dotted.server.as_deref(), Some("my.server"));
+        assert_eq!(dotted.canonical, "mcp__my.server__get");
+        let nested = ToolSurfaceEntry::from_claude_tool("mcp__a__b__run", &servers);
+        assert_eq!(nested.server.as_deref(), Some("a__b"), "longest server match wins");
+        let unknown = ToolSurfaceEntry::from_claude_tool("mcp__ambient__x", &servers);
+        assert_eq!(unknown.server.as_deref(), Some("ambient"));
+        assert_eq!(
+            ToolSurfaceEntry::from_claude_tool("Bash", &servers).kind,
+            ToolSurfaceKind::Builtin
+        );
+        assert_eq!(
+            ToolSurfaceEntry::from_claude_tool("mcp__", &servers).kind,
+            ToolSurfaceKind::Builtin
+        );
+    }
+
+    #[test]
+    fn aionrs_ambiguous_bare_name_stays_builtin_and_skill_is_tagged() {
+        let tools = vec![("a".to_string(), "Read".to_string())];
+        // A builtin `Read` collides, so aionrs would have prefixed the MCP one;
+        // the bare `Read` in the registry is the builtin.
+        let entries = normalize_aionrs_tools(&["Read".into(), "mcp__a_Read".into()], &tools);
+        assert_eq!(entries[0].kind, ToolSurfaceKind::Builtin);
+        assert_eq!(entries[1].kind, ToolSurfaceKind::Mcp);
+        let skill = ToolSurfaceEntry::skill("pdf");
+        assert_eq!(
+            (skill.canonical.as_str(), skill.kind),
+            ("skill:pdf", ToolSurfaceKind::Skill)
+        );
+    }
+
+    #[test]
+    fn surface_without_entries_keeps_legacy_json() {
+        let surface = ConversationToolSurface {
+            source: ToolSurfaceSource::ClaudeInit,
+            tools: vec!["Bash".into()],
+            mcp_servers: vec![],
+            mcp_isolation: McpIsolation::Ambient,
+            tool_policy: None,
+            entries: vec![],
+            tool_search_inert: false,
+        };
+        let json = serde_json::to_value(&surface).unwrap();
+        assert!(json.get("entries").is_none() && json.get("tool_search_inert").is_none());
+        let legacy: ConversationToolSurface = serde_json::from_value(serde_json::json!({
+            "source": "claude_init", "tools": ["Bash"], "mcp_isolation": "ambient"
+        }))
+        .unwrap();
+        assert_eq!(legacy, surface);
+    }
+}
 
 #[cfg(test)]
 mod tests {

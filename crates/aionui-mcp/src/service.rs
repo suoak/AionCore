@@ -70,6 +70,7 @@ impl McpConfigService {
     /// If a server with the same name already exists, it is updated
     /// (transport, description, original_json) rather than creating a duplicate.
     pub async fn add_server(&self, user_id: &str, req: CreateMcpServerRequest) -> Result<McpServerResponse, McpError> {
+        self.validate_new_server_name(user_id, &req.name, req.builtin).await?;
         let transport = normalize_transport(McpServerTransport::from(req.transport))?;
         self.upsert_server(UpsertMcpServer {
             user_id,
@@ -200,6 +201,8 @@ impl McpConfigService {
                 continue;
             }
 
+            self.validate_new_server_name(user_id, &server_req.name, server_req.builtin)
+                .await?;
             let transport = normalize_transport(McpServerTransport::from(server_req.transport))?;
             let server = self
                 .upsert_server(UpsertMcpServer {
@@ -238,6 +241,18 @@ impl McpConfigService {
         self.repo.update_status(user_id, id, status, last_connected).await?;
         self.repo.update_tools(user_id, id, tools_json.as_deref()).await?;
         Ok(())
+    }
+
+    /// C-03: a NEW server name must be safe to embed in model-facing tool names
+    /// (OpenAI/Gemini reject a request whose tool names leave `[A-Za-z0-9_-]` or
+    /// exceed 64 chars, which takes the WHOLE session down, not just one tool).
+    /// Existing rows (re-upsert / import of a name already stored) and builtin
+    /// rows are left alone so no stored configuration stops loading.
+    async fn validate_new_server_name(&self, user_id: &str, name: &str, builtin: bool) -> Result<(), McpError> {
+        if builtin || self.repo.find_by_name_any(user_id, name).await?.is_some() {
+            return Ok(());
+        }
+        validate_mcp_server_name(name)
     }
 
     async fn upsert_server(&self, params: UpsertMcpServer<'_>) -> Result<McpServerResponse, McpError> {
@@ -289,6 +304,31 @@ impl McpConfigService {
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
+}
+
+/// Longest server name accepted for a NEW server: leaves room for
+/// `mcp__<server>__<tool>` inside the 64-char provider tool-name limit.
+pub const MCP_SERVER_NAME_MAX_LEN: usize = 32;
+
+/// C-03: `[A-Za-z0-9_-]{1,32}`.
+pub fn validate_mcp_server_name(name: &str) -> Result<(), McpError> {
+    if name.is_empty() {
+        return Err(McpError::InvalidName("name must not be empty".into()));
+    }
+    if name.len() > MCP_SERVER_NAME_MAX_LEN {
+        return Err(McpError::InvalidName(format!(
+            "'{name}' is longer than {MCP_SERVER_NAME_MAX_LEN} characters"
+        )));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        return Err(McpError::InvalidName(format!(
+            "'{name}' contains '{bad}'; use only letters, digits, '_' and '-'"
+        )));
+    }
+    Ok(())
 }
 
 fn normalize_transport(transport: McpServerTransport) -> Result<McpServerTransport, McpError> {
@@ -790,6 +830,48 @@ mod tests {
     }
 
     // -- edit_server ---------------------------------------------------------
+
+    #[test]
+    fn c03_server_name_charset_and_length() {
+        assert!(validate_mcp_server_name("chrome-devtools_2").is_ok());
+        assert!(validate_mcp_server_name(&"a".repeat(MCP_SERVER_NAME_MAX_LEN)).is_ok());
+        for bad in ["", "my server", "a.b", "文档", &"a".repeat(MCP_SERVER_NAME_MAX_LEN + 1)] {
+            assert!(
+                matches!(validate_mcp_server_name(bad), Err(McpError::InvalidName(_))),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn c03_add_rejects_unsafe_new_name_but_keeps_existing_rows() {
+        let repo = Arc::new(MockMcpServerRepo::new());
+        let svc = McpConfigService::new(repo.clone());
+        let err = svc
+            .add_server(TEST_USER_ID, stdio_create_req("bad name"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::InvalidName(_)));
+        // An already-stored legacy name keeps upserting (no stored config breaks).
+        repo.create(CreateMcpServerParams {
+            user_id: TEST_USER_ID,
+            name: "legacy.name",
+            description: None,
+            enabled: false,
+            transport_type: "stdio",
+            transport_config: r#"{"command":"x","args":[],"env":{}}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+        assert!(
+            svc.add_server(TEST_USER_ID, stdio_create_req("legacy.name"))
+                .await
+                .is_ok()
+        );
+    }
 
     #[tokio::test]
     async fn edit_server_rejects_name_change() {

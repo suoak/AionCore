@@ -100,6 +100,14 @@ fn embedded_config_project_dir(config_extra: &AionrsResolvedConfig) -> PathBuf {
     config_extra.session_directory.clone()
 }
 
+/// C-02 (Core side, pin v0.2.24): aionrs registers `ToolSearch` unconditionally,
+/// but Core pins every MCP server to `deferred: Some(false)` ([`CORE_MCP_DEFERRED`]),
+/// so with nothing deferred the tool can only return empty. Report that instead
+/// of hiding it; the aionrs-side gate ships with the 0.2.25 pin bump.
+pub(crate) fn aionrs_tool_search_inert(entries: &[aionui_api_types::ToolSurfaceEntry]) -> bool {
+    entries.iter().any(|entry| entry.name == "ToolSearch") && !entries.iter().any(|entry| entry.deferred == Some(true))
+}
+
 /// Wire label for the runtime tool policy reported in the tool surface.
 pub(crate) fn aionrs_tool_policy_label(policy: AionrsRuntimeToolPolicy) -> &'static str {
     match policy {
@@ -361,9 +369,31 @@ impl AionrsAgentManager {
         // E2 (C-09): the registry is fixed once bootstrap returns (MCP tools are
         // registered during build), so capture it here — reading it later would
         // wait behind the engine lock held by an active `engine.run()` turn.
+        let registry_names = engine.tool_names();
+        let mcp_tools: Vec<(String, String)> = result
+            .mcp_managers
+            .iter()
+            .flat_map(|manager| {
+                manager
+                    .all_tools()
+                    .into_iter()
+                    .map(|(server, tool)| (server.to_owned(), tool.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut entries = aionui_api_types::normalize_aionrs_tools(&registry_names, &mcp_tools);
+        {
+            let registry = engine.registry_mut();
+            for entry in &mut entries {
+                entry.deferred = registry.get(&entry.name).map(|tool| tool.is_deferred());
+            }
+        }
+        let tool_search_inert = aionrs_tool_search_inert(&entries);
         let tool_surface = aionui_api_types::ConversationToolSurface {
             source: aionui_api_types::ToolSurfaceSource::AionrsRegistry,
-            tools: engine.tool_names(),
+            entries,
+            tool_search_inert,
+            tools: registry_names,
             mcp_servers: mcp_server_names
                 .into_iter()
                 .map(|name| aionui_api_types::ToolSurfaceMcpServer { name, status: None })
@@ -847,3 +877,32 @@ fn parse_session_mode(s: &str) -> SessionMode {
 #[cfg(test)]
 #[path = "agent_test.rs"]
 mod agent_test;
+
+#[cfg(test)]
+mod tool_surface_tests {
+    use super::aionrs_tool_search_inert;
+    use aionui_api_types::ToolSurfaceEntry;
+
+    fn entry(name: &str, deferred: bool) -> ToolSurfaceEntry {
+        ToolSurfaceEntry {
+            deferred: Some(deferred),
+            ..ToolSurfaceEntry::builtin(name)
+        }
+    }
+
+    #[test]
+    fn c02_tool_search_inert_only_without_deferred_tools() {
+        assert!(aionrs_tool_search_inert(&[
+            entry("ToolSearch", false),
+            entry("search", false)
+        ]));
+        assert!(!aionrs_tool_search_inert(&[
+            entry("ToolSearch", false),
+            entry("search", true)
+        ]));
+        assert!(
+            !aionrs_tool_search_inert(&[entry("Read", false)]),
+            "no ToolSearch, nothing inert"
+        );
+    }
+}

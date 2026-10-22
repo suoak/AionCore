@@ -27,6 +27,14 @@ use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, AionrsRuntimeToolPolicy};
 
+/// C-02 (Core side): the deferral flag Core sets on EVERY MCP server it hands
+/// aionrs (previously 9 inlined `Some(false)` literals). Kept `Some(false)` on the
+/// v0.2.24 pin: deferring needs a working `ToolSearch` discovery loop, and the
+/// 0.2.25 gate (register `ToolSearch` only when something is deferred) is not
+/// pinned yet. The inert `ToolSearch` this leaves is reported on the tool surface
+/// (`tool_search_inert`). Flip here — one place — together with the pin bump.
+pub(crate) const CORE_MCP_DEFERRED: Option<bool> = Some(false);
+
 /// Render this conversation's skills index, or `""` when there is nothing to add.
 async fn skill_index_text(deps: &AgentFactoryDeps, user_id: &str, skills: &[String]) -> String {
     let index = deps.skill_manager.discover_by_names_for_user(user_id, skills).await;
@@ -687,7 +695,7 @@ async fn row_to_mcp_server_config(
                 env: Some(env),
                 url: None,
                 headers: None,
-                deferred: Some(false),
+                deferred: CORE_MCP_DEFERRED,
                 startup_timeout_ms: None,
             })
         }
@@ -713,7 +721,7 @@ async fn row_to_mcp_server_config(
                 env: None,
                 url: Some(url.to_owned()),
                 headers: Some(headers),
-                deferred: Some(false),
+                deferred: CORE_MCP_DEFERRED,
                 startup_timeout_ms: None,
             })
         }
@@ -739,7 +747,7 @@ async fn row_to_mcp_server_config(
                 env: None,
                 url: Some(url.to_owned()),
                 headers: Some(headers),
-                deferred: Some(false),
+                deferred: CORE_MCP_DEFERRED,
                 startup_timeout_ms: None,
             })
         }
@@ -768,7 +776,7 @@ async fn session_server_to_mcp_server_config(
                 env: Some(env),
                 url: None,
                 headers: None,
-                deferred: Some(false),
+                deferred: CORE_MCP_DEFERRED,
                 startup_timeout_ms: None,
             })
         }
@@ -783,7 +791,7 @@ async fn session_server_to_mcp_server_config(
                 env: None,
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
-                deferred: Some(false),
+                deferred: CORE_MCP_DEFERRED,
                 startup_timeout_ms: None,
             })
         }
@@ -798,7 +806,7 @@ async fn session_server_to_mcp_server_config(
                 env: None,
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
-                deferred: Some(false),
+                deferred: CORE_MCP_DEFERRED,
                 startup_timeout_ms: None,
             })
         }
@@ -813,7 +821,7 @@ async fn session_server_to_mcp_server_config(
                 env: None,
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
-                deferred: Some(false),
+                deferred: CORE_MCP_DEFERRED,
                 startup_timeout_ms: None,
             })
         }
@@ -913,7 +921,7 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
         env: Some(env),
         url: None,
         headers: None,
-        deferred: Some(false),
+        deferred: CORE_MCP_DEFERRED,
         startup_timeout_ms: None,
     };
 

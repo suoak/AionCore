@@ -774,6 +774,8 @@ struct DiscoveredCaps {
     /// E2 (C-09): `system/init` `tools[]` + `mcp_servers[]`, refreshed on every
     /// init (each process run / wake). `None` until the first init arrives.
     init_tools: Option<InitTools>,
+    /// `system/init` `skills[]` (names), when the CLI reports them.
+    init_skills: Vec<String>,
 }
 
 /// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
@@ -2451,7 +2453,20 @@ fn sniff_init_tools(frame: &serde_json::Value, discovered_caps: &Arc<std::sync::
                 .collect()
         })
         .unwrap_or_default();
-    discovered_caps.lock().unwrap_or_else(|e| e.into_inner()).init_tools = Some((tools, servers));
+    let skills: Vec<String> = frame
+        .get("skills")
+        .and_then(Value::as_array)
+        .map(|skills| {
+            skills
+                .iter()
+                .filter_map(|s| s.as_str().or_else(|| s.get("name").and_then(Value::as_str)))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut caps = discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
+    caps.init_tools = Some((tools, servers));
+    caps.init_skills = skills;
 }
 
 /// Sniff the AUTHORITATIVE mode signal: claude stamps `permissionMode` on BOTH its
@@ -3591,6 +3606,7 @@ impl SessionBackend for ClaudeSessionBackend {
             tools,
             mcp_servers,
             mcp_strict: self.mcp_strict,
+            skills: caps.init_skills.clone(),
         })
     }
 
@@ -7815,6 +7831,12 @@ mod tests {
                 ("ambient".into(), "unknown".into())
             ]
         );
+        assert!(caps.lock().unwrap().init_skills.is_empty());
+        sniff_init_tools(
+            &serde_json::json!({"type": "system", "subtype": "init", "tools": [], "skills": ["pdf", {"name": "xlsx"}]}),
+            &caps,
+        );
+        assert_eq!(caps.lock().unwrap().init_skills, vec!["pdf", "xlsx"]);
         // A later init without `tools` must not wipe the inventory.
         sniff_init_tools(&serde_json::json!({"type": "system", "subtype": "init"}), &caps);
         assert!(caps.lock().unwrap().init_tools.is_some());

@@ -207,6 +207,37 @@ fn audited_capabilities_for_integration(
     }
 }
 
+/// C-06: one `failed` status (reason `missing`) per allowlisted id that the
+/// repository did not return. Uses the existing `failed` kind so older clients
+/// that only know `loaded/failed/unsupported` keep parsing the snapshot.
+pub(crate) fn missing_selected_mcp_statuses(selected_ids: &[String], found_ids: &[&str]) -> Vec<ConversationMcpStatus> {
+    let mut seen = HashSet::new();
+    selected_ids
+        .iter()
+        .filter(|id| seen.insert(id.as_str()))
+        .filter(|id| !found_ids.contains(&id.as_str()))
+        .map(|id| ConversationMcpStatus {
+            id: id.clone(),
+            name: id.clone(),
+            status: ConversationMcpStatusKind::Failed,
+            reason: Some("missing: the selected MCP server no longer exists or is unavailable".into()),
+        })
+        .collect()
+}
+
+/// C-07: no runtime consumes `inject_skills` (aionrs, ACP, claude and codex all
+/// ignore it), so a non-empty list would be stored and silently dropped. Reject
+/// it at the API boundary instead of pretending the skills were injected. An
+/// empty list (the default every client sends today) is accepted unchanged.
+pub(crate) fn reject_inject_skills(inject_skills: &[String]) -> Result<(), ConversationError> {
+    if inject_skills.is_empty() {
+        return Ok(());
+    }
+    Err(ConversationError::BadRequest {
+        reason: "inject_skills is not supported: skills are delivered through the conversation skill snapshot".into(),
+    })
+}
+
 fn validate_planning_turn_content(policy: AionrsRuntimeToolPolicy, content: &str) -> Result<(), ConversationError> {
     if policy == AionrsRuntimeToolPolicy::StrictPlanning && content.trim_start().starts_with('/') {
         return Err(ConversationError::Forbidden {
@@ -262,6 +293,14 @@ mod planning_isolation_tests {
     #[test]
     fn strict_planning_rejects_slash_commands_before_turn_start() {
         assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "  /skill mutate").is_err());
+        assert!(
+            reject_inject_skills(&[]).is_ok(),
+            "C-07: the default empty list stays accepted"
+        );
+        assert!(matches!(
+            reject_inject_skills(&["review".into()]),
+            Err(ConversationError::BadRequest { .. })
+        ));
         assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "inspect the repo").is_ok());
         assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::Unrestricted, "/allowed-in-execution").is_ok());
     }
@@ -5770,6 +5809,7 @@ impl ConversationService {
                 reason: "Message content must not be empty".into(),
             });
         }
+        reject_inject_skills(&req.inject_skills)?;
         let send_started_at = now_ms();
 
         // Verify conversation exists and belongs to user
@@ -7384,6 +7424,7 @@ impl ConversationService {
         let mut mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
         let mut seen_mcp_names = HashSet::new();
         let mut status_index_by_name: HashMap<String, usize> = HashMap::new();
+        let mut missing_statuses: Vec<ConversationMcpStatus> = Vec::new();
         let repo = self
             .mcp_server_repo
             .read()
@@ -7400,6 +7441,13 @@ impl ConversationService {
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
             };
+            // C-06: an allowlisted id that no longer resolves (deleted / soft-
+            // deleted row, or a catalog that was never loaded) used to vanish
+            // silently. Record it so the frozen snapshot shows what was lost.
+            if let Some(ids) = selected_ids {
+                let found: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+                missing_statuses = missing_selected_mcp_statuses(ids, &found);
+            }
             let selected_rows = rows
                 .into_iter()
                 .filter(|row| !row.builtin && row.name != TEAM_MCP_SERVER_NAME)
@@ -7434,6 +7482,9 @@ impl ConversationService {
                 &mut status_index_by_name,
                 classify_session_mcp_status(server, mcp_support),
             );
+        }
+        for status in missing_statuses {
+            upsert_conversation_mcp_status(&mut mcp_statuses, &mut status_index_by_name, status);
         }
         for status in additional_statuses {
             if status.name == TEAM_MCP_SERVER_NAME {

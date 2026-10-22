@@ -2029,7 +2029,16 @@ fn clear_stale_model(
 pub(crate) fn tool_surface_from_inventory(
     inventory: aionui_session::ToolInventory,
 ) -> aionui_api_types::ConversationToolSurface {
-    use aionui_api_types::{ConversationToolSurface, McpIsolation, ToolSurfaceMcpServer, ToolSurfaceSource};
+    use aionui_api_types::{
+        ConversationToolSurface, McpIsolation, ToolSurfaceEntry, ToolSurfaceMcpServer, ToolSurfaceSource,
+    };
+    let server_names: Vec<String> = inventory.mcp_servers.iter().map(|(name, _)| name.clone()).collect();
+    let mut entries: Vec<ToolSurfaceEntry> = inventory
+        .tools
+        .iter()
+        .map(|name| ToolSurfaceEntry::from_claude_tool(name, &server_names))
+        .collect();
+    entries.extend(inventory.skills.iter().map(|name| ToolSurfaceEntry::skill(name)));
     ConversationToolSurface {
         source: ToolSurfaceSource::ClaudeInit,
         tools: inventory.tools,
@@ -2047,6 +2056,9 @@ pub(crate) fn tool_surface_from_inventory(
             McpIsolation::Ambient
         },
         tool_policy: None,
+        entries,
+        // claude has no ToolSearch-over-empty-deferred problem (C-02 is aionrs).
+        tool_search_inert: false,
     }
 }
 
@@ -5731,7 +5743,25 @@ mod build_mapping_tests {
             tools: vec!["Bash".into(), "mcp__docs__search".into()],
             mcp_servers: vec![("docs".into(), "connected".into())],
             mcp_strict: true,
+            skills: vec!["pdf".into()],
         });
+        let kinds: Vec<_> = surface
+            .entries
+            .iter()
+            .map(|e| (e.canonical.as_str(), e.kind, e.server.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("Bash", aionui_api_types::ToolSurfaceKind::Builtin, None),
+                (
+                    "mcp__docs__search",
+                    aionui_api_types::ToolSurfaceKind::Mcp,
+                    Some("docs")
+                ),
+                ("skill:pdf", aionui_api_types::ToolSurfaceKind::Skill, None),
+            ]
+        );
         assert_eq!(surface.source, ToolSurfaceSource::ClaudeInit);
         assert_eq!(surface.tools, vec!["Bash", "mcp__docs__search"]);
         assert_eq!(surface.mcp_servers[0].name, "docs");

@@ -180,6 +180,8 @@ pub struct ToolInventory {
     /// `true` when the launch isolated the session from ambient MCP config
     /// (B-09 `--strict-mcp-config`); `false` = ambient servers may be present.
     pub mcp_strict: bool,
+    /// Skills the agent reported as invocable (claude `system/init` `skills[]`).
+    pub skills: Vec<String>,
 }
 
 /// A neutral, SDK-free MCP server spec (Wave 0c). Carries one resolved MCP server
