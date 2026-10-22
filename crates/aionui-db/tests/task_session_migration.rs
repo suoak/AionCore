@@ -223,7 +223,7 @@ async fn migration_063_adds_restart_persistent_context_snapshots_and_artifact_li
 }
 
 #[tokio::test]
-async fn migration_064_adds_managed_worktrees_and_fanout_groups() {
+async fn migration_066_adds_managed_worktrees_and_fanout_groups() {
     let db = aionui_db::init_database_memory().await.unwrap();
     let pool = db.pool();
     let tables: Vec<String> = sqlx::query_scalar(

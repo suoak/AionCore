@@ -1,4 +1,4 @@
-//! `task_worktrees` persistence (migration 064). Every user-facing query is
+//! `task_worktrees` persistence (migration 066). Every user-facing query is
 //! scoped by `user_id`; only boot recovery reads across users.
 
 use aionui_db::SqlitePool;

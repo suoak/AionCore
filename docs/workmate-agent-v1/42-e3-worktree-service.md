@@ -6,7 +6,8 @@
 TYPE      = FEATURE (Core only; no UI yet — E3-3)
 SCOPE     = M7 / E3-1 (design: E3-parallel-worktree-fanout.md §4.1, §4.3, §5, §6.1, §6.3, §7, §8)
 CRATE     = crates/aionui-worktree (new)
-MIGRATION = 064_task_worktrees.sql (task_worktrees, fanout_groups, task_sessions.fanout_group_id)
+MIGRATION = 066_task_worktrees.sql (task_worktrees, fanout_groups, task_sessions.fanout_group_id;
+            designed as 064, renumbered after E4-1 landed 065 so apply order = version order)
 SCM       = unchanged: scm/* protocol and git_provider are not touched
 ```
 
@@ -72,7 +73,7 @@ SCM       = unchanged: scm/* protocol and git_provider are not touched
   panel keeps working without it (git2, read-only).
 - `git worktree add` runs the repository's `post-checkout` hook, exactly as if
   the user ran git themselves.
-- Migration 064: once applied, older Core builds show the existing
+- Migration 066: once applied, older Core builds show the existing
   `database.newer_than_app` dialog (no downgrade to ≤ 0.2.20).
 
 ## Deferred to later E3 PRs
@@ -83,6 +84,6 @@ SCM       = unchanged: scm/* protocol and git_provider are not touched
   `task_trace_events` (`worktree.created`) when a TaskSession is linked.
 - E3-3 (UI): Worktree toggle, Start-from picker, progress / cancel / retry,
   delete dialog, preserved-branch review.
-- E3-4: `FanoutService` and `/api/fanout-groups*` (table already in 064).
+- E3-4: `FanoutService` and `/api/fanout-groups*` (table already in 066).
 - E3-7 (M8): remote `fetch` before create, `size_bytes`, disk quotas, Windows
   deepest-path pre-check.
