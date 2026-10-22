@@ -207,6 +207,19 @@ fn audited_capabilities_for_integration(
     }
 }
 
+/// C-07: no runtime consumes `inject_skills` (aionrs, ACP, claude and codex all
+/// ignore it), so a non-empty list would be stored and silently dropped. Reject
+/// it at the API boundary instead of pretending the skills were injected. An
+/// empty list (the default every client sends today) is accepted unchanged.
+pub(crate) fn reject_inject_skills(inject_skills: &[String]) -> Result<(), ConversationError> {
+    if inject_skills.is_empty() {
+        return Ok(());
+    }
+    Err(ConversationError::BadRequest {
+        reason: "inject_skills is not supported: skills are delivered through the conversation skill snapshot".into(),
+    })
+}
+
 fn validate_planning_turn_content(policy: AionrsRuntimeToolPolicy, content: &str) -> Result<(), ConversationError> {
     if policy == AionrsRuntimeToolPolicy::StrictPlanning && content.trim_start().starts_with('/') {
         return Err(ConversationError::Forbidden {
@@ -262,6 +275,14 @@ mod planning_isolation_tests {
     #[test]
     fn strict_planning_rejects_slash_commands_before_turn_start() {
         assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "  /skill mutate").is_err());
+        assert!(
+            reject_inject_skills(&[]).is_ok(),
+            "C-07: the default empty list stays accepted"
+        );
+        assert!(matches!(
+            reject_inject_skills(&["review".into()]),
+            Err(ConversationError::BadRequest { .. })
+        ));
         assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::StrictPlanning, "inspect the repo").is_ok());
         assert!(validate_planning_turn_content(AionrsRuntimeToolPolicy::Unrestricted, "/allowed-in-execution").is_ok());
     }
@@ -5770,6 +5791,7 @@ impl ConversationService {
                 reason: "Message content must not be empty".into(),
             });
         }
+        reject_inject_skills(&req.inject_skills)?;
         let send_started_at = now_ms();
 
         // Verify conversation exists and belongs to user

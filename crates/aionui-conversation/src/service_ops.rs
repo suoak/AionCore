@@ -858,6 +858,7 @@ impl ConversationService {
             });
         }
         reject_deprecated_runtime_row(&row)?;
+        crate::service::reject_inject_skills(&req.inject_skills)?;
         let capabilities = self.conversation_capabilities(user_id, conversation_id).await?;
         let supported = match req.mode {
             ConversationInputMode::Followup => capabilities.followup,
