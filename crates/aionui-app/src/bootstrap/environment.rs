@@ -87,6 +87,12 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
     let config = AppConfig {
         host: cli.host.clone(),
         port: cli.port,
+        allowed_hosts: cli
+            .allowed_hosts
+            .iter()
+            .cloned()
+            .chain(std::env::var(aionui_auth::ALLOWED_HOSTS_ENV).ok())
+            .collect(),
         data_dir: cli.data_dir.clone(),
         work_dir,
         app_version: cli.app_version.clone(),
@@ -108,6 +114,13 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         local_api_secret_configured = config.local_api_secret.is_some(),
         "startup: identity mode resolved"
     );
+    if cli.command.is_none() && aionui_auth::HostAllowlist::new(&config.host, &config.allowed_hosts).allows_any() {
+        warn!(
+            host = %config.host,
+            "Host header allowlist is off (wildcard bind without --allowed-hosts, or '*'); \
+             list the names this server is reached under to enable DNS-rebinding protection"
+        );
+    }
     if config.identity_mode.is_local() && config.local_api_secret.is_none() && cli.command.is_none() {
         warn!(
             "local API authentication is disabled: launcher did not provide a per-launch secret \

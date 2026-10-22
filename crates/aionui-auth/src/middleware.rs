@@ -14,7 +14,9 @@ use crate::JwtService;
 use crate::agent_approval::{
     AGENT_APPROVAL_ID_HEADER, AGENT_APPROVAL_REQUIRED_CODE, AgentActionApprovals, ApprovalCheck, request_fingerprint,
 };
-use crate::agent_scope::{AgentRouteDecision, classify_agent_request, is_rename_only_patch, redact_secrets};
+use crate::agent_scope::{
+    AgentRouteDecision, classify_agent_request, filter_conversation_list, is_rename_only_patch, redact_secrets,
+};
 use crate::extract::extract_token_from_headers;
 use crate::local_secret::LocalApiSecret;
 
@@ -56,6 +58,16 @@ pub const RUNTIME_CONVERSATION_ID_HEADER: &str = "x-aionui-conversation-id";
 /// token bound to exactly this (user_id, conversation_id) pair.
 pub trait IRuntimeTokenVerifier: Send + Sync {
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
+}
+
+/// Port answering "may the agent running in `own` read conversation `target`?"
+/// beyond its own conversation — i.e. did the user grant `own -> target` with
+/// `@@` (see `aionui_conversation::session_mentions::SessionMentionGrants`).
+///
+/// Implemented in the composition layer; `None` in [`AuthState`] means an agent
+/// token may read only its own conversation.
+pub trait IAgentConversationAccess: Send + Sync {
+    fn is_granted(&self, user_id: &str, own_conversation_id: &str, target_conversation_id: &str) -> bool;
 }
 
 /// Authenticated user injected into request extensions by the auth middleware.
@@ -103,6 +115,19 @@ pub struct AuthState {
     /// Approval store for configuration writes requested by agent tokens.
     /// `None` denies such writes outright.
     pub agent_approvals: Option<Arc<AgentActionApprovals>>,
+    /// `@@` read grants for agent tokens. `None`: own conversation only.
+    pub agent_conversation_access: Option<Arc<dyn IAgentConversationAccess>>,
+}
+
+impl AuthState {
+    /// Whether an agent token bound to `own` may read `target`.
+    fn agent_may_read(&self, user_id: &str, own: &str, target: &str) -> bool {
+        target == own
+            || self
+                .agent_conversation_access
+                .as_ref()
+                .is_some_and(|access| access.is_granted(user_id, own, target))
+    }
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -231,6 +256,10 @@ async fn runtime_token_channel(state: &AuthState, request: Request, next: Next) 
         ));
     }
 
+    let is_conversation_list = matches!(
+        classify_agent_request(request.method(), request.uri().path(), &conversation_id),
+        AgentRouteDecision::AllowConversationList
+    );
     let mut request = enforce_agent_scope(state, request, &user.id, &conversation_id).await?;
     let redact_response = request.method() == axum::http::Method::GET;
     request.extensions_mut().insert(AgentPrincipal {
@@ -243,9 +272,15 @@ async fn runtime_token_channel(state: &AuthState, request: Request, next: Next) 
         status: user.status,
     });
 
+    let user_id = request
+        .extensions()
+        .get::<CurrentUser>()
+        .map(|user| user.id.clone())
+        .unwrap_or_default();
     let response = next.run(request).await;
     if redact_response {
-        redact_json_response(response).await
+        let list_filter = is_conversation_list.then_some((state, user_id.as_str(), conversation_id.as_str()));
+        redact_json_response(response, list_filter).await
     } else {
         Ok(response)
     }
@@ -278,7 +313,21 @@ async fn enforce_agent_scope(
         .unwrap_or_else(|| request.uri().path().to_owned());
 
     match classify_agent_request(&method, request.uri().path(), conversation_id) {
-        AgentRouteDecision::Allow => Ok(request),
+        AgentRouteDecision::Allow | AgentRouteDecision::AllowConversationList => Ok(request),
+        AgentRouteDecision::AllowConversationRead(target) => {
+            if state.agent_may_read(user_id, conversation_id, &target) {
+                Ok(request)
+            } else {
+                tracing::info!(
+                    method = %method,
+                    path = request.uri().path(),
+                    "agent token read of a conversation that was not @@-granted"
+                );
+                Err(scope_denied(
+                    "Agent tokens may only read their own conversation and conversations the user selected with @@.",
+                ))
+            }
+        }
         AgentRouteDecision::Deny => {
             tracing::info!(method = %method, path = request.uri().path(), "agent token request outside scope");
             Err(scope_denied("This route is not available to agent tokens."))
@@ -354,13 +403,22 @@ async fn enforce_agent_scope(
 }
 
 /// Redact secrets from a JSON response served to an agent token.
-async fn redact_json_response(response: Response) -> Result<Response, ApiError> {
+async fn redact_json_response(
+    response: Response,
+    conversation_list_filter: Option<(&AuthState, &str, &str)>,
+) -> Result<Response, ApiError> {
     let is_json = response
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("json"));
     if !is_json {
+        if conversation_list_filter.is_some() && response.status().is_success() {
+            // Never pass an unfilterable conversation list through.
+            return Err(scope_denied(
+                "Unexpected conversation list response for an agent token.",
+            ));
+        }
         return Ok(response);
     }
     let (mut parts, body) = response.into_parts();
@@ -368,8 +426,16 @@ async fn redact_json_response(response: Response) -> Result<Response, ApiError> 
         .await
         .map_err(|_| ApiError::PayloadTooLarge("Response too large for an agent token".into()))?;
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        if conversation_list_filter.is_some() {
+            return Err(scope_denied(
+                "Unexpected conversation list response for an agent token.",
+            ));
+        }
         return Ok(Response::from_parts(parts, axum::body::Body::from(bytes)));
     };
+    if let Some((state, user_id, own)) = conversation_list_filter {
+        filter_conversation_list(&mut value, |id| state.agent_may_read(user_id, own, id));
+    }
     redact_secrets(&mut value);
     let redacted = serde_json::to_vec(&value).map_err(|_| ApiError::Internal("Failed to encode response".into()))?;
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);

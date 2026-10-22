@@ -8,6 +8,7 @@ mod cookie;
 mod csrf;
 mod error;
 mod extract;
+pub mod host_allowlist;
 mod jwt;
 pub mod local_secret;
 pub mod middleware;
@@ -20,6 +21,9 @@ mod security;
 mod service;
 mod singleflight;
 mod validation;
+
+// Host header allowlist (DNS-rebinding defence)
+pub use host_allowlist::{ALLOWED_HOSTS_ENV, HostAllowlist, host_allowlist_middleware};
 
 // Error type
 pub use error::AuthError;
@@ -75,8 +79,9 @@ pub use agent_approval::{
 };
 pub use agent_scope::{AgentActionKind, AgentRouteDecision};
 pub use middleware::{
-    AgentPrincipal, AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
-    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, local_auth_middleware,
+    AgentPrincipal, AuthIdentityMode, AuthState, CurrentUser, IAgentConversationAccess, IRuntimeTokenVerifier,
+    RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware,
+    local_auth_middleware,
 };
 
 // QR token store

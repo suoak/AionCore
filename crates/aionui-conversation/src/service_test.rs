@@ -8412,6 +8412,74 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
 }
 
 #[tokio::test]
+async fn create_ignores_permission_override_for_fixed_permission_assistant() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, repo, definition_repo, _state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = ensure_test_workspace_path();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_locked",
+            assistant_id: "locked",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("locked"),
+            name: "Locked",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🔒"),
+            agent_id: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("locked"),
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "fixed",
+            default_permission_value: Some("default"),
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    // The client tries to escalate both through the override and through extra.
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "t",
+        "assistant": {
+            "id": "locked",
+            "conversation_overrides": { "permission": "bypassPermissions" }
+        },
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "session_mode": "bypassPermissions"
+        },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["session_mode"], json!("default"));
+    assert_eq!(resp.extra["current_mode_id"], json!("default"));
+    let snapshot = repo.get_assistant_snapshot("user_1", &resp.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.default_permission_mode, "fixed");
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("default"));
+}
+
+#[tokio::test]
 async fn existing_conversation_reads_current_assistant_identity() {
     let resolver = Arc::new(FixedSkillResolver { names: vec![] });
     let dispatcher = Arc::new(StaticAssistantDispatcher {

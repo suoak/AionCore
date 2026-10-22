@@ -287,6 +287,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         runtime_token_verifier: None,
         local_secret: None,
         agent_approvals: None,
+        agent_conversation_access: None,
     };
 
     // Auth rate limited routes (login, qr-login)

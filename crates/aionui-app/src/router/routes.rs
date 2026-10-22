@@ -280,6 +280,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         })),
         local_secret: services.local_api_secret.clone(),
         agent_approvals: Some(services.agent_approvals.clone()),
+        agent_conversation_access: Some(Arc::new(SessionMentionReadAccess {
+            grants: services.conversation_service.session_mention_grants().clone(),
+        })),
     };
 
     let agent_approvals_authenticated = aionui_auth::agent_approval_routes(services.agent_approvals.clone())
@@ -466,6 +469,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = router.layer(middleware::from_fn(normalize_boundary_error_response));
 
     let router = with_access_log(router);
+    // Outermost of the app layers (CORS aside): a request under a foreign
+    // `Host` never reaches auth, CSRF or a handler.
+    let router = router.layer(middleware::from_fn_with_state(
+        services.host_allowlist.clone(),
+        aionui_auth::host_allowlist_middleware,
+    ));
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: route tree build with states completed"
@@ -555,6 +564,20 @@ impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
                 TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             )
             .is_ok()
+    }
+}
+
+/// Agent-token read access beyond the token's own conversation: exactly the
+/// `@@` grants the user made (the same in-memory grants that authorize
+/// cross-session delivery), so a restart fails closed.
+struct SessionMentionReadAccess {
+    grants: Arc<aionui_conversation::session_mentions::SessionMentionGrants>,
+}
+
+impl aionui_auth::IAgentConversationAccess for SessionMentionReadAccess {
+    fn is_granted(&self, user_id: &str, own_conversation_id: &str, target_conversation_id: &str) -> bool {
+        self.grants
+            .is_granted(user_id, own_conversation_id, target_conversation_id)
     }
 }
 

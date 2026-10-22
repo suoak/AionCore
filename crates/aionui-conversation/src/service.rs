@@ -3565,14 +3565,13 @@ impl ConversationService {
                 "auto" => preference.as_ref().and_then(|row| row.last_model_id.clone()),
                 _ => None,
             });
-        let permission = overrides
-            .permission
-            .clone()
-            .or_else(|| match definition.default_permission_mode.as_str() {
-                "fixed" => definition.default_permission_value.clone(),
-                "auto" => preference.as_ref().and_then(|row| row.last_permission_value.clone()),
-                _ => None,
-            });
+        let permission = resolve_assistant_permission(
+            assistant_id,
+            &definition.default_permission_mode,
+            definition.default_permission_value.as_deref(),
+            overrides.permission.as_deref(),
+            preference.as_ref().and_then(|row| row.last_permission_value.as_deref()),
+        );
         let thought_level =
             overrides
                 .thought_level
@@ -8119,6 +8118,39 @@ fn protected_extra_value_changes(existing: &serde_json::Value, incoming: &serde_
     }
 }
 
+/// Permission a new assistant conversation starts with.
+///
+/// A `fixed` permission is the assistant's contract: the client override in
+/// the create request is ignored (with a warning) so a caller cannot escalate
+/// it. Otherwise the override wins, then the mode's default.
+fn resolve_assistant_permission(
+    assistant_id: &str,
+    mode: &str,
+    fixed_value: Option<&str>,
+    requested: Option<&str>,
+    last_used: Option<&str>,
+) -> Option<String> {
+    if mode == "fixed" {
+        if let Some(requested) = requested
+            && Some(requested) != fixed_value
+        {
+            tracing::warn!(
+                assistant_id,
+                requested,
+                fixed = fixed_value.unwrap_or_default(),
+                "ignoring permission override: the assistant's permission is fixed"
+            );
+        }
+        return fixed_value.map(ToOwned::to_owned);
+    }
+    requested
+        .or(match mode {
+            "auto" => last_used,
+            _ => None,
+        })
+        .map(ToOwned::to_owned)
+}
+
 /// Validates a client `conversation.extra` patch against host-owned keys.
 pub(crate) fn check_protected_extra_patch(
     existing: &serde_json::Value,
@@ -8630,6 +8662,30 @@ mod tests {
             "pinned": true,
         });
         assert!(check_protected_extra_patch(&existing, &echoed, true).is_ok());
+    }
+
+    #[test]
+    fn fixed_permission_ignores_the_client_override() {
+        let resolve = |mode, fixed, requested, last| resolve_assistant_permission("a", mode, fixed, requested, last);
+        assert_eq!(
+            resolve("fixed", Some("default"), Some("yolo"), None).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            resolve("fixed", Some("default"), None, Some("yolo")).as_deref(),
+            Some("default")
+        );
+        assert_eq!(resolve("fixed", None, Some("yolo"), None), None);
+        assert_eq!(
+            resolve("auto", None, Some("yolo"), Some("last")).as_deref(),
+            Some("yolo")
+        );
+        assert_eq!(resolve("auto", None, None, Some("last")).as_deref(), Some("last"));
+        assert_eq!(
+            resolve("default", None, Some("plan"), Some("last")).as_deref(),
+            Some("plan")
+        );
+        assert_eq!(resolve("default", None, None, Some("last")), None);
     }
 
     #[test]

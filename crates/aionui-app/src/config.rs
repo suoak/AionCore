@@ -30,6 +30,9 @@ impl IdentityMode {
 pub struct AppConfig {
     pub host: String,
     pub port: u16,
+    /// Extra `Host` values accepted besides loopback and the bind address
+    /// (`--allowed-hosts` + `AIONCORE_ALLOWED_HOSTS`; `*` disables the check).
+    pub allowed_hosts: Vec<String>,
     pub data_dir: PathBuf,
     pub work_dir: PathBuf,
     pub app_version: String,
@@ -80,6 +83,7 @@ impl Default for AppConfig {
         Self {
             host: aionui_common::constants::DEFAULT_HOST.to_string(),
             port: aionui_common::constants::DEFAULT_PORT,
+            allowed_hosts: Vec::new(),
             data_dir: PathBuf::from("data"),
             work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
