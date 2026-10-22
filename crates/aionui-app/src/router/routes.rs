@@ -469,6 +469,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = router.layer(middleware::from_fn(normalize_boundary_error_response));
 
     let router = with_access_log(router);
+    // Outermost of the app layers (CORS aside): a request under a foreign
+    // `Host` never reaches auth, CSRF or a handler.
+    let router = router.layer(middleware::from_fn_with_state(
+        services.host_allowlist.clone(),
+        aionui_auth::host_allowlist_middleware,
+    ));
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: route tree build with states completed"

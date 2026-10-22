@@ -238,3 +238,79 @@ async fn local_mode_cors_rejects_foreign_origins() {
 
     services.database.close().await;
 }
+
+#[tokio::test]
+async fn forged_host_is_rejected_before_auth() {
+    let (router, services) = local_secret_router().await;
+
+    for host in ["evil.example", "evil.example:25808", "127.0.0.1.nip.io:25808"] {
+        for uri in ["/health", "/api/settings", "/ws"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("host", host)
+                        .header("x-aionui-local-secret", LOCAL_SECRET)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{host} {uri}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "HOST_NOT_ALLOWED", "{host} {uri}");
+        }
+    }
+
+    for host in ["127.0.0.1:25808", "localhost:5173", "[::1]:49152"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/settings")
+                    .header("host", host)
+                    .header("x-aionui-local-secret", LOCAL_SECRET)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+    }
+
+    services.database.close().await;
+}
+
+#[tokio::test]
+async fn configured_remote_host_is_accepted() {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        allowed_hosts: vec!["workmate.lan".into()],
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let router = aionui_app::create_router(&services).await.expect("build router");
+
+    let status = |host: &'static str| {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header("host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(status("workmate.lan:25809").await, StatusCode::OK);
+    assert_eq!(status("other.lan:25809").await, StatusCode::FORBIDDEN);
+
+    services.database.close().await;
+}

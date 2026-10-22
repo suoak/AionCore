@@ -8,6 +8,7 @@ mod cookie;
 mod csrf;
 mod error;
 mod extract;
+pub mod host_allowlist;
 mod jwt;
 pub mod local_secret;
 pub mod middleware;
@@ -20,6 +21,9 @@ mod security;
 mod service;
 mod singleflight;
 mod validation;
+
+// Host header allowlist (DNS-rebinding defence)
+pub use host_allowlist::{ALLOWED_HOSTS_ENV, HostAllowlist, host_allowlist_middleware};
 
 // Error type
 pub use error::AuthError;

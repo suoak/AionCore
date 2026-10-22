@@ -80,6 +80,8 @@ pub struct AppServices {
     pub local_api_secret: Option<aionui_auth::LocalApiSecret>,
     /// Pending user approvals for configuration writes requested by agents.
     pub agent_approvals: Arc<aionui_auth::AgentActionApprovals>,
+    /// `Host` header allowlist applied to every route (DNS-rebinding defence).
+    pub host_allowlist: Arc<aionui_auth::HostAllowlist>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -478,6 +480,7 @@ impl AppServices {
             identity_mode,
             bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
             local_api_secret: if local { config.local_api_secret.clone() } else { None },
+            host_allowlist: Arc::new(aionui_auth::HostAllowlist::new(&config.host, &config.allowed_hosts)),
             agent_approvals,
             app_version,
             skill_paths,

@@ -16,6 +16,12 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = String::from(aionui_common::constants::DEFAULT_HOST))]
     pub host: String,
 
+    /// Extra `Host` header values the server answers to (comma separated or
+    /// repeated), on top of loopback and the bind address. `*` disables the
+    /// check. Also read from AIONCORE_ALLOWED_HOSTS.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_hosts: Vec<String>,
+
     /// Port number to listen on.
     #[arg(long, default_value_t = aionui_common::constants::DEFAULT_PORT)]
     pub port: u16,
