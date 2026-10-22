@@ -37,6 +37,7 @@ use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler};
+use aionui_review::review_routes;
 use aionui_shell::shell_routes;
 use aionui_sidebar::sidebar_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
@@ -373,6 +374,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let skill_evolution_authenticated = skill_evolution_routes(states.skill_evolution)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // M7 E4 diff annotations. User identity only; agent tokens are denied by
+    // the agent scope (prefix not allow-listed).
+    let review_authenticated =
+        review_routes(states.review).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office proxy routes serve iframe content but still require auth so
     // preview ports remain scoped to the active Core user.
     let office_proxy =
@@ -440,6 +446,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(assistant_authenticated)
         .merge(agent_center_authenticated)
         .merge(skill_evolution_authenticated)
+        .merge(review_authenticated)
         .merge(session_message_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)

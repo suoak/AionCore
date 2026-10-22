@@ -380,6 +380,35 @@ mod tests {
         }
     }
 
+    /// M7 E4: agents may neither read nor write diff annotations, nor send
+    /// annotation batches or drive commit / push / PR delivery through the
+    /// WorkMate API. These prefixes must never join an allow-list.
+    #[test]
+    fn review_and_delivery_routes_are_denied() {
+        for (method, path) in [
+            (Method::GET, "/api/review-threads"),
+            (Method::GET, "/api/review-threads?scope_kind=scm&scope_id=/repo"),
+            (Method::HEAD, "/api/review-threads"),
+            (Method::GET, "/api/review-threads/rt_1"),
+            (Method::POST, "/api/review-threads"),
+            (Method::PATCH, "/api/review-threads/rt_1"),
+            (Method::DELETE, "/api/review-threads/rt_1"),
+            (Method::POST, "/api/review-threads/rt_1/resolve"),
+            (Method::POST, "/api/review-threads/rt_1/reopen"),
+            (Method::POST, "/api/review-threads/rt_1/comments"),
+            (Method::GET, "/api/review-batches?target_conversation_id=conv-own"),
+            (Method::POST, "/api/review-batches"),
+            (Method::GET, "/api/scm-deliveries/host?repo_path=/repo"),
+            (Method::POST, "/api/scm-deliveries/pull-request"),
+        ] {
+            assert_eq!(
+                classify(method.clone(), path),
+                AgentRouteDecision::Deny,
+                "{method} {path}"
+            );
+        }
+    }
+
     #[test]
     fn rename_only_patch_detection() {
         assert!(is_rename_only_patch(br#"{"name":"new title"}"#));

@@ -47,6 +47,7 @@ use aionui_mcp::{
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
+use aionui_review::{AllowedRootsResolver, ReviewRouterState, ReviewService};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
@@ -164,6 +165,8 @@ pub struct ModuleStates {
     pub assistant: AssistantRouterState,
     pub agent_center: AgentCenterRouterState,
     pub skill_evolution: SkillEvolutionRouterState,
+    /// M7 E4 diff annotations (`/api/review-threads*`).
+    pub review: ReviewRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -400,6 +403,7 @@ pub async fn build_module_states(
         assistant: assistant.clone(),
         agent_center,
         skill_evolution,
+        review: build_module_state_phase(&boot, "review", || build_review_state(services)),
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -795,6 +799,17 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
     AgentCenterRouterState {
         service,
         agent_execution_canceller: Some(agent_execution_canceller),
+    }
+}
+
+/// Build the review-thread (diff annotation) router state. Repositories are
+/// read under the same sandbox roots as the file routes.
+pub fn build_review_state(services: &AppServices) -> ReviewRouterState {
+    let resolver = Arc::new(AllowedRootsResolver::new(default_allowed_roots(Some(
+        services.work_dir.as_path(),
+    ))));
+    ReviewRouterState {
+        service: Arc::new(ReviewService::new(services.database.pool().clone(), resolver)),
     }
 }
 
