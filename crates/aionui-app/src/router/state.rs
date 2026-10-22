@@ -167,6 +167,7 @@ pub struct ModuleStates {
     pub skill_evolution: SkillEvolutionRouterState,
     /// M7 E4 diff annotations (`/api/review-threads*`).
     pub review: ReviewRouterState,
+    pub worktree: aionui_worktree::WorktreeRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -360,6 +361,10 @@ pub async fn build_module_states(
         .with_turn_starting_hook(Arc::new(AgentWorkflowTurnStartGuard {
             agent_center: Arc::downgrade(&agent_center.service),
         }));
+    let worktree = build_module_state_phase(&boot, "worktree", || build_worktree_state(services));
+    if let Err(error) = worktree.service.recover_on_boot().await {
+        tracing::warn!(error = %error, "worktree: startup recovery failed");
+    }
     let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
         build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
     });
@@ -404,6 +409,7 @@ pub async fn build_module_states(
         agent_center,
         skill_evolution,
         review: build_module_state_phase(&boot, "review", || build_review_state(services)),
+        worktree,
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -1300,6 +1306,21 @@ pub fn build_team_state(
         service,
         active_leases: services.active_lease_registry.clone(),
     }
+}
+
+/// Build the M7 E3 worktree state: managed root `{data_dir}/worktrees`,
+/// system `git` CLI, events on the shared bus.
+pub fn build_worktree_state(services: &AppServices) -> aionui_worktree::WorktreeRouterState {
+    let store = aionui_worktree::WorktreeStore::new(services.database.pool().clone());
+    let service = aionui_worktree::WorktreeService::new(
+        store,
+        aionui_worktree::WorktreeServiceConfig {
+            root_dir: services.data_dir.join("worktrees"),
+            git: aionui_worktree::GitCli::default(),
+            events: aionui_worktree::WorktreeEvents::new(services.event_bus.clone()),
+        },
+    );
+    aionui_worktree::WorktreeRouterState { service }
 }
 
 /// Build the default `CronRouterState` from application services.

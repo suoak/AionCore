@@ -444,6 +444,7 @@ dependencies = [
  "aionui-system",
  "aionui-team",
  "aionui-team-prompts",
+ "aionui-worktree",
  "anyhow",
  "async-trait",
  "axum",
@@ -1099,6 +1100,30 @@ dependencies = [
  "aionui-api-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aionui-worktree"
+version = "0.2.20"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-realtime",
+ "aionui-runtime",
+ "axum",
+ "dashmap",
+ "dunce",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

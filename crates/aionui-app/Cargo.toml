@@ -43,6 +43,7 @@ aionui-project.workspace = true
 aionui-sidebar.workspace = true
 aionui-assistant.workspace = true
 aionui-review.workspace = true
+aionui-worktree.workspace = true
 aionui-runtime.workspace = true
 aionui-process.workspace = true
 aion-config.workspace = true

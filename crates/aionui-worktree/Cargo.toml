@@ -1,0 +1,31 @@
+[package]
+name = "aionui-worktree"
+version.workspace = true
+edition.workspace = true
+
+# M7 E3: WorkMate-managed git worktrees (lifecycle, GitCli runner, routes).
+# Write operations go through the system `git` CLI; see
+# docs/workmate-agent-v1/42-e3-worktree-service.md.
+
+[dependencies]
+aionui-common.workspace = true
+aionui-db.workspace = true
+aionui-api-types.workspace = true
+aionui-realtime.workspace = true
+aionui-auth.workspace = true
+aionui-runtime.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "sync", "rt", "macros", "time"] }
+tokio-util = { version = "0.7" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+dunce.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["test-util"] }

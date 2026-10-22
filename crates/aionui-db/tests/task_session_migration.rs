@@ -221,3 +221,62 @@ async fn migration_063_adds_restart_persistent_context_snapshots_and_artifact_li
     .unwrap();
     assert_eq!(tables, ["context_snapshot_artifacts", "context_snapshots"]);
 }
+
+#[tokio::test]
+async fn migration_066_adds_managed_worktrees_and_fanout_groups() {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let pool = db.pool();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('task_worktrees', 'fanout_groups') ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(tables, ["fanout_groups", "task_worktrees"]);
+
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('task_sessions')")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert!(columns.iter().any(|c| c == "fanout_group_id"));
+
+    let insert = |id: &'static str, user: &'static str, path: &'static str, status: &'static str| {
+        sqlx::query(
+            "INSERT INTO task_worktrees (id, user_id, source_repo_path, repo_common_dir, path, branch, base_ref, \
+             base_commit, status, created_at, updated_at) VALUES (?, ?, '/r', '/r/.git', ?, 'wm/x', 'HEAD', 'abc', ?, 1, 1)",
+        )
+        .bind(id)
+        .bind(user)
+        .bind(path)
+        .bind(status)
+        .execute(pool)
+    };
+    insert("wt-1", "system_default_user", "/wt/1", "creating")
+        .await
+        .unwrap();
+    insert("wt-2", "missing-user", "/wt/2", "creating")
+        .await
+        .expect_err("user FK must be enforced");
+    insert("wt-3", "system_default_user", "/wt/3", "bogus")
+        .await
+        .expect_err("status CHECK must be enforced");
+    insert("wt-4", "system_default_user", "/wt/1", "ready")
+        .await
+        .expect_err("a live path is unique");
+    sqlx::query("UPDATE task_worktrees SET status = 'removed', removed_at = 2 WHERE id = 'wt-1'")
+        .execute(pool)
+        .await
+        .unwrap();
+    insert("wt-5", "system_default_user", "/wt/1", "creating")
+        .await
+        .expect("a removed record frees its path");
+
+    sqlx::query(
+        "INSERT INTO fanout_groups (id, user_id, source_repo_path, repo_common_dir, base_ref, base_commit, prompt, \
+         max_parallel, status, created_at, updated_at) VALUES ('g1', 'system_default_user', '/r', '/r/.git', 'HEAD', \
+         'abc', 'p', 6, 'preparing', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .expect_err("max_parallel is capped at 5");
+}
