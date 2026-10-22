@@ -214,6 +214,76 @@ async fn review_thread_crud_and_reanchor_over_http() {
     services.database.close().await;
 }
 
+/// The renderer only knows pe-relative identities: a `pe:{pe_id}/{rel}` scope
+/// resolves through the user's own project entry.
+#[tokio::test]
+async fn pe_scope_resolves_through_the_users_project() {
+    let (mut app, services) = common::build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "password123").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    std::fs::create_dir_all(workspace.join("repo")).unwrap();
+    write_lines(
+        &workspace.join("repo/a.txt"),
+        &["one".into(), "two".into(), "three".into()],
+    );
+    let uri = aionui_project::canonical::to_file_uri(&workspace).unwrap();
+    let resolved = services
+        .project_service
+        .resolve_existing("system_default_user", uri)
+        .await
+        .unwrap();
+    let pe_id = resolved.project_explorer.pe_id.clone();
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/review-threads",
+            json!({
+                "scope_kind": "scm", "scope_id": format!("pe:{pe_id}/repo"), "file_path": "a.txt", "side": "new",
+                "start_line": 2, "end_line": 2, "body": "why two?", "diff_context": {"lines": ["two"]}
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let thread = body_json(resp).await["data"].clone();
+    assert_eq!(thread["scope_id"], format!("pe:{pe_id}/repo"));
+    assert!(thread["anchor"]["content_sha"].is_string());
+
+    write_lines(
+        &workspace.join("repo/a.txt"),
+        &["zero".into(), "one".into(), "two".into(), "three".into()],
+    );
+    let uri = format!(
+        "/api/review-threads?scope_kind=scm&scope_id={}",
+        url_encode(&format!("pe:{pe_id}/repo"))
+    );
+    let resp = app.clone().oneshot(get_with_token(&uri, &token)).await.unwrap();
+    assert_eq!(body_json(resp).await["data"][0]["start_line"], 3);
+
+    // Unknown pe → 400.
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/review-threads",
+            json!({
+                "scope_kind": "scm", "scope_id": "pe:nope", "file_path": "a.txt", "side": "new",
+                "start_line": 1, "end_line": 1, "body": "x", "diff_context": {"lines": ["one"]}
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    services.database.close().await;
+}
+
 fn url_encode(value: &str) -> String {
     value
         .bytes()

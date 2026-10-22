@@ -811,9 +811,12 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
 /// Build the review-thread (diff annotation) router state. Repositories are
 /// read under the same sandbox roots as the file routes.
 pub fn build_review_state(services: &AppServices) -> ReviewRouterState {
-    let resolver = Arc::new(AllowedRootsResolver::new(default_allowed_roots(Some(
-        services.work_dir.as_path(),
-    ))));
+    let projects = Arc::new(ReviewProjectDirs {
+        projects: services.project_service.clone(),
+    });
+    let resolver = Arc::new(
+        AllowedRootsResolver::new(default_allowed_roots(Some(services.work_dir.as_path()))).with_projects(projects),
+    );
     ReviewRouterState {
         service: Arc::new(ReviewService::new(services.database.pool().clone(), resolver)),
     }
@@ -2016,5 +2019,23 @@ mod tests {
         assert_eq!(loaded[0].name, "demo-ext");
 
         services.database.close().await;
+    }
+}
+
+/// Resolves review `pe:` scopes through the caller's own project entries.
+struct ReviewProjectDirs {
+    projects: aionui_project::ProjectService,
+}
+
+#[async_trait::async_trait]
+impl aionui_review::ProjectDirResolver for ReviewProjectDirs {
+    async fn resolve_dir(&self, user_id: &str, pe_id: &str, relative_path: &str) -> Option<std::path::PathBuf> {
+        let input = aionui_project::types::ReferenceInput {
+            pe_id: pe_id.to_owned(),
+            relative_path: relative_path.to_owned(),
+            op: aionui_project::types::FileOp::Browse,
+        };
+        let resolved = self.projects.resolve_reference(user_id, input).await.ok()?;
+        resolved.absolute_path.map(std::path::PathBuf::from)
     }
 }

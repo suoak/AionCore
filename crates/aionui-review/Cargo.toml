@@ -10,6 +10,7 @@ edition.workspace = true
 aionui-api-types.workspace = true
 aionui-auth.workspace = true
 aionui-common.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 hex.workspace = true
 serde.workspace = true
