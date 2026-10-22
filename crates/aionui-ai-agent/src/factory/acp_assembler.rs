@@ -63,7 +63,7 @@ pub async fn assemble_acp_params(
     user_id: String,
     workspace: WorkspaceInfo,
     metadata: AgentMetadata,
-    command_spec: CommandSpec,
+    mut command_spec: CommandSpec,
     config: AcpBuildExtra,
     user_mcp_servers: Vec<McpServer>,
     session_snapshot: Option<PersistedSessionState>,
@@ -71,6 +71,7 @@ pub async fn assemble_acp_params(
     dump_prompts: bool,
 ) -> AcpSessionParams {
     let mcp_servers = resolve_mcp_servers(&config, user_mcp_servers);
+    apply_gemini_mcp_isolation_args(&mut command_spec, &metadata, &config, &mcp_servers);
     let preset_context = compose_preset_context(config.preset_context.as_deref());
 
     AcpSessionParams {
@@ -100,6 +101,80 @@ fn resolve_mcp_servers(config: &AcpBuildExtra, user_mcp_servers: Vec<McpServer>)
     }
     servers.extend(user_mcp_servers);
     servers
+}
+
+/// Allowlist entry that names no real server. gemini-cli treats an
+/// `--allowed-mcp-server-names` list as "only these", so a managed session
+/// with an EMPTY WorkMate allowlist passes this to mean "none at all".
+pub(crate) const GEMINI_NO_MCP_SENTINEL: &str = "__csbu_workmate_no_mcp__";
+
+/// The gemini-cli backend (`gemini --acp`). Its forks (qwen, …) are NOT
+/// assumed to honor the same flags until verified.
+fn is_gemini_cli(metadata: &AgentMetadata) -> bool {
+    metadata.backend.as_deref() == Some("gemini")
+}
+
+/// M7 E1: whether this ACP launch is isolated from ambient MCP config. Only a
+/// managed (`extra.mcp_strict`) gemini session is: gemini-cli otherwise merges
+/// user, system and WORKSPACE `.gemini/settings.json` servers plus extension
+/// servers into every ACP session (verified against gemini-cli 0.65.0, see
+/// `docs/workmate-agent-v1/41-backend-mcp-matrix.md`).
+pub(crate) fn acp_launch_is_mcp_strict(metadata: &AgentMetadata, config: &AcpBuildExtra) -> bool {
+    config.mcp_strict && is_gemini_cli(metadata)
+}
+
+/// Name of an ACP MCP server entry; `None` for transports this build does not
+/// model (never allowlisted, so they fail closed under a strict launch).
+pub(crate) fn acp_mcp_server_name(server: &McpServer) -> Option<&str> {
+    match server {
+        McpServer::Stdio(s) => Some(s.name.as_str()),
+        McpServer::Http(s) => Some(s.name.as_str()),
+        McpServer::Sse(s) => Some(s.name.as_str()),
+        _ => None,
+    }
+}
+
+/// M7 E1 (B-09 for gemini): a managed gemini session may load ONLY the MCP
+/// servers WorkMate injects through `session/new`, and no extensions (which
+/// can carry their own MCP servers). Legacy / unmanaged sessions are untouched.
+fn apply_gemini_mcp_isolation_args(
+    command_spec: &mut CommandSpec,
+    metadata: &AgentMetadata,
+    config: &AcpBuildExtra,
+    mcp_servers: &[McpServer],
+) {
+    if !acp_launch_is_mcp_strict(metadata, config) {
+        return;
+    }
+    let names: Vec<&str> = mcp_servers.iter().filter_map(acp_mcp_server_name).collect();
+    let allowlist = if names.is_empty() {
+        GEMINI_NO_MCP_SENTINEL.to_owned()
+    } else {
+        names.join(",")
+    };
+    command_spec.args.extend([
+        "--allowed-mcp-server-names".to_owned(),
+        allowlist,
+        "--extensions".to_owned(),
+        "none".to_owned(),
+    ]);
+}
+
+/// M7 E1: launch-config tool surface of a generic ACP session (see
+/// `AcpAgentManager::tool_surface`).
+pub(crate) fn tool_surface_from_params(params: &AcpSessionParams) -> aionui_api_types::ConversationToolSurface {
+    let isolation = if acp_launch_is_mcp_strict(&params.metadata, &params.config) {
+        aionui_api_types::McpIsolation::Strict
+    } else {
+        aionui_api_types::McpIsolation::Ambient
+    };
+    let injected = params
+        .mcp_servers
+        .iter()
+        .filter_map(acp_mcp_server_name)
+        .map(str::to_owned)
+        .collect();
+    aionui_api_types::ConversationToolSurface::launch_config(injected, isolation)
 }
 
 /// Compose first-message preset context.
@@ -327,5 +402,169 @@ mod tests {
         };
         let servers = resolve_mcp_servers(&config, Vec::new());
         assert!(servers.is_empty());
+    }
+
+    // ── M7 E1: gemini managed-MCP launch isolation ──────────────────────
+
+    fn gemini_metadata() -> AgentMetadata {
+        AgentMetadata {
+            backend: Some("gemini".into()),
+            command: Some("gemini".into()),
+            args: vec!["--acp".into()],
+            ..test_metadata()
+        }
+    }
+
+    fn gemini_spec() -> CommandSpec {
+        CommandSpec {
+            command: "gemini".into(),
+            args: vec!["--acp".into()],
+            ..Default::default()
+        }
+    }
+
+    async fn assemble_with(
+        metadata: AgentMetadata,
+        config: AcpBuildExtra,
+        user_mcp_servers: Vec<McpServer>,
+    ) -> AcpSessionParams {
+        assemble_acp_params(
+            "conv-1".into(),
+            "user-1".into(),
+            WorkspaceInfo {
+                path: "/tmp/workspace".into(),
+                is_custom: false,
+            },
+            metadata,
+            gemini_spec(),
+            config,
+            user_mcp_servers,
+            None,
+            PathBuf::from("/tmp/data"),
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_gemini_with_empty_allowlist_launches_with_no_mcp_at_all() {
+        let config = AcpBuildExtra {
+            backend: Some("gemini".into()),
+            mcp_strict: true,
+            mcp_server_ids: Some(vec![]),
+            ..Default::default()
+        };
+        let params = assemble_with(gemini_metadata(), config, Vec::new()).await;
+        assert!(params.mcp_servers.is_empty());
+        assert_eq!(
+            params.command_spec.args,
+            vec![
+                "--acp",
+                "--allowed-mcp-server-names",
+                GEMINI_NO_MCP_SENTINEL,
+                "--extensions",
+                "none"
+            ]
+        );
+        assert!(acp_launch_is_mcp_strict(&params.metadata, &params.config));
+    }
+
+    #[tokio::test]
+    async fn managed_gemini_allowlists_exactly_the_injected_servers_including_team() {
+        let config = AcpBuildExtra {
+            backend: Some("gemini".into()),
+            mcp_strict: true,
+            mcp_server_ids: Some(vec!["mcp-docs".into()]),
+            team_mcp_stdio_config: Some(team_cfg()),
+            ..Default::default()
+        };
+        let params = assemble_with(gemini_metadata(), config, vec![user_stdio("docs")]).await;
+        let names: Vec<&str> = params.mcp_servers.iter().filter_map(acp_mcp_server_name).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"docs"));
+        assert!(names.contains(&TEAM_MCP_SERVER_NAME));
+        let args = &params.command_spec.args;
+        assert_eq!(args[0], "--acp");
+        assert_eq!(args[1], "--allowed-mcp-server-names");
+        assert_eq!(args[2], names.join(","));
+        assert!(!args[2].contains(GEMINI_NO_MCP_SENTINEL));
+        assert_eq!(&args[3..], ["--extensions", "none"]);
+    }
+
+    #[tokio::test]
+    async fn unmanaged_gemini_launch_args_are_unchanged() {
+        // Legacy / unmanaged session: no mcp_strict stamp → historical launch.
+        let config = AcpBuildExtra {
+            backend: Some("gemini".into()),
+            ..Default::default()
+        };
+        let params = assemble_with(gemini_metadata(), config, vec![user_stdio("docs")]).await;
+        assert_eq!(params.command_spec.args, vec!["--acp"]);
+        assert!(!acp_launch_is_mcp_strict(&params.metadata, &params.config));
+    }
+
+    #[tokio::test]
+    async fn non_gemini_acp_backends_are_not_given_gemini_flags_even_when_strict() {
+        for backend in ["qwen", "codebuddy", "claude"] {
+            let metadata = AgentMetadata {
+                backend: Some(backend.into()),
+                ..test_metadata()
+            };
+            let config = AcpBuildExtra {
+                backend: Some(backend.into()),
+                mcp_strict: true,
+                mcp_server_ids: Some(vec![]),
+                ..Default::default()
+            };
+            let params = assemble_with(metadata, config, Vec::new()).await;
+            assert_eq!(params.command_spec.args, vec!["--acp"], "{backend}");
+            assert!(!acp_launch_is_mcp_strict(&params.metadata, &params.config), "{backend}");
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_tool_surface_is_strict_only_for_managed_gemini() {
+        use aionui_api_types::{McpDiscovery, McpIsolation, ToolSurfaceSource};
+        let strict = AcpBuildExtra {
+            backend: Some("gemini".into()),
+            mcp_strict: true,
+            mcp_server_ids: Some(vec!["mcp-docs".into()]),
+            ..Default::default()
+        };
+        let params = assemble_with(gemini_metadata(), strict, vec![user_stdio("docs")]).await;
+        let surface = tool_surface_from_params(&params);
+        assert_eq!(surface.source, ToolSurfaceSource::LaunchConfig);
+        assert_eq!(surface.mcp_isolation, McpIsolation::Strict);
+        assert_eq!(surface.mcp_discovery, McpDiscovery::Unavailable);
+        assert_eq!(surface.mcp_servers.len(), 1);
+        assert_eq!(surface.mcp_servers[0].name, "docs");
+        assert!(!surface.mcp_servers[0].external);
+        assert!(surface.external_mcp_servers.is_empty());
+        assert!(surface.tools.is_empty());
+
+        // Unmanaged gemini and every other ACP backend: honest "may load local MCP".
+        let unmanaged = AcpBuildExtra {
+            backend: Some("gemini".into()),
+            ..Default::default()
+        };
+        let params = assemble_with(gemini_metadata(), unmanaged, vec![user_stdio("docs")]).await;
+        let surface = tool_surface_from_params(&params);
+        assert_eq!(surface.mcp_isolation, McpIsolation::Ambient);
+        assert_eq!(surface.mcp_discovery, McpDiscovery::Unavailable);
+
+        let qwen = AgentMetadata {
+            backend: Some("qwen".into()),
+            ..test_metadata()
+        };
+        let cfg = AcpBuildExtra {
+            backend: Some("qwen".into()),
+            mcp_strict: true,
+            mcp_server_ids: Some(vec![]),
+            ..Default::default()
+        };
+        let params = assemble_with(qwen, cfg, Vec::new()).await;
+        let surface = tool_surface_from_params(&params);
+        assert_eq!(surface.mcp_isolation, McpIsolation::Ambient);
+        assert!(surface.mcp_servers.is_empty());
     }
 }

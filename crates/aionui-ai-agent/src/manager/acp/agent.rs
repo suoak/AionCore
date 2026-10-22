@@ -1274,6 +1274,16 @@ impl AcpAgentManager {
         self.params.metadata.behavior_policy.session_lifetime
     }
 
+    /// M7 E1: the honest tool surface of a generic ACP session. ACP has no
+    /// wire for "which MCP servers did you actually load", so this reports the
+    /// launch configuration: the servers WorkMate injected and whether the
+    /// launch was isolated from ambient MCP config (only a managed gemini
+    /// session is — see `acp_launch_is_mcp_strict`). Every other ACP backend
+    /// is `Ambient` with discovery `Unavailable`: it may load local MCP.
+    pub fn tool_surface(&self) -> aionui_api_types::ConversationToolSurface {
+        crate::factory::acp_assembler::tool_surface_from_params(&self.params)
+    }
+
     /// Agent metadata id this session was spawned from.
     pub fn agent_id(&self) -> &str {
         &self.params.metadata.id
