@@ -185,6 +185,7 @@ fn protected_auth_app_with_mode_and_verifier(
         runtime_token_verifier,
         local_secret: None,
         agent_approvals: None,
+        agent_conversation_access: None,
     };
 
     Router::new()
@@ -207,6 +208,7 @@ fn identity_echo_app(
         runtime_token_verifier,
         local_secret: None,
         agent_approvals: None,
+        agent_conversation_access: None,
     };
 
     Router::new()
@@ -883,6 +885,7 @@ fn local_secret_echo_app(
         runtime_token_verifier,
         local_secret,
         agent_approvals: None,
+        agent_conversation_access: None,
     };
     Router::new()
         .route(
@@ -1047,6 +1050,7 @@ fn scoped_agent_app(
         })),
         local_secret: Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
         agent_approvals: approvals,
+        agent_conversation_access: Some(Arc::new(MentionGrant)),
     };
     let ok_json = || async { axum::Json(serde_json::json!({"success": true, "data": "written"})) };
     Router::new()
@@ -1061,11 +1065,43 @@ fn scoped_agent_app(
             .post(ok_json),
         )
         .route("/api/mcp/servers", post(ok_json))
-        .route("/api/conversations/{id}", axum::routing::patch(ok_json))
+        .route(
+            "/api/conversations/{id}",
+            get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                axum::Json(serde_json::json!({"success": true, "data": {"id": id}}))
+            })
+            .patch(ok_json),
+        )
+        .route(
+            "/api/conversations/{id}/messages",
+            get(|| async { axum::Json(serde_json::json!({"success": true, "data": {"items": []}})) }),
+        )
+        .route(
+            "/api/conversations",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "items": [{"id": "conv-1"}, {"id": "conv-granted"}, {"id": "conv-other"}],
+                        "total": 3,
+                        "has_more": true
+                    }
+                }))
+            }),
+        )
         .route("/api/fs/write", post(ok_json))
         .route("/api/webui/reset-password", post(ok_json))
         .route("/api/agent-approvals/{id}/approve", post(ok_json))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+/// The user `@@`-selected `conv-granted` from `conv-1`, and nothing else.
+struct MentionGrant;
+
+impl aionui_auth::IAgentConversationAccess for MentionGrant {
+    fn is_granted(&self, user_id: &str, own: &str, target: &str) -> bool {
+        user_id == "system_default_user" && own == "conv-1" && target == "conv-granted"
+    }
 }
 
 fn agent_request(method: &str, path: &str, body: &str, approval_id: Option<&str>) -> Request<Body> {
@@ -1233,4 +1269,59 @@ async fn agent_config_write_is_denied_without_an_approval_store() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(json_body(resp).await["code"], "AGENT_SCOPE_DENIED");
+}
+
+#[tokio::test]
+async fn agent_token_reads_only_its_own_and_mention_granted_conversations() {
+    let (app, _) = agent_app_with_store().await;
+    for path in [
+        "/api/conversations/conv-1",
+        "/api/conversations/conv-1/messages",
+        "/api/conversations/conv-granted",
+        "/api/conversations/conv-granted/messages",
+    ] {
+        let resp = app.clone().oneshot(agent_request("GET", path, "", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    for path in [
+        "/api/conversations/conv-other",
+        "/api/conversations/conv-other/messages",
+    ] {
+        let resp = app.clone().oneshot(agent_request("GET", path, "", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(json_body(resp).await["code"], "AGENT_SCOPE_DENIED", "{path}");
+    }
+}
+
+#[tokio::test]
+async fn agent_token_conversation_list_is_filtered_to_readable_ones() {
+    let (app, _) = agent_app_with_store().await;
+    let resp = app
+        .clone()
+        .oneshot(agent_request("GET", "/api/conversations", "", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let ids: Vec<&str> = json["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["conv-1", "conv-granted"]);
+    assert_eq!(json["data"]["total"], 2);
+    assert_eq!(json["data"]["has_more"], false);
+
+    // The desktop keeps the full list.
+    let resp = app
+        .oneshot(
+            Request::get("/api/conversations")
+                .header("x-aionui-local-secret", LOCAL_SECRET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["data"]["items"].as_array().unwrap().len(), 3);
 }

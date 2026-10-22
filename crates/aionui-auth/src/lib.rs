@@ -75,8 +75,9 @@ pub use agent_approval::{
 };
 pub use agent_scope::{AgentActionKind, AgentRouteDecision};
 pub use middleware::{
-    AgentPrincipal, AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
-    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, local_auth_middleware,
+    AgentPrincipal, AuthIdentityMode, AuthState, CurrentUser, IAgentConversationAccess, IRuntimeTokenVerifier,
+    RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware,
+    local_auth_middleware,
 };
 
 // QR token store

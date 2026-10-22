@@ -21,6 +21,12 @@ use serde_json::Value;
 pub enum AgentRouteDecision {
     /// Allowed as-is (read-only routes).
     Allow,
+    /// `GET /api/conversations` — allowed, but the response is filtered to the
+    /// conversations this token may read (its own plus `@@`-granted ones).
+    AllowConversationList,
+    /// `GET /api/conversations/{id}/...` — allowed only when `id` is the
+    /// token's own conversation or one the user granted it with `@@`.
+    AllowConversationRead(String),
     /// `PATCH /api/conversations/{own}` — allowed only for a rename-only body.
     AllowOwnRename,
     /// A configuration write that needs explicit user approval.
@@ -43,8 +49,10 @@ pub enum AgentActionKind {
 }
 
 /// Route prefixes an agent token may read (GET/HEAD).
+///
+/// `/api/conversations` is NOT here: conversation reads are scoped per id (see
+/// [`AgentRouteDecision::AllowConversationRead`]).
 const READ_PREFIXES: &[&str] = &[
-    "/api/conversations",
     "/api/assistants",
     "/api/skills",
     "/api/mcp/servers",
@@ -103,6 +111,21 @@ pub fn classify_agent_request(method: &Method, path: &str, own_conversation_id: 
     };
 
     if method == Method::GET || method == Method::HEAD {
+        if path == "/api/conversations" {
+            return AgentRouteDecision::AllowConversationList;
+        }
+        if path == "/api/conversations/active-count" {
+            // A bare count; reveals no conversation content.
+            return AgentRouteDecision::Allow;
+        }
+        if let Some(rest) = path.strip_prefix("/api/conversations/") {
+            let id = rest.split('/').next().unwrap_or("");
+            return if id.is_empty() || id == "." || id == ".." {
+                AgentRouteDecision::Deny
+            } else {
+                AgentRouteDecision::AllowConversationRead(id.to_owned())
+            };
+        }
         return if READ_PREFIXES.iter().any(|prefix| has_prefix(path, prefix)) {
             AgentRouteDecision::Allow
         } else {
@@ -133,6 +156,27 @@ pub fn classify_agent_request(method: &Method, path: &str, own_conversation_id: 
     }
 
     AgentRouteDecision::Deny
+}
+
+/// Keep only the conversations an agent token may read in a
+/// `GET /api/conversations` response (`{ data: { items: [...], total } }`).
+///
+/// Fail closed: an unexpected shape drops `data` entirely rather than passing
+/// other conversations through.
+pub fn filter_conversation_list(value: &mut Value, may_read: impl Fn(&str) -> bool) {
+    let Some(data) = value.get_mut("data") else {
+        return;
+    };
+    let Some(items) = data.get_mut("items").and_then(Value::as_array_mut) else {
+        *data = Value::Null;
+        return;
+    };
+    items.retain(|item| item.get("id").and_then(Value::as_str).is_some_and(&may_read));
+    let kept = items.len();
+    if let Some(map) = data.as_object_mut() {
+        map.insert("total".to_owned(), Value::from(kept));
+        map.insert("has_more".to_owned(), Value::Bool(false));
+    }
 }
 
 /// Whether a JSON body is a rename-only conversation patch.
@@ -217,8 +261,7 @@ mod tests {
             "/api/mcp/servers",
             "/api/providers",
             "/api/settings/client",
-            "/api/conversations?limit=50",
-            "/api/conversations/conv-own/messages?limit=10",
+            "/api/conversations/active-count",
             "/api/agents/management",
             "/api/cron/jobs",
             "/api/agent-approvals/abc",
@@ -236,6 +279,42 @@ mod tests {
         ] {
             assert_eq!(classify(Method::GET, path), AgentRouteDecision::Deny, "{path}");
         }
+    }
+
+    #[test]
+    fn conversation_reads_are_scoped_per_id() {
+        assert_eq!(
+            classify(Method::GET, "/api/conversations?limit=50"),
+            AgentRouteDecision::AllowConversationList
+        );
+        for (path, id) in [
+            ("/api/conversations/conv-own", "conv-own"),
+            ("/api/conversations/conv-own/messages?limit=10", "conv-own"),
+            ("/api/conversations/other/messages", "other"),
+            ("/api/conversations/other/transcript", "other"),
+        ] {
+            assert_eq!(
+                classify(Method::GET, path),
+                AgentRouteDecision::AllowConversationRead(id.to_owned()),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_list_is_filtered_and_fails_closed() {
+        let mut value = json!({
+            "success": true,
+            "data": { "items": [{"id": "conv-own"}, {"id": "other"}, {"id": "granted"}], "total": 3, "has_more": true }
+        });
+        filter_conversation_list(&mut value, |id| id == "conv-own" || id == "granted");
+        assert_eq!(value["data"]["items"], json!([{"id": "conv-own"}, {"id": "granted"}]));
+        assert_eq!(value["data"]["total"], 2);
+        assert_eq!(value["data"]["has_more"], false);
+
+        let mut odd = json!({ "success": true, "data": [{"id": "other"}] });
+        filter_conversation_list(&mut odd, |_| false);
+        assert!(odd["data"].is_null());
     }
 
     #[test]
