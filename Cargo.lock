@@ -870,6 +870,7 @@ dependencies = [
  "aionui-auth",
  "aionui-common",
  "aionui-db",
+ "async-trait",
  "axum",
  "hex",
  "serde",

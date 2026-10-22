@@ -18,7 +18,9 @@ mod service;
 mod types;
 
 pub use error::ReviewError;
-pub use resolver::{AllowedRootsResolver, ScopeContentResolver};
+pub use resolver::{
+    AllowedRootsResolver, PE_SCOPE_PREFIX, ProjectDirResolver, ScopeContentResolver, parse_pe_scope, pe_scope_id,
+};
 pub use routes::{ReviewRouterState, review_routes};
 pub use service::ReviewService;
 pub use types::{

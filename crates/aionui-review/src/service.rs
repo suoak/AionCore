@@ -351,7 +351,7 @@ impl ReviewService {
         scope_id: &str,
         file_path: &str,
     ) -> Option<SideText> {
-        let root = self.resolver.scope_root(user_id, row_kind, scope_id)?;
+        let root = self.resolver.scope_root(user_id, row_kind, scope_id).await?;
         Some(read_side(&root, file_path).await)
     }
 
@@ -368,7 +368,8 @@ impl ReviewService {
         let run_id = optional_ref(req.run_id, "run_id")?;
         let scope_id = self
             .resolver
-            .canonical_scope_id(kind, &req.scope_id)
+            .canonical_scope_id(user_id, kind, &req.scope_id)
+            .await
             .ok_or_else(|| bad("scope_id is not an accessible repository directory"))?;
         if let Some(id) = &conversation_id {
             self.ensure_owned("conversations", id, user_id, "conversation_id")
@@ -553,7 +554,11 @@ impl ReviewService {
         )?;
         let raw_scope = query.scope_id.ok_or_else(|| bad("scope_id is required"))?;
         validate_scope_id(&raw_scope)?;
-        let scope_id = self.resolver.canonical_scope_id(kind, &raw_scope).unwrap_or(raw_scope);
+        let scope_id = self
+            .resolver
+            .canonical_scope_id(user_id, kind, &raw_scope)
+            .await
+            .unwrap_or(raw_scope);
         let file_path = query.file_path.as_deref().map(normalize_file_path).transpose()?;
         let status = query.status.as_deref().map(ReviewThreadStatus::parse).transpose()?;
 

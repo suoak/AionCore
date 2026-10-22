@@ -528,3 +528,65 @@ async fn symlink_escaping_the_repo_is_not_read() {
     assert!(thread.anchor.content_sha.is_none());
     assert_eq!(thread.anchor.lines, vec!["whatever the diff showed"]);
 }
+
+struct FakeProjects {
+    owner: &'static str,
+    pe_id: &'static str,
+    dir: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl crate::resolver::ProjectDirResolver for FakeProjects {
+    async fn resolve_dir(&self, user_id: &str, pe_id: &str, relative_path: &str) -> Option<PathBuf> {
+        (user_id == self.owner && pe_id == self.pe_id).then(|| self.dir.join(relative_path))
+    }
+}
+
+#[tokio::test]
+async fn pe_scope_ids_resolve_through_the_users_project() {
+    let fx = fixture().await;
+    // The project folder is the parent of the repo, outside nothing in
+    // particular: pe scopes do not need the allowed-roots sandbox.
+    let projects = Arc::new(FakeProjects {
+        owner: "u1",
+        pe_id: "pe-1",
+        dir: fx.repo.parent().unwrap().to_path_buf(),
+    });
+    let resolver = Arc::new(AllowedRootsResolver::new(Vec::new()).with_projects(projects));
+    let service = ReviewService::new(fx.service.pool.clone(), resolver);
+
+    let mut req = scm_request(&fx, 5, 5, &["line 5"]);
+    req.scope_id = "pe:pe-1/repo/".into();
+    let thread = service.create("u1", req.clone()).await.unwrap();
+    assert_eq!(thread.scope_id, "pe:pe-1/repo");
+    assert!(thread.anchor.content_sha.is_some(), "anchored from the real file");
+
+    let mut lines = base_lines();
+    lines.insert(0, "new top".into());
+    write(&fx.repo, FILE, &lines);
+    let listed = service
+        .list(
+            "u1",
+            ListReviewThreadsQuery {
+                scope_kind: Some("scm".into()),
+                scope_id: Some("pe:pe-1/repo".into()),
+                file_path: None,
+                status: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].start_line, 6);
+
+    // Another user cannot use u1's pe; traversal is rejected.
+    assert!(matches!(
+        service.create("u2", req.clone()).await,
+        Err(ReviewError::BadRequest(_))
+    ));
+    req.scope_id = "pe:pe-1/../etc".into();
+    assert!(matches!(
+        service.create("u1", req).await,
+        Err(ReviewError::BadRequest(_))
+    ));
+}
