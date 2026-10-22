@@ -2018,6 +2018,15 @@ fn clear_stale_model(
     None
 }
 
+/// B-09: is this session's MCP surface MANAGED by WorkMate? The conversation
+/// create path stamps `extra.mcp_strict` for an Agent Center assistant session and
+/// for any explicit MCP allowlist — including an EMPTY one, which must mean "no
+/// MCP" rather than "fall back to the machine's ambient config". Backends that can
+/// isolate (claude: `--strict-mcp-config`) do so when this is true.
+pub(crate) fn managed_mcp_surface(config: &aionui_api_types::AcpBuildExtra) -> bool {
+    config.mcp_strict
+}
+
 /// Build a claude/codex `SessionAgentTask` (the session-model port's `IAgentTask`)
 /// from a resolved ACP build request, or `Ok(None)` for a non-session backend.
 ///
@@ -2090,6 +2099,7 @@ pub async fn build_antigravity_instance(
 
     let init = SessionInit {
         mcp_servers,
+        strict_mcp: managed_mcp_surface(config),
         skills: config.skills.clone(),
         // The COMPOSED block (preset context + skills index + dual-channel
         // instructions), not the raw preset context: agy has no prompt pipeline,
@@ -2234,6 +2244,7 @@ pub async fn build_session_instance(
     // GAP #4 — preset_context + skills carried into the init surface.
     let init = SessionInit {
         mcp_servers,
+        strict_mcp: managed_mcp_surface(config),
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
         // Layer 1. `Some` only for a protocol vendor (codex): the backend has to
@@ -5608,6 +5619,83 @@ mod build_mapping_tests {
             serde_json::json!("/usr/bin/team-coordinator"),
             "the coordination MCP must survive both repo and inline reserved-name collisions"
         );
+    }
+
+    /// B-09 acceptance (end-to-end through the real spawn argv): a managed
+    /// session (`mcp_strict`) whose allowlist is EMPTY launches claude with
+    /// `--mcp-config {"mcpServers":{}} --strict-mcp-config`, so neither user rows
+    /// nor the machine's ambient `~/.claude` servers reach the session.
+    async fn spawn_claude_argv(config: &AcpBuildExtra, rows: Vec<aionui_db::models::McpServerRow>) -> Vec<String> {
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo { rows });
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+        let _ = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-strict-mcp".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config,
+                metadata: &metadata,
+                skill_delivery: Default::default(),
+                is_custom_workspace: false,
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: Some(&repo),
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+        spawner.last_command().expect("direct backend must reach spawn").args
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_strict_empty_allowlist_has_no_mcp() {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(Vec::new()),
+            mcp_strict: true,
+            ..Default::default()
+        };
+        // An enabled user row exists but is NOT in the (empty) allowlist.
+        let args = spawn_claude_argv(&config, vec![direct_mcp_row("mcp-docs", "mcp-docs")]).await;
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("strict session must always pass --mcp-config");
+        assert_eq!(args[i + 1], r#"{"mcpServers":{}}"#);
+        assert_eq!(args.get(i + 2).map(String::as_str), Some("--strict-mcp-config"));
+    }
+
+    /// Pre-B-09 conversations (no `mcp_strict`) keep the ambient behavior: no
+    /// servers → no MCP flags at all.
+    #[tokio::test]
+    async fn direct_claude_spawn_unmanaged_empty_keeps_ambient() {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(Vec::new()),
+            ..Default::default()
+        };
+        let args = spawn_claude_argv(&config, Vec::new()).await;
+        assert!(!args.iter().any(|a| a == "--mcp-config" || a == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn acp_build_extra_mcp_strict_defaults_false_and_round_trips() {
+        let legacy: AcpBuildExtra = serde_json::from_value(serde_json::json!({"backend": "claude"})).unwrap();
+        assert!(!legacy.mcp_strict);
+        let managed: AcpBuildExtra = serde_json::from_value(serde_json::json!({"mcp_strict": true})).unwrap();
+        assert!(managed_mcp_surface(&managed));
     }
 
     #[test]

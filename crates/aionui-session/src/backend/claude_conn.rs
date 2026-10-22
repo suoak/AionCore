@@ -137,7 +137,9 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// produces no flags (pre-0c spawn byte-identical):
 /// - `init.mcp_servers` → `--mcp-config <json>` + `--strict-mcp-config` (the latter
 ///   ONLY alongside `--mcp-config`: it makes the session ignore the machine's
-///   ambient `~/.claude` servers, which we must NOT do when we inject none).
+///   ambient `~/.claude` servers, which we must NOT do when we inject none — UNLESS
+///   `init.strict_mcp` marks a managed surface (B-09), which always isolates and
+///   passes `{"mcpServers":{}}` when the allowlist is empty).
 /// - `init.preset_context` → `--append-system-prompt` (composed `[Assistant Rules]` /
 ///   skills index / team-guide text, already assembled by the app boundary). It MUST be
 ///   the APPEND flag: `--system-prompt` REPLACES claude's built-in prompt wholesale
@@ -151,6 +153,10 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// claude's `--mcp-config` uses a MAP shape `{"mcpServers":{"<name>":{…}}}` (NOT the
 /// ACP array), so this builds its own JSON rather than reusing `acp_conn`'s array
 /// serializer. stdio → `{command,args,env:{k:v}}`; http/sse → `{type,url,headers:{…}}`.
+/// The explicit empty MCP map passed for a strict (managed) session with no
+/// servers, so `--strict-mcp-config` leaves claude with zero MCP tools.
+const EMPTY_CLAUDE_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+
 pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -165,7 +171,12 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         args.push(preset.to_string());
     }
 
-    if let Some(mcp_json) = build_claude_mcp_config(&config.init.mcp_servers) {
+    // B-09: a managed MCP surface (Agent Center / explicit allowlist) is ALWAYS
+    // strict — even when the allowlist resolves to nothing, an explicit empty map
+    // keeps the machine's ambient `~/.claude` servers out of the session.
+    let mcp_json = build_claude_mcp_config(&config.init.mcp_servers)
+        .or_else(|| config.init.strict_mcp.then(|| EMPTY_CLAUDE_MCP_CONFIG.to_string()));
+    if let Some(mcp_json) = mcp_json {
         args.push("--mcp-config".to_string());
         args.push(mcp_json);
         args.push("--strict-mcp-config".to_string());
@@ -3795,6 +3806,61 @@ mod tests {
             !args.iter().any(|a| a == "--strict-mcp-config"),
             "no --strict-mcp-config without --mcp-config"
         );
+    }
+
+    /// B-09 acceptance: a managed MCP surface (Agent Center / allowlist) with an
+    /// EMPTY allowlist still launches claude isolated — `--mcp-config
+    /// {"mcpServers":{}}` + `--strict-mcp-config` — so the session carries zero
+    /// MCP servers (ambient `~/.claude` ones included).
+    #[test]
+    fn build_claude_init_args_strict_empty_allowlist_passes_empty_map() {
+        let config = SessionConfig {
+            init: SessionInit {
+                strict_mcp: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_claude_init_args(&config);
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("strict session must pass --mcp-config even with no servers");
+        assert_eq!(args[i + 1], r#"{"mcpServers":{}}"#);
+        assert_eq!(args.get(i + 2).map(String::as_str), Some("--strict-mcp-config"));
+        let json: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert!(
+            json["mcpServers"].as_object().unwrap().is_empty(),
+            "no MCP server may reach a strict session with an empty allowlist"
+        );
+        assert_eq!(args.iter().filter(|a| *a == "--mcp-config").count(), 1);
+    }
+
+    /// B-09: a strict session WITH servers keeps exactly its allowlisted servers
+    /// (no empty-map duplicate) and stays strict.
+    #[test]
+    fn build_claude_init_args_strict_with_servers_keeps_only_allowlist() {
+        let config = SessionConfig {
+            init: SessionInit {
+                strict_mcp: true,
+                mcp_servers: vec![McpServerSpec {
+                    name: "docs".into(),
+                    transport: McpTransport::Http {
+                        url: "https://example.invalid/mcp".into(),
+                        headers: vec![],
+                    },
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_claude_init_args(&config);
+        assert_eq!(args.iter().filter(|a| *a == "--mcp-config").count(), 1);
+        assert_eq!(args.iter().filter(|a| *a == "--strict-mcp-config").count(), 1);
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        let servers = json["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.keys().collect::<Vec<_>>(), vec!["docs"]);
     }
 
     /// The assistant preset must NOT replace claude's default system prompt.

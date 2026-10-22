@@ -218,6 +218,12 @@ pub struct SessionInit {
     /// User/team/guide MCP servers, already resolved + flattened by the app
     /// boundary. Empty = no injection (the pre-0c default).
     pub mcp_servers: Vec<McpServerSpec>,
+    /// B-09: the session's MCP surface is MANAGED (an Agent Center assistant, or
+    /// an explicit `mcp_server_ids` allowlist — even an empty one). Backends that
+    /// can isolate from machine-ambient MCP config must do so: claude always gets
+    /// `--strict-mcp-config`, and an empty set becomes `{"mcpServers":{}}` so the
+    /// session sees NO MCP tools. `false` (default) keeps the pre-B-09 behavior.
+    pub strict_mcp: bool,
     /// Skill ids/names to surface to the agent on the first turn (acp/aionrs
     /// deliver these via the first prompt, not a `session/new` param).
     ///
