@@ -249,6 +249,9 @@ pub enum ToolSurfaceSource {
     ClaudeInit,
     /// aionrs engine tool registry (`AgentEngine::tool_names`).
     AionrsRegistry,
+    /// codex `mcpServerStatus/list`: MCP servers + tools only (codex builtins
+    /// have no discovery wire, so they are absent rather than guessed).
+    CodexMcpStatus,
 }
 
 /// How the session's MCP surface is scoped.
@@ -267,6 +270,10 @@ pub struct ToolSurfaceMcpServer {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Loaded by the agent from machine-ambient config, NOT injected by
+    /// WorkMate (outside the conversation's MCP selection). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external: bool,
 }
 
 /// E2 (C-09): the real tool list of a live session.
@@ -292,6 +299,11 @@ pub struct ConversationToolSurface {
     /// only ever return nothing. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tool_search_inert: bool,
+    /// UI hint (plan D, detect-only): names of the `external` servers above.
+    /// Non-empty ⇒ the session can call MCP tools the user did not select for
+    /// it. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_mcp_servers: Vec<String>,
 }
 
 /// Where one normalized tool comes from.
@@ -844,9 +856,11 @@ mod tool_surface_tests {
             tool_policy: None,
             entries: vec![],
             tool_search_inert: false,
+            external_mcp_servers: vec![],
         };
         let json = serde_json::to_value(&surface).unwrap();
         assert!(json.get("entries").is_none() && json.get("tool_search_inert").is_none());
+        assert!(json.get("external_mcp_servers").is_none());
         let legacy: ConversationToolSurface = serde_json::from_value(serde_json::json!({
             "source": "claude_init", "tools": ["Bash"], "mcp_isolation": "ambient"
         }))
