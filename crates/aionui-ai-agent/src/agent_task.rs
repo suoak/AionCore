@@ -315,7 +315,7 @@ impl AgentInstance {
         match self {
             Self::Session(manager) => manager.tool_surface(),
             Self::Aionrs(manager) => Some(manager.tool_surface()),
-            Self::Acp(_) => None,
+            Self::Acp(manager) => Some(manager.tool_surface()),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(_) => None,
         }

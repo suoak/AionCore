@@ -1029,6 +1029,13 @@ impl SessionBackend for AntigravitySessionBackend {
         }
     }
 
+    /// M7 E1: agy has no MCP transport WorkMate can drive and no discovery
+    /// wire, yet it always reads its own global `mcp_config.json`. Report that
+    /// honestly as an ambient launch with unknown loaded servers.
+    fn tool_inventory(&self) -> Option<crate::backend::ToolInventory> {
+        Some(antigravity_tool_inventory())
+    }
+
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         // Lets the REST `/confirmations` recovery path rebuild permission cards
         // after a page reload; without it a card raised before the client
@@ -1126,6 +1133,18 @@ impl SessionBackend for AntigravitySessionBackend {
                 PermissionDecision::Denied
             }
         }
+    }
+}
+
+/// M7 E1: the launch-config inventory every antigravity session reports.
+/// Nothing is injected (agy has no MCP channel) and nothing is strict (agy
+/// reads `~/.gemini/config/mcp_config.json` regardless); the loaded set is not
+/// observable, which `ToolInventorySource::LaunchConfig` carries upward.
+pub(crate) fn antigravity_tool_inventory() -> crate::backend::ToolInventory {
+    crate::backend::ToolInventory {
+        mcp_strict: false,
+        source: crate::backend::ToolInventorySource::LaunchConfig,
+        ..Default::default()
     }
 }
 
@@ -1864,6 +1883,14 @@ mod tests {
     #[test]
     fn capabilities_do_not_advertise_midturn_delivery() {
         assert!(!antigravity_capabilities().supports_midturn_delivery);
+    }
+
+    #[test]
+    fn tool_inventory_is_an_honest_ambient_launch_config() {
+        let inv = antigravity_tool_inventory();
+        assert!(!inv.mcp_strict, "agy always reads its global mcp_config.json");
+        assert_eq!(inv.source, crate::backend::ToolInventorySource::LaunchConfig);
+        assert!(inv.mcp_servers.is_empty() && inv.managed_mcp_servers.is_empty() && inv.tools.is_empty());
     }
 
     #[test]

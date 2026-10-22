@@ -252,6 +252,11 @@ pub enum ToolSurfaceSource {
     /// codex `mcpServerStatus/list`: MCP servers + tools only (codex builtins
     /// have no discovery wire, so they are absent rather than guessed).
     CodexMcpStatus,
+    /// M7 E1: the backend reports NO tool list (generic ACP vendors,
+    /// antigravity). The surface is what WorkMate launched it with: the MCP
+    /// servers WorkMate injected and the launch-time isolation. `tools` is
+    /// empty because it is unknown, not because there are none.
+    LaunchConfig,
 }
 
 /// How the session's MCP surface is scoped.
@@ -262,6 +267,25 @@ pub enum McpIsolation {
     Strict,
     /// Machine-ambient MCP config may add servers on top of WorkMate's.
     Ambient,
+}
+
+/// M7 E1: can WorkMate see which MCP servers the agent ACTUALLY loaded?
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpDiscovery {
+    /// The backend reported its loaded servers; `external` flags are real.
+    #[default]
+    Reported,
+    /// The backend has no discovery wire: only WorkMate-injected servers are
+    /// listed, and with `mcp_isolation = ambient` the agent may ALSO load
+    /// machine/workspace MCP that WorkMate cannot see (status unknown).
+    Unavailable,
+}
+
+impl McpDiscovery {
+    pub fn is_reported(&self) -> bool {
+        matches!(self, Self::Reported)
+    }
 }
 
 /// One MCP server as the agent reported it.
@@ -304,6 +328,36 @@ pub struct ConversationToolSurface {
     /// it. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_mcp_servers: Vec<String>,
+    /// M7 E1: whether the loaded MCP set was observed (`reported`, default,
+    /// omitted on the wire so pre-M7 JSON is unchanged) or cannot be
+    /// (`unavailable`, see [`McpDiscovery`]).
+    #[serde(default, skip_serializing_if = "McpDiscovery::is_reported")]
+    pub mcp_discovery: McpDiscovery,
+}
+
+impl ConversationToolSurface {
+    /// M7 E1: surface of a backend that reports no tools (generic ACP,
+    /// antigravity): the WorkMate-injected servers plus the launch isolation.
+    pub fn launch_config(managed_mcp_servers: Vec<String>, isolation: McpIsolation) -> Self {
+        Self {
+            source: ToolSurfaceSource::LaunchConfig,
+            tools: Vec::new(),
+            mcp_servers: managed_mcp_servers
+                .into_iter()
+                .map(|name| ToolSurfaceMcpServer {
+                    name,
+                    status: None,
+                    external: false,
+                })
+                .collect(),
+            mcp_isolation: isolation,
+            tool_policy: None,
+            entries: Vec::new(),
+            tool_search_inert: false,
+            external_mcp_servers: Vec::new(),
+            mcp_discovery: McpDiscovery::Unavailable,
+        }
+    }
 }
 
 /// Where one normalized tool comes from.
@@ -857,15 +911,30 @@ mod tool_surface_tests {
             entries: vec![],
             tool_search_inert: false,
             external_mcp_servers: vec![],
+            mcp_discovery: McpDiscovery::Reported,
         };
         let json = serde_json::to_value(&surface).unwrap();
         assert!(json.get("entries").is_none() && json.get("tool_search_inert").is_none());
         assert!(json.get("external_mcp_servers").is_none());
+        assert!(json.get("mcp_discovery").is_none(), "reported is the omitted default");
         let legacy: ConversationToolSurface = serde_json::from_value(serde_json::json!({
             "source": "claude_init", "tools": ["Bash"], "mcp_isolation": "ambient"
         }))
         .unwrap();
         assert_eq!(legacy, surface);
+    }
+
+    #[test]
+    fn launch_config_surface_wire_shape() {
+        let surface = ConversationToolSurface::launch_config(vec!["fs".into()], McpIsolation::Strict);
+        let json = serde_json::to_value(&surface).unwrap();
+        assert_eq!(json["source"], "launch_config");
+        assert_eq!(json["mcp_discovery"], "unavailable");
+        assert_eq!(json["mcp_isolation"], "strict");
+        assert_eq!(json["tools"], serde_json::json!([]));
+        assert_eq!(json["mcp_servers"], serde_json::json!([{ "name": "fs" }]));
+        let back: ConversationToolSurface = serde_json::from_value(json).unwrap();
+        assert_eq!(back, surface);
     }
 }
 

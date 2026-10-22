@@ -198,6 +198,9 @@ pub enum ToolInventorySource {
     /// codex `mcpServerStatus/list` (MCP servers + their tools only; codex
     /// builtins have no discovery wire).
     CodexMcpStatus,
+    /// M7 E1: no discovery wire at all (antigravity). The inventory is the
+    /// launch configuration: WorkMate-injected servers and launch isolation.
+    LaunchConfig,
 }
 
 /// A neutral, SDK-free MCP server spec (Wave 0c). Carries one resolved MCP server

@@ -2051,6 +2051,13 @@ pub(crate) fn tool_surface_from_inventory(
             external: is_external(name),
         })
         .collect();
+    // A launch-config inventory has no discovery wire: what it lists is only
+    // what WorkMate injected, so nothing can be flagged external and the
+    // ambient part (if any) is UNKNOWN rather than empty.
+    let mcp_discovery = match inventory.source {
+        aionui_session::ToolInventorySource::LaunchConfig => aionui_api_types::McpDiscovery::Unavailable,
+        _ => aionui_api_types::McpDiscovery::Reported,
+    };
     let external_mcp_servers = mcp_servers
         .iter()
         .filter(|server| server.external)
@@ -2060,6 +2067,7 @@ pub(crate) fn tool_surface_from_inventory(
         source: match inventory.source {
             aionui_session::ToolInventorySource::ClaudeInit => ToolSurfaceSource::ClaudeInit,
             aionui_session::ToolInventorySource::CodexMcpStatus => ToolSurfaceSource::CodexMcpStatus,
+            aionui_session::ToolInventorySource::LaunchConfig => ToolSurfaceSource::LaunchConfig,
         },
         tools: inventory.tools,
         mcp_servers,
@@ -2073,6 +2081,7 @@ pub(crate) fn tool_surface_from_inventory(
         // ToolSearch-over-empty-deferred (C-02) is an aionrs-only condition.
         tool_search_inert: false,
         external_mcp_servers,
+        mcp_discovery,
     }
 }
 
@@ -5809,6 +5818,46 @@ mod build_mapping_tests {
             ..Default::default()
         });
         assert!(strict.external_mcp_servers.is_empty());
+    }
+
+    /// M7 E1: per-backend isolation reporting on the session path. Claude and
+    /// codex report what they loaded (`mcp_discovery` reported); antigravity's
+    /// launch-config inventory is ambient with discovery unavailable.
+    #[test]
+    fn tool_surface_reports_isolation_and_discovery_per_backend() {
+        use aionui_api_types::{McpDiscovery, McpIsolation, ToolSurfaceSource};
+        use aionui_session::{ToolInventory, ToolInventorySource};
+        let claude = tool_surface_from_inventory(ToolInventory {
+            mcp_strict: true,
+            source: ToolInventorySource::ClaudeInit,
+            ..Default::default()
+        });
+        assert_eq!(claude.mcp_isolation, McpIsolation::Strict);
+        assert_eq!(claude.mcp_discovery, McpDiscovery::Reported);
+
+        let codex = tool_surface_from_inventory(ToolInventory {
+            mcp_servers: vec![("home".into(), "ready".into())],
+            mcp_strict: false,
+            source: ToolInventorySource::CodexMcpStatus,
+            ..Default::default()
+        });
+        assert_eq!(codex.mcp_isolation, McpIsolation::Ambient);
+        assert_eq!(codex.mcp_discovery, McpDiscovery::Reported);
+        assert_eq!(codex.external_mcp_servers, vec!["home"]);
+
+        let agy = tool_surface_from_inventory(ToolInventory {
+            source: ToolInventorySource::LaunchConfig,
+            ..Default::default()
+        });
+        assert_eq!(agy.source, ToolSurfaceSource::LaunchConfig);
+        assert_eq!(agy.mcp_isolation, McpIsolation::Ambient);
+        assert_eq!(agy.mcp_discovery, McpDiscovery::Unavailable);
+        assert!(agy.external_mcp_servers.is_empty() && agy.tools.is_empty());
+        let wire = serde_json::to_value(&agy).unwrap();
+        assert_eq!(wire["source"], "launch_config");
+        assert_eq!(wire["mcp_discovery"], "unavailable");
+        // Reported surfaces keep the pre-E1 wire shape (no mcp_discovery key).
+        assert!(serde_json::to_value(&codex).unwrap().get("mcp_discovery").is_none());
     }
 
     #[test]
