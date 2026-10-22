@@ -965,6 +965,9 @@ enum DiscoveryKind {
     Permissions,
     Checkpoints,
     Rewind,
+    /// E2 plan D: `mcpServerStatus/list` — the MCP servers codex ACTUALLY loaded
+    /// (WorkMate-injected AND machine-ambient), observed only, never blocked.
+    McpStatus,
 }
 
 #[derive(Clone, Default)]
@@ -982,6 +985,86 @@ struct Discovered {
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
+    /// E2 plan D: last `mcpServerStatus/list` page, `None` until codex answers
+    /// (older codex without the method never does → no inventory, honestly).
+    mcp_servers: Option<Vec<CodexMcpServerStatus>>,
+}
+
+/// One server row of codex's `mcpServerStatus/list` response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CodexMcpServerStatus {
+    name: String,
+    /// Tool names (keys of the response's `tools` map), sorted.
+    tools: Vec<String>,
+    /// `runtimeStatus` (thread-scoped requests) or `null`.
+    status: Option<String>,
+}
+
+/// Parse a `mcpServerStatus/list` result (`{data:[{name, tools:{<name>:…},
+/// runtimeStatus?}], nextCursor}`). Tolerates `tools` as an array of names or
+/// `{name}` objects (cross-version), and skips rows without a name.
+fn parse_mcp_status_page(result: &Value) -> Vec<CodexMcpServerStatus> {
+    let rows = result
+        .get("data")
+        .or_else(|| result.get("servers"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rows.iter()
+        .filter_map(|row| {
+            let name = row.get("name").and_then(Value::as_str)?.to_owned();
+            let mut tools: Vec<String> = match row.get("tools") {
+                Some(Value::Object(map)) => map.keys().cloned().collect(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|t| t.as_str().or_else(|| t.get("name").and_then(Value::as_str)))
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            tools.sort();
+            let status = row.get("runtimeStatus").and_then(|s| {
+                s.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| s.get("status").and_then(Value::as_str).map(str::to_owned))
+            });
+            Some(CodexMcpServerStatus { name, tools, status })
+        })
+        .collect()
+}
+
+/// Build the neutral inventory from codex's observed MCP rows. codex exposes
+/// MCP tools to the model as `mcp__<server>__<tool>`, the canonical shape.
+fn codex_tool_inventory(
+    servers: &[CodexMcpServerStatus],
+    injected: &[crate::backend::McpServerSpec],
+) -> crate::backend::ToolInventory {
+    crate::backend::ToolInventory {
+        tools: servers
+            .iter()
+            .flat_map(|s| s.tools.iter().map(move |t| format!("mcp__{}__{t}", s.name)))
+            .collect(),
+        mcp_servers: servers
+            .iter()
+            .map(|s| (s.name.clone(), s.status.clone().unwrap_or_else(|| "unknown".into())))
+            .collect(),
+        // codex cannot isolate from ambient config (spike doc 40, option D).
+        mcp_strict: false,
+        skills: Vec::new(),
+        managed_mcp_servers: injected.iter().map(|s| s.name.clone()).collect(),
+        source: crate::backend::ToolInventorySource::CodexMcpStatus,
+    }
+}
+
+/// The `mcpServerStatus/list` request frame (no threadId: the config-level view,
+/// which is exactly where ambient `~/.codex/config.toml` servers show up).
+fn mcp_status_list_frame(id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "mcpServerStatus/list",
+        "params": { "detail": "toolsAndAuthOnly", "limit": 100 }
+    })
 }
 
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server
@@ -1562,6 +1645,14 @@ impl CodexSessionBackend {
             "jsonrpc": "2.0", "id": perm_list_id, "method": "permissionProfile/list", "params": {}
         }))
         .await?;
+        // E2 plan D: observe which MCP servers codex actually loaded. Best-effort:
+        // a codex without the method answers with an error (dropped) or never.
+        let mcp_status_id = self.next_rpc_id();
+        self.pending_discovery
+            .lock()
+            .await
+            .insert(mcp_status_id, DiscoveryKind::McpStatus);
+        self.write_frame(mcp_status_list_frame(mcp_status_id)).await?;
         Ok(())
     }
 
@@ -1780,6 +1871,22 @@ async fn reader_task(
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
                                 *thread_binding.lock().await = Some(tid.to_string());
+                            }
+                        }
+                        // E2 plan D: a server settled (ready/failed/cancelled) →
+                        // refresh the observed MCP inventory so late-starting
+                        // servers' tools appear. Bounded: one request per settle.
+                        if m == "mcpServer/startupStatus/updated"
+                            && matches!(
+                                params.get("status").and_then(Value::as_str),
+                                Some("ready" | "failed" | "cancelled")
+                            )
+                        {
+                            let id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+                            pending_discovery.lock().await.insert(id, DiscoveryKind::McpStatus);
+                            if let Err(error) = write_json_frame(&stdin, &mcp_status_list_frame(id)).await {
+                                pending_discovery.lock().await.remove(&id);
+                                tracing::debug!(conversation_id = %session_id, "codex mcpServerStatus/list refresh failed: {error}");
                             }
                         }
                         if m == "thread/tokenUsage/updated" {
@@ -2288,6 +2395,9 @@ async fn reader_task(
                                             },
                                         );
                                     }
+                                    DiscoveryKind::McpStatus => {
+                                        fill_discovery(kind, result, &discovered);
+                                    }
                                     DiscoveryKind::Rewind => {
                                         // G3 up-leg: thread/rollback response → Rewound
                                         // {to_turn}. to_turn = the post-rollback history-
@@ -2755,6 +2865,9 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
         // Checkpoints → CheckpointList event, Rewind → Rewound event: both mapped at
         // the call site, not a cache fill — fill_discovery is never called for them.
         DiscoveryKind::Checkpoints | DiscoveryKind::Rewind => {}
+        DiscoveryKind::McpStatus => {
+            discovered.lock().unwrap_or_else(|e| e.into_inner()).mcp_servers = Some(parse_mcp_status_page(result));
+        }
     }
 }
 
@@ -4980,6 +5093,19 @@ impl SessionBackend for CodexSessionBackend {
     /// duplicate live+recovered pair de-dups. codex approvals carry no question
     /// payload (AskUserQuestion is claude-only), so `questions` is always `None`;
     /// the raw command body is NOT exposed (TIO-13) — only the approval-class title.
+    /// E2 plan D: the MCP surface codex ACTUALLY loaded, from
+    /// `mcpServerStatus/list` — observed, never blocked. Servers outside the
+    /// WorkMate-injected set are machine-ambient (`~/.codex/config.toml`).
+    fn tool_inventory(&self) -> Option<crate::backend::ToolInventory> {
+        let servers = self
+            .discovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mcp_servers
+            .clone()?;
+        Some(codex_tool_inventory(&servers, &self.wake.config.init.mcp_servers))
+    }
+
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         self.pending_tool_approvals
             .lock()
@@ -8772,6 +8898,70 @@ mod tests {
     /// mode axis IS its permission axis) and MUST NOT send `collaborationMode/list`
     /// (plan/default has no UI entry — matches legacy ACP). Drives a real `run_handshake`
     /// against captured stdin and asserts the wire.
+    #[test]
+    fn plan_d_parses_mcp_status_page_shapes() {
+        let page = serde_json::json!({
+            "data": [
+                {"name": "docs", "tools": {"search": {}, "fetch": {}}, "runtimeStatus": "connected"},
+                {"name": "home", "tools": [{"name": "lights"}, "heat"], "runtimeStatus": null},
+                {"tools": {"orphan": {}}}
+            ],
+            "nextCursor": null
+        });
+        let rows = parse_mcp_status_page(&page);
+        assert_eq!(rows.len(), 2, "a row without a name is skipped");
+        assert_eq!(rows[0].tools, vec!["fetch", "search"]);
+        assert_eq!(rows[0].status.as_deref(), Some("connected"));
+        assert_eq!(rows[1].tools, vec!["heat", "lights"]);
+        assert_eq!(rows[1].status, None);
+        assert!(parse_mcp_status_page(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn plan_d_inventory_marks_injected_servers_as_managed() {
+        let rows = vec![
+            CodexMcpServerStatus {
+                name: "docs".into(),
+                tools: vec!["search".into()],
+                status: Some("connected".into()),
+            },
+            CodexMcpServerStatus {
+                name: "home".into(),
+                tools: vec!["lights".into()],
+                status: None,
+            },
+        ];
+        let injected = vec![crate::backend::McpServerSpec {
+            name: "docs".into(),
+            transport: crate::backend::McpTransport::Http {
+                url: "https://x.invalid".into(),
+                headers: vec![],
+            },
+        }];
+        let inv = codex_tool_inventory(&rows, &injected);
+        assert_eq!(inv.tools, vec!["mcp__docs__search", "mcp__home__lights"]);
+        assert_eq!(inv.managed_mcp_servers, vec!["docs"]);
+        assert_eq!(inv.mcp_servers[1], ("home".to_string(), "unknown".to_string()));
+        assert!(!inv.mcp_strict);
+        assert_eq!(inv.source, crate::backend::ToolInventorySource::CodexMcpStatus);
+    }
+
+    #[test]
+    fn plan_d_fill_discovery_stores_observed_servers() {
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        assert!(
+            discovered.lock().unwrap().mcp_servers.is_none(),
+            "no answer yet ⇒ no inventory"
+        );
+        fill_discovery(
+            DiscoveryKind::McpStatus,
+            &serde_json::json!({"data": [{"name": "fs", "tools": {"read": {}}}]}),
+            &discovered,
+        );
+        let servers = discovered.lock().unwrap().mcp_servers.clone().unwrap();
+        assert_eq!(servers[0].name, "fs");
+    }
+
     #[tokio::test]
     async fn handshake_discovers_permission_profiles_not_collaboration_mode() {
         let fake = FakeAgentIo::never_exits(Vec::new());
@@ -8789,6 +8979,10 @@ mod tests {
         assert!(
             written.contains(r#""method":"permissionProfile/list""#),
             "feature 012: handshake discovers permissionProfile/list, got: {written}"
+        );
+        assert!(
+            written.contains(r#""method":"mcpServerStatus/list""#),
+            "E2 plan D: handshake observes the loaded MCP servers, got: {written}"
         );
         assert!(
             !written.contains(r#""method":"collaborationMode/list""#),

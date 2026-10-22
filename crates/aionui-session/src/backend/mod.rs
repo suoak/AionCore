@@ -182,6 +182,22 @@ pub struct ToolInventory {
     pub mcp_strict: bool,
     /// Skills the agent reported as invocable (claude `system/init` `skills[]`).
     pub skills: Vec<String>,
+    /// MCP server names WorkMate itself injected; any reported server outside
+    /// this set is EXTERNAL (machine-ambient config).
+    pub managed_mcp_servers: Vec<String>,
+    /// Which wire reported this inventory.
+    pub source: ToolInventorySource,
+}
+
+/// Wire that produced a [`ToolInventory`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolInventorySource {
+    /// claude `system/init` (`tools[]`, builtins included).
+    #[default]
+    ClaudeInit,
+    /// codex `mcpServerStatus/list` (MCP servers + their tools only; codex
+    /// builtins have no discovery wire).
+    CodexMcpStatus,
 }
 
 /// A neutral, SDK-free MCP server spec (Wave 0c). Carries one resolved MCP server
