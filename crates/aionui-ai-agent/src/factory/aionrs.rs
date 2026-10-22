@@ -27,13 +27,20 @@ use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, AionrsRuntimeToolPolicy};
 
-/// C-02 (Core side): the deferral flag Core sets on EVERY MCP server it hands
-/// aionrs (previously 9 inlined `Some(false)` literals). Kept `Some(false)` on the
-/// v0.2.24 pin: deferring needs a working `ToolSearch` discovery loop, and the
-/// 0.2.25 gate (register `ToolSearch` only when something is deferred) is not
-/// pinned yet. The inert `ToolSearch` this leaves is reported on the tool surface
-/// (`tool_search_inert`). Flip here — one place — together with the pin bump.
-pub(crate) const CORE_MCP_DEFERRED: Option<bool> = Some(false);
+/// C-02 switch: defer the tools of every user / session MCP server Core hands
+/// aionrs (only name + short description reach the model; the full schema is
+/// loaded through `ToolSearch`). From the 0.2.25 pin aionrs registers
+/// `ToolSearch` only while a policy-allowed deferred tool exists, so turning
+/// this off simply leaves MCP tools fully advertised. One switch, one place.
+pub(crate) const CORE_DEFER_MCP_TOOLS: bool = true;
+
+/// Deferral flag set on every user / session MCP server config.
+pub(crate) const CORE_MCP_DEFERRED: Option<bool> = Some(CORE_DEFER_MCP_TOOLS);
+
+/// The team MCP bridge is never deferred: team coordination tools are named
+/// directly by the team prompts and must be callable without a discovery
+/// round-trip (team bridge behaviour unchanged).
+pub(crate) const TEAM_MCP_DEFERRED: Option<bool> = Some(false);
 
 /// Render this conversation's skills index, or `""` when there is nothing to add.
 async fn skill_index_text(deps: &AgentFactoryDeps, user_id: &str, skills: &[String]) -> String {
@@ -921,7 +928,7 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
         env: Some(env),
         url: None,
         headers: None,
-        deferred: CORE_MCP_DEFERRED,
+        deferred: TEAM_MCP_DEFERRED,
         startup_timeout_ms: None,
     };
 
@@ -2113,6 +2120,40 @@ mod tests {
         assert_eq!(
             assembled[TEAM_MCP_SERVER_NAME].command.as_deref(),
             Some("/usr/bin/team-coordinator")
+        );
+    }
+
+    #[tokio::test]
+    async fn c02_user_mcp_servers_are_deferred_but_the_team_bridge_is_not() {
+        assert!(CORE_DEFER_MCP_TOOLS, "C-02 switch is on for the 0.2.25 pin");
+        let server = SessionMcpServer {
+            id: "mcp_http".into(),
+            name: "docs".into(),
+            transport: SessionMcpTransport::Http {
+                url: "https://mcp.example/mcp".into(),
+                headers: HashMap::new(),
+            },
+        };
+        let config = session_server_to_mcp_server_config(&server, "user-1", "conv-1", test_broadcaster())
+            .await
+            .unwrap();
+        assert_eq!(
+            config.deferred,
+            Some(true),
+            "user MCP tools are loaded through ToolSearch"
+        );
+
+        let team = team_mcp_to_config(&TeamMcpStdioConfig {
+            team_id: "team-1".into(),
+            port: 9000,
+            token: "tok".into(),
+            slot_id: "slot-1".into(),
+            binary_path: "/usr/bin/backend".into(),
+        });
+        assert_eq!(
+            team[TEAM_MCP_SERVER_NAME].deferred,
+            Some(false),
+            "team coordination tools stay directly callable"
         );
     }
 

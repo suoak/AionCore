@@ -100,10 +100,10 @@ fn embedded_config_project_dir(config_extra: &AionrsResolvedConfig) -> PathBuf {
     config_extra.session_directory.clone()
 }
 
-/// C-02 (Core side, pin v0.2.24): aionrs registers `ToolSearch` unconditionally,
-/// but Core pins every MCP server to `deferred: Some(false)` ([`CORE_MCP_DEFERRED`]),
-/// so with nothing deferred the tool can only return empty. Report that instead
-/// of hiding it; the aionrs-side gate ships with the 0.2.25 pin bump.
+/// C-02: `ToolSearch` is present but nothing is deferred, so it can only
+/// answer "nothing found". From the 0.2.25 pin aionrs registers `ToolSearch`
+/// only while a deferred tool exists, so on a healthy runtime this is always
+/// `false`; it stays on the tool surface as a regression tripwire.
 pub(crate) fn aionrs_tool_search_inert(entries: &[aionui_api_types::ToolSurfaceEntry]) -> bool {
     entries.iter().any(|entry| entry.name == "ToolSearch") && !entries.iter().any(|entry| entry.deferred == Some(true))
 }
@@ -113,6 +113,23 @@ pub(crate) fn aionrs_tool_policy_label(policy: AionrsRuntimeToolPolicy) -> &'sta
     match policy {
         AionrsRuntimeToolPolicy::Unrestricted => "unrestricted",
         AionrsRuntimeToolPolicy::StrictPlanning => "strict_planning",
+    }
+}
+
+/// `AIONUI_*` runtime variables an MCP server may still receive. aionrs 0.2.25
+/// strips every `AIONUI_*` variable from MCP server environments unless it is
+/// listed here. No Core-launched MCP server reads one (the team bridge uses its
+/// explicit `TEAM_MCP_*` env; helper CLIs run through `ExecCommand`, whose
+/// environment is unchanged), so the list is deliberately empty.
+pub(crate) const CORE_MCP_ENV_PASSTHROUGH: &[&str] = &[];
+
+/// `ToolSearch` only returns tool schemas from the in-memory registry
+/// snapshot: no side effects, nothing leaves the process. With MCP tools
+/// deferred (C-02) it runs before most MCP calls, so it must not cost the user
+/// an extra approval card in the default mode.
+pub(crate) fn allow_tool_search_without_approval(config: &mut Config) {
+    if !config.tools.allow_list.iter().any(|name| name == "ToolSearch") {
+        config.tools.allow_list.push("ToolSearch".to_owned());
     }
 }
 
@@ -301,6 +318,7 @@ impl AionrsAgentManager {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
         }
         let tool_policy = apply_runtime_tool_policy(&mut config, config_extra.tool_policy);
+        allow_tool_search_without_approval(&mut config);
         // E2 (C-09): the MCP servers that actually start are exactly the ones in
         // this Core-assembled config (after the policy pass above).
         let mut mcp_server_names: Vec<String> = config.mcp.servers.keys().cloned().collect();
@@ -321,6 +339,7 @@ impl AionrsAgentManager {
         let mut bootstrap = isolate_session_skills(
             AgentBootstrap::new(config, &workspace, sink)
                 .runtime_env(runtime_env)
+                .mcp_env_passthrough(CORE_MCP_ENV_PASSTHROUGH.iter().map(|name| (*name).to_owned()).collect())
                 .tool_policy(tool_policy),
             config_extra.skill_roots.clone(),
         );
