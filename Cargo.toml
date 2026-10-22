@@ -65,12 +65,12 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.24" }
-aion-providers = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.24" }
-aion-types = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.24" }
-aion-protocol = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.24" }
-aion-config = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.24" }
-aion-mcp = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.24" }
+aion-agent = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.25" }
+aion-providers = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.25" }
+aion-types = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.25" }
+aion-protocol = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.25" }
+aion-config = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.25" }
+aion-mcp = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.25" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
