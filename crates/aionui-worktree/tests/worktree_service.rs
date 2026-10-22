@@ -76,6 +76,11 @@ async fn create_validates_inputs() {
         assert!(matches!(err, WorktreeError::InvalidRef(_)), "{bad}: {err:?}");
     }
     let mut r = req(&h.repo);
+    r.task_session_id = Some("no-such-task".into());
+    let err = h.service.create(USER, r).await.unwrap_err();
+    assert!(matches!(err, WorktreeError::BadRequest(_)), "{err:?}");
+
+    let mut r = req(&h.repo);
     r.base_ref = Some("no-such-branch".into());
     assert!(matches!(
         h.service.create(USER, r).await.unwrap_err(),

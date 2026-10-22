@@ -260,6 +260,14 @@ impl GitCli {
         cmd.envs(scrub_env(self.base_env_vars()));
         cmd.env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never");
         if let Some(dir) = &opts.cwd {
+            // A missing cwd would surface as ENOENT from spawn and be
+            // misreported as "git not installed".
+            if !dir.is_dir() {
+                return Err(GitCliError::Io(format!(
+                    "working directory not found: {}",
+                    dir.display()
+                )));
+            }
             cmd.current_dir(dir);
         }
         cmd.stdin(Stdio::null())
@@ -271,13 +279,22 @@ impl GitCli {
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
-        let mut child = cmd.spawn().map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                GitCliError::NotAvailable(format!("{}: {err}", self.program.display()))
-            } else {
-                GitCliError::Io(err.to_string())
+        let mut attempt = 0;
+        let mut child = loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                // ETXTBSY: the executable was just written and another thread's
+                // fork still holds the write fd. Transient; retry briefly.
+                Err(err) if cfg!(unix) && err.raw_os_error() == Some(26) && attempt < 10 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(20 * attempt)).await;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(GitCliError::NotAvailable(format!("{}: {err}", self.program.display())));
+                }
+                Err(err) => return Err(GitCliError::Io(err.to_string())),
             }
-        })?;
+        };
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

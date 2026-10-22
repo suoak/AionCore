@@ -143,6 +143,16 @@ mod stub {
 }
 
 #[tokio::test]
+async fn missing_cwd_is_not_reported_as_missing_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = GitCli::default()
+        .run(["status"], RunOptions::in_dir(dir.path().join("gone")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GitCliError::Io(_)), "{err:?}");
+}
+
+#[tokio::test]
 async fn too_old_git_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let program = stub::write(dir.path(), "echo 'git version 2.25.1'", "echo git version 2.25.1");

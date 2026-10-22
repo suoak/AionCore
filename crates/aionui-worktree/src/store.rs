@@ -59,6 +59,8 @@ fn map_err(err: sqlx::Error) -> WorktreeError {
     let text = err.to_string();
     if aionui_db::message_indicates_unique_violation(&text) {
         WorktreeError::PathConflict(text)
+    } else if text.contains("FOREIGN KEY constraint failed") {
+        WorktreeError::BadRequest("unknown user or task_session_id".into())
     } else {
         WorktreeError::Database(text)
     }
