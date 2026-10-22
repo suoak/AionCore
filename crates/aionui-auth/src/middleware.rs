@@ -279,7 +279,7 @@ async fn runtime_token_channel(state: &AuthState, request: Request, next: Next) 
         .unwrap_or_default();
     let response = next.run(request).await;
     if redact_response {
-        let list_filter = is_conversation_list.then(|| (state, user_id.as_str(), conversation_id.as_str()));
+        let list_filter = is_conversation_list.then_some((state, user_id.as_str(), conversation_id.as_str()));
         redact_json_response(response, list_filter).await
     } else {
         Ok(response)
