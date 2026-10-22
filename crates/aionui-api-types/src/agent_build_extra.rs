@@ -93,6 +93,11 @@ pub struct AcpBuildExtra {
     pub mcp_server_ids: Option<Vec<String>>,
     #[serde(default)]
     pub session_mcp_servers: Vec<SessionMcpServer>,
+    /// B-09: the MCP surface is MANAGED (Agent Center assistant or an explicit
+    /// allowlist, possibly empty). Written once at conversation create; absent on
+    /// older conversations (= `false`, the pre-B-09 ambient behavior).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp_strict: bool,
     #[serde(default)]
     pub user_id: Option<String>,
     /// Present only on a forked conversation (see [`ForkSpec`]). Consumed by

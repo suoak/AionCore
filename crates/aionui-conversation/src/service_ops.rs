@@ -696,17 +696,19 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
         let active_task = self.task(conversation_id).ok();
+        // E2 (C-09): the agent-reported tool surface of the LIVE task (never
+        // synthesized from config). C-08: enforcement follows it.
+        let tool_surface = active_task
+            .as_ref()
+            .and_then(aionui_ai_agent::AgentInstance::tool_surface);
         let mut capabilities = ConversationCapabilities {
             followup: true,
             steer: active_task
                 .as_ref()
                 .is_some_and(aionui_ai_agent::AgentInstance::supports_steer),
             inject: row.r#type == "aionrs",
-            tool_enforcement: if row.r#type == "aionrs" {
-                ToolEnforcementLevel::Native
-            } else {
-                ToolEnforcementLevel::ObserveOnly
-            },
+            tool_enforcement: effective_tool_enforcement(&row.r#type, tool_surface.as_ref()),
+            tool_surface,
             revision: None,
             negotiated_at: None,
         };
@@ -1614,4 +1616,77 @@ pub(crate) async fn append_input_status_event(
         .await
         .map_err(|error| ConversationError::internal(format!("Failed to journal input status: {error}")))?;
     Ok(())
+}
+
+/// C-08: report the tool enforcement ACTUALLY in effect. aionrs restricts the
+/// tool set natively only under the `strict_planning` runtime policy; an
+/// unrestricted aionrs session exposes its full registry behind the approval
+/// gate. claude/codex/acp tools are observed, not restricted, by WorkMate.
+fn effective_tool_enforcement(
+    conversation_type: &str,
+    surface: Option<&aionui_api_types::ConversationToolSurface>,
+) -> ToolEnforcementLevel {
+    if conversation_type != "aionrs" {
+        return ToolEnforcementLevel::ObserveOnly;
+    }
+    match surface.and_then(|surface| surface.tool_policy.as_deref()) {
+        Some("strict_planning") => ToolEnforcementLevel::Native,
+        _ => ToolEnforcementLevel::ApprovalGate,
+    }
+}
+
+#[cfg(test)]
+mod tool_enforcement_tests {
+    use super::*;
+    use aionui_api_types::{ConversationToolSurface, McpIsolation, ToolSurfaceSource};
+
+    fn aionrs_surface(policy: &str) -> ConversationToolSurface {
+        ConversationToolSurface {
+            source: ToolSurfaceSource::AionrsRegistry,
+            tools: vec!["Read".into()],
+            mcp_servers: Vec::new(),
+            mcp_isolation: McpIsolation::Strict,
+            tool_policy: Some(policy.into()),
+        }
+    }
+
+    #[test]
+    fn c08_aionrs_native_only_under_strict_planning() {
+        assert_eq!(
+            effective_tool_enforcement("aionrs", Some(&aionrs_surface("strict_planning"))),
+            ToolEnforcementLevel::Native
+        );
+        assert_eq!(
+            effective_tool_enforcement("aionrs", Some(&aionrs_surface("unrestricted"))),
+            ToolEnforcementLevel::ApprovalGate
+        );
+        assert_eq!(
+            effective_tool_enforcement("aionrs", None),
+            ToolEnforcementLevel::ApprovalGate,
+            "no live surface must not claim native restriction"
+        );
+        assert_eq!(
+            effective_tool_enforcement("acp", None),
+            ToolEnforcementLevel::ObserveOnly
+        );
+    }
+
+    #[test]
+    fn capabilities_without_surface_keep_legacy_wire_shape() {
+        let caps = ConversationCapabilities {
+            followup: true,
+            steer: false,
+            inject: false,
+            tool_enforcement: ToolEnforcementLevel::ObserveOnly,
+            tool_surface: None,
+            revision: None,
+            negotiated_at: None,
+        };
+        let json = serde_json::to_value(&caps).unwrap();
+        assert!(json.get("tool_surface").is_none());
+        let legacy: ConversationCapabilities =
+            serde_json::from_str(r#"{"followup":true,"steer":false,"inject":false,"tool_enforcement":"observe-only"}"#)
+                .unwrap();
+        assert_eq!(legacy, caps);
+    }
 }

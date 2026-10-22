@@ -3217,7 +3217,16 @@ impl ConversationService {
             )
             .await?;
 
+        // B-09: an Agent Center assistant session or an explicit allowlist
+        // (client selection / team snapshot) is a MANAGED MCP surface. Captured
+        // before the snapshot is built so an empty allowlist still counts.
+        let mcp_strict = selected_mcp_server_ids.is_some() || assistant_snapshot.is_some();
         if let Some(obj) = extra.as_object_mut() {
+            if mcp_strict {
+                obj.insert("mcp_strict".to_owned(), serde_json::Value::Bool(true));
+            } else {
+                obj.remove("mcp_strict");
+            }
             obj.insert(
                 "mcp_server_ids".to_owned(),
                 serde_json::Value::Array(

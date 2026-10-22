@@ -100,6 +100,14 @@ fn embedded_config_project_dir(config_extra: &AionrsResolvedConfig) -> PathBuf {
     config_extra.session_directory.clone()
 }
 
+/// Wire label for the runtime tool policy reported in the tool surface.
+pub(crate) fn aionrs_tool_policy_label(policy: AionrsRuntimeToolPolicy) -> &'static str {
+    match policy {
+        AionrsRuntimeToolPolicy::Unrestricted => "unrestricted",
+        AionrsRuntimeToolPolicy::StrictPlanning => "strict_planning",
+    }
+}
+
 fn apply_runtime_tool_policy(config: &mut Config, policy: AionrsRuntimeToolPolicy) -> ToolPolicy {
     match policy {
         AionrsRuntimeToolPolicy::Unrestricted => ToolPolicy::Unrestricted,
@@ -167,6 +175,8 @@ pub struct AionrsAgentManager {
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
+    /// E2 (C-09): the real tool surface captured at bootstrap.
+    tool_surface: aionui_api_types::ConversationToolSurface,
     /// Holds `Arc<McpManager>` instances alive for the duration of this agent's
     /// lifetime. The managers are not accessed after construction — they exist
     /// solely so their underlying MCP connections outlive the engine's event
@@ -283,6 +293,10 @@ impl AionrsAgentManager {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
         }
         let tool_policy = apply_runtime_tool_policy(&mut config, config_extra.tool_policy);
+        // E2 (C-09): the MCP servers that actually start are exactly the ones in
+        // this Core-assembled config (after the policy pass above).
+        let mut mcp_server_names: Vec<String> = config.mcp.servers.keys().cloned().collect();
+        mcp_server_names.sort();
         info!(
             conversation_id = %conversation_id,
             policy = ?config_extra.tool_policy,
@@ -344,6 +358,19 @@ impl AionrsAgentManager {
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
         let injection_handle = engine.injection_handle();
+        // E2 (C-09): the registry is fixed once bootstrap returns (MCP tools are
+        // registered during build), so capture it here — reading it later would
+        // wait behind the engine lock held by an active `engine.run()` turn.
+        let tool_surface = aionui_api_types::ConversationToolSurface {
+            source: aionui_api_types::ToolSurfaceSource::AionrsRegistry,
+            tools: engine.tool_names(),
+            mcp_servers: mcp_server_names
+                .into_iter()
+                .map(|name| aionui_api_types::ToolSurfaceMcpServer { name, status: None })
+                .collect(),
+            mcp_isolation: aionui_api_types::McpIsolation::Strict,
+            tool_policy: Some(aionrs_tool_policy_label(config_extra.tool_policy).to_owned()),
+        };
         let slash_commands = engine
             .slash_command_list()
             .into_iter()
@@ -363,6 +390,7 @@ impl AionrsAgentManager {
             engine: Mutex::new(engine),
             injection_handle,
             slash_commands,
+            tool_surface,
             mcp_managers: result.mcp_managers,
             approval_manager,
             auto_approve,
@@ -372,6 +400,11 @@ impl AionrsAgentManager {
             turn_finished_notify: Arc::new(Notify::new()),
             last_total_usage: Mutex::new(last_total_usage),
         })
+    }
+
+    /// E2 (C-08/C-09): the tool surface this engine actually exposes.
+    pub fn tool_surface(&self) -> aionui_api_types::ConversationToolSurface {
+        self.tool_surface.clone()
     }
 
     /// Queue host input for the next model boundary of the active turn.

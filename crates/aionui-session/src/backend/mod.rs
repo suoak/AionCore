@@ -113,6 +113,14 @@ pub trait SessionBackend: Send + Sync {
         Vec::new()
     }
 
+    /// E2 (C-09): the tool surface the backend ACTUALLY exposes to the model, as
+    /// reported by the agent itself after its handshake (claude: `system/init`
+    /// `tools[]` + `mcp_servers[]`). `None` = not reported yet / not supported —
+    /// callers must not invent a list. Default `None` for every other backend.
+    fn tool_inventory(&self) -> Option<ToolInventory> {
+        None
+    }
+
     /// Force-terminate this session's process tree NOW (the `UserCancelTimeout`
     /// force-kill path), WITHOUT waiting for the last `Arc<dyn SessionBackend>`
     /// to drop. The Drop-driven reap needs the last handle released to fire
@@ -159,6 +167,19 @@ pub trait BackendConnection: Send + Sync {
     /// Connection-level capabilities (the same shape a freshly-opened session
     /// reports; lets the caller gate UI before opening).
     fn capabilities(&self) -> Capabilities;
+}
+
+/// E2 (C-09): the agent-reported tool surface of one live session. Names are
+/// verbatim from the agent (claude MCP tools are `mcp__<server>__<tool>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolInventory {
+    /// Every tool name the agent advertised to the model, in reported order.
+    pub tools: Vec<String>,
+    /// MCP servers the agent reported (name, status), ambient ones included.
+    pub mcp_servers: Vec<(String, String)>,
+    /// `true` when the launch isolated the session from ambient MCP config
+    /// (B-09 `--strict-mcp-config`); `false` = ambient servers may be present.
+    pub mcp_strict: bool,
 }
 
 /// A neutral, SDK-free MCP server spec (Wave 0c). Carries one resolved MCP server
@@ -218,6 +239,12 @@ pub struct SessionInit {
     /// User/team/guide MCP servers, already resolved + flattened by the app
     /// boundary. Empty = no injection (the pre-0c default).
     pub mcp_servers: Vec<McpServerSpec>,
+    /// B-09: the session's MCP surface is MANAGED (an Agent Center assistant, or
+    /// an explicit `mcp_server_ids` allowlist — even an empty one). Backends that
+    /// can isolate from machine-ambient MCP config must do so: claude always gets
+    /// `--strict-mcp-config`, and an empty set becomes `{"mcpServers":{}}` so the
+    /// session sees NO MCP tools. `false` (default) keeps the pre-B-09 behavior.
+    pub strict_mcp: bool,
     /// Skill ids/names to surface to the agent on the first turn (acp/aionrs
     /// deliver these via the first prompt, not a `session/new` param).
     ///

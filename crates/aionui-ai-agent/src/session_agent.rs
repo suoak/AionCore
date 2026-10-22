@@ -528,15 +528,7 @@ impl SessionAgentTask {
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
         // capturing a backend Arc there would leak the child process).
         let events = backend.events();
-        spawn_event_pump(
-            events,
-            runtime.clone(),
-            conversation_id.clone(),
-            user_id.clone(),
-            session_repo.clone(),
-            broadcaster,
-        );
-        Arc::new(Self {
+        let task = Arc::new(Self {
             agent_type,
             conversation_id,
             user_id,
@@ -547,7 +539,23 @@ impl SessionAgentTask {
             catalog_preload,
             command_seq: AtomicI64::new(0),
             prompt_dump,
-        })
+        });
+        // Seed the pump's fallback now (port of upstream #1019): a task rebuilt by
+        // `send_message` (idle reclaim) never goes through REST `get_config_options`, so
+        // the `CatalogUpdated` frame would otherwise carry `None` for every untouched
+        // axis and the frontend would fall back to the creation-time model. Seeded
+        // before the pump starts consuming, so ordering is by construction, and it reuses
+        // `effective_catalog()` so the pump frame and REST share one source of truth.
+        task.prime_caps_fallback();
+        spawn_event_pump(
+            events,
+            task.runtime.clone(),
+            task.conversation_id.clone(),
+            task.user_id.clone(),
+            task.session_repo.clone(),
+            broadcaster,
+        );
+        task
     }
 
     fn next_command_id(&self) -> u64 {
@@ -980,23 +988,23 @@ impl SessionAgentTask {
         &self.runtime
     }
 
-    /// Config-options (mode + model selects). For each select the optimistic override
-    /// (last set_config_option) wins over the capabilities snapshot's current_value —
-    /// this is what makes set_config_option's observed re-read succeed (the snapshot
-    /// lags an in-band claude switch).
-    pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
-        // Live catalog wins; cold-start resume falls back to the persisted-handshake
-        // preload (per-axis) so the picker renders before the initialize round-trip lands.
+    /// Mirror `effective_catalog()` into the runtime for the backend-Arc-free event pump,
+    /// returning the same tuple for the caller's own use. Runs at `build()` and on every
+    /// REST `get_config_options`, both from the one source so their values agree.
+    fn prime_caps_fallback(
+        &self,
+    ) -> (
+        Vec<aionui_session::ModelInfo>,
+        Option<String>,
+        Vec<aionui_session::ModeInfo>,
+        Option<String>,
+    ) {
         let (models, current_model, modes, current_mode) = self.effective_catalog();
-        let is_codex = models.iter().any(|model| model.codex.is_some());
-        // The effort catalog depends on the EFFECTIVE current model (override wins over the
-        // snapshot's current_model), resolved before the model option consumes it below.
-        let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
         // Mirror what the BACKEND reports into the runtime so the event pump can apply the
         // same `override → caps` fallback when it re-projects this snapshot. The pump holds
         // no backend Arc and would otherwise send `None` for every axis the user never
         // picked — and since the frontend REPLACES its whole snapshot on that frame, those
-        // pickers would go blank (this is the one path that sees both sides).
+        // pickers would go blank.
         self.runtime.set_caps_fallback(CapsFallback {
             mode: current_mode.clone(),
             model: current_model.clone(),
@@ -1006,11 +1014,25 @@ impl SessionAgentTask {
         // WHOLE snapshot, and the pump can only do that from a catalog it was handed.
         // `CatalogUpdated` is not a reliable supply — agy emits none at all (its modes are
         // static), so gating on it left agy's picker stuck on "switching…" with no signal
-        // that could ever clear it. This path always runs first: the frontend reads
-        // config-options on mount, before any switch is possible.
+        // that could ever clear it.
         if !modes.is_empty() || !models.is_empty() {
             self.runtime.set_last_catalog(modes.clone(), models.clone());
         }
+        (models, current_model, modes, current_mode)
+    }
+
+    /// Config-options (mode + model selects). For each select the optimistic override
+    /// (last set_config_option) wins over the capabilities snapshot's current_value —
+    /// this is what makes set_config_option's observed re-read succeed (the snapshot
+    /// lags an in-band claude switch).
+    pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
+        // Live catalog wins; cold-start resume falls back to the persisted-handshake
+        // preload (per-axis) so the picker renders before the initialize round-trip lands.
+        let (models, current_model, modes, current_mode) = self.prime_caps_fallback();
+        let is_codex = models.iter().any(|model| model.codex.is_some());
+        // The effort catalog depends on the EFFECTIVE current model (override wins over the
+        // snapshot's current_model), resolved before the model option consumes it below.
+        let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
         let mut config_options = Vec::new();
         if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
@@ -1440,6 +1462,13 @@ impl SessionAgentTask {
     /// Whether the live backend has an authenticated, native steer wire.
     pub fn supports_steer(&self) -> bool {
         self.backend.capabilities().supported_commands.steer
+    }
+
+    /// E2 (C-09): the agent-reported tool surface (claude `system/init`), or
+    /// `None` before the first init / for backends that do not report one.
+    pub fn tool_surface(&self) -> Option<aionui_api_types::ConversationToolSurface> {
+        let inventory = self.backend.tool_inventory()?;
+        Some(tool_surface_from_inventory(inventory))
     }
 
     /// Apply host input to the current turn and wait for the backend receipt.
@@ -1996,6 +2025,40 @@ fn clear_stale_model(
     None
 }
 
+/// E2 (C-09): neutral backend inventory → API tool surface.
+pub(crate) fn tool_surface_from_inventory(
+    inventory: aionui_session::ToolInventory,
+) -> aionui_api_types::ConversationToolSurface {
+    use aionui_api_types::{ConversationToolSurface, McpIsolation, ToolSurfaceMcpServer, ToolSurfaceSource};
+    ConversationToolSurface {
+        source: ToolSurfaceSource::ClaudeInit,
+        tools: inventory.tools,
+        mcp_servers: inventory
+            .mcp_servers
+            .into_iter()
+            .map(|(name, status)| ToolSurfaceMcpServer {
+                name,
+                status: Some(status),
+            })
+            .collect(),
+        mcp_isolation: if inventory.mcp_strict {
+            McpIsolation::Strict
+        } else {
+            McpIsolation::Ambient
+        },
+        tool_policy: None,
+    }
+}
+
+/// B-09: is this session's MCP surface MANAGED by WorkMate? The conversation
+/// create path stamps `extra.mcp_strict` for an Agent Center assistant session and
+/// for any explicit MCP allowlist — including an EMPTY one, which must mean "no
+/// MCP" rather than "fall back to the machine's ambient config". Backends that can
+/// isolate (claude: `--strict-mcp-config`) do so when this is true.
+pub(crate) fn managed_mcp_surface(config: &aionui_api_types::AcpBuildExtra) -> bool {
+    config.mcp_strict
+}
+
 /// Build a claude/codex `SessionAgentTask` (the session-model port's `IAgentTask`)
 /// from a resolved ACP build request, or `Ok(None)` for a non-session backend.
 ///
@@ -2068,6 +2131,7 @@ pub async fn build_antigravity_instance(
 
     let init = SessionInit {
         mcp_servers,
+        strict_mcp: managed_mcp_surface(config),
         skills: config.skills.clone(),
         // The COMPOSED block (preset context + skills index + dual-channel
         // instructions), not the raw preset context: agy has no prompt pipeline,
@@ -2212,6 +2276,7 @@ pub async fn build_session_instance(
     // GAP #4 — preset_context + skills carried into the init surface.
     let init = SessionInit {
         mcp_servers,
+        strict_mcp: managed_mcp_surface(config),
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
         // Layer 1. `Some` only for a protocol vendor (codex): the backend has to
@@ -5588,6 +5653,102 @@ mod build_mapping_tests {
         );
     }
 
+    /// B-09 acceptance (end-to-end through the real spawn argv): a managed
+    /// session (`mcp_strict`) whose allowlist is EMPTY launches claude with
+    /// `--mcp-config {"mcpServers":{}} --strict-mcp-config`, so neither user rows
+    /// nor the machine's ambient `~/.claude` servers reach the session.
+    async fn spawn_claude_argv(config: &AcpBuildExtra, rows: Vec<aionui_db::models::McpServerRow>) -> Vec<String> {
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo { rows });
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+        let _ = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-strict-mcp".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config,
+                metadata: &metadata,
+                skill_delivery: Default::default(),
+                is_custom_workspace: false,
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: Some(&repo),
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+        spawner.last_command().expect("direct backend must reach spawn").args
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_strict_empty_allowlist_has_no_mcp() {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(Vec::new()),
+            mcp_strict: true,
+            ..Default::default()
+        };
+        // An enabled user row exists but is NOT in the (empty) allowlist.
+        let args = spawn_claude_argv(&config, vec![direct_mcp_row("mcp-docs", "mcp-docs")]).await;
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("strict session must always pass --mcp-config");
+        assert_eq!(args[i + 1], r#"{"mcpServers":{}}"#);
+        assert_eq!(args.get(i + 2).map(String::as_str), Some("--strict-mcp-config"));
+    }
+
+    /// Pre-B-09 conversations (no `mcp_strict`) keep the ambient behavior: no
+    /// servers → no MCP flags at all.
+    #[tokio::test]
+    async fn direct_claude_spawn_unmanaged_empty_keeps_ambient() {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(Vec::new()),
+            ..Default::default()
+        };
+        let args = spawn_claude_argv(&config, Vec::new()).await;
+        assert!(!args.iter().any(|a| a == "--mcp-config" || a == "--strict-mcp-config"));
+    }
+
+    /// E2 (C-09): the backend's init-reported inventory maps 1:1 onto the API
+    /// tool surface (names verbatim, isolation from the B-09 launch).
+    #[test]
+    fn tool_surface_maps_backend_inventory_verbatim() {
+        use aionui_api_types::{McpIsolation, ToolSurfaceSource};
+        let surface = tool_surface_from_inventory(aionui_session::ToolInventory {
+            tools: vec!["Bash".into(), "mcp__docs__search".into()],
+            mcp_servers: vec![("docs".into(), "connected".into())],
+            mcp_strict: true,
+        });
+        assert_eq!(surface.source, ToolSurfaceSource::ClaudeInit);
+        assert_eq!(surface.tools, vec!["Bash", "mcp__docs__search"]);
+        assert_eq!(surface.mcp_servers[0].name, "docs");
+        assert_eq!(surface.mcp_servers[0].status.as_deref(), Some("connected"));
+        assert_eq!(surface.mcp_isolation, McpIsolation::Strict);
+        let ambient = tool_surface_from_inventory(aionui_session::ToolInventory::default());
+        assert_eq!(ambient.mcp_isolation, McpIsolation::Ambient);
+    }
+
+    #[test]
+    fn acp_build_extra_mcp_strict_defaults_false_and_round_trips() {
+        let legacy: AcpBuildExtra = serde_json::from_value(serde_json::json!({"backend": "claude"})).unwrap();
+        assert!(!legacy.mcp_strict);
+        let managed: AcpBuildExtra = serde_json::from_value(serde_json::json!({"mcp_strict": true})).unwrap();
+        assert!(managed_mcp_surface(&managed));
+    }
+
     #[test]
     fn session_cli_program_prefers_explicit_command_override() {
         let mut metadata = test_metadata(Some("claude"), None);
@@ -7984,6 +8145,9 @@ mod pump_tests {
     struct GatedScriptBackend {
         script: Vec<SessionEnvelope>,
         gate: Arc<tokio::sync::Notify>,
+        /// What `capabilities()` reports — lets a test seed the backend-side
+        /// current model/mode that `open_session` would have written.
+        caps: Capabilities,
     }
 
     #[async_trait::async_trait]
@@ -8010,7 +8174,7 @@ mod pump_tests {
                 .boxed()
         }
         fn capabilities(&self) -> Capabilities {
-            Capabilities::default()
+            self.caps.clone()
         }
     }
 
@@ -8054,10 +8218,16 @@ mod pump_tests {
     // before releasing is what makes the collection deterministic — see
     // `GatedScriptBackend`.
     async fn drain_script(script: Vec<SessionEnvelope>) -> Vec<AgentStreamEvent> {
+        drain_script_with_caps(script, Capabilities::default()).await
+    }
+
+    // `drain_script` over a backend whose `capabilities()` reports `caps`.
+    async fn drain_script_with_caps(script: Vec<SessionEnvelope>, caps: Capabilities) -> Vec<AgentStreamEvent> {
         let gate = Arc::new(tokio::sync::Notify::new());
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps,
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -8315,6 +8485,67 @@ mod pump_tests {
             model_values,
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
+        );
+    }
+
+    // A task rebuilt after an idle reclaim is driven by `send_message`, which never
+    // goes through REST `get_config_options` — so the pushed catalog frame is the only
+    // source of the picker's highlight. `open_session` has already written the spawn
+    // model/mode into `capabilities()`; the frame must carry them instead of `None`,
+    // which made the frontend fall back to the creation-time model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_carries_spawn_seeded_current_model() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let model = |id: &str| ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            reasoning_efforts: Vec::new(),
+            codex: None,
+        };
+        let caps = Capabilities {
+            current_model: Some("fable".into()),
+            current_mode: Some("bypassPermissions".into()),
+            ..Capabilities::default()
+        };
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: vec![model("fable"), model("opus")],
+            modes: vec![ModeInfo {
+                id: "bypassPermissions".into(),
+                name: "Bypass Permissions".into(),
+                description: None,
+            }],
+            slash_commands: Vec::new(),
+        })];
+        let frames = drain_script_with_caps(script, caps).await;
+        let config = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => Some(v),
+                _ => None,
+            })
+            .expect("CatalogUpdated must project to an AcpConfigOption frame");
+        let options = config
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .expect("config_options array");
+        let current = |category: &str| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(|c| c.as_str()) == Some(category))
+                .unwrap_or_else(|| panic!("{category} category"))
+                .get("current_value")
+                .cloned()
+        };
+        assert_eq!(
+            current("model"),
+            Some(serde_json::json!("fable")),
+            "the spawn model from capabilities() must ride the catalog frame"
+        );
+        assert_eq!(
+            current("mode"),
+            Some(serde_json::json!("bypassPermissions")),
+            "the spawn mode from capabilities() must ride the catalog frame"
         );
     }
 
@@ -9486,6 +9717,7 @@ mod pump_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps: Capabilities::default(),
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,

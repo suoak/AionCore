@@ -139,12 +139,12 @@ pub use conversation::{
     ConversationCapabilities, ConversationInputListResponse, ConversationInputMode, ConversationInputReceipt,
     ConversationInputResponse, ConversationInputStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
-    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
-    ForkConversationRequest, InputChangedEvent, ListConversationInputsQuery, ListConversationsQuery, ListMessagesQuery,
-    McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
-    MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SessionRef, SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest,
-    UpdateConversationRequest,
+    ConversationRuntimeSummary, ConversationToolSurface, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ForkCapabilityView, ForkConversationRequest, InputChangedEvent, ListConversationInputsQuery,
+    ListConversationsQuery, ListMessagesQuery, McpIsolation, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SessionRef, SubmitConversationInputRequest, ToolEnforcementLevel,
+    ToolSurfaceMcpServer, ToolSurfaceSource, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,
