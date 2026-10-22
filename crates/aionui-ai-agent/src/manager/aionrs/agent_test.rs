@@ -119,6 +119,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         session_directory: env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
         skills: Vec::new(),
+        skill_roots: Vec::new(),
         extra_mcp_servers: HashMap::new(),
         bedrock_config: None,
         runtime_env: Vec::new(),
@@ -789,4 +790,183 @@ async fn switching_from_yolo_to_default_restores_tool_approval() {
     assert!(engine_flag.load(Ordering::SeqCst));
     agent.set_config_option("mode", "auto_edit").await.unwrap();
     assert!(!engine_flag.load(Ordering::SeqCst));
+}
+
+/// Records what the engine shows the model (system prompt, tool results) and
+/// replays one scripted tool-use turn followed by a closing text turn.
+struct SkillProbeProvider {
+    first_turn: std::sync::Mutex<Option<Vec<LlmEvent>>>,
+    system_prompts: std::sync::Mutex<Vec<String>>,
+    tool_results: std::sync::Mutex<Vec<(bool, String)>>,
+}
+
+impl SkillProbeProvider {
+    fn invoking_skills(names: &[&str]) -> Self {
+        let mut events = names
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| LlmEvent::ToolUse {
+                id: format!("skill-{idx}"),
+                name: "Skill".into(),
+                input: json!({ "skill": name }),
+                extra: None,
+            })
+            .collect::<Vec<_>>();
+        events.push(LlmEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+        });
+        Self {
+            first_turn: std::sync::Mutex::new(Some(events)),
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+            tool_results: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SkillProbeProvider {
+    async fn stream(&self, request: &LlmRequest) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.system_prompts.lock().unwrap().push(request.system.clone());
+        self.tool_results.lock().unwrap().extend(
+            request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult { content, is_error, .. } => Some((*is_error, content.clone())),
+                    _ => None,
+                }),
+        );
+        let events = self.first_turn.lock().unwrap().take().unwrap_or_else(|| {
+            vec![
+                LlmEvent::TextDelta("done".into()),
+                LlmEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                },
+            ]
+        });
+        let (sender, receiver) = mpsc::channel(16);
+        tokio::spawn(async move {
+            for event in events {
+                let _ = sender.send(event).await;
+            }
+        });
+        Ok(receiver)
+    }
+}
+
+fn write_project_skill(project_root: &std::path::Path, layout: &str, name: &str, body: &str) {
+    let dir = project_root.join(layout).join("skills").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {name} skill\n---\n{body}\n"),
+    )
+    .unwrap();
+}
+
+/// C-01 / B-13: a skill planted in the opened workspace (either the branded or
+/// the legacy layout) must not be loaded, while the conversation's enabled skill
+/// delivered through the isolated root IS resolvable by the `Skill` tool.
+#[tokio::test]
+async fn isolated_skill_roots_load_enabled_skills_and_ignore_workspace_skills() {
+    let workspace = tempfile::tempdir().unwrap();
+    write_project_skill(workspace.path(), ".csbu-workmate", "evil-branded", "EVIL_BRANDED_BODY");
+    write_project_skill(workspace.path(), ".aionrs", "evil-legacy", "EVIL_LEGACY_BODY");
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let source = data_dir.path().join("user-skills").join("enabled-skill");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: enabled-skill\ndescription: enabled skill\n---\nENABLED_SKILL_BODY\n",
+    )
+    .unwrap();
+    let root = aionui_extension::skill_view::rebuild_aionrs_skill_root(
+        data_dir.path(),
+        "user_a",
+        "conv_skills",
+        &[aionui_extension::ResolvedAgentSkill {
+            name: "enabled-skill".into(),
+            source_path: source,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let mut config =
+        resolve_aionui_config(&make_cli_args(workspace.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+    config.session.enabled = false;
+    config.tools.auto_approve = true;
+    let provider = Arc::new(SkillProbeProvider::invoking_skills(&[
+        "enabled-skill",
+        "evil-branded",
+        "evil-legacy",
+    ]));
+    let mut engine = isolate_session_skills(
+        AgentBootstrap::new(config, workspace.path().to_string_lossy(), Arc::new(NullSink)).provider(provider.clone()),
+        vec![root],
+    )
+    .build()
+    .await
+    .unwrap()
+    .engine;
+
+    engine.run("use the skills", "skill-isolation-test").await.unwrap();
+
+    let results = provider.tool_results.lock().unwrap().clone();
+    assert!(
+        results
+            .iter()
+            .any(|(is_error, content)| !*is_error && content.contains("ENABLED_SKILL_BODY")),
+        "the enabled skill must resolve through the Skill tool: {results:?}"
+    );
+    for evil in ["evil-branded", "evil-legacy"] {
+        assert!(
+            results
+                .iter()
+                .any(|(is_error, content)| *is_error && content.contains(&format!("Skill '{evil}' not found"))),
+            "workspace skill {evil} must not be loaded: {results:?}"
+        );
+    }
+    assert!(!results.iter().any(|(_, content)| content.contains("EVIL_")));
+    let prompts = provider.system_prompts.lock().unwrap();
+    assert!(
+        prompts
+            .iter()
+            .all(|prompt| !prompt.contains("evil-branded") && !prompt.contains("evil-legacy"))
+    );
+}
+
+/// An empty root list (view unavailable) must still isolate: the workspace skill
+/// stays invisible rather than the loader falling back to scanning it.
+#[tokio::test]
+async fn empty_isolated_skill_roots_never_fall_back_to_the_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    write_project_skill(workspace.path(), ".csbu-workmate", "evil-branded", "EVIL_BRANDED_BODY");
+
+    let mut config =
+        resolve_aionui_config(&make_cli_args(workspace.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+    config.session.enabled = false;
+    config.tools.auto_approve = true;
+    let provider = Arc::new(SkillProbeProvider::invoking_skills(&["evil-branded"]));
+    let mut engine = isolate_session_skills(
+        AgentBootstrap::new(config, workspace.path().to_string_lossy(), Arc::new(NullSink)).provider(provider.clone()),
+        Vec::new(),
+    )
+    .build()
+    .await
+    .unwrap()
+    .engine;
+
+    engine.run("use the skill", "skill-isolation-empty").await.unwrap();
+
+    let results = provider.tool_results.lock().unwrap().clone();
+    assert!(!results.iter().any(|(_, content)| content.contains("EVIL_BRANDED_BODY")));
+    assert!(
+        results.iter().all(|(is_error, _)| *is_error),
+        "no workspace skill may execute: {results:?}"
+    );
 }

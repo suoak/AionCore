@@ -174,6 +174,13 @@ pub struct AionrsResolvedConfig {
     pub session_mode: Option<String>,
     /// Resolved skill names from the conversation snapshot.
     pub skills: Vec<String>,
+    /// Isolated skill project roots handed to aionrs'
+    /// `AgentBootstrap::isolated_skill_dirs`. Each root holds
+    /// `.csbu-workmate/skills/{name}` links to this conversation's enabled
+    /// skills. ALWAYS applied in isolated mode: an empty list means "bundled
+    /// skills only" and never falls back to scanning the workspace or the
+    /// user-level aionrs directory.
+    pub skill_roots: Vec<PathBuf>,
     /// Extra MCP servers to inject (team coordination or guide).
     pub extra_mcp_servers: HashMap<String, aion_config::config::McpServerConfig>,
     /// AWS Bedrock credentials (region + access key or profile).

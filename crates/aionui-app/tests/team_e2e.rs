@@ -1244,11 +1244,12 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     assert_eq!(stop_resp.status(), StatusCode::OK);
 }
 
-// ES-1c: member conversations carry the user's globally enabled MCP snapshot
-// (non-builtin row ids + builtin session servers, e.g. chrome-devtools), and a
-// runtime restart self-heals the snapshot after toggle changes.
+// ES-1c (B-10): members bound to an assistant carry exactly that assistant's
+// MCP allowlist (non-builtin row ids + builtin session servers, e.g.
+// chrome-devtools) -- never the user's whole global enabled set -- and a
+// runtime restart re-resolves the allowlist's rows (a deleted row drops out).
 #[tokio::test]
-async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
+async fn es1c_team_conversations_carry_assistant_mcp_allowlist_including_builtin() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -1333,6 +1334,19 @@ async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
     .await
     .expect("seed reserved-name mcp");
 
+    // The team assistant's allowlist (B-10). `mcp-e2e-off` is deliberately NOT
+    // listed, so turning it on globally later must not reach the member.
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    sqlx::query(
+        "UPDATE assistant_definitions SET default_mcps_mode = 'fixed', default_mcp_ids = ? \
+         WHERE assistant_id = ?",
+    )
+    .bind(r#"["mcp-e2e-docs","mcp-e2e-chrome","mcp-e2e-broken","mcp-e2e-reserved"]"#)
+    .bind(DEFAULT_TEAM_ASSISTANT_ID)
+    .execute(&pool)
+    .await
+    .expect("pin the team assistant's MCP allowlist");
+
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let lead = &data["assistants"][0];
@@ -1377,9 +1391,11 @@ async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
         assert!(extra.get("selected_session_mcp_servers").is_none(), "{conversation_id}");
     }
 
-    // Self-heal: toggle enabled flags, then force a runtime restart; the
-    // refreshed snapshot must drop the disabled row and pick up the new one.
-    sqlx::query("UPDATE mcp_servers SET enabled = 0 WHERE id = 'mcp-e2e-docs'")
+    // Self-heal: delete an allowlisted row and globally enable a row that is
+    // NOT on the allowlist, then force a runtime restart; the refreshed
+    // snapshot must drop the deleted row and must not pick up the other one.
+    sqlx::query("UPDATE mcp_servers SET deleted_at = ? WHERE id = 'mcp-e2e-docs'")
+        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
@@ -1427,13 +1443,11 @@ async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
         "member runtime restart should succeed: {restart_body}"
     );
     let extra = conversation_extra(&services, lead_conversation_id).await;
-    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["mcp_server_ids"], json!([]));
     assert_eq!(extra["session_mcp_servers"][0]["name"], json!("chrome-devtools"));
-    assert_eq!(
-        extra["mcp_servers"],
-        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
-    );
-    assert_eq!(extra["mcp_statuses"].as_array().unwrap().len(), 3);
+    assert_eq!(extra["mcp_servers"], json!(["chrome-devtools", "broken-builtin"]));
+    assert_eq!(extra["mcp_statuses"].as_array().unwrap().len(), 2);
+    assert!(!extra.to_string().contains("mcp-e2e-off"));
 
     services
         .conversation_service
@@ -1458,12 +1472,9 @@ async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
         "second member runtime restart should succeed: {restart_body}"
     );
     let extra = conversation_extra(&services, lead_conversation_id).await;
-    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["mcp_server_ids"], json!([]));
     assert_eq!(extra["session_mcp_servers"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        extra["mcp_servers"],
-        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
-    );
+    assert_eq!(extra["mcp_servers"], json!(["chrome-devtools", "broken-builtin"]));
 }
 
 #[tokio::test]

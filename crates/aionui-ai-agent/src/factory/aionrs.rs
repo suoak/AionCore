@@ -45,6 +45,40 @@ fn merge_skill_index_into_system_prompt(system_prompt: Option<String>, index: &s
     }
 }
 
+/// Materialize this conversation's isolated aionrs skill root.
+///
+/// Returns at most one root. On failure the list is EMPTY, which still runs
+/// aionrs in isolated mode (bundled skills only): losing the session's skills is
+/// recoverable, silently loading the workspace's skills is not.
+async fn isolated_skill_roots(
+    deps: &AgentFactoryDeps,
+    user_id: &str,
+    conversation_id: &str,
+    skills: &[String],
+) -> Vec<std::path::PathBuf> {
+    let skill_dirs = deps.skill_manager.resolve_skill_dirs_for_user(user_id, skills).await;
+    let resolved = skill_dirs
+        .into_iter()
+        .map(|dir| aionui_extension::ResolvedAgentSkill {
+            name: dir.name,
+            source_path: std::path::PathBuf::from(dir.path),
+        })
+        .collect::<Vec<_>>();
+    match aionui_extension::skill_view::rebuild_aionrs_skill_root(&deps.data_dir, user_id, conversation_id, &resolved)
+        .await
+    {
+        Ok(root) => vec![root],
+        Err(error) => {
+            warn!(
+                conversation_id,
+                error = %error,
+                "aionrs isolated skill root unavailable; running with bundled skills only"
+            );
+            Vec::new()
+        }
+    }
+}
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
@@ -91,6 +125,13 @@ pub(super) async fn build(
         overrides.system_prompt.take(),
         &skill_index_text(&deps, &ctx.user_id, &resolved_skills).await,
     );
+
+    // Hand aionrs this conversation's enabled skills as an ISOLATED skill root
+    // (C-01 / B-13). The directories come from the same resolution the other
+    // lanes use (`resolve_skill_dirs_for_user`, see `resolve_skill_delivery`),
+    // so the `Skill` tool and the injected index agree by construction, and the
+    // workspace's `.csbu-workmate/skills` / `.aionrs/skills` are never scanned.
+    let skill_roots = isolated_skill_roots(&deps, &ctx.user_id, &ctx.conversation_id, &resolved_skills).await;
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
@@ -197,6 +238,7 @@ pub(super) async fn build(
         session_directory,
         session_mode: overrides.session_mode,
         skills: resolved_skills,
+        skill_roots,
         extra_mcp_servers,
         bedrock_config,
         runtime_env: ctx.runtime_env,

@@ -77,6 +77,20 @@ fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     Ok(config)
 }
 
+/// Restrict the embedded engine's skill discovery to WorkMate-owned roots.
+///
+/// Without this, aionrs' default loader walks the WORKSPACE for
+/// `.csbu-workmate/skills` / `.aionrs/skills` and also reads the user-level
+/// aionrs directory: an opened (possibly untrusted) repository could ship a
+/// skill that every session in that folder then loads, and skills pinned to one
+/// assistant leak to every other session (B-13). Isolated mode loads only the
+/// given roots plus aionrs' bundled skills, and is applied even when `roots` is
+/// empty so a missing view degrades to "no WorkMate skills", never to the
+/// workspace.
+pub(crate) fn isolate_session_skills(bootstrap: AgentBootstrap, roots: Vec<PathBuf>) -> AgentBootstrap {
+    bootstrap.isolated_skill_dirs(roots)
+}
+
 /// Directory used as aionrs' "project dir" for config resolution.
 ///
 /// aionrs reads `<project_dir>/.aionrs.toml`. The embedded runtime must never
@@ -282,9 +296,12 @@ impl AionrsAgentManager {
             .unwrap_or_default();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
-            .runtime_env(runtime_env)
-            .tool_policy(tool_policy);
+        let mut bootstrap = isolate_session_skills(
+            AgentBootstrap::new(config, &workspace, sink)
+                .runtime_env(runtime_env)
+                .tool_policy(tool_policy),
+            config_extra.skill_roots.clone(),
+        );
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,

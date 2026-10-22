@@ -237,6 +237,95 @@ pub async fn rebuild_view(
     Ok(created)
 }
 
+/// Sub-directory of the view that serves as the embedded aionrs engine's
+/// isolated skill PROJECT ROOT.
+///
+/// aionrs' `AgentBootstrap::isolated_skill_dirs` interprets every directory it
+/// is given as a project root holding `.csbu-workmate/skills/{name}/SKILL.md`,
+/// so the flat `{view}/skills` tree cannot be handed over as-is. This root
+/// lives inside the view (hidden, so neither claude's plugin scan nor codex's
+/// `{view}/skills` root sees it), which means `remove_view` and
+/// `cleanup_orphan_views` reclaim it with no extra bookkeeping.
+const AIONRS_ROOT_DIR_NAME: &str = ".aionrs-root";
+/// The canonical CSBU WorkMate project-skills directory aionrs scans.
+const AIONRS_PROJECT_SKILLS_DIR: [&str; 2] = [".csbu-workmate", "skills"];
+
+/// The isolated aionrs skill project root for one conversation.
+pub fn aionrs_skill_root(data_dir: &Path, user_id: &str, conversation_id: &str) -> Result<PathBuf, ExtensionError> {
+    Ok(view_dir(data_dir, user_id, conversation_id)?.join(AIONRS_ROOT_DIR_NAME))
+}
+
+/// Rebuild the aionrs isolated skill root so it holds EXACTLY `skills`.
+///
+/// Returns the project root to pass to `AgentBootstrap::isolated_skill_dirs`.
+/// The root is always created (possibly empty) so the caller can isolate the
+/// engine even for a conversation with no skills: an empty root means "only
+/// bundled skills", never "fall back to the workspace".
+///
+/// Serialized with [`rebuild_view`] through the same per-conversation lock.
+/// Like the view, a failed link is skipped with a `warn` (no copy fallback).
+pub async fn rebuild_aionrs_skill_root(
+    data_dir: &Path,
+    user_id: &str,
+    conversation_id: &str,
+    skills: &[ResolvedAgentSkill],
+) -> Result<PathBuf, ExtensionError> {
+    let root = aionrs_skill_root(data_dir, user_id, conversation_id)?;
+    let skills_dir = AIONRS_PROJECT_SKILLS_DIR
+        .iter()
+        .fold(root.clone(), |path, segment| path.join(segment));
+
+    let lock = view_lock(user_id, conversation_id);
+    let _serialized = lock.lock().await;
+
+    // Only our own links live here, so a wholesale replace is safe and keeps
+    // the set exact (a skill dropped from the snapshot must disappear).
+    // `remove_dir_all` removes the LINKS, never their targets.
+    match tokio::fs::remove_dir_all(&skills_dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ExtensionError::Io(e)),
+    }
+    tokio::fs::create_dir_all(&skills_dir).await?;
+
+    let mut created = 0usize;
+    for skill in skills {
+        if validate_segment(&skill.name, "skill name").is_err() {
+            warn!(
+                conversation_id = %conversation_id,
+                "skill_view: unsafe skill name skipped from the aionrs skill root"
+            );
+            continue;
+        }
+        if !tokio::fs::try_exists(&skill.source_path).await.unwrap_or(false) {
+            warn!(
+                skill = %skill.name,
+                conversation_id = %conversation_id,
+                "skill_view: source directory missing; skipping this skill for aionrs"
+            );
+            continue;
+        }
+        match create_symlink(&skill.source_path, &skills_dir.join(&skill.name)).await {
+            Ok(()) => created += 1,
+            Err(e) => warn!(
+                skill = %skill.name,
+                conversation_id = %conversation_id,
+                error = %e,
+                "skill_view: failed to link skill into the aionrs skill root"
+            ),
+        }
+    }
+
+    info!(
+        user_id = %user_id,
+        conversation_id = %conversation_id,
+        skills = created,
+        requested = skills.len(),
+        "skill_view: rebuilt aionrs isolated skill root"
+    );
+    Ok(root)
+}
+
 /// Skill names currently linked in the view. Empty when the view does not exist
 /// yet, which is indistinguishable from "no skills" on purpose: both mean there
 /// is no previous state to diff against.
@@ -332,6 +421,73 @@ mod tests {
             name: name.to_owned(),
             source_path: dir,
         }
+    }
+
+    #[tokio::test]
+    async fn aionrs_skill_root_uses_the_branded_project_layout_inside_the_view() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let sources = tmp.path().join("sources");
+        let cron = write_source_skill(&sources, "cron");
+        let pdf = write_source_skill(&sources, "pdf");
+
+        let root = rebuild_aionrs_skill_root(&data_dir, "user_a", "conv_1", &[cron.clone(), pdf])
+            .await
+            .unwrap();
+        assert_eq!(
+            root,
+            view_dir(&data_dir, "user_a", "conv_1").unwrap().join(".aionrs-root")
+        );
+        let skills_dir = root.join(".csbu-workmate").join("skills");
+        assert_eq!(
+            std::fs::read_to_string(skills_dir.join("cron").join("references").join("notes.md")).unwrap(),
+            "REFTOKEN"
+        );
+
+        // Exact match on rebuild: a skill that left the snapshot disappears.
+        rebuild_aionrs_skill_root(&data_dir, "user_a", "conv_1", &[cron])
+            .await
+            .unwrap();
+        assert!(skills_dir.join("cron").exists());
+        assert!(skills_dir.join("pdf").symlink_metadata().is_err());
+        // The real source is untouched.
+        assert!(sources.join("pdf").join("SKILL.md").exists());
+
+        // An empty snapshot still yields an (empty) isolated root.
+        let root = rebuild_aionrs_skill_root(&data_dir, "user_a", "conv_1", &[])
+            .await
+            .unwrap();
+        assert!(root.join(".csbu-workmate").join("skills").is_dir());
+        assert_eq!(
+            std::fs::read_dir(root.join(".csbu-workmate").join("skills"))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        // Removing the view reclaims the aionrs root too.
+        assert!(remove_view(&data_dir, "user_a", "conv_1").await.unwrap());
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn aionrs_skill_root_refuses_traversal_ids_and_skill_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        assert!(rebuild_aionrs_skill_root(&data_dir, "..", "conv_1", &[]).await.is_err());
+        let sources = tmp.path().join("sources");
+        let mut evil = write_source_skill(&sources, "evil");
+        evil.name = "../escape".into();
+        let root = rebuild_aionrs_skill_root(&data_dir, "user_a", "conv_1", &[evil])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.join(".csbu-workmate").join("skills"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!root.join(".csbu-workmate").join("escape").exists());
     }
 
     #[test]
