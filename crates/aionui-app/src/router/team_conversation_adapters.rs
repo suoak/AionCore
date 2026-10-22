@@ -508,6 +508,17 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<TeamMcpSelection, TeamError> {
+        self.conversation_service
+            .resolve_assistant_mcp_selection(user_id, assistant_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
     async fn resolve_conversation_mcp_snapshot(
         &self,
         user_id: &str,
@@ -526,8 +537,10 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                 ))
             })?;
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        // B-10: an assistant-bound member keeps its assistant's allowlist on
+        // every attach; only unbound members refresh from the global set.
         self.conversation_service
-            .resolve_global_mcp_snapshot(user_id, &agent_type, &extra)
+            .resolve_team_member_mcp_snapshot(user_id, conversation_id, &agent_type, &extra)
             .await
             .map_err(map_conversation_update_error)
     }

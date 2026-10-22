@@ -142,6 +142,19 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         Ok(TeamMcpSelection::default())
     }
 
+    /// Resolve the MCP allowlist of a member bound to `assistant_id`: exactly
+    /// that assistant's `resolved_defaults.mcp_ids` (B-10), in the same two
+    /// create-time shapes as [`Self::resolve_global_mcp_selection`]. An empty
+    /// allowlist mounts nothing. The default is the fail-closed empty set.
+    async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<TeamMcpSelection, TeamError> {
+        let _ = (user_id, assistant_id);
+        Ok(TeamMcpSelection::default())
+    }
+
     /// Resolve the user's globally enabled MCP servers into the full typed
     /// four-field runtime snapshot for an existing conversation's agent
     /// (names + statuses classified against its transport support). Used by
@@ -198,6 +211,33 @@ impl TeamAgentProvisioner {
         }
     }
 
+    /// The MCP selection one member may mount (B-10).
+    ///
+    /// A member bound to an assistant gets exactly that assistant's
+    /// `resolved_defaults.mcp_ids` -- an empty allowlist mounts nothing, and
+    /// the global enabled set is never consulted for it. An unbound member
+    /// (raw backend) keeps the legacy global selection, resolved at most once
+    /// per call site through `global`.
+    async fn member_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: Option<&str>,
+        global: &mut Option<TeamMcpSelection>,
+    ) -> Result<TeamMcpSelection, TeamError> {
+        if let Some(assistant_id) = assistant_id {
+            return self
+                .conversation_port
+                .resolve_assistant_mcp_selection(user_id, assistant_id)
+                .await;
+        }
+        if let Some(selection) = global.as_ref() {
+            return Ok(selection.clone());
+        }
+        let selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
+        *global = Some(selection.clone());
+        Ok(selection)
+    }
+
     fn workspace_resolver(&self) -> TeamWorkspaceResolver {
         TeamWorkspaceResolver::new(self.repo.clone(), self.conversation_port.clone())
     }
@@ -232,12 +272,20 @@ impl TeamAgentProvisioner {
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
         let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
-        // Resolve the user's globally enabled MCP selection ONCE, before any
-        // conversation is created, and share it across every member (leader +
-        // teammates): N queries would be redundant and could observe an
-        // inconsistent toggle state mid-provisioning. A read failure aborts
-        // here, before any orphan conversation can be created.
-        let mcp_selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
+        // Resolve every member's MCP selection BEFORE any conversation is
+        // created, so a read failure aborts here rather than leaving orphan
+        // conversations. Members bound to an assistant get that assistant's
+        // allowlist (B-10); unbound members share ONE global resolution so they
+        // cannot observe an inconsistent toggle state mid-provisioning.
+        let mut global_selection = None;
+        let mut member_selections = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
+            member_selections.push(
+                self.member_mcp_selection(user_id, assistant_id.as_deref(), &mut global_selection)
+                    .await?,
+            );
+        }
         let leader_backend = self
             .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
@@ -253,7 +301,7 @@ impl TeamAgentProvisioner {
                 leader_assistant_id.as_deref(),
                 shared_workspace,
                 None,
-                Some(&mcp_selection),
+                Some(&member_selections[*leader_idx]),
             )
             .await?;
 
@@ -284,10 +332,11 @@ impl TeamAgentProvisioner {
             cli_path: None,
         });
 
-        for (input, role) in inputs
+        for ((input, role), mcp_selection) in inputs
             .iter()
             .zip(roles.iter())
-            .filter(|(_, role)| **role == TeammateRole::Teammate)
+            .zip(member_selections.iter())
+            .filter(|((_, role), _)| **role == TeammateRole::Teammate)
         {
             let slot_id = generate_id();
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
@@ -306,7 +355,7 @@ impl TeamAgentProvisioner {
                     assistant_id.as_deref(),
                     Some(&team_workspace),
                     None,
-                    Some(&mcp_selection),
+                    Some(mcp_selection),
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -360,8 +409,10 @@ impl TeamAgentProvisioner {
         let backend = self
             .resolve_requested_backend(user_id, req.backend.as_deref(), assistant_id.as_deref())
             .await?;
-        // Resolve the global MCP selection once for this agent.
-        let mcp_selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
+        // The assistant's allowlist for a bound member, else the global set.
+        let mcp_selection = self
+            .member_mcp_selection(user_id, assistant_id.as_deref(), &mut None)
+            .await?;
         let agent = self
             .provision_new_agent(
                 NewAgentProvisioning {
@@ -418,10 +469,10 @@ impl TeamAgentProvisioner {
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
-        // Resolve the global MCP selection once for this spawned agent.
+        // The assistant's allowlist for a bound member, else the global set.
+        let spawned_assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let mcp_selection = self
-            .conversation_port
-            .resolve_global_mcp_selection(&req.user_id)
+            .member_mcp_selection(&req.user_id, spawned_assistant_id.as_deref(), &mut None)
             .await?;
         let agent = self
             .provision_new_agent(

@@ -7591,18 +7591,129 @@ impl ConversationService {
         })
     }
 
-    /// Resolve the operator's globally enabled MCP servers into a full typed
-    /// runtime snapshot (four fields) classified against the given agent type
-    /// and `extra`. Used by the team attach path to refresh the persisted
-    /// snapshot before rebuilding a member session. Read-only — the caller
-    /// persists via `update_extra`.
-    pub async fn resolve_global_mcp_snapshot(
+    /// Resolve an explicit MCP id allowlist into the two create-time request
+    /// shapes: active non-builtin rows by id, active builtin rows as neutral
+    /// session servers (launch commands resolved server-side).
+    ///
+    /// Used for team members bound to an assistant (B-10): the member gets
+    /// exactly its assistant's `resolved_defaults.mcp_ids`. An empty allowlist
+    /// yields an empty selection -- nothing is mounted. Unknown / deleted ids
+    /// and the reserved team bridge name are dropped.
+    pub async fn resolve_mcp_selection_for_ids(
         &self,
         user_id: &str,
+        ids: &[String],
+    ) -> Result<TeamMcpSelection, ConversationError> {
+        let mut selection = TeamMcpSelection::default();
+        if ids.is_empty() {
+            return Ok(selection);
+        }
+        let repo = {
+            let repo_guard = self
+                .mcp_server_repo
+                .read()
+                .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?;
+            repo_guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
+        };
+        let rows = repo
+            .list_active_by_ids(user_id, ids)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load allowlisted MCP servers: {e}")))?;
+        for row in rows {
+            if row.name == TEAM_MCP_SERVER_NAME || !ids.iter().any(|id| id == &row.id) {
+                continue;
+            }
+            if row.builtin {
+                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
+                    Ok(server) => selection.session_mcp_servers.push(server),
+                    Err(err) => {
+                        selection.mcp_statuses.push(ConversationMcpStatus {
+                            id: row.id.clone(),
+                            name: row.name.clone(),
+                            status: ConversationMcpStatusKind::Failed,
+                            reason: Some(err.clone()),
+                        });
+                        warn!(
+                            user_id,
+                            server_id = %row.id,
+                            server_name = %row.name,
+                            error = %err,
+                            "user_mcp: malformed builtin row skipped from allowlisted snapshot"
+                        );
+                    }
+                }
+            } else {
+                selection.mcp_server_ids.push(row.id);
+            }
+        }
+        Ok(selection)
+    }
+
+    /// The MCP selection a team member bound to `assistant_id` may mount: that
+    /// assistant's `resolved_defaults.mcp_ids` allowlist (B-10), never the
+    /// user's global enabled set. An assistant that cannot be resolved yields
+    /// an EMPTY selection (fail closed).
+    pub async fn resolve_assistant_mcp_selection(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<TeamMcpSelection, ConversationError> {
+        let snapshot = self
+            .resolve_assistant_snapshot(
+                user_id,
+                assistant_id,
+                None,
+                &AssistantConversationOverrides::default(),
+                &serde_json::Value::Object(Default::default()),
+            )
+            .await?;
+        let Some(snapshot) = snapshot else {
+            warn!(
+                user_id,
+                assistant_id, "team member assistant could not be resolved; mounting no user MCP"
+            );
+            return Ok(TeamMcpSelection::default());
+        };
+        self.resolve_mcp_selection_for_ids(user_id, &snapshot.resolved_defaults.mcp_ids)
+            .await
+    }
+
+    /// Refresh a team member's runtime MCP snapshot on attach.
+    ///
+    /// The allowlist is resolved in this order:
+    /// 1. the conversation's frozen assistant snapshot (`resolved_mcp_ids`);
+    /// 2. the assistant named in `extra.assistant_id` (live resolution);
+    /// 3. no assistant binding: the user's global enabled selection (unchanged
+    ///    legacy behavior for raw-backend members).
+    pub async fn resolve_team_member_mcp_snapshot(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
         agent_type: &AgentType,
         extra: &serde_json::Value,
     ) -> Result<McpRuntimeSnapshot, ConversationError> {
-        let selection = self.resolve_global_mcp_selection(user_id).await?;
+        let frozen = self
+            .conversation_repo
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load assistant snapshot: {e}")))?;
+        let assistant_id = extra
+            .get("assistant_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let selection = match (frozen, assistant_id) {
+            (Some(row), _) if !row.assistant_id.trim().is_empty() => {
+                let ids: Vec<String> = serde_json::from_str(&row.resolved_mcp_ids)
+                    .map_err(|e| ConversationError::internal(format!("Invalid frozen assistant MCP allowlist: {e}")))?;
+                self.resolve_mcp_selection_for_ids(user_id, &ids).await?
+            }
+            (_, Some(assistant_id)) => self.resolve_assistant_mcp_selection(user_id, assistant_id).await?,
+            _ => self.resolve_global_mcp_selection(user_id).await?,
+        };
         self.build_runtime_mcp_snapshot(
             user_id,
             Some(&selection.mcp_server_ids),
