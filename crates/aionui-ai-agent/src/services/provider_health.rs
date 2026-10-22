@@ -101,6 +101,7 @@ impl ProviderHealthCheckService {
             session_directory: self.data_dir.join("aionrs-health-check-sessions"),
             session_mode: None,
             skills: Vec::new(),
+            skill_roots: Vec::new(),
             extra_mcp_servers: HashMap::new(),
             bedrock_config,
             runtime_env: Vec::new(),
@@ -242,12 +243,14 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         config.compat.transport.api_path = Some(path);
     }
 
-    AgentBootstrap::new(config, workspace, sink)
-        .runtime_env(config_extra.runtime_env)
-        .build()
-        .await
-        .map(|result| result.engine)
-        .map_err(|error| AgentError::internal(error.to_string()))
+    crate::manager::aionrs::agent::isolate_session_skills(
+        AgentBootstrap::new(config, workspace, sink).runtime_env(config_extra.runtime_env),
+        config_extra.skill_roots,
+    )
+    .build()
+    .await
+    .map(|result| result.engine)
+    .map_err(|error| AgentError::internal(error.to_string()))
 }
 
 fn unhealthy_response(
