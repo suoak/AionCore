@@ -10,6 +10,9 @@ pub enum McpError {
     #[error("Invalid MCP server edit: {0}")]
     InvalidEdit(String),
 
+    #[error("Invalid MCP server name: {0}")]
+    InvalidName(String),
+
     #[error("Invalid transport configuration: {0}")]
     InvalidTransport(String),
 

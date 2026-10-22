@@ -28,6 +28,7 @@ impl From<McpError> for ApiError {
             McpError::NotFound(msg) => ApiError::NotFound(msg),
             McpError::Conflict(msg) => ApiError::Conflict(msg),
             McpError::InvalidEdit(msg) => ApiError::BadRequest(msg),
+            McpError::InvalidName(msg) => ApiError::BadRequest(format!("Invalid MCP server name: {msg}")),
             McpError::InvalidTransport(msg) => ApiError::BadRequest(msg),
             McpError::AgentNotInstalled(msg) => ApiError::BadRequest(msg),
             McpError::AgentOperationFailed(msg) => ApiError::Internal(msg),
