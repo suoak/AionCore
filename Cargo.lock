@@ -434,6 +434,7 @@ dependencies = [
  "aionui-process",
  "aionui-project",
  "aionui-realtime",
+ "aionui-review",
  "aionui-runtime",
  "aionui-session",
  "aionui-session-message",
@@ -859,6 +860,27 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
+]
+
+[[package]]
+name = "aionui-review"
+version = "0.2.20"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "axum",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

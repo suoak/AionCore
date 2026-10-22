@@ -39,6 +39,8 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("cron_job_runs", "job_id", "cron_jobs"),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
+    // M7 E4 diff-annotation replies inherit ownership from review_threads.user_id.
+    ("review_comments", "thread_id", "review_threads"),
     // Plan/Goal execution records inherit ownership from task_sessions.user_id.
     ("task_acceptance_criteria", "task_session_id", "task_sessions"),
     ("task_approvals", "task_session_id", "task_sessions"),
