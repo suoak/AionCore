@@ -12,12 +12,14 @@
 
 pub mod anchor;
 mod error;
+pub mod prompt;
 mod resolver;
 pub mod routes;
 mod service;
 mod types;
 
 pub use error::ReviewError;
+pub use prompt::{REVIEW_BLOCK_MAX_BYTES, render_review_block};
 pub use resolver::{
     AllowedRootsResolver, PE_SCOPE_PREFIX, ProjectDirResolver, ScopeContentResolver, parse_pe_scope, pe_scope_id,
 };
