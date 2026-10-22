@@ -2039,17 +2039,30 @@ pub(crate) fn tool_surface_from_inventory(
         .map(|name| ToolSurfaceEntry::from_claude_tool(name, &server_names))
         .collect();
     entries.extend(inventory.skills.iter().map(|name| ToolSurfaceEntry::skill(name)));
+    // Plan D (detect-only): a reported server WorkMate did not inject came from
+    // the machine's own agent config. A strict launch cannot have any.
+    let is_external = |name: &str| !inventory.mcp_strict && !inventory.managed_mcp_servers.iter().any(|m| m == name);
+    let mcp_servers: Vec<ToolSurfaceMcpServer> = inventory
+        .mcp_servers
+        .iter()
+        .map(|(name, status)| ToolSurfaceMcpServer {
+            name: name.clone(),
+            status: Some(status.clone()),
+            external: is_external(name),
+        })
+        .collect();
+    let external_mcp_servers = mcp_servers
+        .iter()
+        .filter(|server| server.external)
+        .map(|server| server.name.clone())
+        .collect();
     ConversationToolSurface {
-        source: ToolSurfaceSource::ClaudeInit,
+        source: match inventory.source {
+            aionui_session::ToolInventorySource::ClaudeInit => ToolSurfaceSource::ClaudeInit,
+            aionui_session::ToolInventorySource::CodexMcpStatus => ToolSurfaceSource::CodexMcpStatus,
+        },
         tools: inventory.tools,
-        mcp_servers: inventory
-            .mcp_servers
-            .into_iter()
-            .map(|(name, status)| ToolSurfaceMcpServer {
-                name,
-                status: Some(status),
-            })
-            .collect(),
+        mcp_servers,
         mcp_isolation: if inventory.mcp_strict {
             McpIsolation::Strict
         } else {
@@ -2057,8 +2070,9 @@ pub(crate) fn tool_surface_from_inventory(
         },
         tool_policy: None,
         entries,
-        // claude has no ToolSearch-over-empty-deferred problem (C-02 is aionrs).
+        // ToolSearch-over-empty-deferred (C-02) is an aionrs-only condition.
         tool_search_inert: false,
+        external_mcp_servers,
     }
 }
 
@@ -5744,6 +5758,7 @@ mod build_mapping_tests {
             mcp_servers: vec![("docs".into(), "connected".into())],
             mcp_strict: true,
             skills: vec!["pdf".into()],
+            ..Default::default()
         });
         let kinds: Vec<_> = surface
             .entries
@@ -5769,6 +5784,31 @@ mod build_mapping_tests {
         assert_eq!(surface.mcp_isolation, McpIsolation::Strict);
         let ambient = tool_surface_from_inventory(aionui_session::ToolInventory::default());
         assert_eq!(ambient.mcp_isolation, McpIsolation::Ambient);
+    }
+
+    /// Plan D: an ambient (non-strict) session flags every reported server
+    /// WorkMate did not inject as external, and lists them for the UI hint.
+    #[test]
+    fn tool_surface_flags_external_mcp_servers() {
+        use aionui_api_types::ToolSurfaceSource;
+        let surface = tool_surface_from_inventory(aionui_session::ToolInventory {
+            tools: vec!["mcp__docs__search".into(), "mcp__home__lights".into()],
+            mcp_servers: vec![("docs".into(), "ready".into()), ("home".into(), "ready".into())],
+            managed_mcp_servers: vec!["docs".into()],
+            source: aionui_session::ToolInventorySource::CodexMcpStatus,
+            ..Default::default()
+        });
+        assert_eq!(surface.source, ToolSurfaceSource::CodexMcpStatus);
+        assert_eq!(surface.external_mcp_servers, vec!["home"]);
+        assert!(!surface.mcp_servers[0].external && surface.mcp_servers[1].external);
+        assert_eq!(surface.entries[1].server.as_deref(), Some("home"));
+        // A strict launch can carry no external server, whatever it reports.
+        let strict = tool_surface_from_inventory(aionui_session::ToolInventory {
+            mcp_servers: vec![("home".into(), "connected".into())],
+            mcp_strict: true,
+            ..Default::default()
+        });
+        assert!(strict.external_mcp_servers.is_empty());
     }
 
     #[test]
