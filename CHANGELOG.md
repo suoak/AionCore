@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.20](https://github.com/suoak/AionCore/compare/v0.2.19...v0.2.20) (2026-10-22)
+
+
+### Features
+
+* **m7/e2:** codex plan D — report loaded MCP servers, flag external (detect only) ([#154](https://github.com/suoak/AionCore/issues/154)) ([a5b6af8](https://github.com/suoak/AionCore/commit/a5b6af8a34f7a125d439d81e593f009d6343b245))
+* **m7/e2:** normalized tool surface + C-02/C-03/C-06/C-07 core side ([#153](https://github.com/suoak/AionCore/issues/153)) ([51b8f50](https://github.com/suoak/AionCore/commit/51b8f50a5f2b9b20dd5fe468a8e9e6bb920d8265))
+* **m7:** E2 claude strict MCP + real tool inventory (B-09, C-08/C-09, upstream #1019 port) ([#152](https://github.com/suoak/AionCore/issues/152)) ([687a917](https://github.com/suoak/AionCore/commit/687a917d275f1dd7857c221c094a1bbecf1e8ed7))
+
+
+### Bug Fixes
+
+* **security:** E1-a 技能隔离 + MCP 白名单（C-01/B-13、B-12、B-10） ([#150](https://github.com/suoak/AionCore/issues/150)) ([b7a189f](https://github.com/suoak/AionCore/commit/b7a189fdc649a2cd9292a469a3d23eedc1dedd07))
+* **security:** M7 E1 安全收尾：Agent 读权限收窄 + Host 白名单 + 固定权限不可提权 ([#151](https://github.com/suoak/AionCore/issues/151)) ([2169e1a](https://github.com/suoak/AionCore/commit/2169e1a3db4fdd015338ee878e739b54fe164cb7))
+
+
+### Miscellaneous Chores
+
+* **deps:** aionrs pin v0.2.24 → v0.2.25 + C-02 MCP deferred 接线 ([#155](https://github.com/suoak/AionCore/issues/155)) ([0059e5c](https://github.com/suoak/AionCore/commit/0059e5c8ec3855042e3ae05ad61f2c32a48e9693))
+
 ## [0.2.19](https://github.com/suoak/AionCore/compare/v0.2.18...v0.2.19) (2026-10-21)
 
 
