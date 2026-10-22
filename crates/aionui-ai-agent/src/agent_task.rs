@@ -309,6 +309,18 @@ impl AgentInstance {
         }
     }
 
+    /// E2 (C-08/C-09): the tool surface the running agent actually exposes,
+    /// `None` when the backend has not reported one (or cannot).
+    pub fn tool_surface(&self) -> Option<aionui_api_types::ConversationToolSurface> {
+        match self {
+            Self::Session(manager) => manager.tool_surface(),
+            Self::Aionrs(manager) => Some(manager.tool_surface()),
+            Self::Acp(_) => None,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => None,
+        }
+    }
+
     /// Whether this concrete running backend supports native mid-turn steer.
     pub fn supports_steer(&self) -> bool {
         match self {

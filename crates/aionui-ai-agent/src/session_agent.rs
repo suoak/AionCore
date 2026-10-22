@@ -1464,6 +1464,13 @@ impl SessionAgentTask {
         self.backend.capabilities().supported_commands.steer
     }
 
+    /// E2 (C-09): the agent-reported tool surface (claude `system/init`), or
+    /// `None` before the first init / for backends that do not report one.
+    pub fn tool_surface(&self) -> Option<aionui_api_types::ConversationToolSurface> {
+        let inventory = self.backend.tool_inventory()?;
+        Some(tool_surface_from_inventory(inventory))
+    }
+
     /// Apply host input to the current turn and wait for the backend receipt.
     pub async fn steer(&self, input_id: String, content: String) -> Result<(), AgentError> {
         if !self.supports_steer() {
@@ -2016,6 +2023,31 @@ fn clear_stale_model(
          the agent default for this session"
     );
     None
+}
+
+/// E2 (C-09): neutral backend inventory → API tool surface.
+pub(crate) fn tool_surface_from_inventory(
+    inventory: aionui_session::ToolInventory,
+) -> aionui_api_types::ConversationToolSurface {
+    use aionui_api_types::{ConversationToolSurface, McpIsolation, ToolSurfaceMcpServer, ToolSurfaceSource};
+    ConversationToolSurface {
+        source: ToolSurfaceSource::ClaudeInit,
+        tools: inventory.tools,
+        mcp_servers: inventory
+            .mcp_servers
+            .into_iter()
+            .map(|(name, status)| ToolSurfaceMcpServer {
+                name,
+                status: Some(status),
+            })
+            .collect(),
+        mcp_isolation: if inventory.mcp_strict {
+            McpIsolation::Strict
+        } else {
+            McpIsolation::Ambient
+        },
+        tool_policy: None,
+    }
 }
 
 /// B-09: is this session's MCP surface MANAGED by WorkMate? The conversation
@@ -5688,6 +5720,25 @@ mod build_mapping_tests {
         };
         let args = spawn_claude_argv(&config, Vec::new()).await;
         assert!(!args.iter().any(|a| a == "--mcp-config" || a == "--strict-mcp-config"));
+    }
+
+    /// E2 (C-09): the backend's init-reported inventory maps 1:1 onto the API
+    /// tool surface (names verbatim, isolation from the B-09 launch).
+    #[test]
+    fn tool_surface_maps_backend_inventory_verbatim() {
+        use aionui_api_types::{McpIsolation, ToolSurfaceSource};
+        let surface = tool_surface_from_inventory(aionui_session::ToolInventory {
+            tools: vec!["Bash".into(), "mcp__docs__search".into()],
+            mcp_servers: vec![("docs".into(), "connected".into())],
+            mcp_strict: true,
+        });
+        assert_eq!(surface.source, ToolSurfaceSource::ClaudeInit);
+        assert_eq!(surface.tools, vec!["Bash", "mcp__docs__search"]);
+        assert_eq!(surface.mcp_servers[0].name, "docs");
+        assert_eq!(surface.mcp_servers[0].status.as_deref(), Some("connected"));
+        assert_eq!(surface.mcp_isolation, McpIsolation::Strict);
+        let ambient = tool_surface_from_inventory(aionui_session::ToolInventory::default());
+        assert_eq!(ambient.mcp_isolation, McpIsolation::Ambient);
     }
 
     #[test]

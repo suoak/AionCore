@@ -407,6 +407,8 @@ impl BackendConnection for ClaudeConnection {
 pub struct ClaudeSessionBackend {
     session_id: String,
     capabilities: Capabilities,
+    /// B-09: launched with `--strict-mcp-config` (managed MCP surface).
+    mcp_strict: bool,
     /// Retained stdin for prompt/control delivery. `BoxedStdin` taken once from
     /// the process; behind a Mutex so concurrent dispatches serialize at the
     /// byte-frame level only. `Arc` so a wake (`wake_handle`) can swap in the fresh
@@ -769,6 +771,9 @@ struct DiscoveredCaps {
     /// for those rows). Kept private to this module — the reconcile is the only
     /// consumer today, so it does not need to ride `ModelInfo` across the seam.
     resolved_models: std::collections::HashMap<String, String>,
+    /// E2 (C-09): `system/init` `tools[]` + `mcp_servers[]`, refreshed on every
+    /// init (each process run / wake). `None` until the first init arrives.
+    init_tools: Option<InitTools>,
 }
 
 /// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
@@ -902,6 +907,7 @@ impl ClaudeSessionBackend {
             caps.current_mode = config.mode.clone();
             caps
         };
+        let mcp_strict = config.init.strict_mcp || !config.init.mcp_servers.is_empty();
         let adapter = Arc::new(adapter);
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let turn_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1020,6 +1026,7 @@ impl ClaudeSessionBackend {
         Self {
             session_id,
             capabilities,
+            mcp_strict,
             stdin,
             adapter,
             turn_gen,
@@ -1736,6 +1743,7 @@ async fn reader_task(
                     cur_gen,
                     &wake_session_slot,
                 );
+                sniff_init_tools(v, &discovered_caps);
                 // Confirm the in-band `set_model` we sent at spawn/wake landed. The
                 // init frame is the ONLY signal for this (a `set_model` sent mid-turn
                 // has no confirmation channel at all — see dispatch(SetModel)), and it
@@ -2409,6 +2417,41 @@ fn sniff_init(
             });
         }
     }
+}
+
+/// `system/init` tool names + `(mcp server name, status)` pairs.
+type InitTools = (Vec<String>, Vec<(String, String)>);
+
+/// E2 (C-09): capture the agent-reported tool surface from `system/init`
+/// (`tools: [name…]`, `mcp_servers: [{name,status}…]`). Non-init frames and
+/// inits without a `tools` array are ignored, so a partial frame never wipes a
+/// previously captured inventory.
+fn sniff_init_tools(frame: &serde_json::Value, discovered_caps: &Arc<std::sync::Mutex<DiscoveredCaps>>) {
+    use serde_json::Value;
+    if frame.get("type").and_then(Value::as_str) != Some("system")
+        || frame.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return;
+    }
+    let Some(tools) = frame.get("tools").and_then(Value::as_array) else {
+        return;
+    };
+    let tools: Vec<String> = tools.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    let servers: Vec<(String, String)> = frame
+        .get("mcp_servers")
+        .and_then(Value::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|s| {
+                    let name = s.get("name").and_then(Value::as_str)?;
+                    let status = s.get("status").and_then(Value::as_str).unwrap_or("unknown");
+                    Some((name.to_owned(), status.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    discovered_caps.lock().unwrap_or_else(|e| e.into_inner()).init_tools = Some((tools, servers));
 }
 
 /// Sniff the AUTHORITATIVE mode signal: claude stamps `permissionMode` on BOTH its
@@ -3541,6 +3584,16 @@ impl SessionBackend for ClaudeSessionBackend {
     /// (the card's id/call_id) + `tool_name` (the title). The raw tool `input` is NOT
     /// exposed (TIO-13: it carries command bodies / args). claude does not advertise
     /// options, so the recovered card's options default is synthesized frontend-side.
+    fn tool_inventory(&self) -> Option<crate::backend::ToolInventory> {
+        let caps = self.discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
+        let (tools, mcp_servers) = caps.init_tools.clone()?;
+        Some(crate::backend::ToolInventory {
+            tools,
+            mcp_servers,
+            mcp_strict: self.mcp_strict,
+        })
+    }
+
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         self.pending_perms
             .lock()
@@ -7739,6 +7792,34 @@ mod tests {
     /// wake recipe's resume anchor — for a fork (claude always mints a new id)
     /// AND for a plain resume rotation. Without the rotation, the next idle-wake
     /// `--resume <stale>` re-forks / resurrects the parent session.
+    /// E2 (C-09): the init frame's `tools[]` + `mcp_servers[]` become the
+    /// session's tool inventory; a non-init frame or an init without `tools`
+    /// leaves the captured inventory untouched.
+    #[test]
+    fn sniff_init_tools_captures_reported_surface() {
+        let caps = Arc::new(std::sync::Mutex::new(DiscoveredCaps::default()));
+        sniff_init_tools(&serde_json::json!({"type": "assistant"}), &caps);
+        assert!(caps.lock().unwrap().init_tools.is_none());
+        let init = serde_json::json!({
+            "type": "system", "subtype": "init",
+            "tools": ["Bash", "Read", "mcp__docs__search"],
+            "mcp_servers": [{"name": "docs", "status": "connected"}, {"name": "ambient"}]
+        });
+        sniff_init_tools(&init, &caps);
+        let (tools, servers) = caps.lock().unwrap().init_tools.clone().expect("captured");
+        assert_eq!(tools, vec!["Bash", "Read", "mcp__docs__search"]);
+        assert_eq!(
+            servers,
+            vec![
+                ("docs".into(), "connected".into()),
+                ("ambient".into(), "unknown".into())
+            ]
+        );
+        // A later init without `tools` must not wipe the inventory.
+        sniff_init_tools(&serde_json::json!({"type": "system", "subtype": "init"}), &caps);
+        assert!(caps.lock().unwrap().init_tools.is_some());
+    }
+
     #[test]
     fn sniff_init_rotates_wake_session_slot() {
         let slot = Arc::new(std::sync::Mutex::new("parent-sid".to_string()));

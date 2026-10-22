@@ -241,12 +241,60 @@ pub enum ToolEnforcementLevel {
     ObserveOnly,
 }
 
+/// Where a [`ConversationToolSurface`] came from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfaceSource {
+    /// claude `system/init` `tools[]` / `mcp_servers[]`.
+    ClaudeInit,
+    /// aionrs engine tool registry (`AgentEngine::tool_names`).
+    AionrsRegistry,
+}
+
+/// How the session's MCP surface is scoped.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpIsolation {
+    /// Only WorkMate-managed servers can reach the session.
+    Strict,
+    /// Machine-ambient MCP config may add servers on top of WorkMate's.
+    Ambient,
+}
+
+/// One MCP server as the agent reported it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolSurfaceMcpServer {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// E2 (C-09): the real tool list of a live session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationToolSurface {
+    pub source: ToolSurfaceSource,
+    /// Every tool name advertised to the model, verbatim.
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<ToolSurfaceMcpServer>,
+    pub mcp_isolation: McpIsolation,
+    /// aionrs only: the runtime tool policy in effect (`strict_planning` /
+    /// `unrestricted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationCapabilities {
     pub followup: bool,
     pub steer: bool,
     pub inject: bool,
     pub tool_enforcement: ToolEnforcementLevel,
+    /// E2 (C-08/C-09): the tool surface the running agent ACTUALLY exposes,
+    /// as reported by the agent itself. Absent until a live session reported it
+    /// (never synthesized from configuration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_surface: Option<ConversationToolSurface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
