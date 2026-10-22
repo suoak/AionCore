@@ -28,8 +28,9 @@ const WORKTREE_BASE: &str = "WORKTREE";
 const ANCHOR_STALE: &str = "ANCHOR_STALE";
 
 pub struct ReviewService {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
     resolver: Arc<dyn ScopeContentResolver>,
+    pub(crate) input_sink: Option<Arc<dyn crate::batch::ReviewInputSink>>,
 }
 
 /// The diff side as it is on disk right now.
@@ -123,7 +124,7 @@ impl ThreadRow {
 const THREAD_COLUMNS: &str = "id, scope_kind, scope_id, conversation_id, task_session_id, run_id, file_path, side, \
      start_line, end_line, anchor, status, last_batch_id, created_at, updated_at, resolved_at";
 
-fn new_id(prefix: &str) -> String {
+pub(crate) fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::now_v7().simple())
 }
 
@@ -328,7 +329,18 @@ fn relocate(row: &ThreadRow, side: &SideText) -> Option<Relocation> {
 
 impl ReviewService {
     pub fn new(pool: SqlitePool, resolver: Arc<dyn ScopeContentResolver>) -> Self {
-        Self { pool, resolver }
+        Self {
+            pool,
+            resolver,
+            input_sink: None,
+        }
+    }
+
+    /// Enable `send_batch`: where review batches are delivered (the
+    /// conversation input queue, wired in `aionui-app`).
+    pub fn with_input_sink(mut self, sink: Arc<dyn crate::batch::ReviewInputSink>) -> Self {
+        self.input_sink = Some(sink);
+        self
     }
 
     async fn ensure_owned(&self, table: &str, id: &str, user_id: &str, field: &str) -> Result<(), ReviewError> {
