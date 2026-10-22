@@ -50,6 +50,7 @@ async fn fixture_params(
         team_mcp_stdio_config: None,
         mcp_server_ids: None,
         session_mcp_servers: vec![],
+        mcp_strict: false,
         user_id: None,
         fork: None,
     };
