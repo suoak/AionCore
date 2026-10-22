@@ -305,14 +305,27 @@ async fn strict_planning_denies_allowlisted_mutation_and_control_tools_without_w
             before_entries,
             "{tool_name} changed the workspace file list"
         );
+        // aionrs 0.2.25 (C-02) registers ToolSearch only when a deferred tool
+        // exists; strict planning clears MCP and plan tools, so there is
+        // nothing to search and ToolSearch is not registered at all. A call
+        // to it fails closed as an unknown tool instead of a policy denial.
+        let expected_code = if tool_name == "ToolSearch" {
+            assert!(
+                !registered.iter().any(|name| name == "ToolSearch"),
+                "strict planning must not register ToolSearch without deferred tools"
+            );
+            "unknown_tool"
+        } else {
+            "policy_denied"
+        };
         assert!(
             provider
                 .observed_tool_results
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(is_error, content)| *is_error && content.contains("policy_denied")),
-            "{tool_name} did not produce a policy denial"
+                .any(|(is_error, content)| *is_error && content.contains(expected_code)),
+            "{tool_name} did not fail closed with {expected_code}"
         );
         let advertised = provider.advertised_tools.lock().unwrap();
         assert!(
