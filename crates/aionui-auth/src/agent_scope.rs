@@ -409,6 +409,57 @@ mod tests {
         }
     }
 
+    /// M7 E3: worktree / fan-out control is user-only. Guard against a future
+    /// allowlist edit accidentally opening these prefixes to agent tokens.
+    #[test]
+    fn worktree_and_fanout_routes_are_denied() {
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            for path in [
+                "/api/worktrees",
+                "/api/worktrees?repo_path=/r&status=ready",
+                "/api/worktrees/capabilities",
+                "/api/worktrees/prune",
+                "/api/worktrees/wt_1",
+                "/api/worktrees/wt_1/cancel",
+                "/api/worktrees/wt_1/retry",
+                "/api/worktrees/wt_1/diff-stat",
+                "/api/worktrees/wt_1/diff?path=a.txt",
+                "/api/fanout-groups",
+                "/api/fanout-groups/g1",
+                "/api/fanout-groups/g1/compare",
+                "/api/fanout-groups/g1/adopt",
+                "/api/fanout-groups/g1/discard",
+                "/api/fanout-groups/g1/cancel",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+        for prefix in ["/api/worktrees", "/api/fanout-groups"] {
+            assert!(
+                !READ_PREFIXES
+                    .iter()
+                    .any(|p| has_prefix(prefix, p) || has_prefix(p, prefix))
+            );
+            assert!(!READ_LIKE_POSTS.iter().any(|p| has_prefix(p, prefix)));
+            assert!(
+                !APPROVAL_PREFIXES
+                    .iter()
+                    .any(|(p, _)| has_prefix(prefix, p) || has_prefix(p, prefix))
+            );
+        }
+    }
+
     #[test]
     fn rename_only_patch_detection() {
         assert!(is_rename_only_patch(br#"{"name":"new title"}"#));

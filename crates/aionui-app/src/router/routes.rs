@@ -379,6 +379,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let review_authenticated =
         review_routes(states.review).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // M7 E3 worktree routes: user identity only (agent tokens are denied by
+    // `agent_scope` because `/api/worktrees` is on no allowlist).
+    let worktree_authenticated = aionui_worktree::worktree_routes(states.worktree)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office proxy routes serve iframe content but still require auth so
     // preview ports remain scoped to the active Core user.
     let office_proxy =
@@ -447,6 +452,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(agent_center_authenticated)
         .merge(skill_evolution_authenticated)
         .merge(review_authenticated)
+        .merge(worktree_authenticated)
         .merge(session_message_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
