@@ -409,6 +409,8 @@ pub struct ClaudeSessionBackend {
     capabilities: Capabilities,
     /// B-09: launched with `--strict-mcp-config` (managed MCP surface).
     mcp_strict: bool,
+    /// Names of the MCP servers WorkMate injected at launch.
+    managed_mcp_servers: Vec<String>,
     /// Retained stdin for prompt/control delivery. `BoxedStdin` taken once from
     /// the process; behind a Mutex so concurrent dispatches serialize at the
     /// byte-frame level only. `Arc` so a wake (`wake_handle`) can swap in the fresh
@@ -910,6 +912,7 @@ impl ClaudeSessionBackend {
             caps
         };
         let mcp_strict = config.init.strict_mcp || !config.init.mcp_servers.is_empty();
+        let managed_mcp_servers: Vec<String> = config.init.mcp_servers.iter().map(|s| s.name.clone()).collect();
         let adapter = Arc::new(adapter);
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let turn_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1029,6 +1032,7 @@ impl ClaudeSessionBackend {
             session_id,
             capabilities,
             mcp_strict,
+            managed_mcp_servers,
             stdin,
             adapter,
             turn_gen,
@@ -3607,6 +3611,8 @@ impl SessionBackend for ClaudeSessionBackend {
             mcp_servers,
             mcp_strict: self.mcp_strict,
             skills: caps.init_skills.clone(),
+            managed_mcp_servers: self.managed_mcp_servers.clone(),
+            source: crate::backend::ToolInventorySource::ClaudeInit,
         })
     }
 

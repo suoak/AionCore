@@ -1650,6 +1650,7 @@ mod tool_enforcement_tests {
             tool_policy: Some(policy.into()),
             entries: Vec::new(),
             tool_search_inert: false,
+            external_mcp_servers: Vec::new(),
         }
     }
 

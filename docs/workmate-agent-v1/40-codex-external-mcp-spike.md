@@ -7,7 +7,8 @@ TYPE      = SPIKE (conclusions only, NO behavior change)
 SCOPE     = M7 / E1 (B-09 follow-up for the codex backend)
 CODE REF  = crates/aionui-session/src/backend/codex_conn.rs — thread_start_params (~L569),
             codex_app_server_args (~L62), mcpServer/startupStatus/updated (~L3134)
-VERIFIED  = code reading only; every "needs live probe" item below is UNVERIFIED
+VERIFIED  = live probes 1-3 on codex-cli 0.160.1 (pinned VERIFIED_CODEX_VERSION), probe 4 partial;
+            see "Live probe results". Option D is implemented (E2 PR B).
 ```
 
 ## Problem
@@ -62,6 +63,38 @@ ceiling.
    per-field (expected) or replace the entry?
 4. Resume/fork: are `-c` process overrides re-applied after an idle-wake respawn
    (expected yes, shared argv builder) — confirm with `mcpServerStatus/list`.
+
+## Live probe results (codex-cli 0.160.1, 2026-10-22)
+
+Setup: throwaway `CODEX_HOME` with two stdio MCP servers (`ambient1`, `shared`),
+a trusted project with `.codex/config.toml` declaring `proj1`, no login.
+`codex app-server` driven over stdio (`initialize` → `initialized` → requests).
+
+1. **Verified.** `mcpServerStatus/list` answers right after `initialized`, before any
+   `thread/start`, and lists ambient servers from `$CODEX_HOME/config.toml` *and* the
+   project config, with their tools. Without `threadId` every `runtimeStatus` is
+   `null`; with `threadId` it is `connected` / `disabled`.
+2. **Verified.** `-c mcp_servers.<name>.enabled=false` on `app-server`: the server is
+   still listed but with no tools. As a `thread/start` `config` overlay: the
+   thread-scoped list reports it `disabled` with no tools, while the unscoped
+   (config-level) list still shows it with tools — the overlay is per thread.
+3. **Verified (merge).** An overlay entry for a name that exists in the user config
+   with only `args` changed: the thread uses the overlay `args` while `command` comes
+   from the user config, i.e. per-field merge, not replacement.
+4. **Partial.** A respawned app-server with the same `-c` disables the server again
+   for new threads (process-level, as expected). `thread/resume` of the earlier
+   thread could not be tested: without a login no turn runs, so no rollout is
+   written (`no rollout found for thread id …`). Needs a signed-in box.
+
+## Option D as implemented
+
+- Handshake sends an unscoped `mcpServerStatus/list` (ambient view); every settled
+  `mcpServer/startupStatus/updated` re-sends it scoped to the bound thread (adds the
+  WorkMate overlay, drops `disabled` servers).
+- Observed servers go into the session tool inventory as `mcp__<server>__<tool>`;
+  `tool_surface.mcp_servers[].external = true` for a reported server that WorkMate
+  did not inject, and `tool_surface.external_mcp_servers` lists them for the UI hint.
+- Nothing is blocked; `mcp_strict` stays `false` for codex.
 
 ## Risks common to every option
 

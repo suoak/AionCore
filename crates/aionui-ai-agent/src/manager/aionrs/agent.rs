@@ -393,10 +393,16 @@ impl AionrsAgentManager {
             source: aionui_api_types::ToolSurfaceSource::AionrsRegistry,
             entries,
             tool_search_inert,
+            // aionrs only starts the Core-assembled config: nothing is ambient.
+            external_mcp_servers: Vec::new(),
             tools: registry_names,
             mcp_servers: mcp_server_names
                 .into_iter()
-                .map(|name| aionui_api_types::ToolSurfaceMcpServer { name, status: None })
+                .map(|name| aionui_api_types::ToolSurfaceMcpServer {
+                    name,
+                    status: None,
+                    external: false,
+                })
                 .collect(),
             mcp_isolation: aionui_api_types::McpIsolation::Strict,
             tool_policy: Some(aionrs_tool_policy_label(config_extra.tool_policy).to_owned()),
