@@ -1039,6 +1039,12 @@ fn codex_tool_inventory(
     servers: &[CodexMcpServerStatus],
     injected: &[crate::backend::McpServerSpec],
 ) -> crate::backend::ToolInventory {
+    // A thread-scoped list reports `enabled = false` servers as `disabled` with no
+    // tools (verified on codex 0.160.1): not loaded, so not part of the surface.
+    let servers: Vec<&CodexMcpServerStatus> = servers
+        .iter()
+        .filter(|s| s.status.as_deref() != Some("disabled"))
+        .collect();
     crate::backend::ToolInventory {
         tools: servers
             .iter()
@@ -1056,14 +1062,21 @@ fn codex_tool_inventory(
     }
 }
 
-/// The `mcpServerStatus/list` request frame (no threadId: the config-level view,
-/// which is exactly where ambient `~/.codex/config.toml` servers show up).
-fn mcp_status_list_frame(id: u64) -> Value {
+/// The `mcpServerStatus/list` request frame. Without a threadId codex answers
+/// with the config-level view (ambient `$CODEX_HOME` + project servers, even
+/// before `thread/start`); with one it answers for that thread, which also
+/// carries the WorkMate `config.mcp_servers` overlay and per-server
+/// `runtimeStatus` (verified on codex 0.160.1, spike doc 40).
+fn mcp_status_list_frame(id: u64, thread_id: Option<&str>) -> Value {
+    let mut params = json!({ "detail": "toolsAndAuthOnly", "limit": 100 });
+    if let Some(tid) = thread_id {
+        params["threadId"] = json!(tid);
+    }
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "mcpServerStatus/list",
-        "params": { "detail": "toolsAndAuthOnly", "limit": 100 }
+        "params": params
     })
 }
 
@@ -1652,7 +1665,7 @@ impl CodexSessionBackend {
             .lock()
             .await
             .insert(mcp_status_id, DiscoveryKind::McpStatus);
-        self.write_frame(mcp_status_list_frame(mcp_status_id)).await?;
+        self.write_frame(mcp_status_list_frame(mcp_status_id, None)).await?;
         Ok(())
     }
 
@@ -1874,8 +1887,9 @@ async fn reader_task(
                             }
                         }
                         // E2 plan D: a server settled (ready/failed/cancelled) →
-                        // refresh the observed MCP inventory so late-starting
-                        // servers' tools appear. Bounded: one request per settle.
+                        // refresh the observed MCP inventory, scoped to the bound
+                        // thread (codex starts servers per thread, so this also
+                        // picks up the WorkMate overlay). One request per settle.
                         if m == "mcpServer/startupStatus/updated"
                             && matches!(
                                 params.get("status").and_then(Value::as_str),
@@ -1883,8 +1897,11 @@ async fn reader_task(
                             )
                         {
                             let id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+                            let scoped_thread = thread_binding.lock().await.clone();
                             pending_discovery.lock().await.insert(id, DiscoveryKind::McpStatus);
-                            if let Err(error) = write_json_frame(&stdin, &mcp_status_list_frame(id)).await {
+                            if let Err(error) =
+                                write_json_frame(&stdin, &mcp_status_list_frame(id, scoped_thread.as_deref())).await
+                            {
                                 pending_discovery.lock().await.remove(&id);
                                 tracing::debug!(conversation_id = %session_id, "codex mcpServerStatus/list refresh failed: {error}");
                             }
@@ -8930,6 +8947,11 @@ mod tests {
                 tools: vec!["lights".into()],
                 status: None,
             },
+            CodexMcpServerStatus {
+                name: "off".into(),
+                tools: vec![],
+                status: Some("disabled".into()),
+            },
         ];
         let injected = vec![crate::backend::McpServerSpec {
             name: "docs".into(),
@@ -8942,8 +8964,19 @@ mod tests {
         assert_eq!(inv.tools, vec!["mcp__docs__search", "mcp__home__lights"]);
         assert_eq!(inv.managed_mcp_servers, vec!["docs"]);
         assert_eq!(inv.mcp_servers[1], ("home".to_string(), "unknown".to_string()));
+        assert_eq!(inv.mcp_servers.len(), 2, "disabled servers are not loaded");
         assert!(!inv.mcp_strict);
         assert_eq!(inv.source, crate::backend::ToolInventorySource::CodexMcpStatus);
+    }
+
+    #[test]
+    fn plan_d_status_frame_scopes_to_thread_when_bound() {
+        let unscoped = mcp_status_list_frame(7, None);
+        assert_eq!(unscoped["method"], "mcpServerStatus/list");
+        assert!(unscoped["params"].get("threadId").is_none());
+        let scoped = mcp_status_list_frame(8, Some("t-1"));
+        assert_eq!(scoped["params"]["threadId"], "t-1");
+        assert_eq!(scoped["params"]["detail"], "toolsAndAuthOnly");
     }
 
     #[test]
