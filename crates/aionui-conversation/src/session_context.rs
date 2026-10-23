@@ -740,10 +740,7 @@ mod tests {
         CreateAcpSessionParams, SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
         UpsertAgentMetadataParams, init_database_memory,
     };
-    use std::io::Write;
-    use std::sync::Mutex;
     use tracing::Level;
-    use tracing_subscriber::fmt;
 
     struct TestRepos {
         workspace_root: PathBuf,
@@ -795,35 +792,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_logs(max_level: Level, f: impl FnOnce()) -> String {
-        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let make_writer = {
-            let buffer = Arc::clone(&buffer);
-            move || SharedBuf(Arc::clone(&buffer))
-        };
-        let subscriber = fmt::Subscriber::builder()
-            .with_max_level(max_level)
-            .with_writer(make_writer)
-            .with_ansi(false)
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, f);
-        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
-    }
+    use crate::test_log_capture::capture_logs;
 
     async fn setup() -> TestRepos {
         let db = init_database_memory().await.unwrap();
