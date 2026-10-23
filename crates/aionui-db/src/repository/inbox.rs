@@ -51,6 +51,15 @@ pub trait IInboxRepository: Send + Sync {
     /// Resolve (and mark read) the item with this dedupe key, if any.
     async fn resolve_by_dedupe_key(&self, user_id: &str, dedupe_key: &str, at: TimestampMs) -> Result<bool, DbError>;
 
+    /// Resolve every still-open approval item of one conversation (its turn
+    /// settled, so the pending asks can no longer be answered). Returns rows touched.
+    async fn resolve_open_approvals(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        at: TimestampMs,
+    ) -> Result<u64, DbError>;
+
     /// Drop items older than `cutoff`, then keep at most `max_items` newest.
     async fn prune_for_user(&self, user_id: &str, cutoff: TimestampMs, max_items: i64) -> Result<(), DbError>;
 }

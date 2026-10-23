@@ -121,6 +121,25 @@ impl IInboxRepository for SqliteInboxRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn resolve_open_approvals(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        at: TimestampMs,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE inbox_items SET resolved_at = ?, read_at = COALESCE(read_at, ?) \
+             WHERE user_id = ? AND conversation_id = ? AND kind = 'approval' AND resolved_at IS NULL",
+        )
+        .bind(at)
+        .bind(at)
+        .bind(user_id)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn prune_for_user(&self, user_id: &str, cutoff: TimestampMs, max_items: i64) -> Result<(), DbError> {
         sqlx::query("DELETE FROM inbox_items WHERE user_id = ? AND created_at < ?")
             .bind(user_id)

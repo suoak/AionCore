@@ -117,3 +117,27 @@ async fn prune_applies_age_and_count_caps() {
     assert_eq!(left, ["d", "c"]);
     assert_eq!(repo.list("u2", &all(10)).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn resolve_open_approvals_is_conversation_and_kind_scoped() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteInboxRepository::new(db.pool().clone());
+    repo.upsert(&item("u1", "approval:a", "A", 10)).await.unwrap();
+    repo.upsert(&item("u1", "approval:b", "B", 11)).await.unwrap();
+    let mut other_conv = item("u1", "approval:c", "C", 12);
+    other_conv.conversation_id = Some("conv-2");
+    repo.upsert(&other_conv).await.unwrap();
+    let mut completed = item("u1", "turn:conv-1", "Done", 13);
+    completed.kind = "completed";
+    repo.upsert(&completed).await.unwrap();
+    repo.upsert(&item("u2", "approval:a", "A", 10)).await.unwrap();
+
+    assert_eq!(repo.resolve_open_approvals("u1", "conv-1", 20).await.unwrap(), 2);
+    assert_eq!(repo.resolve_open_approvals("u1", "conv-1", 21).await.unwrap(), 0);
+    assert_eq!(
+        repo.unread_count("u1").await.unwrap(),
+        2,
+        "conv-2 approval + completed stay open"
+    );
+    assert_eq!(repo.unread_count("u2").await.unwrap(), 1);
+}

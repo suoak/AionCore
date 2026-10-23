@@ -5687,6 +5687,9 @@ impl ConversationService {
                 "Failed to journal approval decision"
             );
         }
+        if let Some(inbox) = self.inbox_sink() {
+            inbox.approval_resolved(user_id, conversation_id, call_id).await;
+        }
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({
@@ -5735,6 +5738,9 @@ impl ConversationService {
             .map(|c| c.id.clone());
 
         agent.answer_ask(request_id, answers)?;
+        if let Some(inbox) = self.inbox_sink() {
+            inbox.approval_resolved(user_id, conversation_id, request_id).await;
+        }
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({
