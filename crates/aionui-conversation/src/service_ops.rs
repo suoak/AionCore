@@ -692,10 +692,18 @@ impl ConversationService {
         conversation_id: &str,
     ) -> Result<aionui_api_types::ContextBreakdownResponse, ConversationError> {
         let usage = self.get_usage(user_id, conversation_id).await?;
+        // Estimates come from the LIVE task's reported tool surface only (never
+        // synthesized from config); a reaped task simply has none.
+        let surface = self
+            .task(conversation_id)
+            .ok()
+            .as_ref()
+            .and_then(aionui_ai_agent::AgentInstance::tool_surface);
+        let estimates = crate::context_breakdown::estimates_from_tool_surface(surface.as_ref());
         Ok(crate::context_breakdown::build_context_breakdown(
             conversation_id,
             usage.as_ref(),
-            &[],
+            &estimates,
         ))
     }
 
