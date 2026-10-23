@@ -4,6 +4,7 @@
 
 ### Behavior Changes
 
+* **task/retry:** 已批准计划的执行支持有界重试与超时（迁移 069）。新增 `PUT /api/task-sessions/{id}/retry-policy`（`max_attempts` 1–3，默认 1 即不重试，须显式开启；`timeout_ms` 1000–86400000 或 null）。仅「失败」的执行 run 会重试（用户取消、暂停、完成不重试），超时按失败计并走正常取消流程。重试创建新 run（`attempt`、`retry_of_run_id`、`timeout_ms` 新字段），在同一事务内原子转移审批认领，保证一个审批同一时间只被一个 run 执行。Agent 令牌访问该路由返回 403。（M7 E5-5）
 * **security/extension:** 新增扩展设置页 iframe 资产的短时 token：`POST /api/extensions/{name}/asset-token`（需登录）签发绑定用户和扩展、10 分钟有效的 token；`GET /api/extensions/{name}/asset-session/{token}/{path}` 凭 token 只读该扩展的资产，不再需要完整凭据。旧的 `/assets/` 路由保持不变，供旧 UI 兼容。（M7 E1 遗留④）
 * **security/team:** 未绑定助手的团队成员不再挂载用户全局 MCP。此前此类成员会继承所有已启用的用户 MCP 及内置 MCP；现在只按所绑定助手的 MCP 白名单（`mcp_ids`）挂载，未绑定则默认不挂任何用户/内置 MCP。团队自身的 aionui-team 工具服务器不受影响。如需给成员使用 MCP，请为其绑定助手并在助手中勾选。（M7 E1 遗留①）
 * **security/team:** Agent 令牌访问 `/api/teams` 时只能看到自身会话所属的团队；`GET /api/teams` 结果被过滤，读取无关或不存在的团队（含 `/tasks`、`/mailbox`、`/activity`、`/run-state` 等子路由）返回 403 `AGENT_SCOPE_DENIED`。用户会话不受影响。（M7 E1 遗留②）

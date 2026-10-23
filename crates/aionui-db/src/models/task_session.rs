@@ -17,6 +17,10 @@ pub struct TaskSessionRow {
     pub agent_session_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Total execution attempts allowed per approval (1 = no retry, max 3).
+    pub retry_max_attempts: i64,
+    /// Per-attempt timeout snapshotted onto each new execution run.
+    pub retry_timeout_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
@@ -68,6 +72,9 @@ pub struct TaskRunRow {
     pub result_summary: Option<String>,
     pub usage: Option<String>,
     pub next_trace_sequence: i64,
+    pub attempt: i64,
+    pub retry_of_run_id: Option<String>,
+    pub timeout_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]

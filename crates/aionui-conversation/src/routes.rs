@@ -18,8 +18,8 @@ use aionui_api_types::{
     StartAutomaticPlanningRequest, SubmitConversationInputRequest, SubmitTaskArtifactRequest,
     SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskEvidenceResponse, TaskReviewResponse,
     TaskRunReplayQuery, TaskRunReplayResponse, TaskRunResponse, TaskSessionResponse, TaskTraceEventResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
-    VerifyAcceptanceCriterionRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskRetryPolicyRequest,
+    UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -142,6 +142,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route(
             "/api/task-sessions/{id}",
             get(get_task_session).patch(update_task_session),
+        )
+        .route(
+            "/api/task-sessions/{id}/retry-policy",
+            axum::routing::put(update_task_retry_policy),
         )
         .route(
             "/api/task-sessions/{id}/planning-isolation",
@@ -281,6 +285,21 @@ async fn update_task_session(
     let session = state
         .service
         .update_task_session(&user.id, &id, request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(session)))
+}
+
+async fn update_task_retry_policy(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateTaskRetryPolicyRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TaskSessionResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let session = state
+        .service
+        .update_task_retry_policy(&user.id, &id, request)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(session)))
