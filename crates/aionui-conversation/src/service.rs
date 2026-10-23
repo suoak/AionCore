@@ -1232,15 +1232,18 @@ impl ConversationService {
                     on_started: None,
                 },
                 false,
-                Some(crate::task_trace::TaskTraceContext::new(
-                    user_id.to_owned(),
-                    task_session_id.to_owned(),
-                    planning_run.id.clone(),
-                    conversation_id.to_owned(),
-                    crate::task_trace::TaskTracePolicy::StrictPlanning,
-                    repo.clone(),
-                    self.output_retention_policy(),
-                )),
+                Some(
+                    crate::task_trace::TaskTraceContext::new(
+                        user_id.to_owned(),
+                        task_session_id.to_owned(),
+                        planning_run.id.clone(),
+                        conversation_id.to_owned(),
+                        crate::task_trace::TaskTracePolicy::StrictPlanning,
+                        repo.clone(),
+                        self.output_retention_policy(),
+                    )
+                    .with_broadcaster(self.broadcaster().clone()),
+                ),
             )
             .await;
         let planning_usage = self.capture_task_run_usage(conversation_id).await;
@@ -1743,7 +1746,8 @@ impl ConversationService {
             policy,
             repo,
             self.output_retention_policy(),
-        );
+        )
+        .with_broadcaster(self.broadcaster().clone());
         context_snapshot_response(
             trace
                 .record_context_snapshot(request.provider, request.query, request.hits, request.artifact_id)
@@ -2031,15 +2035,18 @@ impl ConversationService {
                     on_started: None,
                 },
                 true,
-                Some(crate::task_trace::TaskTraceContext::new(
-                    user_id.to_owned(),
-                    task_session_id.to_owned(),
-                    run.id.clone(),
-                    conversation_id.to_owned(),
-                    crate::task_trace::TaskTracePolicy::ApprovedExecution,
-                    repo.clone(),
-                    self.output_retention_policy(),
-                )),
+                Some(
+                    crate::task_trace::TaskTraceContext::new(
+                        user_id.to_owned(),
+                        task_session_id.to_owned(),
+                        run.id.clone(),
+                        conversation_id.to_owned(),
+                        crate::task_trace::TaskTracePolicy::ApprovedExecution,
+                        repo.clone(),
+                        self.output_retention_policy(),
+                    )
+                    .with_broadcaster(self.broadcaster().clone()),
+                ),
             )
             .await;
         let run_usage = self.capture_task_run_usage(conversation_id).await;
