@@ -85,6 +85,11 @@ pub struct CreateConversationRequest {
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
     pub extra: serde_json::Value,
+    /// Managed worktree to run in (M7 E3-2). The server sets
+    /// `extra.workspace` / `extra.worktree_id` from it and locks the
+    /// workspace; client-supplied `extra.worktree_id` is ignored.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 /// Body for `POST /api/conversations/{id}/fork`.

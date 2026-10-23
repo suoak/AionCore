@@ -150,6 +150,12 @@ pub struct ScmRepository {
     /// text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_of: Option<String>,
+    /// When this repository is a WorkMate-managed worktree (M7 E3), its
+    /// `task_worktrees.id`. Back-filled by the runtime from the composition
+    /// layer's lookup; omitted from the wire when absent so older clients see
+    /// the same frame as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree_id: Option<String>,
     pub capabilities: ScmCapabilities,
     pub state: ScmRepositoryState,
 }

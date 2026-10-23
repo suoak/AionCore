@@ -106,3 +106,11 @@ pub trait IScmStaging: Send + Sync {
 /// Commit-graph / history reads. Stage 2 — declared here so adding it later is
 /// an added capability rather than a change to the core contract.
 pub trait IScmHistory: Send + Sync {}
+
+/// Maps a repository working directory to the id of the WorkMate-managed
+/// worktree living there (M7 E3). Implemented by the composition layer, which
+/// owns `task_worktrees`; `None` for any directory WorkMate does not manage.
+#[async_trait]
+pub trait IManagedWorktreeLookup: Send + Sync {
+    async fn managed_worktree_id(&self, workdir: &std::path::Path) -> Option<String>;
+}

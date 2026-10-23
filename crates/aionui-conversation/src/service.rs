@@ -795,6 +795,9 @@ pub struct ConversationService {
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
     usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
     task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
+    /// Managed worktree port (M7 E3-2). `None` until the composition layer
+    /// wires it; `worktree_id` creates are then refused.
+    worktree_binding: Arc<RwLock<Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>>>>,
     input_queue_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Cross-session delivery grants created by the user's `@@` picks.
     session_mention_grants: Arc<session_mentions::SessionMentionGrants>,
@@ -945,6 +948,7 @@ impl ConversationService {
             acp_session_repo,
             usage_event_repo: Arc::new(RwLock::new(None)),
             task_session_repo: Arc::new(RwLock::new(None)),
+            worktree_binding: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
             session_mention_grants: Arc::new(session_mentions::SessionMentionGrants::new()),
         }
@@ -2279,6 +2283,18 @@ impl ConversationService {
         }
     }
 
+    /// Wire the managed worktree port (M7 E3-2) that `create` uses for
+    /// `worktree_id`. Unbinding on delete is a regular delete hook.
+    pub fn with_worktree_binding(&self, binding: Arc<dyn crate::worktree_binding::IWorktreeBinding>) {
+        if let Ok(mut guard) = self.worktree_binding.write() {
+            *guard = Some(binding);
+        }
+    }
+
+    fn worktree_binding_optional(&self) -> Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>> {
+        self.worktree_binding.read().ok().and_then(|guard| guard.clone())
+    }
+
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order before
@@ -2911,6 +2927,49 @@ impl ConversationService {
         // value would let anyone fork an arbitrary `parent_session_id` they do
         // not own — strip it unconditionally on the create path.
         strip_request_fork_spec(&mut extra);
+        // Worktree binding keys are server-minted from `req.worktree_id` only;
+        // a forged `extra.worktree_id` must never bind or lock anything.
+        if crate::worktree_binding::strip_client_worktree_binding(&mut extra) {
+            warn!("Stripped client-supplied worktree binding keys from conversation.extra");
+        }
+        let worktree_target = match req
+            .worktree_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(worktree_id) => {
+                let binding = self
+                    .worktree_binding_optional()
+                    .ok_or_else(|| ConversationError::BadRequest {
+                        reason: "managed worktrees are not available".into(),
+                    })?;
+                Some(binding.resolve(user_id, worktree_id).await?)
+            }
+            None => None,
+        };
+        if let Some(target) = worktree_target.as_ref() {
+            if extra
+                .get("workspace")
+                .is_some_and(|value| value.as_str() != Some(target.path.as_str()))
+            {
+                warn!(
+                    worktree_id = %target.worktree_id,
+                    "Ignoring client workspace: a worktree-bound conversation runs in the worktree"
+                );
+            }
+            if !extra.is_object() {
+                extra = serde_json::json!({});
+            }
+            extra["workspace"] = serde_json::Value::String(target.path.clone());
+            extra["worktree_id"] = serde_json::Value::String(target.worktree_id.clone());
+            if let Some(group) = target.fanout_group_id.as_ref() {
+                extra["fanout_group_id"] = serde_json::Value::String(group.clone());
+            }
+            if let Some(slot) = target.fanout_slot.as_ref() {
+                extra["fanout_slot"] = serde_json::Value::String(slot.clone());
+            }
+        }
 
         let assistant_id = req
             .assistant
@@ -3333,6 +3392,31 @@ impl ConversationService {
         };
 
         self.conversation_repo.create(&row).await?;
+
+        // Claim the worktree only once the row exists (`task_worktrees`
+        // references it). Losing the race to another conversation rolls this
+        // one back so no unbound conversation is left pointing at a worktree
+        // it does not own.
+        if let Some(target) = worktree_target.as_ref() {
+            let bound = match self.worktree_binding_optional() {
+                Some(binding) => binding.bind(user_id, &target.worktree_id, &id).await,
+                None => Err(crate::worktree_binding::WorktreeBindingError::Internal(
+                    "worktree binding port disappeared".into(),
+                )),
+            };
+            if let Err(error) = bound {
+                warn!(
+                    conversation_id = %id,
+                    worktree_id = %target.worktree_id,
+                    error = ?error,
+                    "Worktree bind failed; rolling back the conversation"
+                );
+                if let Err(rollback) = self.delete(user_id, &id).await {
+                    warn!(conversation_id = %id, error = %ErrorChain(&rollback), "Rollback after failed worktree bind failed");
+                }
+                return Err(error.into());
+            }
+        }
 
         // Project-bind side branch (best-effort; never affects creation).
         // Uses the workspace the existing flow already decided + created.
@@ -4211,6 +4295,12 @@ impl ConversationService {
                 warn!(conversation_id = %id, reason, "Rejected protected conversation.extra write");
                 return Err(ConversationError::BadRequest { reason: reason.into() });
             }
+            if crate::worktree_binding::patch_moves_bound_workspace(&existing_extra, incoming) {
+                warn!(conversation_id = %id, "Rejected workspace change on a worktree-bound conversation");
+                return Err(ConversationError::BadRequest {
+                    reason: crate::worktree_binding::WORKSPACE_LOCKED_REASON.into(),
+                });
+            }
         }
 
         // Antigravity keeps its runtime mode/model in the same `acp_session`
@@ -4381,6 +4471,14 @@ impl ConversationService {
 
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        // Internal callers may write host-owned keys, but nobody may move a
+        // worktree-bound conversation off its worktree.
+        if crate::worktree_binding::patch_moves_bound_workspace(&merged, &patch) {
+            warn!(conversation_id = %conversation_id, "Rejected workspace change on a worktree-bound conversation");
+            return Err(ConversationError::BadRequest {
+                reason: crate::worktree_binding::WORKSPACE_LOCKED_REASON.into(),
+            });
+        }
         merge_json(&mut merged, &patch);
         if patch.get("workspace").is_some() {
             normalize_workspace_extra(&mut merged)?;
@@ -4623,7 +4721,11 @@ impl ConversationService {
         user_id: &str,
         req: CloneConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
-        self.create(user_id, req.conversation).await
+        // A clone is a fresh conversation: it never inherits (or claims) the
+        // source's managed worktree, which stays bound to the source.
+        let mut conversation = req.conversation;
+        conversation.worktree_id = None;
+        self.create(user_id, conversation).await
     }
 
     /// Fork a conversation at a message (inclusive) into a NEW conversation.
@@ -4781,6 +4883,9 @@ impl ConversationService {
         let now = now_ms();
         let mut extra: serde_json::Value = serde_json::from_str(&parent.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid parent extra JSON: {e}")))?;
+        // The parent keeps its managed worktree: the fork shares the directory
+        // (same as an inherited auto workspace) but is neither bound nor locked.
+        crate::worktree_binding::strip_client_worktree_binding(&mut extra);
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "fork".to_owned(),
@@ -8223,6 +8328,14 @@ pub(crate) fn check_protected_extra_patch(
     {
         return Err(
             "team binding fields (teamId, slot_id, role, team_mcp_stdio_config) are managed by the team service",
+        );
+    }
+    if crate::worktree_binding::WORKTREE_BINDING_EXTRA_KEYS
+        .iter()
+        .any(|key| protected_extra_value_changes(existing, incoming, key))
+    {
+        return Err(
+            "worktree binding fields (worktree_id, fanout_group_id, fanout_slot) are managed by the worktree service",
         );
     }
     if protected_extra_value_changes(existing, incoming, "session_mode") {

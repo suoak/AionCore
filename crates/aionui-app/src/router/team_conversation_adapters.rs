@@ -422,6 +422,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .create(
                 &request.user_id,
                 CreateConversationRequest {
+                    worktree_id: None,
                     r#type: request.agent_type,
                     name: Some(request.name),
                     model: request.top_level_model,

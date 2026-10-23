@@ -908,6 +908,36 @@ async fn fork_head_creates_lineage_row_and_copies_messages() {
     );
 }
 
+/// M7 E3-2: a fork shares a worktree-bound parent's directory but never its
+/// binding — only the parent holds the worktree (and its workspace lock).
+#[tokio::test]
+async fn fork_of_a_worktree_bound_parent_does_not_inherit_the_binding() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, fork_create_req("claude")).await.unwrap();
+    // Internal writer standing in for the worktree binding.
+    svc.update_extra(
+        USER_ID,
+        &parent.id,
+        json!({ "worktree_id": "wt_parent", "fanout_group_id": "fg_1", "fanout_slot": "A" }),
+    )
+    .await
+    .unwrap();
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "parent-sid-wt")
+        .await
+        .unwrap();
+    let m1 = make_message(&parent.id, "hello", 0);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+
+    let fork = svc.fork(USER_ID, &parent.id, fork_req(&m1.id)).await.unwrap();
+    for key in ["worktree_id", "fanout_group_id", "fanout_slot"] {
+        assert!(fork.extra.get(key).is_none(), "fork must not inherit {key}");
+    }
+    assert_eq!(fork.extra.get("workspace"), parent.extra.get("workspace"));
+    let parent_after = svc.get(USER_ID, &parent.id).await.unwrap();
+    assert_eq!(parent_after.extra["worktree_id"], "wt_parent");
+}
+
 #[tokio::test]
 async fn fork_mid_history_is_refused_for_head_only_backends() {
     let (svc, repo, acp_repo) = setup_fork().await;

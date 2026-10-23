@@ -40,6 +40,7 @@ mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;
 mod usage_ledger;
+pub mod worktree_binding;
 
 pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;
@@ -55,6 +56,9 @@ pub use service::{
     RecordTaskContextSnapshotRequest,
 };
 pub use state::ConversationRouterState;
+pub use worktree_binding::{
+    IWorktreeBinding, WORKTREE_BINDING_EXTRA_KEYS, WorktreeBindingError, WorktreeBindingTarget,
+};
 
 #[cfg(test)]
 #[path = "service_test.rs"]

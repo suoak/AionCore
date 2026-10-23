@@ -30,7 +30,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::error::ScmError;
 use super::git_provider::GitScmProvider;
-use super::provider::IScmProvider;
+use super::provider::{IManagedWorktreeLookup, IScmProvider};
 use super::types::{FileRef, RepoRef, ResolvedRoot, ScmRepository, ScmStatus};
 use super::watch::GitWatcher;
 
@@ -73,6 +73,9 @@ pub struct ScmRuntime {
     /// when it unsubscribes from a repository, so a client that navigates away and
     /// back keeps receiving changes without re-registering.
     project_interest: RwLock<HashMap<String, HashSet<String>>>,
+    /// Back-fills `ScmRepository.managed_worktree_id`; unset in tests and
+    /// whenever the worktree service is not wired.
+    managed_worktrees: std::sync::OnceLock<Arc<dyn IManagedWorktreeLookup>>,
 }
 
 impl ScmRuntime {
@@ -88,9 +91,15 @@ impl ScmRuntime {
                 locks: RwLock::new(HashMap::new()),
                 project_repos: RwLock::new(HashMap::new()),
                 project_interest: RwLock::new(HashMap::new()),
+                managed_worktrees: std::sync::OnceLock::new(),
             },
             dirty_rx,
         ))
+    }
+
+    /// Wire the managed-worktree lookup (first call wins).
+    pub(super) fn set_managed_worktrees(&self, lookup: Arc<dyn IManagedWorktreeLookup>) {
+        let _ = self.managed_worktrees.set(lookup);
     }
 
     /// Discover which of a set of roots are repositories.
@@ -106,7 +115,16 @@ impl ScmRuntime {
                 // A root may surface many repositories now (one-level workspace
                 // discovery); an attached root still yields at most one.
                 Ok(repositories) => {
-                    for repository in repositories {
+                    for mut repository in repositories {
+                        if let Some(lookup) = self.managed_worktrees.get() {
+                            // The pe root is absolute; a surfaced repository sits at
+                            // its pe-relative path below it.
+                            let mut workdir = PathBuf::from(&root.absolute_path);
+                            if !repository.root.relative_path.is_empty() {
+                                workdir.push(&repository.root.relative_path);
+                            }
+                            repository.managed_worktree_id = lookup.managed_worktree_id(&workdir).await;
+                        }
                         let git_dir = self.provider.git_dir_of(&RepoRef {
                             repo_id: repository.repo_id.clone(),
                         });

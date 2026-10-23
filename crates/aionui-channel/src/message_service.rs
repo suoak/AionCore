@@ -171,6 +171,7 @@ impl ChannelMessageService {
         };
 
         let req = CreateConversationRequest {
+            worktree_id: None,
             r#type: if assistant_id.is_some() { None } else { Some(agent_type) },
             name: Some(name),
             model: top_level_model,

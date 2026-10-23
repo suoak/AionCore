@@ -155,3 +155,56 @@ pub struct RecoverReport {
     pub interrupted_removes: usize,
     pub stale_admin_entries: usize,
 }
+
+/// One changed file relative to the worktree's `base_commit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffStatFile {
+    /// Path relative to the worktree root, `/`-separated.
+    pub path: String,
+    /// Previous path for a rename.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// `added` | `modified` | `deleted` | `renamed` | `typechange` | `untracked`.
+    pub status: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub binary: bool,
+}
+
+/// `GET /api/worktrees/{id}/diff-stat`: committed, staged, unstaged and
+/// untracked changes against `base_commit`, in one list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffStatResponse {
+    pub worktree_id: String,
+    pub base_commit: String,
+    pub files: Vec<DiffStatFile>,
+    pub files_changed: u32,
+    pub additions: u64,
+    pub deletions: u64,
+    /// More than [`crate::diff::MAX_DIFF_STAT_FILES`] files changed; `files`
+    /// holds the first ones only (totals still cover every file).
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DiffQuery {
+    /// Worktree-relative file path.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// `GET /api/worktrees/{id}/diff?path=`: unified diff of one file against
+/// `base_commit` (untracked files diff against `/dev/null`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffResponse {
+    pub worktree_id: String,
+    pub base_commit: String,
+    pub path: String,
+    /// `unchanged` when the file does not differ from the base.
+    pub status: String,
+    pub binary: bool,
+    /// Unified diff text; empty for binary or unchanged files.
+    pub patch: String,
+    /// The patch exceeded [`crate::diff::MAX_PATCH_BYTES`] and was cut.
+    pub truncated: bool,
+}

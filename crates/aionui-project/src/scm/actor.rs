@@ -87,6 +87,12 @@ impl ScmActor {
         })
     }
 
+    /// Back-fill `ScmRepository.managed_worktree_id` from `lookup` (M7 E3).
+    pub fn with_managed_worktrees(self, lookup: Arc<dyn super::provider::IManagedWorktreeLookup>) -> Self {
+        self.runtime.set_managed_worktrees(lookup);
+        self
+    }
+
     /// Run the loop until every inbound sender is dropped.
     pub async fn run(mut self, mut inbound: UnboundedReceiver<ScmInbound>) {
         let mut dirty_rx = self.dirty_rx.take().expect("scm dirty receiver taken once in run");

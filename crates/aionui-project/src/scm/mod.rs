@@ -24,7 +24,7 @@ mod wire;
 
 pub use actor::{ScmActor, ScmInbound, ScmSessionId, ScmWirePush};
 pub use error::ScmError;
-pub use provider::{IScmHistory, IScmProvider, IScmStaging};
+pub use provider::{IManagedWorktreeLookup, IScmHistory, IScmProvider, IScmStaging};
 pub use types::{
     ContentRef, DiffContent, FileRef, RepoRef, ResolvedRoot, ScmActionFailure, ScmActionOutcome, ScmCapabilities,
     ScmHead, ScmRepository, ScmRepositoryState, ScmResource, ScmResourceState, ScmStatus,

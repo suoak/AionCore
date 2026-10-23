@@ -1047,6 +1047,9 @@ impl IScmProvider for GitScmProvider {
                 head: o.head,
                 is_worktree: o.is_worktree,
                 worktree_of,
+                // Provider-neutral: the runtime back-fills it (see
+                // `ScmRuntime::with_managed_worktrees`).
+                managed_worktree_id: None,
                 capabilities: caps,
                 state: ScmRepositoryState::Idle,
             });

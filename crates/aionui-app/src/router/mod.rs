@@ -13,6 +13,7 @@ mod system_file_opener;
 mod team_capability_resolver;
 mod team_conversation_adapters;
 mod trace;
+mod worktree_adapters;
 
 pub use routes::{
     RouterRuntime, create_router, create_router_with_all_state, create_router_with_runtime, create_router_with_states,

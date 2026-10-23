@@ -246,6 +246,7 @@ impl ConversationService {
             extra.insert(key.clone(), value.clone());
         }
         let request = CreateConversationRequest {
+            worktree_id: None,
             r#type: plan.r#type,
             name: Some(name.to_owned()),
             model: plan.model,

@@ -171,7 +171,15 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let fs_router = spawn_fs_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
     // Source control shares the connection but owns its own envelope name, so the
     // two inbound routers are composed behind the realtime layer's single slot.
-    let scm_router = spawn_scm_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
+    let managed_worktrees: Arc<dyn aionui_project::scm::IManagedWorktreeLookup> =
+        Arc::new(super::worktree_adapters::ScmManagedWorktreeLookup {
+            service: states.worktree.service.clone(),
+        });
+    let scm_router = spawn_scm_monitor(
+        Arc::new(services.project_service.clone()),
+        services.ws_manager.clone(),
+        Some(managed_worktrees),
+    );
     let inbound_router: Arc<dyn aionui_realtime::MessageRouter> = match scm_router {
         Some(scm) => Arc::new(CompositeMessageRouter::new(vec![fs_router, scm])),
         None => fs_router,

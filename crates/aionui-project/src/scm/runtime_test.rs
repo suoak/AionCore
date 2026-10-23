@@ -405,3 +405,51 @@ async fn re_discovery_keeps_subscribers_and_sequence() {
         "and the sequence continues rather than resetting"
     );
 }
+
+/// Lookup stub: one managed directory.
+struct OneManaged {
+    path: std::path::PathBuf,
+    seen: std::sync::Mutex<Vec<std::path::PathBuf>>,
+}
+
+#[async_trait::async_trait]
+impl IManagedWorktreeLookup for OneManaged {
+    async fn managed_worktree_id(&self, workdir: &std::path::Path) -> Option<String> {
+        self.seen.lock().unwrap().push(workdir.to_path_buf());
+        (workdir == self.path).then(|| "wt_managed".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn discovery_back_fills_managed_worktree_id_from_the_lookup() {
+    let managed_dir = TempDir::new().expect("tempdir");
+    let _managed = fixture(&managed_dir);
+    let other_dir = TempDir::new().expect("tempdir");
+    let _other = fixture(&other_dir);
+
+    // Without a lookup the field stays absent (and off the wire).
+    let (plain, _dirty) = ScmRuntime::new().expect("runtime builds");
+    let found = plain.discover("proj-plain", &[root_of(&managed_dir, "pe-m")]).await;
+    assert_eq!(found[0].managed_worktree_id, None);
+    let wire = serde_json::to_value(&found[0]).expect("serialize");
+    assert!(wire.get("managed_worktree_id").is_none(), "{wire}");
+
+    let (runtime, _dirty) = ScmRuntime::new().expect("runtime builds");
+    let lookup = Arc::new(OneManaged {
+        path: managed_dir.path().to_path_buf(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    runtime.set_managed_worktrees(lookup.clone());
+    let found = runtime
+        .discover(
+            "proj-managed",
+            &[root_of(&managed_dir, "pe-m"), root_of(&other_dir, "pe-o")],
+        )
+        .await;
+    let by_pe = |pe: &str| found.iter().find(|r| r.root.pe_id == pe).expect("repo listed");
+    assert_eq!(by_pe("pe-m").managed_worktree_id.as_deref(), Some("wt_managed"));
+    assert_eq!(by_pe("pe-o").managed_worktree_id, None);
+    let wire = serde_json::to_value(by_pe("pe-m")).expect("serialize");
+    assert_eq!(wire["managed_worktree_id"], "wt_managed");
+    assert_eq!(lookup.seen.lock().unwrap().len(), 2);
+}
