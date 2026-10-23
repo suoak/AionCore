@@ -838,6 +838,7 @@ pub struct ConversationService {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
     usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
+    inbox_repo: Arc<RwLock<Option<Arc<dyn aionui_db::IInboxRepository>>>>,
     task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
     /// Managed worktree port (M7 E3-2). `None` until the composition layer
     /// wires it; `worktree_id` creates are then refused.
@@ -991,6 +992,7 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
             usage_event_repo: Arc::new(RwLock::new(None)),
+            inbox_repo: Arc::new(RwLock::new(None)),
             task_session_repo: Arc::new(RwLock::new(None)),
             worktree_binding: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
@@ -1036,6 +1038,18 @@ impl ConversationService {
         if let Ok(mut guard) = self.usage_event_repo.write() {
             *guard = Some(repo);
         }
+    }
+
+    /// M7 E5-4: inject the inbox store. When unset, inbox routes return an
+    /// empty inbox and producers are no-ops.
+    pub fn with_inbox_repo(&self, repo: Arc<dyn aionui_db::IInboxRepository>) {
+        if let Ok(mut guard) = self.inbox_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub(crate) fn inbox_repo(&self) -> Option<Arc<dyn aionui_db::IInboxRepository>> {
+        self.inbox_repo.read().ok().and_then(|guard| guard.clone())
     }
 
     pub fn with_task_session_repo(&self, repo: Arc<dyn ITaskSessionRepository>) {

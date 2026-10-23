@@ -7,6 +7,7 @@ mod approval_audit;
 mod background_stream;
 mod convert;
 pub mod error;
+mod inbox;
 mod journal_compaction;
 mod journal_fork;
 mod journal_transcript;

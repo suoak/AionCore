@@ -472,6 +472,25 @@ mod tests {
     }
 
     #[test]
+    fn inbox_routes_are_denied() {
+        // M7 E5-4: the inbox is the user's attention queue; agents never read or ack it.
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            for path in [
+                "/api/inbox",
+                "/api/inbox?unread_only=true",
+                "/api/inbox/read-all",
+                "/api/inbox/i1/read",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn task_run_replay_routes_are_denied() {
         // M7 E5-2: run replay exposes the full sanitized trace; user-only.
         for method in [
