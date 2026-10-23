@@ -9,10 +9,15 @@ use aionui_db::{
     AppendTaskTraceEventParams, ContextSnapshotRow, CreateContextSnapshotParams, CreateTaskCheckpointParams,
     CreateTaskEvidenceParams, DbError, ITaskSessionRepository, LinkContextSnapshotArtifactParams,
 };
+use aionui_realtime::EventBroadcaster;
 use sha2::{Digest, Sha256};
 
 use crate::stream_persistence::OutputRetentionPolicy;
 use crate::trace_redaction::sanitize_json;
+
+/// Realtime push for every persisted task trace event (M7 E5), so open replay
+/// timelines append live instead of polling `/trace`.
+pub(crate) const EVENT_TASK_TRACE_APPENDED: &str = "task.trace.appended";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskTracePolicy {
@@ -30,6 +35,7 @@ pub(crate) struct TaskTraceContext {
     repo: Arc<dyn ITaskSessionRepository>,
     output_retention: OutputRetentionPolicy,
     observed_calls: Arc<Mutex<HashMap<String, bool>>>,
+    broadcaster: Option<Arc<dyn EventBroadcaster>>,
 }
 
 impl TaskTraceContext {
@@ -51,7 +57,13 @@ impl TaskTraceContext {
             repo,
             output_retention,
             observed_calls: Arc::new(Mutex::new(HashMap::new())),
+            broadcaster: None,
         }
+    }
+
+    pub(crate) fn with_broadcaster(mut self, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
     }
 
     async fn event(&self, event_type: &str, payload: serde_json::Value) -> Result<String, DbError> {
@@ -67,6 +79,22 @@ impl TaskTraceContext {
                 payload: &payload,
             })
             .await?;
+        if let Some(broadcaster) = &self.broadcaster {
+            // Metadata only: subscribers refetch `/trace` for the (redacted)
+            // payload, so nothing beyond ids and the type leaves the store here.
+            broadcaster.broadcast(aionui_api_types::WebSocketMessage::new(
+                EVENT_TASK_TRACE_APPENDED,
+                serde_json::json!({
+                    "user_id": self.user_id,
+                    "task_session_id": self.task_id,
+                    "run_id": self.run_id,
+                    "conversation_id": self.conversation_id,
+                    "event_id": event.id,
+                    "event_type": event_type,
+                    "timestamp": event.timestamp,
+                }),
+            ));
+        }
         Ok(event.id)
     }
 
@@ -701,6 +729,67 @@ mod tests {
                 .iter()
                 .any(|checkpoint| checkpoint.checkpoint_type == "after_mutation")
         );
+    }
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<aionui_api_types::WebSocketMessage<serde_json::Value>>>);
+
+    impl EventBroadcaster for Recorder {
+        fn broadcast(&self, event: aionui_api_types::WebSocketMessage<serde_json::Value>) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn appended_trace_events_are_pushed_with_metadata_only() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at)
+             VALUES ('push-conversation', 'system_default_user', 'Trace', 'aionrs', 1, 1);
+             INSERT INTO task_sessions
+             (id, user_id, title, conversation_id, mode, objective, acceptance_criteria, status, agent_type, created_at, updated_at)
+             VALUES ('push-task', 'system_default_user', 'Trace', 'push-conversation', 'plan', '', '[]', 'running', 'aionrs', 1, 1);
+             INSERT INTO task_runs
+             (id, task_session_id, conversation_id, run_kind, status, started_at)
+             VALUES ('push-run', 'push-task', 'push-conversation', 'planning', 'running', 3);",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo = Arc::new(SqliteTaskSessionRepository::new(db.pool().clone()));
+        let retained = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let silent = TaskTraceContext::new(
+            "system_default_user".into(),
+            "push-task".into(),
+            "push-run".into(),
+            "push-conversation".into(),
+            TaskTracePolicy::StrictPlanning,
+            repo.clone(),
+            OutputRetentionPolicy::new(retained.path().to_path_buf()),
+        );
+        silent
+            .event("tool.started", serde_json::json!({"secret": "sk-test"}))
+            .await
+            .unwrap();
+        let ctx = silent.clone().with_broadcaster(recorder.clone());
+        let id = ctx
+            .event("tool.started", serde_json::json!({"secret": "sk-test"}))
+            .await
+            .unwrap();
+
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "only the context with a broadcaster pushes");
+        assert_eq!(events[0].name, EVENT_TASK_TRACE_APPENDED);
+        let data = &events[0].data;
+        assert_eq!(data["user_id"], "system_default_user");
+        assert_eq!(data["task_session_id"], "push-task");
+        assert_eq!(data["run_id"], "push-run");
+        assert_eq!(data["conversation_id"], "push-conversation");
+        assert_eq!(data["event_id"], id.as_str());
+        assert_eq!(data["event_type"], "tool.started");
+        assert!(data.get("payload").is_none());
+        assert!(!data.to_string().contains("sk-test"));
     }
 
     #[test]
