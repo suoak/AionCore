@@ -170,6 +170,11 @@ Adopt (`strategy` default `branch_only`):
   (`reset --merge` / `merge --abort` / `cherry-pick --abort`) and returned as
   `ADOPT_CONFLICT` (409) with the conflicted paths; the group stays in
   `comparing`.
+- Adopt commits (snapshot, squash commit, `--no-ff` merge commit) pass
+  `--no-verify`: repository hooks are not run by WorkMate in M7 (design §8
+  item 10); signing and the rest of the user's `.gitconfig` still apply. A
+  snapshot commit stays on the slot branch even when the merge then
+  conflicts, so no work is lost.
 - A busy winner is `SLOT_BUSY` (409); concurrent adopt / discard / cancel on
   one group get `FANOUT_INVALID_STATE` ("busy").
 - Only the winner branch is kept: losing slots are removed (turn stopped,
