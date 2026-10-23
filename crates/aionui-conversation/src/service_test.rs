@@ -11036,3 +11036,181 @@ async fn team_member_snapshot_without_assistant_mounts_no_user_mcp() {
     assert!(snapshot.session_mcp_servers.is_empty());
     assert!(snapshot.mcp_servers.is_empty());
 }
+
+#[tokio::test]
+async fn failed_execution_retries_once_when_policy_allows_and_links_the_chain() {
+    // M7 E5-5: attempt 1 fails, the policy (max_attempts = 2) creates attempt
+    // 2 which takes over the approval claim; when it fails too, the chain
+    // stops at the cap instead of running a third time.
+    let workspace = unique_test_workspace_path("execution-retry");
+    let failing = Arc::new(
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+                "upstream blew up",
+                Some(AgentErrorCode::UnknownUpstreamError),
+            ))]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    let failing_again = Arc::new(
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
+                "upstream blew up again",
+                Some(AgentErrorCode::UnknownUpstreamError),
+            ))]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    // A third agent that would succeed: it must never be used, because the
+    // policy caps execution at 2 attempts.
+    let never_used = Arc::new(
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(failing),
+        AgentInstance::Mock(failing_again),
+        AgentInstance::Mock(never_used),
+    ]));
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr,
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let task_repo = Arc::new(SqliteTaskSessionRepository::new(db.pool().clone()));
+    service.with_task_session_repo(task_repo);
+    let conversation = service
+        .create(
+            "user_1",
+            serde_json::from_value(json!({
+                "type": "aionrs",
+                "extra": { "workspace": workspace },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, 'user_1', 'Execution retry', 'aionrs', 1, 1)",
+    )
+    .bind(&conversation.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let task = service
+        .create_task_session(
+            "user_1",
+            CreateTaskSessionRequest {
+                title: "Retry execution".into(),
+                project_id: None,
+                conversation_id: Some(conversation.id),
+                mode: TaskSessionMode::Plan,
+                objective: "Do it".into(),
+                acceptance_criteria: Vec::new(),
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(task.retry_max_attempts, 1, "retry is off by default");
+
+    for (max_attempts, timeout_ms) in [(0, None), (4, None), (2, Some(10)), (2, Some(86_400_001))] {
+        assert!(matches!(
+            service
+                .update_task_retry_policy(
+                    "user_1",
+                    &task.id,
+                    aionui_api_types::UpdateTaskRetryPolicyRequest {
+                        max_attempts,
+                        timeout_ms,
+                    },
+                )
+                .await,
+            Err(ConversationError::BadRequest { .. })
+        ));
+    }
+    let updated = service
+        .update_task_retry_policy(
+            "user_1",
+            &task.id,
+            aionui_api_types::UpdateTaskRetryPolicyRequest {
+                max_attempts: 2,
+                timeout_ms: Some(600_000),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.retry_max_attempts, 2);
+    assert_eq!(updated.retry_timeout_ms, Some(600_000));
+
+    let plan = service
+        .submit_task_artifact(
+            "user_1",
+            &task.id,
+            SubmitTaskArtifactRequest {
+                kind: TaskArtifactKind::Plan,
+                content: "Do the thing".into(),
+                acceptance_criteria: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .decide_task_approval(
+            "user_1",
+            &task.id,
+            &plan.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: plan.artifact.id.clone(),
+                artifact_hash: plan.artifact.content_hash.clone(),
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    let run = service
+        .execute_approved_plan(
+            "user_1",
+            &task.id,
+            ExecuteApprovedPlanRequest {
+                approval_id: plan.approval.id.clone(),
+                artifact_id: plan.artifact.id.clone(),
+                artifact_hash: plan.artifact.content_hash.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.status, aionui_api_types::TaskRunStatus::Failed, "{run:?}");
+    assert_eq!(run.attempt, 2);
+    assert_eq!(run.timeout_ms, Some(600_000));
+    let runs = service.list_task_runs("user_1", &task.id).await.unwrap();
+    let first = runs.iter().find(|candidate| candidate.attempt == 1).unwrap();
+    assert_eq!(first.status, aionui_api_types::TaskRunStatus::Failed);
+    assert_eq!(run.retry_of_run_id.as_deref(), Some(first.id.as_str()));
+    assert_eq!(runs.len(), 2, "max_attempts = 2 caps the chain");
+    let approvals = service.list_task_approvals("user_1", &task.id).await.unwrap();
+    let approval = approvals
+        .iter()
+        .find(|candidate| candidate.id == plan.approval.id)
+        .unwrap();
+    assert_eq!(
+        approval.run_id.as_deref(),
+        Some(run.id.as_str()),
+        "claim moved to the last attempt"
+    );
+}

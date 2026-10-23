@@ -7,10 +7,10 @@ use crate::models::{
     TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow, TaskTraceEventRow,
 };
 use crate::repository::task_session::{
-    AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams,
-    CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams,
-    FinishTaskRunParams, ITaskSessionRepository, LinkContextSnapshotArtifactParams, ResolveTaskApprovalParams,
-    UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
+    AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateRetryTaskRunParams,
+    CreateTaskArtifactParams, CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams,
+    CreateTaskSessionParams, FinishTaskRunParams, ITaskSessionRepository, LinkContextSnapshotArtifactParams,
+    ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
 };
 
 async fn append_trace_event_tx(
@@ -656,8 +656,9 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         sqlx::query(
             "INSERT INTO task_runs \
              (id, task_session_id, conversation_id, plan_artifact_id, goal_artifact_id, approval_id, status, started_at, \
-              agent_id, agent_runtime, model, mode, planning_isolation) \
-             VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
+              agent_id, agent_runtime, model, mode, planning_isolation, timeout_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, \
+                     (SELECT retry_timeout_ms FROM task_sessions WHERE id = ?))",
         )
         .bind(&run_id)
         .bind(params.task_session_id)
@@ -671,6 +672,7 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .bind(params.model)
         .bind(params.mode)
         .bind(params.planning_isolation)
+        .bind(params.task_session_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE task_sessions SET status = 'running', updated_at = ? WHERE id = ? AND user_id = ?")
@@ -823,6 +825,178 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
             .await?;
         tx.commit().await?;
         Ok(row)
+    }
+
+    async fn create_retry_run(&self, params: &CreateRetryTaskRunParams<'_>) -> Result<TaskRunRow, DbError> {
+        let run_id = aionui_common::generate_prefixed_id("run");
+        let mut tx = self.pool.begin().await?;
+        // Invariant: an approval is executed by at most one run at a time.
+        // `task_approvals.run_id` is the single claim slot. This UPDATE is the
+        // first write of the transaction, so SQLite's single-writer lock
+        // serializes it against every other claim/transfer. It moves the
+        // claim ONLY from the previous run (`run_id = previous`) and only if
+        // that run is already terminal `failed`, so no live run can lose its
+        // claim and two concurrent retries of the same run cannot both match:
+        // whichever commits first changes `run_id`, the other affects 0 rows.
+        let claimed = sqlx::query(
+            "UPDATE task_approvals SET run_id = ? \
+             WHERE run_id = ? AND task_session_id = ? AND status = 'approved' \
+             AND id = ( \
+                 SELECT previous.approval_id FROM task_runs previous \
+                 JOIN task_sessions task ON task.id = previous.task_session_id \
+                 WHERE previous.id = ? AND previous.task_session_id = ? AND task.user_id = ? \
+                 AND previous.run_kind = 'execution' AND previous.status = 'failed' \
+                 AND previous.finished_at IS NOT NULL \
+                 AND task.conversation_id = previous.conversation_id \
+                 AND previous.attempt < task.retry_max_attempts \
+                 AND NOT EXISTS (SELECT 1 FROM task_runs retry WHERE retry.retry_of_run_id = previous.id) \
+             ) \
+             AND EXISTS ( \
+                 SELECT 1 FROM task_artifacts artifact \
+                 WHERE artifact.id = task_approvals.artifact_id \
+                 AND artifact.task_session_id = task_approvals.task_session_id \
+                 AND artifact.content_hash = task_approvals.artifact_hash \
+                 AND artifact.status = 'approved' \
+             )",
+        )
+        .bind(&run_id)
+        .bind(params.previous_run_id)
+        .bind(params.task_session_id)
+        .bind(params.previous_run_id)
+        .bind(params.task_session_id)
+        .bind(params.user_id)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "Task run is not retryable: it must be a failed execution run that still holds a valid \
+                 approval and has attempts remaining"
+                    .into(),
+            ));
+        }
+        // Copy the previous run's execution snapshot. The partial unique index
+        // on retry_of_run_id makes a second retry of the same run fail here
+        // even if the claim guard above were ever bypassed.
+        sqlx::query(
+            "INSERT INTO task_runs \
+             (id, task_session_id, conversation_id, run_kind, plan_artifact_id, goal_artifact_id, approval_id, \
+              status, started_at, agent_id, agent_runtime, model, mode, planning_isolation, \
+              attempt, retry_of_run_id, timeout_ms) \
+             SELECT ?, previous.task_session_id, previous.conversation_id, 'execution', previous.plan_artifact_id, \
+                    previous.goal_artifact_id, previous.approval_id, 'running', ?, previous.agent_id, \
+                    previous.agent_runtime, previous.model, previous.mode, previous.planning_isolation, \
+                    previous.attempt + 1, previous.id, task.retry_timeout_ms \
+             FROM task_runs previous JOIN task_sessions task ON task.id = previous.task_session_id \
+             WHERE previous.id = ? AND previous.task_session_id = ? AND task.user_id = ?",
+        )
+        .bind(&run_id)
+        .bind(params.started_at)
+        .bind(params.previous_run_id)
+        .bind(params.task_session_id)
+        .bind(params.user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE task_sessions SET status = 'running', updated_at = ? WHERE id = ? AND user_id = ?")
+            .bind(params.started_at)
+            .bind(params.task_session_id)
+            .bind(params.user_id)
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query_as::<_, TaskRunRow>("SELECT * FROM task_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            params.previous_run_id,
+            "run.retried",
+            params.started_at,
+            &serde_json::json!({ "retry_run_id": run_id, "attempt": row.attempt }).to_string(),
+        )
+        .await?;
+        let retry_payload = serde_json::json!({
+            "retry_of_run_id": params.previous_run_id,
+            "attempt": row.attempt,
+            "approval_id": row.approval_id,
+            "timeout_ms": row.timeout_ms
+        })
+        .to_string();
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "run.retry",
+            params.started_at,
+            &retry_payload,
+        )
+        .await?;
+        append_trace_event_tx(
+            &mut tx,
+            params.task_session_id,
+            &run_id,
+            "run.started",
+            params.started_at,
+            "{}",
+        )
+        .await?;
+        let checkpoint_sequence: i64 = sqlx::query_scalar("SELECT next_trace_sequence FROM task_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO task_checkpoints \
+             (id, task_session_id, run_id, checkpoint_type, sequence, artifact_id, state, created_at) \
+             VALUES (?, ?, ?, 'before_execution', ?, ?, ?, ?)",
+        )
+        .bind(aionui_common::generate_prefixed_id("checkpoint"))
+        .bind(params.task_session_id)
+        .bind(&run_id)
+        .bind(checkpoint_sequence)
+        .bind(row.plan_artifact_id.as_deref())
+        .bind(&retry_payload)
+        .bind(params.started_at)
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query_as::<_, TaskRunRow>("SELECT * FROM task_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    async fn set_retry_policy(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        max_attempts: i64,
+        timeout_ms: Option<i64>,
+        updated_at: TimestampMs,
+    ) -> Result<TaskSessionRow, DbError> {
+        if !(1..=3).contains(&max_attempts) || timeout_ms.is_some_and(|value| value <= 0) {
+            return Err(DbError::Conflict("Invalid retry policy".into()));
+        }
+        let result = sqlx::query(
+            "UPDATE task_sessions SET retry_max_attempts = ?, retry_timeout_ms = ?, updated_at = ? \
+             WHERE id = ? AND user_id = ?",
+        )
+        .bind(max_attempts)
+        .bind(timeout_ms)
+        .bind(updated_at)
+        .bind(task_session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::NotFound(format!("task session {task_session_id}")));
+        }
+        sqlx::query_as::<_, TaskSessionRow>("SELECT * FROM task_sessions WHERE id = ? AND user_id = ?")
+            .bind(task_session_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DbError::from)
     }
 
     async fn list_runs(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskRunRow>, DbError> {
@@ -1993,6 +2167,362 @@ mod tests {
         };
         assert!(matches!(rejected, DbError::Conflict(_)), "unexpected error: {rejected}");
         assert_eq!(repo.list_runs(USER, &task.id).await.unwrap().len(), 1);
+    }
+
+    struct RetryFixture {
+        _directory: tempfile::TempDir,
+        db: crate::Database,
+        repo: SqliteTaskSessionRepository,
+        task_id: String,
+        artifact_id: String,
+        approval_id: String,
+        run_id: String,
+    }
+
+    /// An approved plan whose first execution run is still `running`.
+    async fn retry_fixture(max_attempts: i64) -> RetryFixture {
+        let (directory, db) = init_concurrent_database().await;
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+             VALUES ('conversation-retry', ?, 'Retry', 'acp', 1, 1)",
+        )
+        .bind(USER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let repo = SqliteTaskSessionRepository::new(db.pool().clone());
+        let mut task_params = create_params("ready");
+        task_params.conversation_id = Some("conversation-retry");
+        let task = repo.create(&task_params).await.unwrap();
+        if max_attempts != 1 {
+            repo.set_retry_policy(USER, &task.id, max_attempts, Some(60_000), 2)
+                .await
+                .unwrap();
+        }
+        let (artifact, approval, _) = repo
+            .create_artifact_with_approval(&CreateTaskArtifactParams {
+                user_id: USER,
+                task_session_id: &task.id,
+                kind: "plan",
+                content: "retry me",
+                content_hash: "retry-hash",
+                acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
+            })
+            .await
+            .unwrap();
+        repo.resolve_approval(&ResolveTaskApprovalParams {
+            user_id: USER,
+            task_session_id: &task.id,
+            approval_id: &approval.id,
+            artifact_id: &artifact.id,
+            artifact_hash: &artifact.content_hash,
+            status: "approved",
+            resolved_by: USER,
+            comment: None,
+            resolved_at: 20,
+        })
+        .await
+        .unwrap();
+        let run = repo
+            .create_run(&CreateTaskRunParams {
+                user_id: USER,
+                task_session_id: &task.id,
+                conversation_id: "conversation-retry",
+                plan_artifact_id: &artifact.id,
+                goal_artifact_id: None,
+                approval_id: &approval.id,
+                artifact_hash: &artifact.content_hash,
+                started_at: 21,
+                agent_id: "aionrs",
+                agent_runtime: Some("aionrs"),
+                model: None,
+                mode: "plan",
+                planning_isolation: Some("guaranteed"),
+            })
+            .await
+            .unwrap();
+        RetryFixture {
+            _directory: directory,
+            db,
+            repo,
+            task_id: task.id,
+            artifact_id: artifact.id,
+            approval_id: approval.id,
+            run_id: run.id,
+        }
+    }
+
+    async fn finish_as(fixture: &RetryFixture, run_id: &str, status: &str) {
+        fixture
+            .repo
+            .finish_run(&FinishTaskRunParams {
+                user_id: USER,
+                task_session_id: &fixture.task_id,
+                run_id,
+                run_status: status,
+                task_status: if status == "completed" { "completed" } else { "failed" },
+                finished_at: 30,
+                error_message: Some("boom"),
+                result_summary: None,
+                usage: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn retry_params<'a>(fixture: &'a RetryFixture, previous_run_id: &'a str) -> CreateRetryTaskRunParams<'a> {
+        CreateRetryTaskRunParams {
+            user_id: USER,
+            task_session_id: &fixture.task_id,
+            previous_run_id,
+            started_at: 40,
+        }
+    }
+
+    async fn claim_holder(fixture: &RetryFixture) -> Option<String> {
+        fixture
+            .repo
+            .get_approval(USER, &fixture.task_id, &fixture.approval_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_id
+    }
+
+    #[tokio::test]
+    async fn retry_policy_defaults_to_single_attempt_and_is_bounded() {
+        let fixture = retry_fixture(1).await;
+        let task = fixture.repo.get(USER, &fixture.task_id).await.unwrap().unwrap();
+        assert_eq!(task.retry_max_attempts, 1);
+        assert_eq!(task.retry_timeout_ms, None);
+        for invalid in [0, 4, -1] {
+            assert!(
+                fixture
+                    .repo
+                    .set_retry_policy(USER, &fixture.task_id, invalid, None, 3)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            fixture
+                .repo
+                .set_retry_policy(USER, &fixture.task_id, 2, Some(0), 3)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            fixture
+                .repo
+                .set_retry_policy("other-user", &fixture.task_id, 2, None, 3)
+                .await,
+            Err(DbError::NotFound(_))
+        ));
+        // Default policy: a failed run is NOT retryable.
+        finish_as(&fixture, &fixture.run_id, "failed").await;
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
+        assert_eq!(claim_holder(&fixture).await.as_deref(), Some(fixture.run_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn retry_transfers_claim_links_chain_and_stops_at_max_attempts() {
+        let fixture = retry_fixture(3).await;
+        let first = fixture
+            .repo
+            .get_run(USER, &fixture.task_id, &fixture.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attempt, 1);
+        assert_eq!(
+            first.timeout_ms,
+            Some(60_000),
+            "create_run snapshots the policy timeout"
+        );
+        finish_as(&fixture, &fixture.run_id, "failed").await;
+
+        let second = fixture
+            .repo
+            .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+            .await
+            .unwrap();
+        assert_eq!(second.attempt, 2);
+        assert_eq!(second.status, "running");
+        assert_eq!(second.retry_of_run_id.as_deref(), Some(fixture.run_id.as_str()));
+        assert_eq!(second.approval_id.as_deref(), Some(fixture.approval_id.as_str()));
+        assert_eq!(second.plan_artifact_id.as_deref(), Some(fixture.artifact_id.as_str()));
+        assert_eq!(second.timeout_ms, Some(60_000));
+        assert_eq!(claim_holder(&fixture).await.as_deref(), Some(second.id.as_str()));
+        let trace = fixture
+            .repo
+            .list_trace_events(USER, &fixture.task_id, &second.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            trace.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(),
+            ["run.retry", "run.started"]
+        );
+        let old_trace = fixture
+            .repo
+            .list_trace_events(USER, &fixture.task_id, &fixture.run_id)
+            .await
+            .unwrap();
+        assert_eq!(old_trace.last().unwrap().event_type, "run.retried");
+
+        // The superseded failed run can never be retried again.
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
+        // A running run is not retryable.
+        assert!(matches!(
+            fixture.repo.create_retry_run(&retry_params(&fixture, &second.id)).await,
+            Err(DbError::Conflict(_))
+        ));
+        finish_as(&fixture, &second.id, "failed").await;
+        let third = fixture
+            .repo
+            .create_retry_run(&retry_params(&fixture, &second.id))
+            .await
+            .unwrap();
+        assert_eq!(third.attempt, 3);
+        finish_as(&fixture, &third.id, "failed").await;
+        assert!(
+            matches!(
+                fixture.repo.create_retry_run(&retry_params(&fixture, &third.id)).await,
+                Err(DbError::Conflict(_))
+            ),
+            "attempts are capped at retry_max_attempts"
+        );
+        assert_eq!(claim_holder(&fixture).await.as_deref(), Some(third.id.as_str()));
+        assert_eq!(fixture.repo.list_runs(USER, &fixture.task_id).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_non_failed_runs_invalid_approvals_and_other_users() {
+        // cancelled / completed are terminal but not retryable.
+        for status in ["cancelled", "completed"] {
+            let fixture = retry_fixture(3).await;
+            finish_as(&fixture, &fixture.run_id, status).await;
+            assert!(matches!(
+                fixture
+                    .repo
+                    .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                    .await,
+                Err(DbError::Conflict(_))
+            ));
+        }
+        // Another user cannot retry.
+        let fixture = retry_fixture(3).await;
+        finish_as(&fixture, &fixture.run_id, "failed").await;
+        let mut foreign = retry_params(&fixture, &fixture.run_id);
+        foreign.user_id = "other-user";
+        assert!(matches!(
+            fixture.repo.create_retry_run(&foreign).await,
+            Err(DbError::Conflict(_))
+        ));
+        // The plan artifact was superseded after the failure.
+        sqlx::query("UPDATE task_artifacts SET status = 'superseded' WHERE id = ?")
+            .bind(&fixture.artifact_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
+        // The approval itself is no longer approved.
+        let fixture = retry_fixture(3).await;
+        finish_as(&fixture, &fixture.run_id, "failed").await;
+        sqlx::query("UPDATE task_approvals SET status = 'cancelled' WHERE id = ?")
+            .bind(&fixture.approval_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
+        // The artifact content hash no longer matches the approved hash.
+        let fixture = retry_fixture(3).await;
+        finish_as(&fixture, &fixture.run_id, "failed").await;
+        sqlx::query("UPDATE task_artifacts SET content_hash = 'tampered' WHERE id = ?")
+            .bind(&fixture.artifact_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
+        assert_eq!(fixture.repo.list_runs(USER, &fixture.task_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_retries_of_one_failed_run_allow_exactly_one_new_run() {
+        let fixture = retry_fixture(3).await;
+        finish_as(&fixture, &fixture.run_id, "failed").await;
+        let left_params = retry_params(&fixture, &fixture.run_id);
+        let right_params = retry_params(&fixture, &fixture.run_id);
+        let third_params = retry_params(&fixture, &fixture.run_id);
+        let (left, right, third) = tokio::join!(
+            fixture.repo.create_retry_run(&left_params),
+            fixture.repo.create_retry_run(&right_params),
+            fixture.repo.create_retry_run(&third_params)
+        );
+        let results = [left, right, third];
+        let winners: Vec<&TaskRunRow> = results.iter().filter_map(|result| result.as_ref().ok()).collect();
+        assert_eq!(winners.len(), 1, "exactly one retry may take over the approval");
+        for result in &results {
+            if let Err(error) = result {
+                assert!(matches!(error, DbError::Conflict(_)), "unexpected error: {error}");
+            }
+        }
+        assert_eq!(claim_holder(&fixture).await.as_deref(), Some(winners[0].id.as_str()));
+        // A fresh create_run cannot steal the claim back either.
+        let stolen = fixture
+            .repo
+            .create_run(&CreateTaskRunParams {
+                user_id: USER,
+                task_session_id: &fixture.task_id,
+                conversation_id: "conversation-retry",
+                plan_artifact_id: &fixture.artifact_id,
+                goal_artifact_id: None,
+                approval_id: &fixture.approval_id,
+                artifact_hash: "retry-hash",
+                started_at: 50,
+                agent_id: "aionrs",
+                agent_runtime: Some("aionrs"),
+                model: None,
+                mode: "plan",
+                planning_isolation: Some("guaranteed"),
+            })
+            .await;
+        assert!(matches!(stolen, Err(DbError::Conflict(_))));
+        let runs = fixture.repo.list_runs(USER, &fixture.task_id).await.unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs.iter().filter(|run| run.status == "running").count(), 1);
     }
 
     #[tokio::test]

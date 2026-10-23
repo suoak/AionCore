@@ -3,8 +3,8 @@
 //! Builds the `GET /api/conversations/{id}/context-breakdown` response from
 //! the persisted / live `context_usage` JSON. Provider-reported categories
 //! (an optional `breakdown` array inside `context_usage`) win; local
-//! estimates fill in only keys the provider did not report, and are always
-//! marked `estimated`. Segments are clamped so they never exceed `used`, and
+//! estimates are used only when the provider reported no categories, and are
+//! always marked `estimated`. Segments are clamped so they never exceed `used`, and
 //! the remainder is an `other` segment, so the ring always sums to `used`.
 
 use aionui_api_types::{ContextBreakdownResponse, ContextBreakdownSegment, ContextSegmentSource};
@@ -16,6 +16,50 @@ const OTHER_KEY: &str = "other";
 
 /// Categories that describe unused capacity rather than context content.
 const CAPACITY_KEYS: &[&str] = &["free_space", "free", "autocompact_buffer", "reserved"];
+
+/// Rough per-schema cost of one advertised (non-deferred) tool. Real schemas
+/// range from ~50 to several thousand tokens; this is labeled `estimated`.
+pub(crate) const EST_TOKENS_PER_TOOL_SCHEMA: u64 = 300;
+/// Rough cost of one skill listing (name + description) in the system prompt.
+pub(crate) const EST_TOKENS_PER_SKILL_LISTING: u64 = 100;
+
+/// Local estimates from the live tool surface: tool schemas and skill listings.
+pub(crate) fn estimates_from_tool_surface(
+    surface: Option<&aionui_api_types::ConversationToolSurface>,
+) -> Vec<EstimatedSegment> {
+    use aionui_api_types::ToolSurfaceKind;
+    let Some(surface) = surface else {
+        return Vec::new();
+    };
+    let (mut tools, mut skills) = (0u64, 0u64);
+    if surface.entries.is_empty() {
+        tools = surface.tools.len() as u64;
+    } else {
+        for entry in &surface.entries {
+            match entry.kind {
+                ToolSurfaceKind::Skill => skills += 1,
+                ToolSurfaceKind::Builtin | ToolSurfaceKind::Mcp if entry.deferred != Some(true) => tools += 1,
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if tools > 0 {
+        out.push(EstimatedSegment {
+            key: "tools".to_owned(),
+            label: "Tool schemas".to_owned(),
+            tokens: tools.saturating_mul(EST_TOKENS_PER_TOOL_SCHEMA),
+        });
+    }
+    if skills > 0 {
+        out.push(EstimatedSegment {
+            key: "skills".to_owned(),
+            label: "Skills".to_owned(),
+            tokens: skills.saturating_mul(EST_TOKENS_PER_SKILL_LISTING),
+        });
+    }
+    out
+}
 
 /// A locally estimated segment supplied by the caller.
 #[derive(Debug, Clone)]
@@ -120,6 +164,10 @@ pub(crate) fn build_context_breakdown(
             source: ContextSegmentSource::Reported,
         });
     }
+    // Provider categories already cover the whole context (claude reports
+    // system tools / MCP tools / skills itself), so estimates are only used when
+    // the provider reported none — mixing both would double-count.
+    let estimates = if reported.is_empty() { estimates } else { &[] };
     for estimate in estimates {
         let key = slug(&estimate.key);
         if key.is_empty()
@@ -227,14 +275,61 @@ mod tests {
             &[estimate("system_tools", 999), estimate("skills", 120)],
         );
         let keys: Vec<_> = resp.segments.iter().map(|segment| segment.key.as_str()).collect();
-        assert_eq!(keys, ["system_prompt", "system_tools", "messages", "skills", "other"]);
+        assert_eq!(keys, ["system_prompt", "system_tools", "messages", "other"]);
         assert_eq!(resp.segments[1].tokens, 200, "reported value beats estimate");
-        assert_eq!(resp.segments[1].source, ContextSegmentSource::Reported);
+        assert!(
+            resp.segments
+                .iter()
+                .all(|segment| segment.source == ContextSegmentSource::Reported),
+            "estimates never mix into a provider breakdown"
+        );
         assert_eq!(resp.segments[2].tokens, 150, "duplicate keys merge");
-        assert_eq!(resp.segments[3].source, ContextSegmentSource::Estimated);
-        assert_eq!(resp.segments[4].tokens, 1000 - 300 - 200 - 150 - 120);
-        assert_eq!(resp.segments[4].source, ContextSegmentSource::Estimated);
+        assert_eq!(resp.segments[3].tokens, 1000 - 300 - 200 - 150);
         assert_eq!(sum(&resp), 1000);
+    }
+
+    #[test]
+    fn estimates_fill_in_without_provider_categories() {
+        let usage = json!({"used": 1000});
+        let resp = build_context_breakdown("c1", Some(&usage), &[estimate("tools", 600), estimate("skills", 100)]);
+        let keys: Vec<_> = resp.segments.iter().map(|segment| segment.key.as_str()).collect();
+        assert_eq!(keys, ["tools", "skills", "other"]);
+        assert!(
+            resp.segments
+                .iter()
+                .all(|segment| segment.source == ContextSegmentSource::Estimated)
+        );
+        assert_eq!(sum(&resp), 1000);
+    }
+
+    #[test]
+    fn tool_surface_estimates_skip_deferred_tools() {
+        use aionui_api_types::{ConversationToolSurface, McpIsolation, ToolSurfaceEntry, ToolSurfaceKind};
+        assert!(estimates_from_tool_surface(None).is_empty());
+        let entry = |name: &str, kind: ToolSurfaceKind, deferred: Option<bool>| ToolSurfaceEntry {
+            name: name.to_owned(),
+            canonical: name.to_owned(),
+            kind,
+            server: None,
+            deferred,
+        };
+        let mut surface = ConversationToolSurface::launch_config(Vec::new(), McpIsolation::Strict);
+        surface.tools = vec!["Read".into(), "Bash".into()];
+        let names_only = estimates_from_tool_surface(Some(&surface));
+        assert_eq!(names_only.len(), 1);
+        assert_eq!(names_only[0].tokens, 2 * EST_TOKENS_PER_TOOL_SCHEMA);
+
+        surface.entries = vec![
+            entry("Read", ToolSurfaceKind::Builtin, None),
+            entry("mcp__a__x", ToolSurfaceKind::Mcp, Some(false)),
+            entry("mcp__a__y", ToolSurfaceKind::Mcp, Some(true)),
+            entry("skill:pdf", ToolSurfaceKind::Skill, None),
+        ];
+        let estimates = estimates_from_tool_surface(Some(&surface));
+        assert_eq!(estimates[0].key, "tools");
+        assert_eq!(estimates[0].tokens, 2 * EST_TOKENS_PER_TOOL_SCHEMA);
+        assert_eq!(estimates[1].key, "skills");
+        assert_eq!(estimates[1].tokens, EST_TOKENS_PER_SKILL_LISTING);
     }
 
     #[test]

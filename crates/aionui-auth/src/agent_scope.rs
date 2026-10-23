@@ -479,6 +479,34 @@ mod tests {
     }
 
     #[test]
+    fn task_retry_policy_and_execution_routes_are_denied() {
+        // M7 E5-5: retry policy decides how often an approval may be
+        // re-executed; an agent must never be able to widen it or re-run.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            for path in [
+                "/api/task-sessions/t1/retry-policy",
+                "/api/task-sessions/t1/retry-policy?max_attempts=3",
+                "/api/task-sessions/t1/execute",
+                "/api/task-sessions/t1/runs",
+                "/api/task-sessions/t1",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn task_run_replay_routes_are_denied() {
         // M7 E5-2: run replay exposes the full sanitized trace; user-only.
         for method in [
