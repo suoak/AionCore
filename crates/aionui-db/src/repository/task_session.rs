@@ -50,7 +50,8 @@ pub trait ITaskSessionRepository: Send + Sync {
     /// still holds its approval's claim (`task_approvals.run_id`), the approval
     /// is still `approved` for an artifact that is still approved with the same
     /// hash, the task is still bound to the same conversation, the previous run
-    /// has not been retried already, and `attempt < retry_max_attempts`.
+    /// has not been retried already, no user cancel is recorded on the task
+    /// (`cancel_requested_at IS NULL`), and `attempt < retry_max_attempts`.
     async fn create_retry_run(&self, params: &CreateRetryTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
     /// Set the retry policy. `max_attempts` must be 1..=3 (1 disables retry).
     async fn set_retry_policy(
@@ -61,6 +62,18 @@ pub trait ITaskSessionRepository: Send + Sync {
         timeout_ms: Option<i64>,
         updated_at: TimestampMs,
     ) -> Result<TaskSessionRow, DbError>;
+    /// Record a user cancel on every task of `conversation_id` whose execution
+    /// is in flight (`running`) or between a failed attempt and its retry
+    /// (`failed`). Blocks `create_retry_run` until `create_run` clears it.
+    /// Returns the number of tasks marked.
+    async fn request_execution_cancel(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        requested_at: TimestampMs,
+    ) -> Result<u64, DbError>;
+    /// Whether a cancel was requested for this task since its last execution start.
+    async fn execution_cancel_requested(&self, user_id: &str, task_session_id: &str) -> Result<bool, DbError>;
     async fn list_runs(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskRunRow>, DbError>;
     async fn get_run(&self, user_id: &str, task_session_id: &str, run_id: &str) -> Result<Option<TaskRunRow>, DbError>;
     async fn append_trace_event(&self, params: &AppendTaskTraceEventParams<'_>) -> Result<TaskTraceEventRow, DbError>;

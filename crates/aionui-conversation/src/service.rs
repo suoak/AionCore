@@ -88,6 +88,25 @@ use std::sync::RwLock;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard cap on how long a task execution may keep running after it was told to
+/// stop (policy timeout or user cancel). Past it the agent is killed; it sits
+/// behind the cancel watchdog so that one normally wins.
+const TASK_EXECUTION_STOP_GRACE: Duration = Duration::from_secs(ACP_CANCEL_DRAIN_TIMEOUT.as_secs() + 5);
+/// After the hard-cap kill, how long the turn gets to unwind before the
+/// supervisor abandons it (capped by the stop grace).
+const TASK_EXECUTION_KILL_SETTLE: Duration = Duration::from_secs(5);
+/// How often a supervised execution re-checks for a recorded user cancel and
+/// re-issues cancels that did not apply yet.
+const TASK_EXECUTION_SUPERVISE_TICK: Duration = Duration::from_millis(250);
+
+/// How a supervised task execution turn ended.
+enum SupervisedTurn<O> {
+    /// The turn future resolved on its own (possibly after a cancel).
+    Settled { output: O, timed_out: bool },
+    /// The agent ignored the stop request; it was killed and the turn
+    /// abandoned after the hard cap.
+    Abandoned { timed_out: bool },
+}
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
@@ -853,6 +872,9 @@ pub struct ConversationService {
     input_queue_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Cross-session delivery grants created by the user's `@@` picks.
     session_mention_grants: Arc<session_mentions::SessionMentionGrants>,
+    /// Stop grace for task executions in milliseconds (see
+    /// [`TASK_EXECUTION_STOP_GRACE`]); adjustable for tests.
+    task_execution_stop_grace_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -1003,7 +1025,26 @@ impl ConversationService {
             worktree_binding: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
             session_mention_grants: Arc::new(session_mentions::SessionMentionGrants::new()),
+            task_execution_stop_grace_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                TASK_EXECUTION_STOP_GRACE.as_millis() as u64,
+            )),
         }
+    }
+
+    /// Override how long a task execution may keep running after a timeout or
+    /// cancel before its agent is killed. Tests shorten it.
+    pub fn set_task_execution_stop_grace(&self, grace: Duration) {
+        self.task_execution_stop_grace_ms.store(
+            u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn task_execution_stop_grace(&self) -> Duration {
+        Duration::from_millis(
+            self.task_execution_stop_grace_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Shared `@@` delivery grants (see [`session_mentions::SessionMentionGrants`]).
@@ -2086,84 +2127,101 @@ impl ConversationService {
                     self.output_retention_policy(),
                 )),
             );
-            let (outcome, timed_out) = self
-                .await_turn_with_timeout(turn, user_id, conversation_id, run.timeout_ms)
-                .await;
+            let (outcome, timed_out) = match self
+                .supervise_task_turn(turn, user_id, conversation_id, task_session_id, run.timeout_ms)
+                .await
+            {
+                SupervisedTurn::Settled { output, timed_out } => (Some(output), timed_out),
+                SupervisedTurn::Abandoned { timed_out } => (None, timed_out),
+            };
+            let abandoned = outcome.is_none();
             let run_usage = self.capture_task_run_usage(conversation_id).await;
             let (mut run_status, mut task_status, mut error_message, result_summary) = match outcome {
-                Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => {
-                    let result_summary = outcome
-                        .assistant_output
-                        .as_deref()
-                        .map(crate::trace_redaction::redact_and_bound);
-                    if mode == TaskSessionMode::Goal {
-                        let criteria = repo.list_acceptance_criteria(user_id, task_session_id).await?;
-                        let goal_artifact_id = goal_artifact_id.as_deref().expect("goal mode has a goal artifact");
-                        let current_criteria: Vec<_> = criteria
-                            .iter()
-                            .filter(|criterion| criterion.goal_artifact_id == goal_artifact_id)
-                            .collect();
-                        if !current_criteria.is_empty()
-                            && current_criteria.iter().all(|criterion| criterion.status == "passed")
-                        {
+                None => (
+                    TaskRunStatus::Cancelled,
+                    TaskSessionStatus::Cancelled,
+                    Some("Cancelled; agent did not stop and was terminated".to_owned()),
+                    None,
+                ),
+                Some(outcome) => match outcome {
+                    Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => {
+                        let result_summary = outcome
+                            .assistant_output
+                            .as_deref()
+                            .map(crate::trace_redaction::redact_and_bound);
+                        if mode == TaskSessionMode::Goal {
+                            let criteria = repo.list_acceptance_criteria(user_id, task_session_id).await?;
+                            let goal_artifact_id = goal_artifact_id.as_deref().expect("goal mode has a goal artifact");
+                            let current_criteria: Vec<_> = criteria
+                                .iter()
+                                .filter(|criterion| criterion.goal_artifact_id == goal_artifact_id)
+                                .collect();
+                            if !current_criteria.is_empty()
+                                && current_criteria.iter().all(|criterion| criterion.status == "passed")
+                            {
+                                (
+                                    TaskRunStatus::Completed,
+                                    TaskSessionStatus::Completed,
+                                    None,
+                                    result_summary,
+                                )
+                            } else {
+                                (
+                                    TaskRunStatus::Completed,
+                                    TaskSessionStatus::Paused,
+                                    None,
+                                    result_summary,
+                                )
+                            }
+                        } else {
                             (
                                 TaskRunStatus::Completed,
                                 TaskSessionStatus::Completed,
                                 None,
                                 result_summary,
                             )
-                        } else {
-                            (
-                                TaskRunStatus::Completed,
-                                TaskSessionStatus::Paused,
-                                None,
-                                result_summary,
-                            )
                         }
-                    } else {
-                        (
-                            TaskRunStatus::Completed,
-                            TaskSessionStatus::Completed,
-                            None,
-                            result_summary,
-                        )
                     }
-                }
-                Ok(outcome) => (
-                    if outcome.status == ConversationAgentTurnStatus::Cancelled {
-                        TaskRunStatus::Cancelled
-                    } else {
-                        TaskRunStatus::Failed
-                    },
-                    if outcome.status == ConversationAgentTurnStatus::Cancelled {
-                        TaskSessionStatus::Cancelled
-                    } else {
-                        TaskSessionStatus::Failed
-                    },
-                    outcome
-                        .error_message
-                        .as_deref()
-                        .map(crate::trace_redaction::redact_and_bound),
-                    outcome
-                        .assistant_output
-                        .as_deref()
-                        .map(crate::trace_redaction::redact_and_bound),
-                ),
-                Err(error) => (
-                    TaskRunStatus::Failed,
-                    TaskSessionStatus::Failed,
-                    Some(crate::trace_redaction::redact_and_bound(&error.to_string())),
-                    None,
-                ),
+                    Ok(outcome) => (
+                        if outcome.status == ConversationAgentTurnStatus::Cancelled {
+                            TaskRunStatus::Cancelled
+                        } else {
+                            TaskRunStatus::Failed
+                        },
+                        if outcome.status == ConversationAgentTurnStatus::Cancelled {
+                            TaskSessionStatus::Cancelled
+                        } else {
+                            TaskSessionStatus::Failed
+                        },
+                        outcome
+                            .error_message
+                            .as_deref()
+                            .map(crate::trace_redaction::redact_and_bound),
+                        outcome
+                            .assistant_output
+                            .as_deref()
+                            .map(crate::trace_redaction::redact_and_bound),
+                    ),
+                    Err(error) => (
+                        TaskRunStatus::Failed,
+                        TaskSessionStatus::Failed,
+                        Some(crate::trace_redaction::redact_and_bound(&error.to_string())),
+                        None,
+                    ),
+                },
             };
             if timed_out && run_status != TaskRunStatus::Completed {
                 // A policy timeout is a failure (retryable), not a user cancel.
                 run_status = TaskRunStatus::Failed;
                 task_status = TaskSessionStatus::Failed;
-                error_message = Some(format!(
-                    "Execution timed out after {} ms",
-                    run.timeout_ms.unwrap_or_default()
-                ));
+                error_message = Some(if abandoned {
+                    format!(
+                        "Execution timed out after {} ms; agent did not stop and was terminated",
+                        run.timeout_ms.unwrap_or_default()
+                    )
+                } else {
+                    format!("Execution timed out after {} ms", run.timeout_ms.unwrap_or_default())
+                });
             }
             let finished = repo
                 .finish_run(&FinishTaskRunParams {
@@ -2212,53 +2270,129 @@ impl ConversationService {
         }
     }
 
-    /// Await an execution turn, cancelling it once `timeout_ms` elapses.
+    /// Supervise an approved-execution turn.
     ///
-    /// The turn future is never dropped mid-flight: after the deadline the
-    /// active turn is cancelled through the normal cancel path and the future
-    /// is awaited until it settles, so persistence and hooks run as usual.
-    /// Returns whether the deadline fired.
-    async fn await_turn_with_timeout<F>(
+    /// The turn is stopped through the normal cancel path when either the
+    /// policy `timeout_ms` elapses or a user cancel is recorded on the task
+    /// (which also covers a cancel that arrived while no turn was live, e.g.
+    /// just as a retry attempt started). The future is normally awaited until
+    /// it settles so persistence and hooks run as usual.
+    ///
+    /// Hard cap: if the turn is still running [`Self::task_execution_stop_grace`]
+    /// after the stop began, the agent is killed; if even that does not
+    /// unwind the turn within [`TASK_EXECUTION_KILL_SETTLE`] (capped by the
+    /// grace), the future is
+    /// dropped (its turn claim is released on drop) and the turn is reported
+    /// as abandoned.
+    async fn supervise_task_turn<F>(
         &self,
         turn: F,
         user_id: &str,
         conversation_id: &str,
+        task_session_id: &str,
         timeout_ms: Option<i64>,
-    ) -> (F::Output, bool)
+    ) -> SupervisedTurn<F::Output>
     where
         F: std::future::Future,
     {
-        let Some(timeout) = timeout_ms
+        let deadline = timeout_ms
             .and_then(|value| u64::try_from(value).ok())
             .filter(|value| *value > 0)
-            .map(Duration::from_millis)
-        else {
-            return (turn.await, false);
-        };
+            .map(|value| tokio::time::Instant::now() + Duration::from_millis(value));
+        let repo = self.task_session_repo_optional();
         tokio::pin!(turn);
-        tokio::select! {
-            output = &mut turn => return (output, false),
-            () = tokio::time::sleep(timeout) => {}
-        }
-        warn!(conversation_id, timeout_ms = ?timeout_ms, "Task execution run timed out; cancelling turn");
+        let mut tick = tokio::time::interval(TASK_EXECUTION_SUPERVISE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut timed_out = false;
+        let mut stop_started: Option<tokio::time::Instant> = None;
         let mut cancelled_turn: Option<String> = None;
-        let mut retry_cancel = tokio::time::interval(Duration::from_secs(1));
+        let mut killed_at: Option<tokio::time::Instant> = None;
         loop {
+            let deadline_sleep = async {
+                match deadline {
+                    Some(deadline) if !timed_out => tokio::time::sleep_until(deadline).await,
+                    _ => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
-                output = &mut turn => return (output, true),
-                _ = retry_cancel.tick() => {
-                    let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) else {
-                        continue;
-                    };
-                    if cancelled_turn.as_deref() == Some(turn_id.as_str()) {
-                        continue;
-                    }
-                    if let Err(error) = self.cancel(user_id, conversation_id, &turn_id, &self.task_manager).await {
-                        debug!(conversation_id, %error, "Timed-out turn cancel did not apply yet");
-                    } else {
-                        cancelled_turn = Some(turn_id);
+                output = &mut turn => return SupervisedTurn::Settled { output, timed_out },
+                () = deadline_sleep => {
+                    warn!(conversation_id, timeout_ms = ?timeout_ms, "Task execution run timed out; cancelling turn");
+                    timed_out = true;
+                    stop_started.get_or_insert_with(tokio::time::Instant::now);
+                }
+                _ = tick.tick() => {
+                    if stop_started.is_none()
+                        && let Some(repo) = repo.as_ref()
+                        && repo
+                            .execution_cancel_requested(user_id, task_session_id)
+                            .await
+                            .unwrap_or_else(|error| {
+                                warn!(task_session_id, %error, "Failed to read task cancel request");
+                                false
+                            })
+                    {
+                        info!(conversation_id, task_session_id, "User cancel recorded on task; stopping execution turn");
+                        stop_started = Some(tokio::time::Instant::now());
                     }
                 }
+            }
+            let Some(started) = stop_started else {
+                continue;
+            };
+            if let Some(killed_at) = killed_at {
+                if killed_at.elapsed() >= TASK_EXECUTION_KILL_SETTLE.min(self.task_execution_stop_grace()) {
+                    error!(
+                        conversation_id,
+                        task_session_id, "Task execution turn did not unwind after kill; abandoning it"
+                    );
+                    // Dropping the pinned future releases its turn claim.
+                    self.runtime_state.clear_cancelling(conversation_id);
+                    return SupervisedTurn::Abandoned { timed_out };
+                }
+                continue;
+            }
+            if started.elapsed() >= self.task_execution_stop_grace() {
+                warn!(
+                    conversation_id,
+                    task_session_id,
+                    grace_ms = self.task_execution_stop_grace().as_millis() as u64,
+                    "Task execution ignored its stop request; killing agent"
+                );
+                if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+                    self.runtime_state.mark_force_terminated(conversation_id, &turn_id);
+                }
+                self.task_manager
+                    .kill_and_wait(conversation_id, Some(AgentKillReason::UserCancelTimeout))
+                    .await;
+                killed_at = Some(tokio::time::Instant::now());
+                continue;
+            }
+            let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) else {
+                continue;
+            };
+            if cancelled_turn.as_deref() == Some(turn_id.as_str()) {
+                continue;
+            }
+            if self.runtime_state.is_cancelling(conversation_id) {
+                // The user's own cancel already reached this turn.
+                cancelled_turn = Some(turn_id);
+                continue;
+            }
+            // `cancel_with_cause`, not `cancel`: a policy timeout must not be
+            // recorded as a user cancel (that would block the retry).
+            match self
+                .cancel_with_cause(
+                    user_id,
+                    conversation_id,
+                    &turn_id,
+                    &self.task_manager,
+                    TurnCancelCause::UserRequested,
+                )
+                .await
+            {
+                Ok(_) => cancelled_turn = Some(turn_id),
+                Err(error) => debug!(conversation_id, %error, "Task execution cancel did not apply yet"),
             }
         }
     }
@@ -6767,6 +6901,14 @@ impl ConversationService {
         turn_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<CancelConversationResponse, ConversationError> {
+        // Record the intent on the conversation's task executions first: the
+        // stop must also hold between a failed attempt and its retry, when
+        // there is no live turn for the id check below to match.
+        if let Some(repo) = self.task_session_repo_optional()
+            && let Err(error) = repo.request_execution_cancel(user_id, conversation_id, now_ms()).await
+        {
+            warn!(conversation_id, %error, "Failed to record task execution cancel request");
+        }
         self.cancel_with_cause(
             user_id,
             conversation_id,
