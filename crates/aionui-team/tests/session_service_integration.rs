@@ -346,9 +346,6 @@ struct FakeConversationPorts {
     repo: Arc<MockConversationRepo>,
     workspace_root: std::path::PathBuf,
     preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
-    /// Canned global MCP selection returned by `resolve_global_mcp_selection`;
-    /// `None` means "no MCP configured" (empty selection).
-    global_mcp_selection: Mutex<Option<TeamMcpSelection>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
     fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
 }
@@ -368,14 +365,9 @@ impl FakeConversationPorts {
             repo,
             workspace_root,
             preset_snapshots: Mutex::new(HashMap::new()),
-            global_mcp_selection: Mutex::new(None),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    fn set_global_mcp_selection(&self, selection: TeamMcpSelection) {
-        *self.global_mcp_selection.lock().unwrap() = Some(selection);
     }
 
     fn upsert_preset_snapshot(&self, id: &str, snapshot: FakePresetAssistantSnapshot) {
@@ -502,10 +494,6 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         }))
-    }
-
-    async fn resolve_global_mcp_selection(&self, _user_id: &str) -> Result<TeamMcpSelection, aionui_team::TeamError> {
-        Ok(self.global_mcp_selection.lock().unwrap().clone().unwrap_or_default())
     }
 
     async fn resolve_assistant_mcp_selection(
@@ -3332,23 +3320,6 @@ async fn team_preset_assistant_snapshot_is_frozen() {
     assert_frozen_preset_extra(&after_live_change);
 }
 
-fn global_selection_with_builtin() -> TeamMcpSelection {
-    use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
-    TeamMcpSelection {
-        mcp_server_ids: vec!["mcp-global".into()],
-        session_mcp_servers: vec![SessionMcpServer {
-            id: "mcp-chrome".into(),
-            name: "chrome-devtools".into(),
-            transport: SessionMcpTransport::Stdio {
-                command: "/runtime/npx".into(),
-                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
-                env: Default::default(),
-            },
-        }],
-        mcp_statuses: Vec::new(),
-    }
-}
-
 /// B-10: a member bound to an assistant mounts exactly that assistant's
 /// `resolved_defaults.mcp_ids` allowlist; the user's global enabled set
 /// (including builtins such as chrome-devtools) must not leak in.
@@ -3367,7 +3338,6 @@ async fn team_member_bound_to_assistant_uses_its_mcp_allowlist_not_global() {
         "word-creator",
         fake_preset_snapshot("assistant rule body", &["pdf", "cron"], &["mcp-docs"]),
     );
-    conversation_ports.set_global_mcp_selection(global_selection_with_builtin());
 
     let resp = svc
         .create_team(
@@ -3414,7 +3384,6 @@ async fn team_member_with_empty_assistant_allowlist_mounts_no_mcp() {
         Arc::new(EmptyAssistantOverlayRepo),
     );
     conversation_ports.upsert_preset_snapshot("word-creator", fake_preset_snapshot("rules", &["pdf"], &[]));
-    conversation_ports.set_global_mcp_selection(global_selection_with_builtin());
 
     let resp = svc
         .create_team(
@@ -3441,11 +3410,11 @@ async fn team_member_with_empty_assistant_allowlist_mounts_no_mcp() {
     assert_eq!(extra["mcp_servers"], serde_json::json!([]));
 }
 
-/// A raw-backend member (no assistant binding) keeps the legacy behavior: the
-/// user's global enabled selection, builtins included.
+/// E1: a raw-backend member (no assistant binding) has no allowlist, so it
+/// mounts no user MCP servers -- it no longer inherits the global enabled set.
 #[tokio::test]
-async fn team_member_without_assistant_keeps_global_mcp_selection() {
-    let (svc, _team_repo, conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
+async fn team_member_without_assistant_mounts_no_user_mcp() {
+    let (svc, _team_repo, _conversation_ports, conv_repo) = setup_with_ports_metadata_assistants_and_conversation_repo(
         success_factory(),
         seeded_agent_metadata_repo(),
         Arc::new(SingleAssistantDefinitionRepo {
@@ -3453,7 +3422,6 @@ async fn team_member_without_assistant_keeps_global_mcp_selection() {
         }),
         Arc::new(EmptyAssistantOverlayRepo),
     );
-    conversation_ports.set_global_mcp_selection(global_selection_with_builtin());
 
     let resp = svc
         .create_team(
@@ -3475,11 +3443,8 @@ async fn team_member_without_assistant_keeps_global_mcp_selection() {
         .expect("create team");
 
     let extra = conv_repo.get_extra(&resp.assistants[0].conversation_id).unwrap();
-    assert_eq!(extra["mcp_server_ids"], serde_json::json!(["mcp-global"]));
-    assert_eq!(
-        extra["session_mcp_servers"][0]["name"],
-        serde_json::json!("chrome-devtools")
-    );
+    assert_eq!(extra["mcp_server_ids"], serde_json::json!([]));
+    assert_eq!(extra["session_mcp_servers"], serde_json::json!([]));
 }
 #[tokio::test]
 async fn spawned_preset_assistant_snapshot_is_frozen() {

@@ -502,13 +502,6 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
-    async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, TeamError> {
-        self.conversation_service
-            .resolve_global_mcp_selection(user_id)
-            .await
-            .map_err(map_conversation_update_error)
-    }
-
     async fn resolve_assistant_mcp_selection(
         &self,
         user_id: &str,

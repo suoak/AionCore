@@ -129,22 +129,10 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError>;
 
-    /// Resolve the user's globally enabled MCP servers (enabled non-builtin
-    /// rows by id + enabled builtin rows as neutral session servers) into the
-    /// two create-time request shapes. Used by team provisioning so member
-    /// conversations carry the operator's full MCP selection — including
-    /// builtin servers the generic enabled-set fallback hard-excludes.
-    ///
-    /// A repo read failure is an error — never a silently empty set — so
-    /// provisioning aborts instead of dropping every user MCP.
-    async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, TeamError> {
-        let _ = user_id;
-        Ok(TeamMcpSelection::default())
-    }
-
     /// Resolve the MCP allowlist of a member bound to `assistant_id`: exactly
-    /// that assistant's `resolved_defaults.mcp_ids` (B-10), in the same two
-    /// create-time shapes as [`Self::resolve_global_mcp_selection`]. An empty
+    /// that assistant's `resolved_defaults.mcp_ids` (B-10), in the two
+    /// create-time request shapes (non-builtin ids + builtin rows as neutral
+    /// session servers). An empty
     /// allowlist mounts nothing. The default is the fail-closed empty set.
     async fn resolve_assistant_mcp_selection(
         &self,
@@ -155,10 +143,11 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         Ok(TeamMcpSelection::default())
     }
 
-    /// Resolve the user's globally enabled MCP servers into the full typed
-    /// four-field runtime snapshot for an existing conversation's agent
-    /// (names + statuses classified against its transport support). Used by
-    /// the attach path to refresh the persisted snapshot.
+    /// Resolve an existing member conversation's MCP allowlist (its assistant's
+    /// frozen or live allowlist; nothing when unbound) into the full typed
+    /// four-field runtime snapshot (names + statuses classified against its
+    /// transport support). Used by the attach path to refresh the persisted
+    /// snapshot.
     async fn resolve_conversation_mcp_snapshot(
         &self,
         user_id: &str,
@@ -215,27 +204,22 @@ impl TeamAgentProvisioner {
     ///
     /// A member bound to an assistant gets exactly that assistant's
     /// `resolved_defaults.mcp_ids` -- an empty allowlist mounts nothing, and
-    /// the global enabled set is never consulted for it. An unbound member
-    /// (raw backend) keeps the legacy global selection, resolved at most once
-    /// per call site through `global`.
+    /// the global enabled set is never consulted. An unbound member (raw
+    /// backend) has no allowlist and mounts no user MCP servers (E1): only the
+    /// team's own tool server, which is wired separately.
     async fn member_mcp_selection(
         &self,
         user_id: &str,
         assistant_id: Option<&str>,
-        global: &mut Option<TeamMcpSelection>,
     ) -> Result<TeamMcpSelection, TeamError> {
-        if let Some(assistant_id) = assistant_id {
-            return self
-                .conversation_port
-                .resolve_assistant_mcp_selection(user_id, assistant_id)
-                .await;
+        match assistant_id {
+            Some(assistant_id) => {
+                self.conversation_port
+                    .resolve_assistant_mcp_selection(user_id, assistant_id)
+                    .await
+            }
+            None => Ok(TeamMcpSelection::default()),
         }
-        if let Some(selection) = global.as_ref() {
-            return Ok(selection.clone());
-        }
-        let selection = self.conversation_port.resolve_global_mcp_selection(user_id).await?;
-        *global = Some(selection.clone());
-        Ok(selection)
     }
 
     fn workspace_resolver(&self) -> TeamWorkspaceResolver {
@@ -275,16 +259,11 @@ impl TeamAgentProvisioner {
         // Resolve every member's MCP selection BEFORE any conversation is
         // created, so a read failure aborts here rather than leaving orphan
         // conversations. Members bound to an assistant get that assistant's
-        // allowlist (B-10); unbound members share ONE global resolution so they
-        // cannot observe an inconsistent toggle state mid-provisioning.
-        let mut global_selection = None;
+        // allowlist (B-10); unbound members mount no user MCP servers.
         let mut member_selections = Vec::with_capacity(inputs.len());
         for input in inputs {
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
-            member_selections.push(
-                self.member_mcp_selection(user_id, assistant_id.as_deref(), &mut global_selection)
-                    .await?,
-            );
+            member_selections.push(self.member_mcp_selection(user_id, assistant_id.as_deref()).await?);
         }
         let leader_backend = self
             .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
@@ -409,10 +388,8 @@ impl TeamAgentProvisioner {
         let backend = self
             .resolve_requested_backend(user_id, req.backend.as_deref(), assistant_id.as_deref())
             .await?;
-        // The assistant's allowlist for a bound member, else the global set.
-        let mcp_selection = self
-            .member_mcp_selection(user_id, assistant_id.as_deref(), &mut None)
-            .await?;
+        // The assistant's allowlist for a bound member, else nothing.
+        let mcp_selection = self.member_mcp_selection(user_id, assistant_id.as_deref()).await?;
         let agent = self
             .provision_new_agent(
                 NewAgentProvisioning {
@@ -469,10 +446,10 @@ impl TeamAgentProvisioner {
             .ok_or_else(|| TeamError::TeamNotFound(req.team_id.clone()))?;
         let mut team = Team::from_row(&row)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
-        // The assistant's allowlist for a bound member, else the global set.
+        // The assistant's allowlist for a bound member, else nothing.
         let spawned_assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let mcp_selection = self
-            .member_mcp_selection(&req.user_id, spawned_assistant_id.as_deref(), &mut None)
+            .member_mcp_selection(&req.user_id, spawned_assistant_id.as_deref())
             .await?;
         let agent = self
             .provision_new_agent(
@@ -519,7 +496,7 @@ impl TeamAgentProvisioner {
             selected_transport = ?transport,
             "resolved Team tool transport"
         );
-        // Refresh the user's globally enabled MCP snapshot (including builtin
+        // Refresh the member's allowlisted MCP snapshot (including builtin
         // servers) BEFORE composing the patch so the rebuilt session carries
         // the current selection. A repo read failure aborts the attach — it is
         // never treated as "enabled set is empty", which would clear the
@@ -951,7 +928,7 @@ mod tests {
     struct RecordingProvisioningPort {
         events: Arc<Mutex<Vec<&'static str>>>,
         patches: Arc<Mutex<Vec<serde_json::Value>>>,
-        /// Canned global MCP snapshot returned to the provisioner, so tests can
+        /// Canned MCP snapshot returned to the provisioner, so tests can
         /// assert the composed patch carries the four snapshot fields.
         mcp_snapshot: Option<McpRuntimeSnapshot>,
         mcp_error: Option<&'static str>,
@@ -968,7 +945,11 @@ mod tests {
             Err(TeamError::InvalidRequest("unused".into()))
         }
 
-        async fn resolve_global_mcp_selection(&self, _user_id: &str) -> Result<TeamMcpSelection, TeamError> {
+        async fn resolve_assistant_mcp_selection(
+            &self,
+            _user_id: &str,
+            _assistant_id: &str,
+        ) -> Result<TeamMcpSelection, TeamError> {
             if let Some(message) = self.mcp_error {
                 return Err(TeamError::InvalidRequest(message.into()));
             }
@@ -1598,7 +1579,7 @@ mod tests {
             role: "lead".into(),
             backend: Some("aionrs".into()),
             model: "test-model".into(),
-            assistant_id: None,
+            assistant_id: Some("assistant-1".into()),
             conversation_id: None,
         }];
 
@@ -1613,8 +1594,44 @@ mod tests {
         assert!(error.to_string().contains("MCP repository unavailable"));
         assert!(
             events.lock().unwrap().is_empty(),
-            "global MCP resolution must fail before any conversation is created"
+            "allowlist MCP resolution must fail before any conversation is created"
         );
+    }
+
+    /// E1: an unbound member has no allowlist, so provisioning never resolves
+    /// user MCP servers for it (the failing MCP repo is not even consulted).
+    #[tokio::test]
+    async fn provision_initial_agents_unbound_member_never_resolves_user_mcp() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let provisioner = test_provisioner_with_port_state(
+            Arc::clone(&events),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some("MCP repository unavailable"),
+            Arc::new(Mutex::new(serde_json::json!({}))),
+        );
+        let inputs = vec![TeamAgentInput {
+            name: "Lead".into(),
+            role: "lead".into(),
+            backend: Some("aionrs".into()),
+            model: "test-model".into(),
+            assistant_id: None,
+            conversation_id: None,
+        }];
+
+        let error = match provisioner
+            .provision_initial_agents("user-1", "team-1", &inputs, Some("/workspace"))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the recording port refuses conversation creation"),
+        };
+
+        assert!(
+            !error.to_string().contains("MCP repository unavailable"),
+            "unbound member must not resolve user MCP: {error}"
+        );
+        assert_eq!(events.lock().unwrap().as_slice(), ["create"]);
     }
 
     #[tokio::test]
