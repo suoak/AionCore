@@ -1,4 +1,4 @@
-# E3-1 / E3-2: managed git worktrees (Core)
+# E3-1 / E3-2 / E3-4: managed git worktrees and fan-out (Core)
 
 ## Status
 
@@ -129,13 +129,80 @@ SCM       = unchanged: scm/* protocol and git_provider are not touched
   ships `.csbu-workmate/skills`, `.aionrs/skills` and a malicious
   `.aionrs.toml` loads none of them (aionrs agent test).
 
+## E3-4: fan-out groups (Core)
+
+`FanoutService` (`crates/aionui-worktree/src/fanout.rs`) runs one prompt in
+2..5 isolated worktrees (one per slot, labels `A`..`E`) and adopts one winner.
+
+Routes (user session only; agent runtime tokens get `403 AGENT_SCOPE_DENIED`
+on every method, `agent_scope.rs`):
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| POST | `/api/fanout-groups` | `202`, group in `preparing` |
+| GET | `/api/fanout-groups?task_session_id=` | newest first, max 200 |
+| GET | `/api/fanout-groups/{id}` | group + slots |
+| GET | `/api/fanout-groups/{id}/compare` | per-file × per-slot diff stat, last reply (≤2000 chars) |
+| POST | `/api/fanout-groups/{id}/adopt` | `{slot, strategy, target_branch?, snapshot_message?, cleanup?}` |
+| POST | `/api/fanout-groups/{id}/discard` | removes every slot |
+| POST | `/api/fanout-groups/{id}/cancel` | stops turns, keeps worktrees |
+
+Defaults (product decisions): at most 5 slots, `max_parallel` defaults to
+`min(3, slots)` and must be 1..5 when given (`FANOUT_LIMIT` otherwise; it
+throttles worktree checkouts, every created slot then runs). Each slot uses
+the assistant's own permission mode: `slots[].permission` is accepted and
+ignored (warn log), YOLO is never forced. A slot only names `assistant_id` and
+an optional `model`; inline `backend` / MCP fields are rejected.
+
+Group states: `preparing → running → comparing → adopted | discarded`;
+`cancelled` from any live state; `failed` when no slot could start (or a
+group was left `preparing` across a restart). `comparing` is entered once
+every started slot is idle (any non-`Idle` runtime counts as busy).
+
+Adopt (`strategy` default `branch_only`):
+
+- `squash` / `no_ff` / `cherry_pick` merge into the source checkout. The
+  target must be the currently checked-out branch, not detached, without an
+  in-progress merge / cherry-pick / revert / rebase and without tracked
+  changes (`TARGET_NOT_CLEAN`, 409). Uncommitted winner changes are first
+  committed on the slot branch (`--no-verify`, fallback identity only when
+  `user.name` / `user.email` are unset). A conflict is aborted
+  (`reset --merge` / `merge --abort` / `cherry-pick --abort`) and returned as
+  `ADOPT_CONFLICT` (409) with the conflicted paths; the group stays in
+  `comparing`.
+- Adopt commits (snapshot, squash commit, `--no-ff` merge commit) pass
+  `--no-verify`: repository hooks are not run by WorkMate in M7 (design §7
+  item 10); signing and the rest of the user's `.gitconfig` still apply. A
+  snapshot commit stays on the slot branch even when the merge then
+  conflicts, so no work is lost.
+- A busy winner is `SLOT_BUSY` (409); concurrent adopt / discard / cancel on
+  one group get `FANOUT_INVALID_STATE` ("busy").
+- Only the winner branch is kept: losing slots are removed (turn stopped,
+  conversation released, `force_dir`, branch delete `auto`, or `keep` with
+  `cleanup.keep_branches`). A loser branch with unmerged commits is never
+  deleted and is listed in `adopt_result.preserved_branches`; its uncommitted
+  files go with the directory. The winner worktree and branch stay.
+- `fanout.adopted` is traced on the winner worktree's task session.
+
+Conversations are created through `IFanoutConversations` (app adapter
+`FanoutConversationsAdapter`), each with `worktree_id` so the E3-2 binding
+and workspace lock apply. Without the adapter the routes answer
+`503 FANOUT_UNAVAILABLE`.
+
+Sub-agent approvals: aionrs is pinned to v0.2.25 (#155); slot conversations
+are ordinary conversations, so sub-agent tool calls reach Core approval with
+the parent `msg_id` (`sub_agent_tool_requests_reach_core_approval_with_the_parent_msg_id`)
+and aionrs `auto_approve` is only set for `session_mode == "yolo"`.
+
+Tests: `crates/aionui-worktree/tests/fanout_service.rs` (real git, scripted
+conversation port), `crates/aionui-app/tests/fanout_e2e.rs` (agent token 403,
+validation over the router).
+
 ## Deferred to later E3 PRs
 
 - E3-3 (UI): Worktree toggle, Start-from picker, progress / cancel / retry,
   delete dialog, preserved-branch review, `managed_worktree_id` label in the
   SCM tree, diff-stat view.
-- E3-4: `FanoutService` and `/api/fanout-groups*` (table already in 066);
-  `fanout.adopted` trace event; fan-out conversations pass `worktree_id` per
-  slot.
+- E3-4 (UI): fan-out send from the guid page, compare / adopt panel.
 - E3-7 (M8): remote `fetch` before create, `size_bytes`, disk quotas, Windows
   deepest-path pre-check.

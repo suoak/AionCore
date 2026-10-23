@@ -13,10 +13,19 @@
 //! Conversation binding (E3-2): a conversation created with `worktree_id`
 //! holds the worktree (`conversation_id`); deleting the conversation marks
 //! it `unbound` and keeps the directory.
+//!
+//! Fan-out (E3-4): [`fanout`] runs one prompt through 2..=5 assistants, each
+//! in its own worktree slot, then compares and adopts one
+//! (`/api/fanout-groups*`, [`fanout_routes`]).
 
 pub mod diff;
 pub mod error;
 pub mod events;
+pub mod fanout;
+pub mod fanout_port;
+pub mod fanout_routes;
+pub mod fanout_store;
+pub mod fanout_types;
 pub mod git_cli;
 pub mod routes;
 pub mod service;
@@ -25,6 +34,10 @@ pub mod types;
 
 pub use error::WorktreeError;
 pub use events::WorktreeEvents;
+pub use fanout::FanoutService;
+pub use fanout_port::{FanoutPrompt, IFanoutConversations, SlotConversationSpec, SlotRuntime};
+pub use fanout_routes::{FanoutRouterState, fanout_routes};
+pub use fanout_store::FanoutStore;
 pub use git_cli::{GitCli, GitCliError, GitVersion, MIN_GIT_VERSION};
 pub use routes::{WorktreeRouterState, worktree_routes};
 pub use service::{WorktreeService, WorktreeServiceConfig};

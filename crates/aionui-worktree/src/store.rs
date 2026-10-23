@@ -47,6 +47,11 @@ pub struct NewWorktree {
     pub base_ref: String,
     pub base_commit: String,
     pub task_session_id: Option<String>,
+    /// E3-4: set for a fan-out slot worktree.
+    pub fanout_group_id: Option<String>,
+    pub slot: Option<String>,
+    /// JSON slot spec (`{}` for a standalone worktree).
+    pub slot_spec: String,
     pub now: i64,
 }
 
@@ -73,13 +78,16 @@ impl WorktreeStore {
 
     pub async fn insert(&self, new: &NewWorktree) -> Result<WorktreeRow, WorktreeError> {
         sqlx::query(
-            "INSERT INTO task_worktrees (id, user_id, task_session_id, source_repo_path, repo_common_dir, path, \
-             branch, base_ref, base_commit, status, phase, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'creating', 'add', ?, ?)",
+            "INSERT INTO task_worktrees (id, user_id, task_session_id, fanout_group_id, slot, slot_spec, \
+             source_repo_path, repo_common_dir, path, branch, base_ref, base_commit, status, phase, created_at, \
+             updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'creating', 'add', ?, ?)",
         )
         .bind(&new.id)
         .bind(&new.user_id)
         .bind(&new.task_session_id)
+        .bind(&new.fanout_group_id)
+        .bind(&new.slot)
+        .bind(&new.slot_spec)
         .bind(&new.source_repo_path)
         .bind(&new.repo_common_dir)
         .bind(&new.path)
@@ -293,5 +301,48 @@ impl WorktreeStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(map_err)
+    }
+
+    // ------------------------------------------------------------------
+    // Fan-out (E3-4)
+    // ------------------------------------------------------------------
+
+    /// Every worktree of a fan-out group (any status), in slot order.
+    pub async fn list_by_group(&self, group_id: &str) -> Result<Vec<WorktreeRow>, WorktreeError> {
+        sqlx::query_as::<_, WorktreeRow>(&format!(
+            "SELECT {COLUMNS} FROM task_worktrees WHERE fanout_group_id = ? ORDER BY slot, created_at"
+        ))
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_err)
+    }
+
+    /// Release a slot worktree from its conversation so it can be removed:
+    /// `conversation_id` is cleared and a `ready` row becomes `unbound`.
+    pub async fn detach_conversation(&self, id: &str, now: i64) -> Result<bool, WorktreeError> {
+        let result = sqlx::query(
+            "UPDATE task_worktrees SET conversation_id = NULL, status = 'unbound', updated_at = ? \
+             WHERE id = ? AND status IN ('ready', 'unbound')",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record a non-fatal slot error on a live worktree (status unchanged).
+    pub async fn set_error(&self, id: &str, code: &str, message: &str, now: i64) -> Result<(), WorktreeError> {
+        sqlx::query("UPDATE task_worktrees SET error_code = ?, error_message = ?, updated_at = ? WHERE id = ?")
+            .bind(code)
+            .bind(message)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_err)?;
+        Ok(())
     }
 }

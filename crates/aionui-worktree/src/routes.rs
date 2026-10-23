@@ -29,8 +29,9 @@ pub struct WorktreeRouterState {
 impl From<WorktreeError> for ApiError {
     fn from(err: WorktreeError) -> Self {
         let status = match &err {
-            WorktreeError::NotFound(_) => StatusCode::NOT_FOUND,
-            WorktreeError::BadRequest(_)
+            WorktreeError::NotFound(_) | WorktreeError::FanoutNotFound(_) => StatusCode::NOT_FOUND,
+            WorktreeError::FanoutLimit(_)
+            | WorktreeError::BadRequest(_)
             | WorktreeError::InvalidRef(_)
             | WorktreeError::NotARepository(_)
             | WorktreeError::RefNotFound(_)
@@ -39,7 +40,12 @@ impl From<WorktreeError> for ApiError {
             WorktreeError::BranchExists(_)
             | WorktreeError::Dirty(_)
             | WorktreeError::InvalidState { .. }
-            | WorktreeError::PathConflict(_) => StatusCode::CONFLICT,
+            | WorktreeError::PathConflict(_)
+            | WorktreeError::FanoutInvalidState { .. }
+            | WorktreeError::SlotBusy(_)
+            | WorktreeError::AdoptConflict(_)
+            | WorktreeError::TargetNotClean(_) => StatusCode::CONFLICT,
+            WorktreeError::FanoutUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             WorktreeError::GitNotAvailable(_) | WorktreeError::GitTooOld { .. } => StatusCode::FAILED_DEPENDENCY,
             WorktreeError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             WorktreeError::Cancelled => StatusCode::CONFLICT,
