@@ -119,7 +119,10 @@ mod tests {
     #[test]
     fn workspace_lock_only_applies_to_bound_conversations() {
         let bound = json!({ "worktree_id": "w", "workspace": "/wt" });
-        assert!(patch_moves_bound_workspace(&bound, &json!({ "workspace": "/elsewhere" })));
+        assert!(patch_moves_bound_workspace(
+            &bound,
+            &json!({ "workspace": "/elsewhere" })
+        ));
         assert!(patch_moves_bound_workspace(&bound, &json!({ "workspace": null })));
         assert!(!patch_moves_bound_workspace(&bound, &json!({ "workspace": "/wt" })));
         assert!(!patch_moves_bound_workspace(&bound, &json!({ "name": "x" })));
@@ -138,8 +141,13 @@ mod tests {
             json!({ "fanout_slot": "B" }),
             json!({ "fanout_group_id": "g" }),
         ] {
-            assert!(check_protected_extra_patch(&existing, &incoming, false).is_err(), "{incoming}");
+            assert!(
+                check_protected_extra_patch(&existing, &incoming, false).is_err(),
+                "{incoming}"
+            );
         }
-        assert!(check_protected_extra_patch(&existing, &json!({ "worktree_id": "w", "fanout_slot": "A" }), false).is_ok());
+        assert!(
+            check_protected_extra_patch(&existing, &json!({ "worktree_id": "w", "fanout_slot": "A" }), false).is_ok()
+        );
     }
 }
