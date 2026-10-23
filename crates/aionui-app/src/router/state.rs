@@ -47,7 +47,7 @@ use aionui_mcp::{
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
-use aionui_review::{AllowedRootsResolver, ReviewRouterState, ReviewService};
+use aionui_review::{AllowedRootsResolver, DeliveryRouterState, DeliveryService, ReviewRouterState, ReviewService};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
@@ -167,6 +167,8 @@ pub struct ModuleStates {
     pub skill_evolution: SkillEvolutionRouterState,
     /// M7 E4 diff annotations (`/api/review-threads*`).
     pub review: ReviewRouterState,
+    /// M7 E4-5 PR delivery (`/api/scm-deliveries*`).
+    pub scm_delivery: DeliveryRouterState,
     pub worktree: aionui_worktree::WorktreeRouterState,
 }
 
@@ -410,6 +412,7 @@ pub async fn build_module_states(
         agent_center,
         skill_evolution,
         review: build_module_state_phase(&boot, "review", || build_review_state(services)),
+        scm_delivery: build_module_state_phase(&boot, "scm_delivery", || build_delivery_state(services)),
         worktree,
     };
     tracing::info!(
@@ -823,6 +826,19 @@ pub fn build_review_state(services: &AppServices) -> ReviewRouterState {
     });
     ReviewRouterState {
         service: Arc::new(ReviewService::new(services.database.pool().clone(), resolver).with_input_sink(input_sink)),
+    }
+}
+
+/// PR delivery through the user's `gh` / `glab`, sandboxed like review scopes.
+pub fn build_delivery_state(services: &AppServices) -> DeliveryRouterState {
+    let projects = Arc::new(ReviewProjectDirs {
+        projects: services.project_service.clone(),
+    });
+    let resolver = Arc::new(
+        AllowedRootsResolver::new(default_allowed_roots(Some(services.work_dir.as_path()))).with_projects(projects),
+    );
+    DeliveryRouterState {
+        service: Arc::new(DeliveryService::new(services.database.pool().clone(), resolver)),
     }
 }
 

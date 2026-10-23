@@ -18,6 +18,10 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 
 use crate::batch::{ListReviewBatchesQuery, ReviewBatch, SendReviewBatchRequest, SendReviewBatchResponse};
+use crate::delivery::{
+    CODE_CREATE_FAILED, CODE_RUN_NOT_FOUND, CreatePullRequestRequest, CreatePullRequestResponse, DeliveryService,
+    DetectHostQuery, HostStatus, ListScmDeliveriesQuery, ScmDelivery,
+};
 use crate::error::ReviewError;
 use crate::service::ReviewService;
 use crate::types::{
@@ -168,4 +172,83 @@ async fn add_comment(
         .await
         .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(thread)))
+}
+
+// ── /api/scm-deliveries (E4-5) ─────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct DeliveryRouterState {
+    pub service: Arc<DeliveryService>,
+}
+
+/// `/api/scm-deliveries*`. User identity only: the prefix is not in the
+/// agent-token allow-list, so an agent cannot open a PR through WorkMate.
+/// The caller applies `auth_middleware`.
+pub fn delivery_routes(state: DeliveryRouterState) -> Router {
+    Router::new()
+        .route("/api/scm-deliveries", get(list_deliveries))
+        .route("/api/scm-deliveries/host", get(detect_host))
+        .route("/api/scm-deliveries/pull-request", post(create_pull_request))
+        .with_state(state)
+}
+
+fn delivery_error(error: ReviewError) -> ApiError {
+    match error {
+        ReviewError::BadRequest(message) => {
+            ApiError::coded(StatusCode::BAD_REQUEST, "SCM_DELIVERY_BAD_REQUEST", message, None)
+        }
+        ReviewError::NotFound => ApiError::coded(StatusCode::NOT_FOUND, "SCM_DELIVERY_NOT_FOUND", "Not found", None),
+        ReviewError::Conflict { code, message } => {
+            let status = match code {
+                CODE_CREATE_FAILED => StatusCode::BAD_GATEWAY,
+                CODE_RUN_NOT_FOUND => StatusCode::NOT_FOUND,
+                _ => StatusCode::CONFLICT,
+            };
+            ApiError::coded(status, code, message, None)
+        }
+        ReviewError::Internal(detail) => {
+            tracing::error!(error = %detail, "scm delivery failure");
+            ApiError::coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SCM_DELIVERY_INTERNAL",
+                "SCM delivery failure",
+                None,
+            )
+        }
+    }
+}
+
+async fn detect_host(
+    State(state): State<DeliveryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<DetectHostQuery>,
+) -> Result<Json<ApiResponse<HostStatus>>, ApiError> {
+    let status = state
+        .service
+        .detect_host(&user.id, query)
+        .await
+        .map_err(delivery_error)?;
+    Ok(Json(ApiResponse::ok(status)))
+}
+
+async fn create_pull_request(
+    State(state): State<DeliveryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<CreatePullRequestRequest>,
+) -> Result<Json<ApiResponse<CreatePullRequestResponse>>, ApiError> {
+    let created = state
+        .service
+        .create_pull_request(&user.id, req)
+        .await
+        .map_err(delivery_error)?;
+    Ok(Json(ApiResponse::ok(created)))
+}
+
+async fn list_deliveries(
+    State(state): State<DeliveryRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<ListScmDeliveriesQuery>,
+) -> Result<Json<ApiResponse<Vec<ScmDelivery>>>, ApiError> {
+    let rows = state.service.list(&user.id, query).await.map_err(delivery_error)?;
+    Ok(Json(ApiResponse::ok(rows)))
 }

@@ -400,6 +400,7 @@ mod tests {
             (Method::POST, "/api/review-batches"),
             (Method::GET, "/api/scm-deliveries/host?repo_path=/repo"),
             (Method::POST, "/api/scm-deliveries/pull-request"),
+            (Method::GET, "/api/scm-deliveries?repo_path=/repo"),
         ] {
             assert_eq!(
                 classify(method.clone(), path),
