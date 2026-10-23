@@ -37,7 +37,7 @@ use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler};
-use aionui_review::review_routes;
+use aionui_review::{delivery_routes, review_routes};
 use aionui_shell::shell_routes;
 use aionui_sidebar::sidebar_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
@@ -386,6 +386,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // the agent scope (prefix not allow-listed).
     let review_authenticated =
         review_routes(states.review).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    // M7 E4-5 PR delivery: user identity only, same agent-scope denial.
+    let delivery_authenticated =
+        delivery_routes(states.scm_delivery).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // M7 E3 worktree routes: user identity only (agent tokens are denied by
     // `agent_scope` because `/api/worktrees` is on no allowlist).
@@ -460,6 +463,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(agent_center_authenticated)
         .merge(skill_evolution_authenticated)
         .merge(review_authenticated)
+        .merge(delivery_authenticated)
         .merge(worktree_authenticated)
         .merge(session_message_authenticated);
 
