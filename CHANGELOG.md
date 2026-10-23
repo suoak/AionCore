@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Behavior Changes
+
+* **security/team:** 未绑定助手的团队成员不再挂载用户全局 MCP。此前此类成员会继承所有已启用的用户 MCP 及内置 MCP；现在只按所绑定助手的 MCP 白名单（`mcp_ids`）挂载，未绑定则默认不挂任何用户/内置 MCP。团队自身的 aionui-team 工具服务器不受影响。如需给成员使用 MCP，请为其绑定助手并在助手中勾选。（M7 E1 遗留①）
+
 ## [0.2.20](https://github.com/suoak/AionCore/compare/v0.2.19...v0.2.20) (2026-10-22)
 
 

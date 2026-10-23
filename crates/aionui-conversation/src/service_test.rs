@@ -10933,13 +10933,14 @@ async fn team_member_snapshot_fails_closed_for_an_unresolvable_assistant() {
 }
 
 #[tokio::test]
-async fn team_member_snapshot_without_assistant_keeps_the_global_selection() {
-    let (svc, builtin_id, user_id) = make_service_with_mcp_rows().await;
+async fn team_member_snapshot_without_assistant_mounts_no_user_mcp() {
+    // E1: an unbound team member must not inherit the user's global MCP set.
+    let (svc, _builtin_id, _user_id) = make_service_with_mcp_rows().await;
     let snapshot = svc
         .resolve_team_member_mcp_snapshot("user_1", "conv-raw", &AgentType::Acp, &json!({ "backend": "claude" }))
         .await
         .unwrap();
-    assert_eq!(snapshot.mcp_server_ids, vec![user_id]);
-    assert_eq!(snapshot.session_mcp_servers.len(), 1);
-    assert_eq!(snapshot.session_mcp_servers[0].id, builtin_id);
+    assert!(snapshot.mcp_server_ids.is_empty());
+    assert!(snapshot.session_mcp_servers.is_empty());
+    assert!(snapshot.mcp_servers.is_empty());
 }

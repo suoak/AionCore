@@ -7696,65 +7696,6 @@ impl ConversationService {
         Ok(resolved)
     }
 
-    /// Resolve the operator's globally enabled MCP servers into final snapshot
-    /// inputs: enabled non-builtin row ids + enabled
-    /// builtin rows (e.g. `chrome-devtools`) converted to neutral session
-    /// servers with stdio launch commands resolved.
-    ///
-    /// A repo read failure is an error — never a silently empty set — so team
-    /// provisioning can abort instead of dropping every user MCP.
-    pub async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, ConversationError> {
-        let mut mcp_server_ids: Vec<String> = Vec::new();
-        let mut session_mcp_servers: Vec<SessionMcpServer> = Vec::new();
-        let mut mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
-        let repo = {
-            let repo_guard = self
-                .mcp_server_repo
-                .read()
-                .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?;
-            repo_guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
-        };
-        let rows = repo
-            .list(user_id)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?;
-        for row in rows {
-            if !row.enabled || row.name == TEAM_MCP_SERVER_NAME {
-                continue;
-            }
-            if row.builtin {
-                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
-                    Ok(server) => session_mcp_servers.push(server),
-                    Err(err) => {
-                        mcp_statuses.push(ConversationMcpStatus {
-                            id: row.id.clone(),
-                            name: row.name.clone(),
-                            status: ConversationMcpStatusKind::Failed,
-                            reason: Some(err.clone()),
-                        });
-                        warn!(
-                            user_id,
-                            server_id = %row.id,
-                            server_name = %row.name,
-                            error = %err,
-                            "user_mcp: malformed builtin row skipped from global snapshot"
-                        );
-                    }
-                }
-            } else {
-                mcp_server_ids.push(row.id);
-            }
-        }
-        Ok(TeamMcpSelection {
-            mcp_server_ids,
-            session_mcp_servers,
-            mcp_statuses,
-        })
-    }
-
     /// Resolve an explicit MCP id allowlist into the two create-time request
     /// shapes: active non-builtin rows by id, active builtin rows as neutral
     /// session servers (launch commands resolved server-side).
@@ -7850,8 +7791,9 @@ impl ConversationService {
     /// The allowlist is resolved in this order:
     /// 1. the conversation's frozen assistant snapshot (`resolved_mcp_ids`);
     /// 2. the assistant named in `extra.assistant_id` (live resolution);
-    /// 3. no assistant binding: the user's global enabled selection (unchanged
-    ///    legacy behavior for raw-backend members).
+    /// 3. no assistant binding: no user MCP servers (E1; raw-backend members
+    ///    used to inherit the global enabled set). The team tool server is
+    ///    wired separately and is unaffected.
     pub async fn resolve_team_member_mcp_snapshot(
         &self,
         user_id: &str,
@@ -7876,7 +7818,7 @@ impl ConversationService {
                 self.resolve_mcp_selection_for_ids(user_id, &ids).await?
             }
             (_, Some(assistant_id)) => self.resolve_assistant_mcp_selection(user_id, assistant_id).await?,
-            _ => self.resolve_global_mcp_selection(user_id).await?,
+            _ => TeamMcpSelection::default(),
         };
         self.build_runtime_mcp_snapshot(
             user_id,
