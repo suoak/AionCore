@@ -430,6 +430,11 @@ impl AppServices {
             .recover_task_sessions()
             .await
             .map_err(|error| anyhow::anyhow!("Failed to recover task sessions: {error}"))?;
+        // Non-fatal: on failure grants simply start empty (fails closed).
+        match conversation_service.session_mention_grants().load_persisted().await {
+            Ok(count) => tracing::debug!(count, "loaded persisted @@ session grants"),
+            Err(error) => tracing::warn!(%error, "loading persisted @@ session grants failed"),
+        }
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());
@@ -554,6 +559,8 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     // Path-1 cascade: a deleted conversation drops its `user_order` rows.
     service.with_delete_hook(Arc::new(UserOrderDeleteHook::new(deps.user_order_store)));
     service.with_project_service(Arc::new(deps.project_service));
+    // E1 tail ③: `@@` grants are written through to SQLite (loaded at startup).
+    service.session_mention_grants().set_store(deps.database.pool().clone());
     service
 }
 

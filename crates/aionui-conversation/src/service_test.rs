@@ -10224,6 +10224,37 @@ async fn get_usage_reads_the_persisted_snapshot_when_no_task_is_live() {
 }
 
 #[tokio::test]
+async fn context_breakdown_reads_persisted_categories_and_is_user_scoped() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    *acp_repo.runtime_state.lock().unwrap() = Some(PersistedSessionState {
+        context_usage_json: Some(
+            r#"{"used":1000,"size":200000,"breakdown":[{"name":"System prompt","tokens":400},{"name":"Free space","tokens":199000}]}"#
+                .to_owned(),
+        ),
+        ..Default::default()
+    });
+    let (svc, _broadcaster, repo, _task_mgr) =
+        make_service_with_resolver_and_acp_session_repo(Arc::new(FixedSkillResolver { names: vec![] }), acp_repo);
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let resp = svc
+        .get_context_breakdown("user_1", &conv.id)
+        .await
+        .expect("breakdown read failed");
+    assert_eq!(resp.used, Some(1000));
+    assert_eq!(resp.size, Some(200000));
+    assert_eq!(resp.source, aionui_api_types::ContextSegmentSource::Reported);
+    let keys: Vec<_> = resp.segments.iter().map(|segment| segment.key.as_str()).collect();
+    assert_eq!(keys, ["system_prompt", "other"]);
+    assert_eq!(resp.segments.iter().map(|segment| segment.tokens).sum::<u64>(), 1000);
+
+    assert!(
+        svc.get_context_breakdown("user_2", &conv.id).await.is_err(),
+        "another user must not read the breakdown"
+    );
+}
+
+#[tokio::test]
 async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
     // The turn is live — its id matches — but the agent has not registered yet,
     // because building one runs real work first (an Antigravity build probes

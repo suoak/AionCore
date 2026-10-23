@@ -48,6 +48,11 @@ pub enum AgentActionKind {
     Cron,
 }
 
+/// Per-conversation read sub-resources an agent token may NOT read even for
+/// its own / `@@`-granted conversation (M7 E5-3: the context ring is a
+/// user-facing cost/context view, not agent input).
+const AGENT_DENIED_CONVERSATION_SUBPATHS: &[&str] = &["context-breakdown"];
+
 /// Route prefixes an agent token may read (GET/HEAD).
 ///
 /// `/api/conversations` is NOT here: conversation reads are scoped per id (see
@@ -119,8 +124,10 @@ pub fn classify_agent_request(method: &Method, path: &str, own_conversation_id: 
             return AgentRouteDecision::Allow;
         }
         if let Some(rest) = path.strip_prefix("/api/conversations/") {
-            let id = rest.split('/').next().unwrap_or("");
-            return if id.is_empty() || id == "." || id == ".." {
+            let mut parts = rest.split('/');
+            let id = parts.next().unwrap_or("");
+            let sub = parts.next().unwrap_or("");
+            return if id.is_empty() || id == "." || id == ".." || AGENT_DENIED_CONVERSATION_SUBPATHS.contains(&sub) {
                 AgentRouteDecision::Deny
             } else {
                 AgentRouteDecision::AllowConversationRead(id.to_owned())
@@ -603,5 +610,34 @@ mod tests {
         assert_eq!(value["env"]["OPENAI_KEY"], "[REDACTED]");
         assert_eq!(value["headers"]["Authorization"], "[REDACTED]");
         assert_eq!(value["password"], "");
+    }
+
+    #[test]
+    fn context_breakdown_route_is_denied_even_for_own_conversation() {
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            for path in [
+                "/api/conversations/own/context-breakdown",
+                "/api/conversations/own/context-breakdown?x=1",
+                "/api/conversations/other/context-breakdown",
+            ] {
+                assert_eq!(
+                    classify_agent_request(&method, path, "own"),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+        // Sibling reads keep their existing per-conversation scoping.
+        assert_eq!(
+            classify_agent_request(&Method::GET, "/api/conversations/own/usage", "own"),
+            AgentRouteDecision::AllowConversationRead("own".to_owned())
+        );
     }
 }

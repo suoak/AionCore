@@ -152,11 +152,21 @@ const MAX_GRANTS_PER_CONVERSATION: usize = 256;
 /// - a successful delivery A → B, which grants B the reply edge B → A (the
 ///   user authorized that pair; it never extends to third conversations).
 ///
-/// In memory only: after a restart the user re-selects targets with `@@`,
-/// which fails closed rather than trusting text an agent could have forged.
+/// Persistence (E1 tail ③): when a store is attached
+/// ([`SessionMentionGrants::set_store`]), grants are written through to the
+/// `session_mention_grants` table and reloaded at startup
+/// ([`SessionMentionGrants::load_persisted`]), so a restart no longer forces
+/// the user to re-select targets. Only these server-side records are trusted;
+/// `@@` text in history is never re-parsed into grants. Without a store
+/// (tests, or a failed load) grants stay in memory and fail closed on restart.
 #[derive(Debug, Default)]
 pub struct SessionMentionGrants {
     inner: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<String>>>,
+    store: std::sync::OnceLock<sqlx::SqlitePool>,
+    /// Single writer: persistence ops are enqueued under the `inner` lock, so
+    /// the database applies them in exactly the order memory changed (a grant
+    /// followed by a forget can never be reordered into a resurrected row).
+    writer: std::sync::OnceLock<PersistQueue>,
 }
 
 impl SessionMentionGrants {
@@ -168,19 +178,126 @@ impl SessionMentionGrants {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Attach the database used to persist grants. Later calls are ignored.
+    pub fn set_store(&self, pool: sqlx::SqlitePool) {
+        let _ = self.store.set(pool);
+    }
+
+    /// Load persisted grants into memory (oldest first, so the per-conversation
+    /// cap keeps the newest). Call once at startup after [`Self::set_store`].
+    pub async fn load_persisted(&self) -> Result<usize, sqlx::Error> {
+        let Some(pool) = self.store.get() else {
+            return Ok(0);
+        };
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT user_id, from_conversation_id, to_conversation_id FROM session_mention_grants \
+             ORDER BY created_at ASC, rowid ASC",
+        )
+        .fetch_all(pool)
+        .await?;
+        let count = rows.len();
+        for (user_id, from, to) in rows {
+            self.grant_in_memory(&user_id, &from, &to);
+        }
+        Ok(count)
+    }
+
+    /// Queue a persistence statement off the caller's path. Callers hold the
+    /// `inner` lock while calling this so queue order equals memory order; one
+    /// worker drains the queue sequentially. Failures are logged and leave the
+    /// in-memory grant intact (it then simply won't survive a restart, which
+    /// fails closed).
+    fn persist(&self, what: &'static str, op: impl FnOnce(sqlx::SqlitePool) -> PersistFuture + Send + 'static) {
+        let Some(pool) = self.store.get() else {
+            return;
+        };
+        let queue = match self.writer.get() {
+            Some(queue) => queue,
+            None => {
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    return;
+                };
+                self.writer.get_or_init(|| {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PersistJob>();
+                    let pool = pool.clone();
+                    handle.spawn(async move {
+                        while let Some((what, op)) = rx.recv().await {
+                            if let Err(error) = op(pool.clone()).await {
+                                tracing::warn!(%error, what, "persisting @@ session grant failed");
+                            }
+                        }
+                    });
+                    PersistQueue(tx)
+                })
+            }
+        };
+        if queue.0.send((what, Box::new(op))).is_err() {
+            tracing::warn!(what, "@@ session grant writer stopped; grant kept in memory only");
+        }
+    }
+
+    /// Update memory only; returns targets evicted by the per-conversation cap.
+    fn grant_in_memory(&self, user_id: &str, from: &str, to: &str) -> Vec<String> {
+        let mut map = self.lock();
+        Self::grant_locked(&mut map, user_id, from, to)
+    }
+
+    fn grant_locked(
+        map: &mut std::collections::HashMap<(String, String), Vec<String>>,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Vec<String> {
+        let targets = map.entry((user_id.to_owned(), from.to_owned())).or_default();
+        targets.retain(|existing| existing != to);
+        targets.push(to.to_owned());
+        if targets.len() > MAX_GRANTS_PER_CONVERSATION {
+            let excess = targets.len() - MAX_GRANTS_PER_CONVERSATION;
+            return targets.drain(..excess).collect();
+        }
+        Vec::new()
+    }
+
     /// Allow `from` to deliver to `to` for `user_id`.
     pub fn grant(&self, user_id: &str, from: &str, to: &str) {
         if from == to || from.is_empty() || to.is_empty() {
             return;
         }
         let mut map = self.lock();
-        let targets = map.entry((user_id.to_owned(), from.to_owned())).or_default();
-        targets.retain(|existing| existing != to);
-        targets.push(to.to_owned());
-        if targets.len() > MAX_GRANTS_PER_CONVERSATION {
-            let excess = targets.len() - MAX_GRANTS_PER_CONVERSATION;
-            targets.drain(..excess);
-        }
+        let evicted = Self::grant_locked(&mut map, user_id, from, to);
+        let (user_id, from, to) = (user_id.to_owned(), from.to_owned(), to.to_owned());
+        self.persist("grant", move |pool| {
+            Box::pin(async move {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default();
+                let mut tx = pool.begin().await?;
+                sqlx::query(
+                    "INSERT INTO session_mention_grants (user_id, from_conversation_id, to_conversation_id, created_at) \
+                     VALUES (?, ?, ?, ?) \
+                     ON CONFLICT (user_id, from_conversation_id, to_conversation_id) DO UPDATE SET created_at = excluded.created_at",
+                )
+                .bind(&user_id)
+                .bind(&from)
+                .bind(&to)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                for target in evicted {
+                    sqlx::query(
+                        "DELETE FROM session_mention_grants \
+                         WHERE user_id = ? AND from_conversation_id = ? AND to_conversation_id = ?",
+                    )
+                    .bind(&user_id)
+                    .bind(&from)
+                    .bind(&target)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await
+            })
+        });
     }
 
     pub fn is_granted(&self, user_id: &str, from: &str, to: &str) -> bool {
@@ -198,6 +315,32 @@ impl SessionMentionGrants {
                 targets.retain(|target| target != conversation_id);
             }
         }
+        let (user_id, conversation_id) = (user_id.to_owned(), conversation_id.to_owned());
+        self.persist("forget", move |pool| {
+            Box::pin(async move {
+                sqlx::query(
+                    "DELETE FROM session_mention_grants \
+                     WHERE user_id = ? AND (from_conversation_id = ? OR to_conversation_id = ?)",
+                )
+                .bind(&user_id)
+                .bind(&conversation_id)
+                .bind(&conversation_id)
+                .execute(&pool)
+                .await
+                .map(|_| ())
+            })
+        });
+    }
+}
+
+type PersistFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send>>;
+type PersistJob = (&'static str, Box<dyn FnOnce(sqlx::SqlitePool) -> PersistFuture + Send>);
+
+struct PersistQueue(tokio::sync::mpsc::UnboundedSender<PersistJob>);
+
+impl std::fmt::Debug for PersistQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PersistQueue")
     }
 }
 
@@ -235,5 +378,95 @@ mod grant_tests {
         }
         assert!(!grants.is_granted("u1", "a", "t0"));
         assert!(grants.is_granted("u1", "a", &format!("t{}", super::MAX_GRANTS_PER_CONVERSATION + 4)));
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::SessionMentionGrants;
+
+    async fn wait_for_rows(pool: &sqlx::SqlitePool, expected: i64) {
+        for _ in 0..200 {
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_mention_grants")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if n == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("session_mention_grants never reached {expected} rows");
+    }
+
+    #[tokio::test]
+    async fn grants_survive_a_restart_and_forget_removes_them() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+
+        let before = SessionMentionGrants::new();
+        before.set_store(pool.clone());
+        before.grant("u1", "a", "b");
+        before.grant("u1", "a", "c");
+        before.grant("u2", "x", "y");
+        wait_for_rows(&pool, 3).await;
+
+        // "Restart": a fresh instance reloads from the table.
+        let after = SessionMentionGrants::new();
+        after.set_store(pool.clone());
+        assert_eq!(after.load_persisted().await.unwrap(), 3);
+        assert!(after.is_granted("u1", "a", "b"));
+        assert!(after.is_granted("u1", "a", "c"));
+        assert!(after.is_granted("u2", "x", "y"));
+        assert!(!after.is_granted("u1", "b", "a"));
+        assert!(!after.is_granted("u2", "a", "b"));
+
+        after.forget_conversation("u1", "c");
+        wait_for_rows(&pool, 2).await;
+        let again = SessionMentionGrants::new();
+        again.set_store(pool);
+        again.load_persisted().await.unwrap();
+        assert!(again.is_granted("u1", "a", "b"));
+        assert!(!again.is_granted("u1", "a", "c"));
+    }
+
+    #[tokio::test]
+    async fn writes_apply_in_call_order() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let grants = SessionMentionGrants::new();
+        grants.set_store(pool.clone());
+        // Back-to-back grant/forget pairs: an out-of-order write would leave a
+        // resurrected a→b row that memory no longer holds.
+        for _ in 0..50 {
+            grants.grant("u1", "a", "b");
+            grants.forget_conversation("u1", "b");
+        }
+        // FIFO sentinel: once it lands, every earlier op has been applied.
+        grants.grant("u9", "s", "t");
+        for _ in 0..200 {
+            let sentinel: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_mention_grants WHERE user_id = 'u9'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if sentinel == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_mention_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "only the sentinel may remain; DB must match memory");
+        assert!(!grants.is_granted("u1", "a", "b"));
+    }
+
+    #[tokio::test]
+    async fn without_a_store_grants_stay_in_memory() {
+        let grants = SessionMentionGrants::new();
+        assert_eq!(grants.load_persisted().await.unwrap(), 0);
+        grants.grant("u1", "a", "b");
+        assert!(grants.is_granted("u1", "a", "b"));
     }
 }
