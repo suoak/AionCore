@@ -554,6 +554,10 @@ impl SessionAgentTask {
             task.user_id.clone(),
             task.session_repo.clone(),
             broadcaster,
+            // WEAK on purpose (see the pump's ownership note): it only lets the pump
+            // ask for a context breakdown after a turn settles; it never keeps the
+            // backend (and its child CLI) alive.
+            Some(Arc::downgrade(&task.backend)),
         );
         task
     }
@@ -3116,6 +3120,7 @@ fn spawn_event_pump(
     user_id: String,
     session_repo: Option<Arc<dyn IAcpSessionRepository>>,
     broadcaster: Option<Arc<dyn EventBroadcaster>>,
+    info_backend: Option<std::sync::Weak<dyn SessionBackend>>,
 ) {
     use futures_util::StreamExt as _;
     // The pump owns ONLY the event stream (a broadcast `Receiver` handle — see
@@ -3705,6 +3710,12 @@ fn spawn_event_pump(
                     // an absorbed teardown, not a mid-turn crash (see `crash_outcome`).
                     if matches!(env.event, SessionEvent::TurnResult { .. }) {
                         terminal_result_seen = true;
+                        // M7 E5-3: ask for the per-category context breakdown once
+                        // the turn has settled. Only backends advertising
+                        // `query_session_info` (claude) are asked; the reply comes
+                        // back as `SessionInfo` and `persist_side_effects` stores it
+                        // as `context_usage.breakdown`.
+                        request_context_breakdown(info_backend.as_ref(), &conversation_id);
                     }
                     // Empty-turn (blank-reply) diagnostic, mirroring the ACP path
                     // (agent_session_flow.rs `prompt_outcome_from_stop_reason`): a turn
@@ -3967,6 +3978,12 @@ async fn persist_side_effects(
         SessionEvent::RuntimeUsageSnapshot { .. } => {
             persist_runtime_usage_snapshot(repo, user_id, conversation_id, event).await;
         }
+        SessionEvent::SessionInfo {
+            context_usage: Some(context),
+            ..
+        } => {
+            persist_context_breakdown(repo, user_id, conversation_id, context).await;
+        }
         // Token usage → the `context_usage` runtime snapshot the usage indicator
         // reads back. This is the ONLY durable sink for direct-CLI usage: the pump
         // is session-scoped and outlives the per-turn `StreamRelay`, so it still
@@ -4140,6 +4157,87 @@ async fn persist_context_usage(
         .await
     {
         tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
+    }
+}
+
+/// Fire-and-forget `get_context_usage` query after a settled turn (M7 E5-3).
+/// A no-op when the backend is gone or does not advertise `query_session_info`.
+fn request_context_breakdown(backend: Option<&std::sync::Weak<dyn SessionBackend>>, conversation_id: &str) {
+    let Some(backend) = backend.and_then(std::sync::Weak::upgrade) else {
+        return;
+    };
+    if !backend.capabilities().supported_commands.query_session_info {
+        return;
+    }
+    let conversation_id = conversation_id.to_owned();
+    tokio::spawn(async move {
+        if let Err(err) = backend
+            .dispatch(Command::QuerySessionInfo {
+                kind: aionui_session::SessionInfoKind::ContextUsage,
+            })
+            .await
+        {
+            tracing::debug!(conv_id = %conversation_id, error = %err, "session-pump: context breakdown query failed");
+        }
+    });
+}
+
+/// Upper bound on stored breakdown categories (the CLI reports ~10).
+const MAX_STORED_BREAKDOWN_CATEGORIES: usize = 32;
+
+/// Store a provider-reported context breakdown (claude `get_context_usage`
+/// categories) as `context_usage.breakdown` (M7 E5-3). A snapshot: REPLACES the
+/// previous breakdown. `used` / `size` are only seeded when no turn report has
+/// established them yet, because the per-turn `UsageDelta` stays the headline
+/// figure. An empty category list is ignored so it never blanks a breakdown.
+async fn persist_context_breakdown(
+    repo: &dyn IAcpSessionRepository,
+    user_id: &str,
+    conversation_id: &str,
+    context: &aionui_session::ContextUsage,
+) {
+    if context.categories.is_empty() {
+        return;
+    }
+    let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
+        Ok(Some(state)) => state
+            .context_usage_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        Ok(None) => serde_json::Map::new(),
+        Err(error) => {
+            tracing::warn!(conversation_id, error = %error, "session-sync: load context breakdown state failed");
+            return;
+        }
+    };
+    let categories: Vec<serde_json::Value> = context
+        .categories
+        .iter()
+        .take(MAX_STORED_BREAKDOWN_CATEGORIES)
+        .map(|category| serde_json::json!({ "name": category.name, "tokens": category.tokens }))
+        .collect();
+    usage.insert("breakdown".into(), serde_json::Value::Array(categories));
+    usage.insert("breakdown_used".into(), serde_json::json!(context.used));
+    if !usage.contains_key("used") && context.used > 0 {
+        usage.insert("used".into(), serde_json::json!(context.used));
+    }
+    if !usage.contains_key("size") && context.max > 0 {
+        usage.insert("size".into(), serde_json::json!(context.max));
+    }
+    let Ok(json) = serde_json::to_string(&usage) else {
+        return;
+    };
+    let params = SaveRuntimeStateParams {
+        context_usage_json: Some(Some(&json)),
+        ..Default::default()
+    };
+    if let Err(error) = repo
+        .save_runtime_state_for_user(user_id, conversation_id, &params)
+        .await
+    {
+        tracing::warn!(conversation_id, error = %error, "session-sync: save context breakdown failed");
     }
 }
 
@@ -7141,6 +7239,65 @@ mod persist_tests {
             stored["cost"]["amount"], 0.5,
             "a costless update must not blank the cost"
         );
+    }
+
+    #[tokio::test]
+    async fn context_breakdown_reply_is_stored_without_overriding_turn_usage() {
+        let (repo, _db) = seeded_repo().await;
+        let info = |used: u64, categories: Vec<(&str, u64)>| SessionEvent::SessionInfo {
+            context_usage: Some(aionui_session::ContextUsage {
+                used,
+                max: 200_000,
+                categories: categories
+                    .into_iter()
+                    .map(|(name, tokens)| aionui_session::ContextUsageCategory {
+                        name: name.to_owned(),
+                        tokens,
+                    })
+                    .collect(),
+            }),
+            cost_text: None,
+        };
+        // Before any turn report: seeds used/size.
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &info(3_025, vec![("System prompt", 1_460), ("Skills", 1_529)]),
+        )
+        .await;
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 3_025);
+        assert_eq!(stored["size"], 200_000);
+        assert_eq!(stored["breakdown"][1]["name"], "Skills");
+        assert_eq!(stored["breakdown_used"], 3_025);
+
+        // A turn report stays the headline; a later breakdown replaces only the breakdown.
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &usage(11_030, Some(0.5), Some(258_400)),
+        )
+        .await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &info(9_000, vec![("Messages", 7_000)]),
+        )
+        .await;
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["used"], 11_030);
+        assert_eq!(stored["size"], 258_400);
+        assert_eq!(stored["breakdown"].as_array().map(Vec::len), Some(1));
+        assert_eq!(stored["breakdown"][0]["name"], "Messages");
+        assert_eq!(stored["cost"]["amount"], 0.5);
+
+        // An empty category list never blanks a stored breakdown.
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &info(9_500, vec![])).await;
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored["breakdown"][0]["name"], "Messages");
     }
 
     #[tokio::test]
