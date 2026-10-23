@@ -33,6 +33,7 @@ SCM       = unchanged: scm/* protocol and git_provider are not touched
   | Method | Path | Notes |
   |---|---|---|
   | GET | `/api/worktrees/capabilities` | git available / version / reason |
+  | GET | `/api/worktrees/estimate?repo_path=&base_ref=` | `{tracked_bytes, tracked_files, base_commit, truncated}`: blob sizes of the base tree (fan-out disk estimate = bytes × N); read-only, capped at 500k entries |
   | POST | `/api/worktrees` | `{repo_path, base_ref?, branch?, title?, task_session_id?}` → 202 `creating` |
   | GET | `/api/worktrees?repo_path=&status=&include_removed=` | managed worktrees only |
   | GET | `/api/worktrees/{id}` | adds `ahead` / `behind` vs `base_commit` |

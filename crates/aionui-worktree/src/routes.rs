@@ -61,6 +61,7 @@ pub fn worktree_routes(state: WorktreeRouterState) -> Router {
     Router::new()
         .route("/api/worktrees", get(list_worktrees).post(create_worktree))
         .route("/api/worktrees/capabilities", get(capabilities))
+        .route("/api/worktrees/estimate", get(estimate))
         .route("/api/worktrees/prune", post(prune_worktrees))
         .route("/api/worktrees/{id}", get(get_worktree).delete(remove_worktree))
         .route("/api/worktrees/{id}/cancel", post(cancel_worktree))
@@ -72,6 +73,19 @@ pub fn worktree_routes(state: WorktreeRouterState) -> Router {
 
 async fn capabilities(State(state): State<WorktreeRouterState>) -> Json<ApiResponse<GitCapabilityResponse>> {
     Json(ApiResponse::ok(state.service.capabilities().await))
+}
+
+async fn estimate(
+    State(state): State<WorktreeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Query(query): Query<crate::types::EstimateQuery>,
+) -> Result<Json<ApiResponse<crate::types::EstimateResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .estimate(&query.repo_path, query.base_ref.as_deref())
+            .await?,
+    )))
 }
 
 async fn create_worktree(

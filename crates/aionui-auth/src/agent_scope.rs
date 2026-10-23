@@ -446,6 +446,7 @@ mod tests {
                 "/api/worktrees",
                 "/api/worktrees?repo_path=/r&status=ready",
                 "/api/worktrees/capabilities",
+                "/api/worktrees/estimate?repo_path=/r",
                 "/api/worktrees/prune",
                 "/api/worktrees/wt_1",
                 "/api/worktrees/wt_1/cancel",

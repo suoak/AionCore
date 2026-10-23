@@ -299,6 +299,71 @@ async fn three_slots_are_isolated_then_squash_adopt_keeps_only_the_winner() {
     }
 }
 
+/// E3-6 acceptance ① in automation: 3 slots → run → compare → adopt
+/// `branch_only` → losers cleaned up, the source checkout never touched.
+#[tokio::test]
+async fn three_slots_branch_only_adopt_keeps_winner_branch_and_cleans_losers() {
+    require_git!();
+    let fx = fixture(&[
+        ("a1", Script::Commit(vec![("fix.txt", "fix from A\n")])),
+        ("a2", Script::Commit(vec![("fix.txt", "fix from B\n")])),
+        ("a3", Script::Write(vec![("fix.txt", "wrong fix from C\n")])),
+    ])
+    .await;
+    let repo = &fx.h.repo;
+    let base = git(repo, &["rev-parse", "HEAD"]);
+    let g = fx
+        .fanout
+        .create(USER, group_req(repo, &["a1", "a2", "a3"]))
+        .await
+        .unwrap();
+    fx.fanout.wait_settled(&g.id).await;
+    let g = wait_group(&fx, &g.id, "comparing").await;
+    let paths: Vec<_> = g.slots.iter().map(|s| PathBuf::from(&s.path)).collect();
+    let branches: Vec<_> = g.slots.iter().map(|s| s.branch.clone()).collect();
+    assert_eq!(
+        paths.iter().collect::<std::collections::HashSet<_>>().len(),
+        3,
+        "distinct worktree paths"
+    );
+    for (i, want) in ["fix from A\n", "fix from B\n", "wrong fix from C\n"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(&std::fs::read_to_string(paths[i].join("fix.txt")).unwrap(), want);
+    }
+
+    let cmp = fx.fanout.compare(USER, &g.id).await.unwrap();
+    let row = cmp.files.iter().find(|f| f.path == "fix.txt").expect("fix.txt row");
+    assert_eq!(row.slots.keys().collect::<Vec<_>>(), ["A", "B", "C"]);
+
+    let done = fx
+        .fanout
+        .adopt(USER, &g.id, adopt("B", AdoptStrategy::BranchOnly))
+        .await
+        .unwrap();
+    assert_eq!(done.status, "adopted");
+    assert_eq!(done.winner_slot.as_deref(), Some("B"));
+    let result = done.adopt_result.clone().unwrap();
+    // branch_only never touches the source checkout.
+    assert_eq!(git(repo, &["rev-parse", "HEAD"]), base);
+    assert!(!repo.join("fix.txt").exists());
+    assert_eq!(git(repo, &["status", "--porcelain"]), "");
+    // Winner keeps worktree + branch, with its commit.
+    assert!(paths[1].is_dir() && branch_exists(repo, &branches[1]));
+    assert_eq!(git(repo, &["show", &format!("{}:fix.txt", branches[1])]), "fix from B");
+    // Losers: worktrees removed; A's unmerged commit keeps its branch, C's
+    // uncommitted edit goes with its directory.
+    assert!(!paths[0].exists() && !paths[2].exists());
+    assert_eq!(result.removed_worktrees.len(), 2);
+    assert_eq!(result.preserved_branches, [branches[0].clone()]);
+    assert!(branch_exists(repo, &branches[0]));
+    assert!(!branch_exists(repo, &branches[2]));
+    assert!(result.cleanup_errors.is_empty(), "{:?}", result.cleanup_errors);
+    let statuses: Vec<_> = done.slots.iter().map(|s| s.status.as_str()).collect();
+    assert_eq!(statuses, ["removed", "adopted", "removed"]);
+}
+
 #[tokio::test]
 async fn conflicting_adopt_is_aborted_and_target_left_clean() {
     require_git!();
