@@ -188,6 +188,8 @@ pub struct StreamRelay {
     usage_event_repo: Option<Arc<dyn IUsageEventRepository>>,
     task_trace: Option<crate::task_trace::TaskTraceContext>,
     last_model_id: Option<String>,
+    /// Set once the provider reported usage for this turn (M7 E5-2).
+    usage_reported: bool,
 }
 
 impl StreamRelay {
@@ -227,6 +229,7 @@ impl StreamRelay {
             usage_event_repo: None,
             task_trace: None,
             last_model_id: None,
+            usage_reported: false,
         }
     }
 
@@ -677,6 +680,9 @@ impl StreamRelay {
                             if let AgentStreamEvent::Error(data) = &event {
                                 attempt.terminal_error = Some(data.clone());
                             }
+                            if !deleting {
+                                self.record_unavailable_usage_if_missing().await;
+                            }
                             let mut outcome = if deleting {
                                 RelayOutcome {
                                     system_responses: Vec::new(),
@@ -1002,6 +1008,7 @@ impl StreamRelay {
                 let Some(spend) = crate::usage_ledger::spend_from_context_usage(payload) else {
                     return;
                 };
+                self.usage_reported = true;
                 if let Err(error) = crate::usage_ledger::record_context_usage_spend(
                     repo.as_ref(),
                     self.adapter.conversation_repo().as_ref(),
@@ -1027,6 +1034,40 @@ impl StreamRelay {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Write an `unavailable` ledger row when the turn ends without any
+    /// provider-reported usage, so missing usage stays visible (M7 E5-2).
+    async fn record_unavailable_usage_if_missing(&mut self) {
+        if self.usage_reported {
+            return;
+        }
+        let Some(repo) = self.usage_event_repo.clone() else {
+            return;
+        };
+        self.usage_reported = true;
+        if let Err(error) = crate::usage_ledger::record_unavailable_turn_usage(
+            repo.as_ref(),
+            self.adapter.conversation_repo().as_ref(),
+            &self.user_id,
+            &self.conversation_id,
+            &self.turn_id,
+            self.last_model_id.as_deref(),
+            self.task_trace
+                .as_ref()
+                .map(|trace| crate::usage_ledger::UsageTaskLink {
+                    task_session_id: trace.task_id.as_str(),
+                    run_id: trace.run_id.as_str(),
+                }),
+        )
+        .await
+        {
+            warn!(
+                conversation_id = %self.conversation_id,
+                error = %error,
+                "Failed to record unavailable turn usage"
+            );
         }
     }
 

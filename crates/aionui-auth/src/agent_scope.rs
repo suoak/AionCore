@@ -472,6 +472,43 @@ mod tests {
     }
 
     #[test]
+    fn task_run_replay_routes_are_denied() {
+        // M7 E5-2: run replay exposes the full sanitized trace; user-only.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            for path in [
+                "/api/task-sessions/t1/runs/r1/replay",
+                "/api/task-sessions/t1/runs/r1/replay?after_sequence=10&limit=50",
+                "/api/task-sessions/t1/runs/r1/trace",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+        let prefix = "/api/task-sessions";
+        assert!(
+            !READ_PREFIXES
+                .iter()
+                .any(|p| has_prefix(prefix, p) || has_prefix(p, prefix))
+        );
+        assert!(!READ_LIKE_POSTS.iter().any(|p| has_prefix(p, prefix)));
+        assert!(
+            !APPROVAL_PREFIXES
+                .iter()
+                .any(|(p, _)| has_prefix(prefix, p) || has_prefix(p, prefix))
+        );
+    }
+
+    #[test]
     fn worktree_and_fanout_routes_are_denied() {
         for method in [
             Method::GET,

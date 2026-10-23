@@ -4784,6 +4784,67 @@ async fn approved_goal_execution_review_links_changes_approval_and_verification(
             .any(|event| event.event_type == "criterion.passed")
     );
     assert!(reviewed.evidence.iter().any(|item| item.kind == "command"));
+
+    // M7 E5-2: paged replay stitches to exactly the full trace (no duplicates,
+    // no gaps); approvals/evidence ride on the first page only.
+    let mut stitched = Vec::new();
+    let mut cursor = 0;
+    let mut pages = 0;
+    loop {
+        let page = service
+            .replay_task_run(
+                "user_1",
+                &task.id,
+                &run.id,
+                aionui_api_types::TaskRunReplayQuery {
+                    after_sequence: Some(cursor),
+                    limit: Some(2),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!page.retention_gap);
+        assert!(page.events.len() <= 2);
+        if pages == 0 {
+            assert_eq!(page.approvals.as_ref().unwrap()[0].id, plan.approval.id);
+            assert!(
+                page.evidence
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item.kind == "command")
+            );
+        } else {
+            assert!(page.approvals.is_none() && page.evidence.is_none());
+        }
+        pages += 1;
+        stitched.extend(page.events.iter().map(|event| event.event_id.clone()));
+        cursor = page.next_after_sequence;
+        if !page.has_more {
+            assert_eq!(page.next_after_sequence, page.latest_sequence);
+            break;
+        }
+    }
+    assert!(pages > 1);
+    assert_eq!(
+        stitched,
+        reviewed
+            .trace
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        service
+            .replay_task_run(
+                "user_2",
+                &task.id,
+                &run.id,
+                aionui_api_types::TaskRunReplayQuery::default()
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
