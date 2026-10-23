@@ -2707,6 +2707,7 @@ impl ConversationService {
             title_only,
             usage_event_repo: self.usage_event_repo(),
             pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
+            inbox: self.inbox_sink(),
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));
