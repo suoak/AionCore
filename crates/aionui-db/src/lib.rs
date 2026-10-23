@@ -56,10 +56,10 @@ pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
 pub use repository::task_session::{
-    AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateTaskArtifactParams,
-    CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams, CreateTaskSessionParams,
-    FinishTaskRunParams, LinkContextSnapshotArtifactParams, ResolveTaskApprovalParams, UpdateAcceptanceCriterionParams,
-    UpdateTaskSessionParams,
+    AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateRetryTaskRunParams,
+    CreateTaskArtifactParams, CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams,
+    CreateTaskSessionParams, FinishTaskRunParams, LinkContextSnapshotArtifactParams, ResolveTaskApprovalParams,
+    UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
 };
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
