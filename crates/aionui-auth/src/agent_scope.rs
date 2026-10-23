@@ -409,6 +409,26 @@ mod tests {
         }
     }
 
+    /// M7 E4-4: `scm/commit` and `scm/push` travel over the user's `/ws`
+    /// connection; an agent token is refused there, and any REST spelling of
+    /// the source-control surface stays closed to agents too.
+    #[test]
+    fn commit_and_push_surfaces_are_denied() {
+        for (method, path) in [
+            (Method::GET, "/ws"),
+            (Method::GET, "/ws?token=x"),
+            (Method::POST, "/api/scm/commit"),
+            (Method::POST, "/api/scm/push"),
+            (Method::GET, "/api/scm/remote-info?repository=scm:r"),
+        ] {
+            assert_eq!(
+                classify(method.clone(), path),
+                AgentRouteDecision::Deny,
+                "{method} {path}"
+            );
+        }
+    }
+
     /// M7 E3: worktree / fan-out control is user-only. Guard against a future
     /// allowlist edit accidentally opening these prefixes to agent tokens.
     #[test]

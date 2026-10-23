@@ -38,6 +38,16 @@ pub(super) const CODE_CAPABILITY_UNSUPPORTED: i64 = -32052;
 /// without parsing messages.
 pub(super) const CODE_RESOURCE_BLOCKED: i64 = -32053;
 
+// Commit / push (M7 E4-4). Each failure a user can act on differently gets its
+// own code, and the message is the stable upper-case name the UI keys off.
+pub(super) const CODE_COMMIT_NOTHING_STAGED: i64 = -32054;
+pub(super) const CODE_COMMIT_IDENTITY_MISSING: i64 = -32055;
+pub(super) const CODE_COMMIT_HOOK_FAILED: i64 = -32056;
+pub(super) const CODE_PUSH_REJECTED: i64 = -32057;
+pub(super) const CODE_PUSH_AUTH_FAILED: i64 = -32058;
+pub(super) const CODE_PUSH_NO_UPSTREAM: i64 = -32059;
+pub(super) const CODE_GIT_NOT_AVAILABLE: i64 = -32060;
+
 /// A decoded inbound frame. `id` is absent for notifications (`scm/unsubscribe`).
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct IncomingFrame {
@@ -61,6 +71,16 @@ pub(super) fn error(id: Option<Value>, code: i64, message: &str, data: Value) ->
         err["data"] = data;
     }
     json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "error": err })
+}
+
+/// The `scm/progress` notification sent to the requesting connection while a
+/// push runs. `percent` is omitted for phases git reports without one.
+pub(super) fn progress(repository: &str, phase: &str, percent: Option<u8>) -> Value {
+    let mut params = json!({ "repository": repository, "phase": phase });
+    if let Some(percent) = percent {
+        params["percent"] = json!(percent);
+    }
+    notification("scm/progress", params)
 }
 
 /// A server-initiated notification.
@@ -138,7 +158,37 @@ pub(super) fn map_error(err: &ScmError) -> (i64, &'static str, Value) {
             "provider_unavailable",
             json!({ "path": path, "message": message }),
         ),
+        ScmError::CommitNothingStaged => (CODE_COMMIT_NOTHING_STAGED, "COMMIT_NOTHING_STAGED", Value::Null),
+        ScmError::CommitIdentityMissing { message } => (
+            CODE_COMMIT_IDENTITY_MISSING,
+            "COMMIT_IDENTITY_MISSING",
+            json!({ "message": message }),
+        ),
+        ScmError::CommitHookFailed { output } => (
+            CODE_COMMIT_HOOK_FAILED,
+            "COMMIT_HOOK_FAILED",
+            json!({ "output": output }),
+        ),
+        ScmError::PushRejected { message } => (CODE_PUSH_REJECTED, "PUSH_REJECTED", json!({ "message": message })),
+        ScmError::PushAuthFailed { message } => {
+            (CODE_PUSH_AUTH_FAILED, "PUSH_AUTH_FAILED", json!({ "message": message }))
+        }
+        ScmError::PushNoUpstream { remote, branch } => (
+            CODE_PUSH_NO_UPSTREAM,
+            "PUSH_NO_UPSTREAM",
+            json!({ "remote": remote, "branch": branch }),
+        ),
+        ScmError::GitNotAvailable { message } => (
+            CODE_GIT_NOT_AVAILABLE,
+            "GIT_NOT_AVAILABLE",
+            json!({ "message": message }),
+        ),
     }
+}
+
+/// The stable wire name of an error (`PUSH_REJECTED`), for logs.
+pub(super) fn error_name(err: &ScmError) -> &'static str {
+    map_error(err).1
 }
 
 /// Build an error response straight from a domain error.

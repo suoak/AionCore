@@ -292,3 +292,46 @@ async fn progress_lines_are_streamed() {
     let seen = seen.lock().unwrap();
     assert!(seen.iter().any(|l| parse_progress_percent(l) == Some(100)), "{seen:?}");
 }
+
+#[tokio::test]
+async fn stdin_is_fed_and_closed() {
+    // `hash-object --stdin` only finishes once stdin reaches EOF, so this also
+    // proves the pipe is closed after the input is written.
+    let out = GitCli::default()
+        .run_ok(
+            ["hash-object", "--stdin"],
+            RunOptions::default().with_stdin(b"hello\n".to_vec()),
+        )
+        .await
+        .expect("hash-object");
+    assert_eq!(out.stdout.trim(), "ce013625030ba8dba906f756967f9e9ca394464a");
+}
+
+#[tokio::test]
+async fn stdin_is_null_by_default() {
+    let out = GitCli::default()
+        .run_ok(["hash-object", "--stdin"], RunOptions::default())
+        .await
+        .expect("hash-object");
+    // The empty blob: a null stdin reads as immediate EOF.
+    assert_eq!(out.stdout.trim(), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+}
+
+#[tokio::test]
+async fn per_run_env_is_applied_but_still_scrubbed() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = stub::write(dir.path(), "env", "set");
+    let base: Vec<(String, String)> = std::env::vars().filter(|(k, _)| !is_scrubbed_env(k)).collect();
+    let out = GitCli::new(program)
+        .with_base_env(base)
+        .run_ok(
+            ["push"],
+            RunOptions::default()
+                .with_env("LC_ALL", "C")
+                .with_env("AIONUI_RUNTIME_TOKEN", "tok-secret"),
+        )
+        .await
+        .unwrap();
+    assert!(out.stdout.contains("LC_ALL=C"), "{}", out.stdout);
+    assert!(!out.stdout.contains("tok-secret"), "{}", out.stdout);
+}

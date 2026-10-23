@@ -31,6 +31,7 @@ fn repository(is_worktree: bool, worktree_of: Option<&str>) -> ScmRepository {
             local_branches: true,
             history_graph: false,
             remote_ops: false,
+            commit: false,
         },
         state: ScmRepositoryState::Idle,
     }
@@ -80,6 +81,7 @@ fn status_frame_carries_head_branch_name() {
     let frame = status_frame(Some(ScmHead {
         name: Some("feature/x".into()),
         detached: None,
+        ..ScmHead::default()
     }));
     let params = &frame["params"];
     assert_eq!(params["head"]["name"], "feature/x");
@@ -92,6 +94,7 @@ fn status_frame_carries_detached_head() {
     let frame = status_frame(Some(ScmHead {
         name: None,
         detached: Some(true),
+        ..ScmHead::default()
     }));
     let head = &frame["params"]["head"];
     assert_eq!(head["detached"], true);

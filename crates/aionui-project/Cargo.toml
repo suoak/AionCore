@@ -31,6 +31,11 @@ ignore.workspace = true
 # plus platform trash for discarding untracked files non-destructively.
 git2.workspace = true
 trash.workspace = true
+# Commit / push (M7 E4-4) go through the system `git` CLI so hooks, credential
+# helpers and ssh behave as in a terminal; the runner (scrubbed env, timeouts,
+# process-tree kill) is shared with the worktree service.
+aionui-worktree.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

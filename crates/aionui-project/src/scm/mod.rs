@@ -12,6 +12,8 @@
 //! Module files hold implementation; this file only declares and re-exports.
 
 mod actor;
+mod commit;
+mod commit_types;
 mod debounce;
 mod error;
 mod git_provider;
@@ -23,8 +25,11 @@ mod watch;
 mod wire;
 
 pub use actor::{ScmActor, ScmInbound, ScmSessionId, ScmWirePush};
+pub use commit_types::{
+    CommitRequest, CommitResult, PushRequest, PushResult, RemoteInfo, ScmProgress, ScmProgressFn, ScmRemote,
+};
 pub use error::ScmError;
-pub use provider::{IManagedWorktreeLookup, IScmHistory, IScmProvider, IScmStaging};
+pub use provider::{IManagedWorktreeLookup, IScmCommit, IScmHistory, IScmProvider, IScmRemote, IScmStaging};
 pub use types::{
     ContentRef, DiffContent, FileRef, RepoRef, ResolvedRoot, ScmActionFailure, ScmActionOutcome, ScmCapabilities,
     ScmHead, ScmRepository, ScmRepositoryState, ScmResource, ScmResourceState, ScmStatus,

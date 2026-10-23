@@ -28,6 +28,9 @@ use super::types::{FileRef, RepoRef, ResolvedRoot};
 use super::watch::ScmDirty;
 use super::wire;
 
+#[path = "actor_publish.rs"]
+mod publish;
+
 /// Identifies one connection. A string mirroring the transport's connection id,
 /// so the domain does not depend on the realtime crate's type.
 pub type ScmSessionId = String;
@@ -68,6 +71,8 @@ pub struct ScmActor {
     /// Watch signals, taken by `run`. Held here so `new` does not expose the
     /// internal signal type in its signature.
     dirty_rx: Option<UnboundedReceiver<ScmDirty>>,
+    /// Repositories with a commit or push running (see `actor_publish.rs`).
+    publishing: publish::InFlight,
 }
 
 impl ScmActor {
@@ -84,6 +89,7 @@ impl ScmActor {
             debouncer: DirtyDebouncer::default(),
             started: Instant::now(),
             dirty_rx: Some(dirty_rx),
+            publishing: publish::InFlight::default(),
         })
     }
 
@@ -183,6 +189,17 @@ impl ScmActor {
             "scm/stage" => self.stage(user_id, params, true).await,
             "scm/unstage" => self.stage(user_id, params, false).await,
             "scm/discard" => self.discard(user_id, params).await,
+            // Commit and push reply from their own task (hooks and the network
+            // must not stall this loop); see `actor_publish.rs`.
+            "scm/commit" => {
+                self.start_commit(session, user_id, id, params).await;
+                return;
+            }
+            "scm/push" => {
+                self.start_push(session, user_id, id, params).await;
+                return;
+            }
+            "scm/remoteInfo" => self.remote_info(user_id, params).await,
             other => {
                 tracing::warn!(session, method = %other, "scm dispatch: unknown method");
                 self.push.push(

@@ -92,8 +92,14 @@ pub struct ScmCapabilities {
     pub local_branches: bool,
     /// Commit graph / DAG history (stage 2).
     pub history_graph: bool,
-    /// Remote operations: push / pull / fetch (stage 2).
+    /// Remote operations: `scm/push` and `scm/remoteInfo` (M7 E4-4). Pull and
+    /// fetch are not exposed yet.
     pub remote_ops: bool,
+    /// Creating commits from the staging area — gates `IScmCommit` /
+    /// `scm/commit` (M7 E4-4). Defaults to `false` when absent so a frame from
+    /// an older peer reads as "cannot commit".
+    #[serde(default)]
+    pub commit: bool,
 }
 
 /// Head position of a repository, as far as the neutral model cares.
@@ -105,6 +111,17 @@ pub struct ScmHead {
     /// Whether head points directly at a revision rather than a branch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detached: Option<bool>,
+    /// Upstream tracking branch (`origin/main`), when the branch has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// Commits on the branch not yet on its upstream. Present only with
+    /// `upstream`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ahead: Option<u32>,
+    /// Commits on the upstream not yet on the branch. Present only with
+    /// `upstream`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u32>,
 }
 
 /// Lifecycle state of a repository as surfaced to the UI.

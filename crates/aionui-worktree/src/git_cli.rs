@@ -147,6 +147,13 @@ pub struct RunOptions {
     pub timeout: Option<Duration>,
     pub cancel: Option<CancellationToken>,
     pub on_progress: Option<ProgressFn>,
+    /// Bytes written to the child's stdin, which is then closed (e.g. a commit
+    /// message for `commit -F -`). `None` gives the child a null stdin.
+    pub stdin: Option<Arc<[u8]>>,
+    /// Extra variables for this invocation (e.g. `LC_ALL=C` so stderr can be
+    /// classified). Still subject to [`is_scrubbed_env`]: a caller cannot
+    /// reintroduce a variable the scrub removes.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl RunOptions {
@@ -169,6 +176,16 @@ impl RunOptions {
 
     pub fn with_progress(mut self, on_progress: ProgressFn) -> Self {
         self.on_progress = Some(on_progress);
+        self
+    }
+
+    pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    pub fn with_stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(Arc::from(input.into()));
         self
     }
 }
@@ -258,6 +275,7 @@ impl GitCli {
         cmd.args(global_args()).args(&args);
         cmd.env_clear();
         cmd.envs(scrub_env(self.base_env_vars()));
+        cmd.envs(scrub_env(opts.env.iter().cloned()));
         cmd.env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never");
         if let Some(dir) = &opts.cwd {
             // A missing cwd would surface as ENOENT from spawn and be
@@ -270,10 +288,14 @@ impl GitCli {
             }
             cmd.current_dir(dir);
         }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.stdin(if opts.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
         #[cfg(windows)]
@@ -296,6 +318,18 @@ impl GitCli {
             }
         };
 
+        // Fed from its own task so a child that writes a lot before reading
+        // stdin cannot deadlock against us; dropping the handle closes it (EOF).
+        let stdin_task = match (child.stdin.take(), opts.stdin.clone()) {
+            (Some(mut pipe), Some(input)) => Some(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                // A child that exits without reading (e.g. a failing hook) closes
+                // the pipe; that broken pipe is not an error of ours.
+                let _ = pipe.write_all(&input).await;
+                let _ = pipe.shutdown().await;
+            })),
+            _ => None,
+        };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_task = tokio::spawn(read_all(stdout, None));
@@ -328,6 +362,9 @@ impl GitCli {
                 })
             }
             Outcome::TimedOut | Outcome::Cancelled => {
+                if let Some(task) = &stdin_task {
+                    task.abort();
+                }
                 if let Err(err) = aionui_runtime::kill_process_tree(&mut child).await {
                     tracing::warn!(operation = %operation, error = %err, "failed to kill git process tree");
                 }
