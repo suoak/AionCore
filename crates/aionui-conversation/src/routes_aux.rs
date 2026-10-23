@@ -21,6 +21,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/side-question", post(side_question))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
+        .route("/api/conversations/{id}/context-breakdown", get(get_context_breakdown))
         .route("/api/usage", get(list_usage_events).delete(clear_usage_events))
         .route("/api/usage/summary", get(summarize_usage))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
@@ -221,6 +222,20 @@ async fn get_usage(
 ) -> Result<Json<ApiResponse<Option<serde_json::Value>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state.service.get_usage(&user.id, &id).await.map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_context_breakdown(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::ContextBreakdownResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_context_breakdown(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
     )))
 }
 

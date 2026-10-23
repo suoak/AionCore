@@ -294,8 +294,8 @@ pub use team_tools::{
     team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
 };
 pub use usage::{
-    UsageCostAmount, UsageEventDto, UsageGroupBy, UsageListQuery, UsageListResponse, UsageSummaryGroup,
-    UsageSummaryQuery, UsageSummaryResponse,
+    ContextBreakdownResponse, ContextBreakdownSegment, ContextSegmentSource, UsageCostAmount, UsageEventDto,
+    UsageGroupBy, UsageListQuery, UsageListResponse, UsageSummaryGroup, UsageSummaryQuery, UsageSummaryResponse,
 };
 pub use websocket::WebSocketMessage;
 

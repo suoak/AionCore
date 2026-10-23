@@ -682,6 +682,23 @@ impl ConversationService {
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()))
     }
 
+    /// Context-ring breakdown (M7 E5-3): provider-reported categories when the
+    /// usage snapshot carries them, otherwise a single `other` slice; always
+    /// sums to `used`. Local estimates (skills / tool schemas) plug in through
+    /// `EstimatedSegment` and are marked `estimated`.
+    pub async fn get_context_breakdown(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<aionui_api_types::ContextBreakdownResponse, ConversationError> {
+        let usage = self.get_usage(user_id, conversation_id).await?;
+        Ok(crate::context_breakdown::build_context_breakdown(
+            conversation_id,
+            usage.as_ref(),
+            &[],
+        ))
+    }
+
     pub async fn get_slash_commands(
         &self,
         user_id: &str,
