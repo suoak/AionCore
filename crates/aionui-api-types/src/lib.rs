@@ -293,7 +293,10 @@ pub use team_tools::{
     TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport, cli_command_for_tool,
     team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
 };
-pub use usage::{UsageEventDto, UsageListQuery, UsageListResponse};
+pub use usage::{
+    UsageCostAmount, UsageEventDto, UsageGroupBy, UsageListQuery, UsageListResponse, UsageSummaryGroup,
+    UsageSummaryQuery, UsageSummaryResponse,
+};
 pub use websocket::WebSocketMessage;
 
 #[cfg(test)]

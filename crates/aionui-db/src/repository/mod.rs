@@ -103,6 +103,6 @@ pub use sqlite_user::SqliteUserRepository;
 pub use sqlite_user_order::SqliteUserOrderStore;
 pub use task_session::ITaskSessionRepository;
 pub use team::{ActivityCursor, ITeamRepository, PageDirection};
-pub use usage_event::{IUsageEventRepository, InsertUsageEventParams};
+pub use usage_event::{IUsageEventRepository, InsertUsageEventParams, UsageEventFilter};
 pub use user::IUserRepository;
 pub use user_order::{IUserOrderStore, MoveOutcome, OrderItemRef, PinOutcome, PinnedCursor};

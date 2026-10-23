@@ -26,4 +26,12 @@ pub struct UsageEventRow {
     pub session_cost_amount: Option<f64>,
     pub cost_currency: Option<String>,
     pub event_source: String,
+    /// M7 E5-1 (migration 067): task linkage; NULL for chat turns and older rows.
+    #[sqlx(default)]
+    pub task_session_id: Option<String>,
+    #[sqlx(default)]
+    pub run_id: Option<String>,
+    /// `reported` or `unavailable` (provider gave no usage for the turn).
+    #[sqlx(default)]
+    pub usage_status: String,
 }

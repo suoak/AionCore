@@ -3,7 +3,13 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::UsageEventRow;
-use crate::repository::usage_event::{IUsageEventRepository, InsertUsageEventParams};
+use crate::repository::usage_event::{IUsageEventRepository, InsertUsageEventParams, UsageEventFilter};
+
+const SELECT_COLUMNS: &str = "SELECT id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
+     conversation_name, assistant_id, assistant_name, model_id, turn_id, total_tokens, \
+     input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, \
+     cost_delta, session_cost_amount, cost_currency, event_source, task_session_id, run_id, usage_status \
+     FROM usage_events";
 
 #[derive(Clone, Debug)]
 pub struct SqliteUsageEventRepository {
@@ -25,8 +31,8 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
                 id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
                 conversation_name, assistant_id, assistant_name, model_id, turn_id, total_tokens, \
                 input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, \
-                cost_delta, session_cost_amount, cost_currency, event_source\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                cost_delta, session_cost_amount, cost_currency, event_source, task_session_id, run_id, usage_status\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(params.user_id)
@@ -50,6 +56,9 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
         .bind(params.session_cost_amount)
         .bind(params.cost_currency)
         .bind(params.event_source)
+        .bind(params.task_session_id)
+        .bind(params.run_id)
+        .bind(params.usage_status)
         .execute(&self.pool)
         .await?;
 
@@ -80,6 +89,9 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
             session_cost_amount: params.session_cost_amount,
             cost_currency: params.cost_currency.map(str::to_owned),
             event_source: params.event_source.to_owned(),
+            task_session_id: params.task_session_id.map(str::to_owned),
+            run_id: params.run_id.map(str::to_owned),
+            usage_status: params.usage_status.to_owned(),
         }))
     }
 
@@ -91,34 +103,61 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
     ) -> Result<Vec<UsageEventRow>, DbError> {
         let limit = limit.clamp(1, 50_000);
         let rows = if let Some(since) = since {
-            sqlx::query_as::<_, UsageEventRow>(
-                "SELECT id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
-                 conversation_name, assistant_id, assistant_name, model_id, turn_id, total_tokens, \
-                 input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, \
-                 cost_delta, session_cost_amount, cost_currency, event_source \
-                 FROM usage_events WHERE user_id = ? AND recorded_at >= ? \
-                 ORDER BY recorded_at ASC LIMIT ?",
-            )
+            sqlx::query_as::<_, UsageEventRow>(&format!(
+                "{SELECT_COLUMNS} WHERE user_id = ? AND recorded_at >= ? ORDER BY recorded_at ASC LIMIT ?"
+            ))
             .bind(user_id)
             .bind(since)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, UsageEventRow>(
-                "SELECT id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
-                 conversation_name, assistant_id, assistant_name, model_id, turn_id, total_tokens, \
-                 input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, \
-                 cost_delta, session_cost_amount, cost_currency, event_source \
-                 FROM usage_events WHERE user_id = ? \
-                 ORDER BY recorded_at ASC LIMIT ?",
-            )
+            sqlx::query_as::<_, UsageEventRow>(&format!(
+                "{SELECT_COLUMNS} WHERE user_id = ? ORDER BY recorded_at ASC LIMIT ?"
+            ))
             .bind(user_id)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
         };
         Ok(rows)
+    }
+
+    async fn list_filtered(&self, user_id: &str, filter: &UsageEventFilter) -> Result<Vec<UsageEventRow>, DbError> {
+        let mut sql = format!("{SELECT_COLUMNS} WHERE user_id = ?");
+        if filter.since.is_some() {
+            sql.push_str(" AND recorded_at >= ?");
+        }
+        if filter.until.is_some() {
+            sql.push_str(" AND recorded_at < ?");
+        }
+        if filter.task_session_id.is_some() {
+            sql.push_str(" AND task_session_id = ?");
+        }
+        if filter.run_id.is_some() {
+            sql.push_str(" AND run_id = ?");
+        }
+        if filter.conversation_id.is_some() {
+            sql.push_str(" AND conversation_id = ?");
+        }
+        sql.push_str(" ORDER BY recorded_at ASC, id ASC LIMIT ?");
+        let mut query = sqlx::query_as::<_, UsageEventRow>(&sql).bind(user_id);
+        if let Some(since) = filter.since {
+            query = query.bind(since);
+        }
+        if let Some(until) = filter.until {
+            query = query.bind(until);
+        }
+        if let Some(task) = &filter.task_session_id {
+            query = query.bind(task);
+        }
+        if let Some(run) = &filter.run_id {
+            query = query.bind(run);
+        }
+        if let Some(conversation) = &filter.conversation_id {
+            query = query.bind(conversation);
+        }
+        Ok(query.bind(filter.limit.clamp(1, 50_000)).fetch_all(&self.pool).await?)
     }
 
     async fn last_session_cost(&self, user_id: &str, conversation_id: &str) -> Result<Option<(f64, String)>, DbError> {

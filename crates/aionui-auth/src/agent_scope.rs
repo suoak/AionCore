@@ -433,6 +433,45 @@ mod tests {
     /// M7 E3: worktree / fan-out control is user-only. Guard against a future
     /// allowlist edit accidentally opening these prefixes to agent tokens.
     #[test]
+    fn usage_ledger_routes_are_denied() {
+        // M7 E5-1: spend/cost ledger is user-only; agent tokens never read or clear it.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            for path in [
+                "/api/usage",
+                "/api/usage?since=0&limit=10",
+                "/api/usage?task_session_id=t1&run_id=r1",
+                "/api/usage/summary",
+                "/api/usage/summary?group_by=task&tz_offset_minutes=480",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+        let prefix = "/api/usage";
+        assert!(
+            !READ_PREFIXES
+                .iter()
+                .any(|p| has_prefix(prefix, p) || has_prefix(p, prefix))
+        );
+        assert!(!READ_LIKE_POSTS.iter().any(|p| has_prefix(p, prefix)));
+        assert!(
+            !APPROVAL_PREFIXES
+                .iter()
+                .any(|(p, _)| has_prefix(prefix, p) || has_prefix(p, prefix))
+        );
+    }
+
+    #[test]
     fn worktree_and_fanout_routes_are_denied() {
         for method in [
             Method::GET,

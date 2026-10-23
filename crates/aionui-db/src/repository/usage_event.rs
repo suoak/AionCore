@@ -27,6 +27,21 @@ pub struct InsertUsageEventParams<'a> {
     pub session_cost_amount: Option<f64>,
     pub cost_currency: Option<&'a str>,
     pub event_source: &'a str,
+    pub task_session_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    /// `reported` or `unavailable`.
+    pub usage_status: &'a str,
+}
+
+/// Filter for ledger reads (M7 E5-1). `until` is exclusive.
+#[derive(Debug, Clone, Default)]
+pub struct UsageEventFilter {
+    pub since: Option<TimestampMs>,
+    pub until: Option<TimestampMs>,
+    pub task_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub limit: i64,
 }
 
 #[async_trait::async_trait]
@@ -40,6 +55,9 @@ pub trait IUsageEventRepository: Send + Sync {
         since: Option<TimestampMs>,
         limit: i64,
     ) -> Result<Vec<UsageEventRow>, DbError>;
+
+    /// Filtered read, oldest first, for summaries and task/run scoped lists.
+    async fn list_filtered(&self, user_id: &str, filter: &UsageEventFilter) -> Result<Vec<UsageEventRow>, DbError>;
 
     async fn last_session_cost(&self, user_id: &str, conversation_id: &str) -> Result<Option<(f64, String)>, DbError>;
 

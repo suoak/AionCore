@@ -83,7 +83,7 @@ pub use repository::{
     SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
     SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillEvolutionProposalRepository,
     SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteTaskSessionRepository, SqliteTeamRepository,
-    SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository,
+    SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository, UsageEventFilter,
 };
 
 // Re-export sqlx pool type for downstream crates
