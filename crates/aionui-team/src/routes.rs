@@ -17,7 +17,7 @@ use aionui_api_types::{
     TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
     TeamRunStateResponse, TeamSetConfigOptionResponse, TeamTaskResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{AgentPrincipal, CurrentUser};
 use aionui_common::ApiError;
 use aionui_db::{ActivityCursor, DbError, PageDirection};
 
@@ -227,7 +227,66 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
         .route("/api/teams/{id}/active-lease", post(active_lease))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), agent_team_scope))
         .with_state(state)
+}
+
+/// `true` when the agent bound to `own_conversation_id` is a member of `team`.
+fn team_has_member_conversation(team: &TeamResponse, own_conversation_id: &str) -> bool {
+    team.assistants
+        .iter()
+        .any(|agent| agent.conversation_id == own_conversation_id)
+}
+
+/// Agent-token scope for `/api/teams/{id}/...` (E1 tail ②).
+///
+/// The auth middleware already restricts agent tokens to GET/HEAD here; this
+/// layer further limits them to teams that contain the token's own
+/// conversation. Unrelated teams answer 403 `AGENT_SCOPE_DENIED`, and lookup
+/// failures fail closed. User (non-agent) requests pass through untouched.
+async fn agent_team_scope(
+    State(state): State<TeamRouterState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    let Some(agent) = request.extensions().get::<AgentPrincipal>().cloned() else {
+        return Ok(next.run(request).await);
+    };
+    let team_id = request
+        .uri()
+        .path()
+        .strip_prefix("/api/teams/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    let Some(team_id) = team_id else {
+        // `GET /api/teams` — filtered in the handler.
+        return Ok(next.run(request).await);
+    };
+    let Some(user_id) = request.extensions().get::<CurrentUser>().map(|user| user.id.clone()) else {
+        return Err(agent_team_scope_denied());
+    };
+    let is_member = match state.service.get_team(&user_id, &team_id).await {
+        Ok(team) => team_has_member_conversation(&team, &agent.conversation_id),
+        Err(_) => false,
+    };
+    if !is_member {
+        tracing::info!(
+            path = request.uri().path(),
+            "agent token read of a team it is not a member of"
+        );
+        return Err(agent_team_scope_denied());
+    }
+    Ok(next.run(request).await)
+}
+
+fn agent_team_scope_denied() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "AGENT_SCOPE_DENIED",
+        "Agent tokens may only read teams their own conversation belongs to.",
+        None,
+    )
 }
 
 async fn create_team(
@@ -243,8 +302,13 @@ async fn create_team(
 async fn list_teams(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
+    agent: Option<Extension<AgentPrincipal>>,
 ) -> Result<Json<ApiResponse<TeamListResponse>>, ApiError> {
-    let teams = state.service.list_teams(&user.id).await?;
+    let mut teams = state.service.list_teams(&user.id).await?;
+    if let Some(Extension(agent)) = agent {
+        // Agent tokens only see teams their own conversation belongs to.
+        teams.retain(|team| team_has_member_conversation(team, &agent.conversation_id));
+    }
     Ok(Json(ApiResponse::ok(teams)))
 }
 
