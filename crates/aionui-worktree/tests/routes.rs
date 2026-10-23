@@ -83,6 +83,50 @@ async fn desktop_user_drives_the_lifecycle_over_http() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(json(resp).await["data"]["available"], true);
 
+    // Disk estimate (E3-5): blob sizes of the base tree, nothing created.
+    let enc: String = h
+        .repo
+        .to_string_lossy()
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_./".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let resp = app
+        .clone()
+        .oneshot(user_request(
+            "GET",
+            &format!("/api/worktrees/estimate?repo_path={enc}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let est = json(resp).await["data"].clone();
+    let want_bytes: u64 = git(&h.repo, &["ls-tree", "-r", "-l", "HEAD"])
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok())
+        .sum();
+    let want_files = git(&h.repo, &["ls-files"]).lines().count() as u64;
+    assert_eq!(est["tracked_bytes"], want_bytes);
+    assert_eq!(est["tracked_files"], want_files);
+    assert_eq!(est["truncated"], false);
+    assert_eq!(est["base_commit"], git(&h.repo, &["rev-parse", "HEAD"]));
+    let resp = app
+        .clone()
+        .oneshot(user_request(
+            "GET",
+            "/api/worktrees/estimate?repo_path=/definitely/not/a/repo",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+
     let resp = app
         .clone()
         .oneshot(user_request(
@@ -186,6 +230,7 @@ async fn agent_tokens_are_denied_on_every_worktree_route() {
         ("GET", "/api/worktrees".to_owned()),
         ("GET", "/api/worktrees?status=ready".to_owned()),
         ("GET", "/api/worktrees/capabilities".to_owned()),
+        ("GET", "/api/worktrees/estimate?repo_path=/r".to_owned()),
         ("POST", "/api/worktrees".to_owned()),
         ("POST", "/api/worktrees/prune".to_owned()),
         ("GET", format!("/api/worktrees/{id}")),

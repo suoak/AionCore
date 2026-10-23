@@ -1136,6 +1136,34 @@ impl WorktreeService {
         })
     }
 
+    /// Disk estimate for one more worktree of `repo_path` (read-only).
+    pub async fn estimate(
+        &self,
+        repo_path: &str,
+        base_ref: Option<&str>,
+    ) -> Result<crate::types::EstimateResponse, WorktreeError> {
+        self.ensure_git().await?;
+        let repo = self.resolve_repo(repo_path).await?;
+        let (base_ref, base_commit) = match base_ref.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(r) => (r.to_owned(), self.resolve_commit(&repo.toplevel, r).await?),
+            None => self.default_base(&repo.toplevel).await?,
+        };
+        let dir = repo.toplevel.clone();
+        let commit = base_commit.clone();
+        let (tracked_bytes, tracked_files, truncated) =
+            tokio::task::spawn_blocking(move || crate::diff::tree_size(&dir, &commit))
+                .await
+                .map_err(|e| WorktreeError::Io(format!("estimate task failed: {e}")))??;
+        Ok(crate::types::EstimateResponse {
+            repo_path: repo.toplevel.to_string_lossy().into_owned(),
+            base_ref,
+            base_commit,
+            tracked_bytes,
+            tracked_files,
+            truncated,
+        })
+    }
+
     pub async fn diff_file(&self, user_id: &str, id: &str, rel_path: &str) -> Result<DiffResponse, WorktreeError> {
         let rel = crate::diff::validate_relative_path(rel_path)?;
         let row = self.diffable(user_id, id).await?;

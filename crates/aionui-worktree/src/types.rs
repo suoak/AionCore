@@ -208,3 +208,26 @@ pub struct DiffResponse {
     /// The patch exceeded [`crate::diff::MAX_PATCH_BYTES`] and was cut.
     pub truncated: bool,
 }
+
+/// `GET /api/worktrees/estimate?repo_path=&base_ref=`: what one more
+/// worktree of this repository would cost on disk (design E3 §2.2: tracked
+/// file size × slots). Read-only; nothing is created.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EstimateQuery {
+    #[serde(default)]
+    pub repo_path: String,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EstimateResponse {
+    pub repo_path: String,
+    pub base_ref: String,
+    pub base_commit: String,
+    /// Sum of blob sizes in the base tree (what a checkout writes).
+    pub tracked_bytes: u64,
+    pub tracked_files: u64,
+    /// The walk stopped at [`crate::diff::MAX_ESTIMATE_ENTRIES`]; the numbers are a lower bound.
+    pub truncated: bool,
+}

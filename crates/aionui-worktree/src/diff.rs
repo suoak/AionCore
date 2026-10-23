@@ -15,6 +15,43 @@ use crate::types::DiffStatFile;
 pub const MAX_DIFF_STAT_FILES: usize = 2000;
 /// A single-file patch is cut at this size.
 pub const MAX_PATCH_BYTES: usize = 1024 * 1024;
+/// The disk estimate walks at most this many tree entries.
+pub const MAX_ESTIMATE_ENTRIES: u64 = 500_000;
+
+/// Sum the blob sizes of `commit`'s tree (object headers only; nothing is
+/// checked out or filtered). Returns `(bytes, files, truncated)`.
+pub(crate) fn tree_size(repo_dir: &Path, commit: &str) -> Result<(u64, u64, bool), WorktreeError> {
+    let repo = Repository::open(repo_dir).map_err(|e| WorktreeError::Git(e.message().to_owned()))?;
+    let oid = Oid::from_str(commit).map_err(|e| WorktreeError::Git(e.message().to_owned()))?;
+    let tree = repo
+        .find_commit(oid)
+        .and_then(|c| c.tree())
+        .map_err(|e| WorktreeError::Git(e.message().to_owned()))?;
+    let odb = repo.odb().map_err(|e| WorktreeError::Git(e.message().to_owned()))?;
+    let (mut bytes, mut files, mut seen, mut truncated) = (0u64, 0u64, 0u64, false);
+    tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+        seen += 1;
+        if seen > MAX_ESTIMATE_ENTRIES {
+            truncated = true;
+            return git2::TreeWalkResult::Abort;
+        }
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            files += 1;
+            if let Ok((size, _)) = odb.read_header(entry.id()) {
+                bytes += size as u64;
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .or_else(|e| {
+        if truncated {
+            Ok(())
+        } else {
+            Err(WorktreeError::Git(e.message().to_owned()))
+        }
+    })?;
+    Ok((bytes, files, truncated))
+}
 
 pub(crate) struct DiffStat {
     pub files: Vec<DiffStatFile>,
