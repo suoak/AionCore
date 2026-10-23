@@ -139,3 +139,41 @@ pub struct UsageSummaryResponse {
     /// True when the ledger read hit the retention cap or groups were cut by `limit`.
     pub truncated: bool,
 }
+
+/// Where a context-breakdown number came from (M7 E5-3).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSegmentSource {
+    /// Reported by the provider / agent CLI.
+    Reported,
+    /// Estimated locally by WorkMate; never presented as exact.
+    Estimated,
+    /// No data available.
+    Unavailable,
+}
+
+/// One slice of the context ring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextBreakdownSegment {
+    /// Stable slug (`system_prompt`, `tools`, `messages`, `other`, ...).
+    pub key: String,
+    /// Display label as reported (or a fixed label for local segments).
+    pub label: String,
+    pub tokens: u64,
+    pub source: ContextSegmentSource,
+}
+
+/// `GET /api/conversations/{id}/context-breakdown`.
+///
+/// Invariant: when `used` is present, `segments` sum to exactly `used`
+/// (the remainder is an `other` segment). When `used` is absent the
+/// response has `source = unavailable` and no segments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextBreakdownResponse {
+    pub conversation_id: String,
+    pub used: Option<u64>,
+    pub size: Option<u64>,
+    /// Source of `used` itself.
+    pub source: ContextSegmentSource,
+    pub segments: Vec<ContextBreakdownSegment>,
+}

@@ -5,6 +5,7 @@ mod acp_error_recovery;
 mod agent_health_policy;
 mod approval_audit;
 mod background_stream;
+mod context_breakdown;
 mod convert;
 pub mod error;
 mod journal_compaction;
