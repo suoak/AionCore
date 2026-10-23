@@ -293,9 +293,7 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
         }])
         .await
         .unwrap();
-    states.extension = ExtensionRouterState {
-        registry: registry.clone(),
-    };
+    states.extension = ExtensionRouterState::new(registry.clone());
     let hub_dir = ext_data_dir.join("extensions");
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());
     let installer = HubInstaller::new(index_manager.clone(), registry.clone());

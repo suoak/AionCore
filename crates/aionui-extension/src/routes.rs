@@ -137,6 +137,17 @@ impl From<ExtensionError> for ApiError {
 #[derive(Clone)]
 pub struct ExtensionRouterState {
     pub registry: ExtensionRegistry,
+    /// Short-lived settings-tab asset tokens (E1 tail ④).
+    pub asset_tokens: std::sync::Arc<crate::asset_tokens::AssetTokenStore>,
+}
+
+impl ExtensionRouterState {
+    pub fn new(registry: ExtensionRegistry) -> Self {
+        Self {
+            registry,
+            asset_tokens: std::sync::Arc::new(crate::asset_tokens::AssetTokenStore::new()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +174,7 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
             "/api/extensions/{extension_name}/assets/{*asset_path}",
             get(get_extension_asset),
         )
+        .route("/api/extensions/{extension_name}/asset-token", post(issue_asset_token))
         .route("/api/extensions/webui", get(get_webui))
         .route("/api/extensions/agent-activity", get(get_agent_activity))
         // Query routes with body
@@ -172,6 +184,18 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         // Management routes
         .route("/api/extensions/enable", post(enable_extension))
         .route("/api/extensions/disable", post(disable_extension))
+        .with_state(state)
+}
+
+/// Routes authenticated by a short-lived asset token in the path instead of
+/// the auth middleware. Mount WITHOUT `auth_middleware`: the token is the
+/// credential, scoped to one user, one extension, read-only assets.
+pub fn extension_asset_session_routes(state: ExtensionRouterState) -> Router {
+    Router::new()
+        .route(
+            "/api/extensions/{extension_name}/asset-session/{token}/{*asset_path}",
+            get(get_extension_asset_with_token),
+        )
         .with_state(state)
 }
 
@@ -457,9 +481,56 @@ async fn get_extension_asset(
     Extension(user): Extension<CurrentUser>,
     Path((extension_name, asset_path)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let ext = state
+    serve_extension_asset(&state, &user.id, &extension_name, &asset_path, "public, max-age=3600").await
+}
+
+/// `POST /api/extensions/{extension_name}/asset-token` — issue a short-lived
+/// token that reads only this extension's assets (settings-tab iframe).
+async fn issue_asset_token(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(extension_name): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    state
         .registry
         .get_extension_by_name_for_user(&user.id, &extension_name)
+        .await
+        .filter(|ext| ext.state.enabled)
+        .ok_or_else(|| ApiError::NotFound(format!("Extension not found: {extension_name}")))?;
+    let (token, expires_at) = state
+        .asset_tokens
+        .issue(&user.id, &extension_name)
+        .map_err(|err| ApiError::Internal(format!("asset token: {err}")))?;
+    let base_path = format!("/api/extensions/{extension_name}/asset-session/{token}/");
+    Ok(Json(ApiResponse::ok(json!({
+        "token": token,
+        "expires_at": expires_at,
+        "base_path": base_path,
+    }))))
+}
+
+/// `GET /api/extensions/{extension_name}/asset-session/{token}/{*asset_path}`
+async fn get_extension_asset_with_token(
+    State(state): State<ExtensionRouterState>,
+    Path((extension_name, token, asset_path)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let user_id = state
+        .asset_tokens
+        .resolve(&token, &extension_name)
+        .ok_or_else(|| ApiError::Unauthorized("Invalid or expired extension asset token".into()))?;
+    serve_extension_asset(&state, &user_id, &extension_name, &asset_path, "private, max-age=600").await
+}
+
+async fn serve_extension_asset(
+    state: &ExtensionRouterState,
+    user_id: &str,
+    extension_name: &str,
+    asset_path: &str,
+    cache_control: &'static str,
+) -> Result<Response, ApiError> {
+    let ext = state
+        .registry
+        .get_extension_by_name_for_user(user_id, extension_name)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("Extension not found: {extension_name}")))?;
     if !ext.state.enabled {
@@ -470,7 +541,7 @@ async fn get_extension_asset(
         .await
         .map_err(map_asset_lookup_error)?;
 
-    let relative_path = normalize_relative_asset_path(&asset_path).ok_or_else(|| {
+    let relative_path = normalize_relative_asset_path(asset_path).ok_or_else(|| {
         ApiError::Forbidden(format!(
             "Asset path escapes extension root: {extension_name}/{asset_path}"
         ))
@@ -495,7 +566,7 @@ async fn get_extension_asset(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type_for_path(&canonical_asset))
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(bytes))
         .map_err(|err| ApiError::Internal(err.to_string()))
 }
@@ -666,7 +737,7 @@ mod tests {
         let bus = Arc::new(BroadcastEventBus::new(64));
         std::mem::forget(tmp);
         let registry = ExtensionRegistry::new(store, bus, "1.0.0".into());
-        ExtensionRouterState { registry }
+        ExtensionRouterState::new(registry)
     }
 
     #[test]
@@ -701,6 +772,15 @@ mod tests {
     }
 
     async fn make_router_with_extension() -> (Router, tempfile::TempDir, PathBuf) {
+        let (state, tmp, ext_dir) = make_state_with_extension().await;
+        (
+            extension_routes(state).layer(Extension(CurrentUser::local_default())),
+            tmp,
+            ext_dir,
+        )
+    }
+
+    async fn make_state_with_extension() -> (ExtensionRouterState, tempfile::TempDir, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let ext_root = tmp.path().join("extensions");
         let ext_dir = ext_root.join("hello");
@@ -727,11 +807,73 @@ mod tests {
             .await
             .unwrap();
 
-        (
-            extension_routes(ExtensionRouterState { registry }).layer(Extension(CurrentUser::local_default())),
-            tmp,
-            ext_dir,
-        )
+        (ExtensionRouterState::new(registry), tmp, ext_dir)
+    }
+
+    #[tokio::test]
+    async fn asset_token_serves_only_its_extension_without_auth() {
+        let (state, _tmp, _ext_dir) = make_state_with_extension().await;
+        let router = extension_routes(state.clone())
+            .layer(Extension(CurrentUser::local_default()))
+            .merge(extension_asset_session_routes(state));
+
+        let issued = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extensions/hello/asset-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&issued.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let base = body["data"]["base_path"].as_str().unwrap().to_owned();
+        let token = body["data"]["token"].as_str().unwrap().to_owned();
+        assert!(base.ends_with(&format!("/asset-session/{token}/")));
+
+        let get = |uri: String| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        let ok = get(format!("{base}settings/index.html")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers()[header::CACHE_CONTROL], "private, max-age=600");
+        assert_eq!(ok.into_body().collect().await.unwrap().to_bytes(), "<h1>Hello</h1>");
+
+        let bad = get("/api/extensions/hello/asset-session/deadbeef/settings/index.html".into()).await;
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+        let other_ext = get(format!(
+            "/api/extensions/other/asset-session/{token}/settings/index.html"
+        ))
+        .await;
+        assert_eq!(other_ext.status(), StatusCode::UNAUTHORIZED);
+        let traversal = get(format!("{base}%2E%2E%2Fsecret.txt")).await;
+        assert_eq!(traversal.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn asset_token_refused_for_unknown_extension() {
+        let (router, _tmp, _ext_dir) = make_router_with_extension().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extensions/unknown/asset-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
