@@ -29,13 +29,15 @@ use aionui_api_types::{
     MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationLevel, PlanningIsolationResponse,
     PromptCapabilityView, RETIRED_DEEPSEEK_HARNESS_BACKEND, RuntimeBindingResponse, RuntimeBindingState,
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
-    StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME,
+    StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse,
+    TASK_RETRY_MAX_ATTEMPTS_LIMIT, TASK_RUN_TIMEOUT_MAX_MS, TASK_RUN_TIMEOUT_MIN_MS, TEAM_MCP_SERVER_NAME,
     TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse,
     TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunReplayQuery,
     TaskRunReplayResponse, TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus,
     TaskTraceEventResponse, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest, WebSocketMessage,
-    assistant_avatar_response_value, assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
+    UpdateConversationRequest, UpdateTaskRetryPolicyRequest, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
 use aionui_common::{
@@ -53,12 +55,13 @@ use aionui_db::models::{
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams,
-    CreatePlanningTaskRunParams, CreateTaskArtifactParams, CreateTaskRunParams, CreateTaskSessionParams,
-    FinishTaskRunParams, IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository,
-    IAssistantOverlayRepository, IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository,
-    IProviderRepository, ITaskSessionRepository, IUsageEventRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, ResolveTaskApprovalParams, SaveRuntimeStateParams, UpdateAcceptanceCriterionParams,
-    UpdateTaskSessionParams, UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
+    CreatePlanningTaskRunParams, CreateRetryTaskRunParams, CreateTaskArtifactParams, CreateTaskRunParams,
+    CreateTaskSessionParams, FinishTaskRunParams, IAcpSessionRepository, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
+    IConversationRepository, IMcpServerRepository, IProviderRepository, ITaskSessionRepository, IUsageEventRepository,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, ResolveTaskApprovalParams, SaveRuntimeStateParams,
+    UpdateAcceptanceCriterionParams, UpdateTaskSessionParams, UpsertConversationAssistantSnapshotParams,
+    resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -147,6 +150,8 @@ fn task_session_response(row: TaskSessionRow) -> Result<TaskSessionResponse, Con
         runtime_binding: None,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        retry_max_attempts: row.retry_max_attempts,
+        retry_timeout_ms: row.retry_timeout_ms,
     })
 }
 
@@ -380,6 +385,9 @@ fn task_run_response(row: TaskRunRow) -> Result<TaskRunResponse, ConversationErr
         planning_isolation,
         result_summary: row.result_summary,
         usage,
+        attempt: row.attempt,
+        retry_of_run_id: row.retry_of_run_id,
+        timeout_ms: row.timeout_ms,
     })
 }
 
@@ -1374,6 +1382,42 @@ impl ConversationService {
         }
     }
 
+    /// Set the bounded retry/timeout policy for approved execution runs.
+    /// Retry is off by default (`max_attempts = 1`) and capped at 3 attempts.
+    pub async fn update_task_retry_policy(
+        &self,
+        user_id: &str,
+        id: &str,
+        request: UpdateTaskRetryPolicyRequest,
+    ) -> Result<TaskSessionResponse, ConversationError> {
+        if !(1..=TASK_RETRY_MAX_ATTEMPTS_LIMIT).contains(&request.max_attempts) {
+            return Err(ConversationError::bad_request(format!(
+                "max_attempts must be between 1 and {TASK_RETRY_MAX_ATTEMPTS_LIMIT}"
+            )));
+        }
+        if let Some(timeout_ms) = request.timeout_ms
+            && !(TASK_RUN_TIMEOUT_MIN_MS..=TASK_RUN_TIMEOUT_MAX_MS).contains(&timeout_ms)
+        {
+            return Err(ConversationError::bad_request(format!(
+                "timeout_ms must be between {TASK_RUN_TIMEOUT_MIN_MS} and {TASK_RUN_TIMEOUT_MAX_MS}"
+            )));
+        }
+        let repo = self.task_session_repo()?;
+        let row = match repo
+            .set_retry_policy(user_id, id, request.max_attempts, request.timeout_ms, now_ms())
+            .await
+        {
+            Ok(row) => row,
+            Err(aionui_db::DbError::NotFound(_)) => {
+                return Err(ConversationError::not_found_reason(format!(
+                    "Task session '{id}' not found"
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.task_session_response_with_runtime(user_id, row).await
+    }
+
     pub async fn update_task_session(
         &self,
         user_id: &str,
@@ -2031,12 +2075,13 @@ impl ConversationService {
             })
             .await?;
 
-        let outcome = self
-            .run_agent_turn_internal(
+        let mut run = run;
+        loop {
+            let turn = self.run_agent_turn_internal(
                 ConversationAgentTurnRequest {
                     user_id: user_id.to_owned(),
                     conversation_id: conversation_id.to_owned(),
-                    content: artifact.content,
+                    content: artifact.content.clone(),
                     files: Vec::new(),
                     inject_skills: Vec::new(),
                     required_runtime_mode: None,
@@ -2054,89 +2099,182 @@ impl ConversationService {
                     repo.clone(),
                     self.output_retention_policy(),
                 )),
-            )
-            .await;
-        let run_usage = self.capture_task_run_usage(conversation_id).await;
-        let (run_status, task_status, error_message, result_summary) = match outcome {
-            Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => {
-                let result_summary = outcome
-                    .assistant_output
-                    .as_deref()
-                    .map(crate::trace_redaction::redact_and_bound);
-                if mode == TaskSessionMode::Goal {
-                    let criteria = repo.list_acceptance_criteria(user_id, task_session_id).await?;
-                    let goal_artifact_id = goal_artifact_id.as_deref().expect("goal mode has a goal artifact");
-                    let current_criteria: Vec<_> = criteria
-                        .iter()
-                        .filter(|criterion| criterion.goal_artifact_id == goal_artifact_id)
-                        .collect();
-                    if !current_criteria.is_empty()
-                        && current_criteria.iter().all(|criterion| criterion.status == "passed")
-                    {
+            );
+            let (outcome, timed_out) = self
+                .await_turn_with_timeout(turn, user_id, conversation_id, run.timeout_ms)
+                .await;
+            let run_usage = self.capture_task_run_usage(conversation_id).await;
+            let (mut run_status, mut task_status, mut error_message, result_summary) = match outcome {
+                Ok(outcome) if outcome.status == ConversationAgentTurnStatus::Completed => {
+                    let result_summary = outcome
+                        .assistant_output
+                        .as_deref()
+                        .map(crate::trace_redaction::redact_and_bound);
+                    if mode == TaskSessionMode::Goal {
+                        let criteria = repo.list_acceptance_criteria(user_id, task_session_id).await?;
+                        let goal_artifact_id = goal_artifact_id.as_deref().expect("goal mode has a goal artifact");
+                        let current_criteria: Vec<_> = criteria
+                            .iter()
+                            .filter(|criterion| criterion.goal_artifact_id == goal_artifact_id)
+                            .collect();
+                        if !current_criteria.is_empty()
+                            && current_criteria.iter().all(|criterion| criterion.status == "passed")
+                        {
+                            (
+                                TaskRunStatus::Completed,
+                                TaskSessionStatus::Completed,
+                                None,
+                                result_summary,
+                            )
+                        } else {
+                            (
+                                TaskRunStatus::Completed,
+                                TaskSessionStatus::Paused,
+                                None,
+                                result_summary,
+                            )
+                        }
+                    } else {
                         (
                             TaskRunStatus::Completed,
                             TaskSessionStatus::Completed,
                             None,
                             result_summary,
                         )
-                    } else {
-                        (
-                            TaskRunStatus::Completed,
-                            TaskSessionStatus::Paused,
-                            None,
-                            result_summary,
-                        )
                     }
-                } else {
-                    (
-                        TaskRunStatus::Completed,
-                        TaskSessionStatus::Completed,
-                        None,
-                        result_summary,
-                    )
+                }
+                Ok(outcome) => (
+                    if outcome.status == ConversationAgentTurnStatus::Cancelled {
+                        TaskRunStatus::Cancelled
+                    } else {
+                        TaskRunStatus::Failed
+                    },
+                    if outcome.status == ConversationAgentTurnStatus::Cancelled {
+                        TaskSessionStatus::Cancelled
+                    } else {
+                        TaskSessionStatus::Failed
+                    },
+                    outcome
+                        .error_message
+                        .as_deref()
+                        .map(crate::trace_redaction::redact_and_bound),
+                    outcome
+                        .assistant_output
+                        .as_deref()
+                        .map(crate::trace_redaction::redact_and_bound),
+                ),
+                Err(error) => (
+                    TaskRunStatus::Failed,
+                    TaskSessionStatus::Failed,
+                    Some(crate::trace_redaction::redact_and_bound(&error.to_string())),
+                    None,
+                ),
+            };
+            if timed_out && run_status != TaskRunStatus::Completed {
+                // A policy timeout is a failure (retryable), not a user cancel.
+                run_status = TaskRunStatus::Failed;
+                task_status = TaskSessionStatus::Failed;
+                error_message = Some(format!(
+                    "Execution timed out after {} ms",
+                    run.timeout_ms.unwrap_or_default()
+                ));
+            }
+            let finished = repo
+                .finish_run(&FinishTaskRunParams {
+                    user_id,
+                    task_session_id,
+                    run_id: &run.id,
+                    run_status: &run_status.to_string(),
+                    task_status: &task_status.to_string(),
+                    finished_at: now_ms(),
+                    error_message: error_message.as_deref(),
+                    result_summary: result_summary.as_deref(),
+                    usage: run_usage.as_deref(),
+                })
+                .await?;
+            // Retry only genuine failures (never user cancels, pauses or
+            // completions) and only while the policy allows; the repository
+            // re-checks every precondition atomically with the claim transfer.
+            if run_status == TaskRunStatus::Failed && finished.attempt < task.retry_max_attempts.clamp(1, 3) {
+                match repo
+                    .create_retry_run(&CreateRetryTaskRunParams {
+                        user_id,
+                        task_session_id,
+                        previous_run_id: &finished.id,
+                        started_at: now_ms(),
+                    })
+                    .await
+                {
+                    Ok(next) => {
+                        info!(
+                            task_session_id,
+                            previous_run_id = %finished.id,
+                            run_id = %next.id,
+                            attempt = next.attempt,
+                            "Retrying failed task execution run"
+                        );
+                        run = next;
+                        continue;
+                    }
+                    Err(aionui_db::DbError::Conflict(reason)) => {
+                        info!(task_session_id, run_id = %finished.id, %reason, "Task execution run not retried");
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
-            Ok(outcome) => (
-                if outcome.status == ConversationAgentTurnStatus::Cancelled {
-                    TaskRunStatus::Cancelled
-                } else {
-                    TaskRunStatus::Failed
-                },
-                if outcome.status == ConversationAgentTurnStatus::Cancelled {
-                    TaskSessionStatus::Cancelled
-                } else {
-                    TaskSessionStatus::Failed
-                },
-                outcome
-                    .error_message
-                    .as_deref()
-                    .map(crate::trace_redaction::redact_and_bound),
-                outcome
-                    .assistant_output
-                    .as_deref()
-                    .map(crate::trace_redaction::redact_and_bound),
-            ),
-            Err(error) => (
-                TaskRunStatus::Failed,
-                TaskSessionStatus::Failed,
-                Some(crate::trace_redaction::redact_and_bound(&error.to_string())),
-                None,
-            ),
+            return task_run_response(finished);
+        }
+    }
+
+    /// Await an execution turn, cancelling it once `timeout_ms` elapses.
+    ///
+    /// The turn future is never dropped mid-flight: after the deadline the
+    /// active turn is cancelled through the normal cancel path and the future
+    /// is awaited until it settles, so persistence and hooks run as usual.
+    /// Returns whether the deadline fired.
+    async fn await_turn_with_timeout<F>(
+        &self,
+        turn: F,
+        user_id: &str,
+        conversation_id: &str,
+        timeout_ms: Option<i64>,
+    ) -> (F::Output, bool)
+    where
+        F: std::future::Future,
+    {
+        let Some(timeout) = timeout_ms
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+        else {
+            return (turn.await, false);
         };
-        let finished = repo
-            .finish_run(&FinishTaskRunParams {
-                user_id,
-                task_session_id,
-                run_id: &run.id,
-                run_status: &run_status.to_string(),
-                task_status: &task_status.to_string(),
-                finished_at: now_ms(),
-                error_message: error_message.as_deref(),
-                result_summary: result_summary.as_deref(),
-                usage: run_usage.as_deref(),
-            })
-            .await?;
-        task_run_response(finished)
+        tokio::pin!(turn);
+        tokio::select! {
+            output = &mut turn => return (output, false),
+            () = tokio::time::sleep(timeout) => {}
+        }
+        warn!(conversation_id, timeout_ms = ?timeout_ms, "Task execution run timed out; cancelling turn");
+        let mut cancelled_turn: Option<String> = None;
+        let mut retry_cancel = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                output = &mut turn => return (output, true),
+                _ = retry_cancel.tick() => {
+                    let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) else {
+                        continue;
+                    };
+                    if cancelled_turn.as_deref() == Some(turn_id.as_str()) {
+                        continue;
+                    }
+                    if let Err(error) = self.cancel(user_id, conversation_id, &turn_id, &self.task_manager).await {
+                        debug!(conversation_id, %error, "Timed-out turn cancel did not apply yet");
+                    } else {
+                        cancelled_turn = Some(turn_id);
+                    }
+                }
+            }
+        }
     }
 
     async fn enforce_task_execution_gate(

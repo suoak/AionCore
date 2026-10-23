@@ -208,6 +208,33 @@ pub struct TaskSessionResponse {
     pub runtime_binding: Option<RuntimeBindingResponse>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Total execution attempts per approval: 1 = no retry (default), max 3.
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: i64,
+    /// Per-attempt execution timeout; absent = no timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_timeout_ms: Option<i64>,
+}
+
+fn default_retry_max_attempts() -> i64 {
+    1
+}
+
+/// Upper bound for `max_attempts` in the task retry policy.
+pub const TASK_RETRY_MAX_ATTEMPTS_LIMIT: i64 = 3;
+/// Allowed per-attempt execution timeout range, in milliseconds.
+pub const TASK_RUN_TIMEOUT_MIN_MS: i64 = 1_000;
+pub const TASK_RUN_TIMEOUT_MAX_MS: i64 = 86_400_000;
+
+/// `PUT /api/task-sessions/{id}/retry-policy`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTaskRetryPolicyRequest {
+    /// 1..=3; 1 disables retry.
+    pub max_attempts: i64,
+    /// `null`/absent disables the timeout.
+    #[serde(default)]
+    pub timeout_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -473,6 +500,14 @@ pub struct TaskRunResponse {
     pub result_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<serde_json::Value>,
+    /// 1-based attempt number within a retry chain.
+    #[serde(default = "default_retry_max_attempts")]
+    pub attempt: i64,
+    /// The failed run this run retries, when it is a retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

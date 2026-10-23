@@ -42,6 +42,25 @@ pub trait ITaskSessionRepository: Send + Sync {
     async fn resolve_approval(&self, params: &ResolveTaskApprovalParams<'_>) -> Result<TaskApprovalRow, DbError>;
     async fn create_run(&self, params: &CreateTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
     async fn finish_run(&self, params: &FinishTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
+    /// Create the next attempt for a failed execution run, transferring the
+    /// approval's single run claim to it in the same transaction.
+    ///
+    /// Returns `DbError::Conflict` unless ALL of these hold at commit time:
+    /// the previous run is a `failed` execution run of this user's task, it
+    /// still holds its approval's claim (`task_approvals.run_id`), the approval
+    /// is still `approved` for an artifact that is still approved with the same
+    /// hash, the task is still bound to the same conversation, the previous run
+    /// has not been retried already, and `attempt < retry_max_attempts`.
+    async fn create_retry_run(&self, params: &CreateRetryTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
+    /// Set the retry policy. `max_attempts` must be 1..=3 (1 disables retry).
+    async fn set_retry_policy(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        max_attempts: i64,
+        timeout_ms: Option<i64>,
+        updated_at: TimestampMs,
+    ) -> Result<TaskSessionRow, DbError>;
     async fn list_runs(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskRunRow>, DbError>;
     async fn get_run(&self, user_id: &str, task_session_id: &str, run_id: &str) -> Result<Option<TaskRunRow>, DbError>;
     async fn append_trace_event(&self, params: &AppendTaskTraceEventParams<'_>) -> Result<TaskTraceEventRow, DbError>;
@@ -182,6 +201,13 @@ pub struct CreateTaskRunParams<'a> {
     pub model: Option<&'a str>,
     pub mode: &'a str,
     pub planning_isolation: Option<&'a str>,
+}
+
+pub struct CreateRetryTaskRunParams<'a> {
+    pub user_id: &'a str,
+    pub task_session_id: &'a str,
+    pub previous_run_id: &'a str,
+    pub started_at: TimestampMs,
 }
 
 pub struct FinishTaskRunParams<'a> {

@@ -266,10 +266,11 @@ pub use task_session::{
     AgentIntegrationMode, CreateTaskSessionRequest, DecideTaskApprovalRequest, ExecuteApprovedPlanRequest,
     ListTaskSessionsQuery, PlanningIsolationLevel, PlanningIsolationResponse, PolicyDecision, PolicyDecisionKind,
     RuntimeBindingResponse, RuntimeBindingState, StartAutomaticPlanningRequest, SubmitTaskArtifactRequest,
-    SubmitTaskArtifactResponse, TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind,
-    TaskArtifactResponse, TaskArtifactStatus, TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse,
-    TaskReviewSummary, TaskRunReplayQuery, TaskRunReplayResponse, TaskRunResponse, TaskRunStatus, TaskSessionMode,
-    TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, ToolCapability, UpdateTaskSessionRequest,
+    SubmitTaskArtifactResponse, TASK_RETRY_MAX_ATTEMPTS_LIMIT, TASK_RUN_TIMEOUT_MAX_MS, TASK_RUN_TIMEOUT_MIN_MS,
+    TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse,
+    TaskArtifactStatus, TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary,
+    TaskRunReplayQuery, TaskRunReplayResponse, TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse,
+    TaskSessionStatus, TaskTraceEventResponse, ToolCapability, UpdateTaskRetryPolicyRequest, UpdateTaskSessionRequest,
     VerifyAcceptanceCriterionRequest,
 };
 pub use team::{
