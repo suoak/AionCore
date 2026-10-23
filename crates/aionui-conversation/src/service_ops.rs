@@ -613,13 +613,41 @@ impl ConversationService {
     pub async fn list_usage_events(
         &self,
         user_id: &str,
-        since: Option<i64>,
-        limit: Option<i64>,
+        query: aionui_api_types::UsageListQuery,
     ) -> Result<aionui_api_types::UsageListResponse, ConversationError> {
         let Some(repo) = self.usage_event_repo() else {
             return Ok(aionui_api_types::UsageListResponse { events: Vec::new() });
         };
-        crate::usage_ledger::list_usage_events(repo.as_ref(), user_id, since, limit).await
+        crate::usage_ledger::list_usage_events(
+            repo.as_ref(),
+            user_id,
+            query.since,
+            query.limit,
+            query.task_session_id,
+            query.run_id,
+        )
+        .await
+    }
+
+    /// M7 E5-1: server-side usage aggregation (`GET /api/usage/summary`).
+    pub async fn summarize_usage(
+        &self,
+        user_id: &str,
+        query: aionui_api_types::UsageSummaryQuery,
+    ) -> Result<aionui_api_types::UsageSummaryResponse, ConversationError> {
+        let Some(repo) = self.usage_event_repo() else {
+            let (totals, groups) = crate::usage_ledger::aggregate_usage(&[], query.group_by, 0);
+            return Ok(aionui_api_types::UsageSummaryResponse {
+                group_by: query.group_by,
+                since: query.since,
+                until: query.until,
+                tz_offset_minutes: query.tz_offset_minutes.unwrap_or(0),
+                totals,
+                groups,
+                truncated: false,
+            });
+        };
+        crate::usage_ledger::summarize_usage(repo.as_ref(), user_id, query).await
     }
 
     pub async fn clear_usage_events(&self, user_id: &str) -> Result<u64, ConversationError> {

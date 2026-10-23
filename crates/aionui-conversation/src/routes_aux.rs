@@ -22,6 +22,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
         .route("/api/usage", get(list_usage_events).delete(clear_usage_events))
+        .route("/api/usage/summary", get(summarize_usage))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
         .route("/api/conversations/{id}/transcript", get(get_event_transcript))
         .route("/api/conversations/{id}/trajectory", get(get_trajectory))
@@ -172,21 +173,29 @@ async fn set_config_option(
     )))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct UsageListQueryParams {
-    since: Option<i64>,
-    limit: Option<i64>,
-}
-
 async fn list_usage_events(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Query(query): Query<UsageListQueryParams>,
+    Query(query): Query<aionui_api_types::UsageListQuery>,
 ) -> Result<Json<ApiResponse<aionui_api_types::UsageListResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .list_usage_events(&user.id, query.since, query.limit)
+            .list_usage_events(&user.id, query)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn summarize_usage(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<aionui_api_types::UsageSummaryQuery>,
+) -> Result<Json<ApiResponse<aionui_api_types::UsageSummaryResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .summarize_usage(&user.id, query)
             .await
             .map_err(ApiError::from)?,
     )))

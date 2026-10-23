@@ -1009,6 +1009,12 @@ impl StreamRelay {
                     &self.conversation_id,
                     Some(self.turn_id.as_str()),
                     self.last_model_id.as_deref(),
+                    self.task_trace
+                        .as_ref()
+                        .map(|trace| crate::usage_ledger::UsageTaskLink {
+                            task_session_id: trace.task_id.as_str(),
+                            run_id: trace.run_id.as_str(),
+                        }),
                     &spend,
                 )
                 .await
