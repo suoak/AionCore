@@ -349,6 +349,9 @@ async fn insert_creating(h: &Harness, id: &str, path: &Path, branch: &str) {
             base_ref: "HEAD".into(),
             base_commit: base,
             task_session_id: None,
+            fanout_group_id: None,
+            slot: None,
+            slot_spec: "{}".into(),
             now: 1,
         })
         .await
@@ -509,6 +512,9 @@ async fn live_path_is_unique() {
             base_ref: "HEAD".into(),
             base_commit: base,
             task_session_id: None,
+            fanout_group_id: None,
+            slot: None,
+            slot_spec: "{}".into(),
             now: 1,
         })
         .await

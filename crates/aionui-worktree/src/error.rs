@@ -39,6 +39,21 @@ pub enum WorktreeError {
     Io(String),
     #[error("database error: {0}")]
     Database(String),
+    // ---- E3-4 fan-out ----
+    #[error("fan-out limit: {0}")]
+    FanoutLimit(String),
+    #[error("fan-out group not found: {0}")]
+    FanoutNotFound(String),
+    #[error("fan-out group is {status}; cannot {action}")]
+    FanoutInvalidState { status: String, action: &'static str },
+    #[error("fan-out is not available: {0}")]
+    FanoutUnavailable(String),
+    #[error("slot {0} is still running; stop it before adopting")]
+    SlotBusy(String),
+    #[error("adopt conflict: {0}")]
+    AdoptConflict(String),
+    #[error("target branch is not clean: {0}")]
+    TargetNotClean(String),
 }
 
 impl WorktreeError {
@@ -63,6 +78,13 @@ impl WorktreeError {
             Self::Cancelled => "CANCELLED",
             Self::Io(_) => "IO_ERROR",
             Self::Database(_) => "DATABASE_ERROR",
+            Self::FanoutLimit(_) => "FANOUT_LIMIT",
+            Self::FanoutNotFound(_) => "FANOUT_NOT_FOUND",
+            Self::FanoutInvalidState { .. } => "FANOUT_INVALID_STATE",
+            Self::FanoutUnavailable(_) => "FANOUT_UNAVAILABLE",
+            Self::SlotBusy(_) => "SLOT_BUSY",
+            Self::AdoptConflict(_) => "ADOPT_CONFLICT",
+            Self::TargetNotClean(_) => "TARGET_NOT_CLEAN",
         }
     }
 }

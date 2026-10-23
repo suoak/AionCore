@@ -1115,6 +1115,7 @@ dependencies = [
  "aionui-db",
  "aionui-realtime",
  "aionui-runtime",
+ "async-trait",
  "axum",
  "dashmap",
  "dunce",

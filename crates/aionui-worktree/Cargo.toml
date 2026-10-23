@@ -25,6 +25,7 @@ tracing.workspace = true
 dashmap.workspace = true
 dunce.workspace = true
 git2.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

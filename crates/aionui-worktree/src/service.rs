@@ -15,7 +15,7 @@ use std::time::Duration;
 use aionui_common::now_ms;
 use aionui_db::{AppendTaskTraceEventParams, ITaskSessionRepository};
 use dashmap::DashMap;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::WorktreeError;
@@ -95,7 +95,7 @@ impl WorktreeService {
     /// Mirror a lifecycle event into the linked TaskSession's latest run.
     /// Best-effort: a TaskSession without any run yet has nowhere to put a
     /// trace event (the table requires `run_id`), so the event is skipped.
-    async fn trace(&self, row: &WorktreeRow, event_type: &str, extra: serde_json::Value) {
+    pub(crate) async fn trace(&self, row: &WorktreeRow, event_type: &str, extra: serde_json::Value) {
         let (Some(repo), Some(task_session_id)) = (self.inner.task_sessions.get(), row.task_session_id.as_deref())
         else {
             return;
@@ -234,6 +234,9 @@ impl WorktreeService {
                 base_ref,
                 base_commit,
                 task_session_id,
+                fanout_group_id: None,
+                slot: None,
+                slot_spec: "{}".into(),
                 now,
             })
             .await?;
@@ -247,8 +250,98 @@ impl WorktreeService {
             "worktree create requested"
         );
         self.inner.events.changed(user_id, &row.id, STATUS_CREATING);
-        self.spawn_create(row.clone(), false);
+        self.spawn_create(row.clone(), false, None);
         Ok(row.into())
+    }
+
+    /// E3-4: create one fan-out slot worktree on the group's pinned base.
+    /// `gate` bounds how many slots of the group check out at once
+    /// (`max_parallel`); a queued slot waits in phase `queued`.
+    pub(crate) async fn create_slot(
+        &self,
+        slot: FanoutSlotWorktree<'_>,
+        gate: Arc<Semaphore>,
+    ) -> Result<WorktreeRow, WorktreeError> {
+        let id = format!("wt_{}", aionui_common::generate_id_with_length(Some(20)));
+        let id8: String = id.trim_start_matches("wt_").chars().take(8).collect();
+        let title = format!("{} {}", slot.title, slot.slot);
+        let branch = default_branch_name(&id8, Some(title.trim()));
+        self.inner
+            .git
+            .check_branch_name(&branch)
+            .await
+            .map_err(|_| WorktreeError::InvalidRef(branch.clone()))?;
+        if self.branch_tip(&slot.repo.toplevel, &branch).await?.is_some() {
+            return Err(WorktreeError::BranchExists(branch));
+        }
+        let path = self.allocate_path(&slot.repo.common_dir, &id8)?;
+        let row = self
+            .inner
+            .store
+            .insert(&NewWorktree {
+                id,
+                user_id: slot.user_id.to_owned(),
+                source_repo_path: path_string(&slot.repo.toplevel),
+                repo_common_dir: path_string(&slot.repo.common_dir),
+                path: path_string(&path),
+                branch,
+                base_ref: slot.base_ref.to_owned(),
+                base_commit: slot.base_commit.to_owned(),
+                task_session_id: slot.task_session_id.map(str::to_owned),
+                fanout_group_id: Some(slot.group_id.to_owned()),
+                slot: Some(slot.slot.to_owned()),
+                slot_spec: slot.slot_spec,
+                now: now_ms(),
+            })
+            .await?;
+        tracing::info!(
+            event = "worktree.create_requested",
+            worktree_id = %row.id,
+            user_id = %row.user_id,
+            fanout_group_id = %slot.group_id,
+            slot = %slot.slot,
+            branch = %row.branch,
+            "fan-out slot worktree requested"
+        );
+        self.inner.events.changed(&row.user_id, &row.id, STATUS_CREATING);
+        self.spawn_create(row.clone(), false, Some(gate));
+        Ok(row)
+    }
+
+    /// E3-4: cancel an in-flight create, if any (fan-out cancel / discard).
+    pub(crate) async fn cancel_if_creating(&self, user_id: &str, id: &str) {
+        if let Ok(row) = self.inner.store.get(user_id, id).await
+            && row.status == STATUS_CREATING
+            && let Err(error) = self.cancel(user_id, id).await
+        {
+            tracing::warn!(worktree_id = %id, error = %error, "fan-out: cancel slot worktree failed");
+        }
+    }
+
+    /// E3-4: release a slot worktree from its conversation so it can be
+    /// removed (`ready` + bound → `unbound`, `conversation_id` cleared). The
+    /// conversation itself is kept; its turn must already be stopped.
+    pub(crate) async fn release_slot(&self, user_id: &str, id: &str) -> Result<(), WorktreeError> {
+        if self.inner.store.detach_conversation(id, now_ms()).await? {
+            self.inner.events.changed(user_id, id, STATUS_UNBOUND);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn store(&self) -> &WorktreeStore {
+        &self.inner.store
+    }
+
+    pub(crate) fn git(&self) -> &GitCli {
+        &self.inner.git
+    }
+
+    pub(crate) fn events(&self) -> &WorktreeEvents {
+        &self.inner.events
+    }
+
+    pub(crate) fn task_sessions(&self) -> Option<&Arc<dyn ITaskSessionRepository>> {
+        self.inner.task_sessions.get()
     }
 
     pub async fn cancel(&self, user_id: &str, id: &str) -> Result<WorktreeResponse, WorktreeError> {
@@ -317,11 +410,11 @@ impl WorktreeService {
         let row = self.inner.store.get(user_id, id).await?;
         tracing::info!(event = "worktree.retry", worktree_id = %id, user_id = %user_id, "worktree retry");
         self.inner.events.changed(user_id, id, STATUS_CREATING);
-        self.spawn_create(row.clone(), true);
+        self.spawn_create(row.clone(), true, None);
         Ok(row.into())
     }
 
-    fn spawn_create(&self, row: WorktreeRow, is_retry: bool) {
+    fn spawn_create(&self, row: WorktreeRow, is_retry: bool, gate: Option<Arc<Semaphore>>) {
         let cancel = CancellationToken::new();
         let (done_tx, done_rx) = watch::channel(false);
         self.inner.inflight.insert(
@@ -334,6 +427,17 @@ impl WorktreeService {
         let this = self.clone();
         tokio::spawn(async move {
             let id = row.id.clone();
+            // Fan-out `max_parallel`: hold a permit for the whole checkout.
+            let mut _permit = None;
+            if let Some(gate) = gate {
+                if gate.available_permits() == 0 {
+                    let _ = this.inner.store.set_phase(&id, "queued", now_ms()).await;
+                }
+                tokio::select! {
+                    permit = gate.acquire_owned() => _permit = permit.ok(),
+                    () = cancel.cancelled() => {}
+                }
+            }
             this.run_create(row, is_retry, cancel).await;
             this.inner.inflight.remove(&id);
             let _ = done_tx.send(true);
@@ -341,7 +445,12 @@ impl WorktreeService {
     }
 
     async fn run_create(&self, row: WorktreeRow, is_retry: bool, cancel: CancellationToken) {
-        let result = self.create_checkout(&row, is_retry, &cancel).await;
+        let result = if cancel.is_cancelled() {
+            // Cancelled while queued behind the fan-out gate: nothing to undo.
+            Err(WorktreeError::Cancelled)
+        } else {
+            self.create_checkout(&row, is_retry, &cancel).await
+        };
         let now = now_ms();
         match result {
             Ok(()) => {
@@ -744,7 +853,7 @@ impl WorktreeService {
         false
     }
 
-    async fn is_dirty(&self, path: &Path) -> bool {
+    pub(crate) async fn is_dirty(&self, path: &Path) -> bool {
         match self
             .inner
             .git
@@ -1151,7 +1260,7 @@ impl WorktreeService {
     // Helpers
     // ------------------------------------------------------------------
 
-    async fn resolve_repo(&self, repo_path: &str) -> Result<RepoInfo, WorktreeError> {
+    pub(crate) async fn resolve_repo(&self, repo_path: &str) -> Result<RepoInfo, WorktreeError> {
         let raw = repo_path.trim();
         if raw.is_empty() {
             return Err(WorktreeError::BadRequest("repo_path is required".into()));
@@ -1185,7 +1294,7 @@ impl WorktreeService {
         Ok(RepoInfo { toplevel, common_dir })
     }
 
-    async fn resolve_commit(&self, repo: &Path, rev: &str) -> Result<String, WorktreeError> {
+    pub(crate) async fn resolve_commit(&self, repo: &Path, rev: &str) -> Result<String, WorktreeError> {
         validate_rev_text(rev).map_err(|_| WorktreeError::InvalidRef(rev.to_owned()))?;
         let spec = format!("{rev}^{{commit}}");
         let out = self
@@ -1204,7 +1313,7 @@ impl WorktreeService {
         }
     }
 
-    async fn default_base(&self, repo: &Path) -> Result<(String, String), WorktreeError> {
+    pub(crate) async fn default_base(&self, repo: &Path) -> Result<(String, String), WorktreeError> {
         for candidate in ["origin/HEAD", "HEAD"] {
             if let Ok(sha) = self.resolve_commit(repo, candidate).await {
                 return Ok((candidate.to_owned(), sha));
@@ -1213,7 +1322,7 @@ impl WorktreeService {
         Err(WorktreeError::RefNotFound("HEAD".into()))
     }
 
-    async fn branch_tip(&self, repo: &Path, branch: &str) -> Result<Option<String>, WorktreeError> {
+    pub(crate) async fn branch_tip(&self, repo: &Path, branch: &str) -> Result<Option<String>, WorktreeError> {
         let full = format!("refs/heads/{branch}");
         let out = self
             .inner
@@ -1271,9 +1380,22 @@ impl WorktreeService {
     }
 }
 
-struct RepoInfo {
-    toplevel: PathBuf,
-    common_dir: PathBuf,
+pub(crate) struct RepoInfo {
+    pub(crate) toplevel: PathBuf,
+    pub(crate) common_dir: PathBuf,
+}
+
+/// Inputs for [`WorktreeService::create_slot`].
+pub(crate) struct FanoutSlotWorktree<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) group_id: &'a str,
+    pub(crate) slot: &'a str,
+    pub(crate) slot_spec: String,
+    pub(crate) title: &'a str,
+    pub(crate) repo: &'a RepoInfo,
+    pub(crate) base_ref: &'a str,
+    pub(crate) base_commit: &'a str,
+    pub(crate) task_session_id: Option<&'a str>,
 }
 
 fn classify_add_error(err: GitCliError, row: &WorktreeRow) -> WorktreeError {

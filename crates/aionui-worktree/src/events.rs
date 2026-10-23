@@ -11,6 +11,7 @@ use serde_json::json;
 
 pub const EVENT_PROGRESS: &str = "worktree.progress";
 pub const EVENT_CHANGED: &str = "worktree.changed";
+pub const EVENT_FANOUT_CHANGED: &str = "fanout.changed";
 pub const PROGRESS_THROTTLE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Default)]
@@ -68,6 +69,16 @@ impl WorktreeEvents {
             EVENT_CHANGED,
             json!({ "user_id": user_id, "worktree_id": worktree_id, "status": status }),
         );
+    }
+
+    /// `fanout.changed`: a group status change, or (with `slot`) one slot's.
+    pub fn fanout_changed(&self, user_id: &str, group_id: &str, status: &str, slot: Option<(&str, &str)>) {
+        let mut payload = json!({ "user_id": user_id, "group_id": group_id, "status": status });
+        if let (Some((slot, slot_status)), Some(obj)) = (slot, payload.as_object_mut()) {
+            obj.insert("slot".into(), json!(slot));
+            obj.insert("slot_status".into(), json!(slot_status));
+        }
+        self.send(EVENT_FANOUT_CHANGED, payload);
     }
 
     fn send(&self, name: &str, payload: serde_json::Value) {
