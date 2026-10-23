@@ -635,3 +635,35 @@ mod tests {
         );
     }
 }
+
+/// Query for `GET /api/task-sessions/{id}/runs/{run_id}/replay` (M7 E5-2).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskRunReplayQuery {
+    /// Return events whose sequence is strictly greater than this cursor.
+    #[serde(default)]
+    pub after_sequence: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// One page of a run replay. Pages stitched by `next_after_sequence` contain
+/// every retained trace event exactly once, in sequence order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRunReplayResponse {
+    pub run: TaskRunResponse,
+    pub events: Vec<TaskTraceEventResponse>,
+    /// Cursor for the next page; equals the request cursor when nothing new.
+    pub next_after_sequence: i64,
+    pub has_more: bool,
+    /// Highest sequence allocated for this run so far.
+    pub latest_sequence: i64,
+    /// True when sequences in the requested window are missing (pruned or
+    /// never persisted), so the replay is known to be incomplete.
+    pub retention_gap: bool,
+    /// Run-scoped approvals; only on the first page (`after_sequence` = 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Vec<TaskApprovalResponse>>,
+    /// Run evidence (linked to events via `trace_event_id`); first page only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<TaskEvidenceResponse>>,
+}

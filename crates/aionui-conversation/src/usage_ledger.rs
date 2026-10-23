@@ -153,6 +153,76 @@ pub fn usage_event_fingerprint(turn_id: Option<&str>, spend: &ContextUsageSpend)
     )
 }
 
+/// Record an `unavailable` ledger row for a turn that finished without any
+/// provider-reported usage (M7 E5-2). Tokens are zero and cost is NULL so
+/// aggregates only count it toward `unavailable_turns`; a later reported row
+/// for the same `turn:<id>` fingerprint supersedes it.
+pub async fn record_unavailable_turn_usage(
+    usage_repo: &dyn IUsageEventRepository,
+    conversation_repo: &dyn IConversationRepository,
+    user_id: &str,
+    conversation_id: &str,
+    turn_id: &str,
+    model_hint: Option<&str>,
+    task_link: Option<UsageTaskLink<'_>>,
+) -> Result<Option<UsageEventRow>, ConversationError> {
+    let turn_id = turn_id.trim();
+    if user_id.trim().is_empty() || conversation_id.trim().is_empty() || turn_id.is_empty() {
+        return Ok(None);
+    }
+    let conversation = conversation_repo
+        .get(user_id, conversation_id)
+        .await
+        .map_err(|e| ConversationError::internal(format!("Failed to load conversation for usage: {e}")))?;
+    let Some(conversation) = conversation else {
+        return Ok(None);
+    };
+    let extra = serde_json::from_str::<Value>(&conversation.extra).unwrap_or(Value::Null);
+    let snapshot = conversation_repo
+        .get_assistant_snapshot(user_id, conversation_id)
+        .await
+        .ok()
+        .flatten();
+    let fingerprint = format!("turn:{turn_id}");
+    let backend = conversation_backend(&conversation, &extra);
+    let event_source = if conversation.r#type == "aionrs" {
+        "aionrs"
+    } else {
+        "acp"
+    };
+    let model_id = conversation_model_id(&conversation, &extra, model_hint);
+    let params = InsertUsageEventParams {
+        user_id,
+        conversation_id,
+        recorded_at: now_ms(),
+        fingerprint: &fingerprint,
+        backend: &backend,
+        conversation_source: conversation.source.as_deref().unwrap_or("aionui"),
+        conversation_name: Some(conversation.name.as_str()).filter(|s| !s.is_empty()),
+        assistant_id: snapshot.as_ref().map(|row| row.assistant_id.as_str()),
+        assistant_name: None,
+        model_id: model_id.as_deref(),
+        turn_id: Some(turn_id),
+        total_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        thought_tokens: 0,
+        cached_read_tokens: 0,
+        cached_write_tokens: 0,
+        cost_delta: 0.0,
+        session_cost_amount: None,
+        cost_currency: None,
+        event_source,
+        task_session_id: task_link.map(|link| link.task_session_id),
+        run_id: task_link.map(|link| link.run_id),
+        usage_status: USAGE_STATUS_UNAVAILABLE,
+    };
+    usage_repo
+        .insert_if_new(&params)
+        .await
+        .map_err(|e| ConversationError::internal(format!("Failed to record unavailable usage: {e}")))
+}
+
 pub fn row_to_usage_dto(row: UsageEventRow) -> UsageEventDto {
     UsageEventDto {
         id: row.id,
@@ -814,5 +884,49 @@ mod summary_tests {
         .expect("inserted");
         assert_eq!(chat.task_session_id, None);
         assert_eq!(usage.list_for_user(user, None, 10).await.unwrap().len(), 2);
+
+        // M7 E5-2: a turn without reported usage leaves an `unavailable` row
+        // that only counts toward `unavailable_turns`; a later report wins.
+        let placeholder = super::record_unavailable_turn_usage(
+            &usage,
+            &conversations,
+            user,
+            "conv-task",
+            "turn-silent",
+            None,
+            Some(UsageTaskLink {
+                task_session_id: "task-1",
+                run_id: "run-1",
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("inserted");
+        assert_eq!(placeholder.usage_status, "unavailable");
+        assert_eq!(placeholder.fingerprint, "turn:turn-silent");
+        assert_eq!(placeholder.total_tokens, 0);
+        assert_eq!(placeholder.session_cost_amount, None);
+        assert_eq!(placeholder.run_id.as_deref(), Some("run-1"));
+        let rows = usage.list_for_user(user, None, 10).await.unwrap();
+        let (totals, _) = super::aggregate_usage(&rows, aionui_api_types::UsageGroupBy::Task, 0);
+        assert_eq!(totals.unavailable_turns, 1);
+        assert_eq!(totals.total_tokens, 12 + 7);
+
+        record_context_usage_spend(
+            &usage,
+            &conversations,
+            user,
+            "conv-task",
+            Some("turn-silent"),
+            None,
+            None,
+            &spend(3),
+        )
+        .await
+        .unwrap()
+        .expect("reported row supersedes placeholder");
+        let rows = usage.list_for_user(user, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.usage_status == "reported"));
     }
 }

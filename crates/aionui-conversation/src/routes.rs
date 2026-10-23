@@ -17,8 +17,9 @@ use aionui_api_types::{
     PlanningIsolationResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     StartAutomaticPlanningRequest, SubmitConversationInputRequest, SubmitTaskArtifactRequest,
     SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskEvidenceResponse, TaskReviewResponse,
-    TaskRunResponse, TaskSessionResponse, TaskTraceEventResponse, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
+    TaskRunReplayQuery, TaskRunReplayResponse, TaskRunResponse, TaskSessionResponse, TaskTraceEventResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -160,6 +161,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/task-sessions/{id}/runs", get(list_task_runs))
         .route("/api/task-sessions/{id}/runs/{run_id}/review", get(get_task_run_review))
         .route("/api/task-sessions/{id}/runs/{run_id}/trace", get(get_task_run_trace))
+        .route("/api/task-sessions/{id}/runs/{run_id}/replay", get(replay_task_run))
         .route(
             "/api/task-sessions/{id}/runs/{run_id}/changes",
             get(get_task_run_changes),
@@ -380,6 +382,17 @@ async fn get_task_run_trace(
 ) -> Result<Json<ApiResponse<Vec<TaskTraceEventResponse>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state.service.get_task_run_trace(&user.id, &id, &run_id).await?,
+    )))
+}
+
+async fn replay_task_run(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, run_id)): Path<(String, String)>,
+    Query(query): Query<TaskRunReplayQuery>,
+) -> Result<Json<ApiResponse<TaskRunReplayResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.replay_task_run(&user.id, &id, &run_id, query).await?,
     )))
 }
 

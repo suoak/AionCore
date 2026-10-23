@@ -174,3 +174,37 @@ async fn pre_067_rows_get_reported_status() {
     assert_eq!(rows[0].usage_status, "reported");
     assert_eq!(rows[0].task_session_id, None);
 }
+
+#[tokio::test]
+async fn reported_row_supersedes_unavailable_placeholder() {
+    // M7 E5-2: a turn that ended without usage gets an `unavailable` row; a
+    // late provider report for the same fingerprint replaces it, but an
+    // `unavailable` write never overrides a reported row.
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteUsageEventRepository::new(db.pool().clone());
+    let mut placeholder = spend_params("user-1", "conv-1", "turn:turn-1", 0);
+    placeholder.total_tokens = 0;
+    placeholder.output_tokens = 0;
+    placeholder.cost_delta = 0.0;
+    placeholder.session_cost_amount = None;
+    placeholder.cost_currency = None;
+    placeholder.usage_status = "unavailable";
+    assert!(repo.insert_if_new(&placeholder).await.unwrap().is_some());
+    // Repeated unavailable write is idempotent.
+    assert!(repo.insert_if_new(&placeholder).await.unwrap().is_none());
+
+    let reported = repo
+        .insert_if_new(&spend_params("user-1", "conv-1", "turn:turn-1", 10))
+        .await
+        .unwrap();
+    assert!(reported.is_some());
+    let listed = repo.list_for_user("user-1", None, 50).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].usage_status, "reported");
+    assert_eq!(listed[0].input_tokens, 10);
+
+    assert!(repo.insert_if_new(&placeholder).await.unwrap().is_none());
+    let listed = repo.list_for_user("user-1", None, 50).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].usage_status, "reported");
+}

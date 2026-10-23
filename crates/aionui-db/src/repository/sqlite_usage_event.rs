@@ -22,10 +22,26 @@ impl SqliteUsageEventRepository {
     }
 }
 
+const USAGE_STATUS_REPORTED_DB: &str = "reported";
+
 #[async_trait::async_trait]
 impl IUsageEventRepository for SqliteUsageEventRepository {
     async fn insert_if_new(&self, params: &InsertUsageEventParams<'_>) -> Result<Option<UsageEventRow>, DbError> {
         let id = generate_prefixed_id("usage");
+        let mut tx = self.pool.begin().await?;
+        if params.usage_status == USAGE_STATUS_REPORTED_DB {
+            // A provider-reported row supersedes an `unavailable` placeholder
+            // written earlier for the same turn fingerprint.
+            sqlx::query(
+                "DELETE FROM usage_events WHERE user_id = ? AND conversation_id = ? AND fingerprint = ? \
+                 AND usage_status = 'unavailable'",
+            )
+            .bind(params.user_id)
+            .bind(params.conversation_id)
+            .bind(params.fingerprint)
+            .execute(&mut *tx)
+            .await?;
+        }
         let result = sqlx::query(
             "INSERT OR IGNORE INTO usage_events (\
                 id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
@@ -59,8 +75,9 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
         .bind(params.task_session_id)
         .bind(params.run_id)
         .bind(params.usage_status)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         if result.rows_affected() == 0 {
             return Ok(None);

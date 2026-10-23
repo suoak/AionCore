@@ -51,6 +51,16 @@ pub trait ITaskSessionRepository: Send + Sync {
         task_session_id: &str,
         run_id: &str,
     ) -> Result<Vec<TaskTraceEventRow>, DbError>;
+    /// Page through a run's trace in sequence order, returning at most `limit`
+    /// events whose sequence is strictly greater than `after_sequence`.
+    async fn list_trace_events_page(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<TaskTraceEventRow>, DbError>;
     async fn create_checkpoint(&self, params: &CreateTaskCheckpointParams<'_>) -> Result<TaskCheckpointRow, DbError>;
     async fn list_checkpoints(
         &self,
