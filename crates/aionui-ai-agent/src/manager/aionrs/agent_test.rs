@@ -953,6 +953,143 @@ async fn isolated_skill_roots_load_enabled_skills_and_ignore_workspace_skills() 
     );
 }
 
+/// Run real git for a fixture; `None` when git is not installed.
+fn fixture_git(dir: &std::path::Path, args: &[&str]) -> Option<()> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=dev@example.com",
+            "-c",
+            "user.name=Dev",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(())
+}
+
+/// M7 E3-2 regression for C-01 / B-13: a managed worktree checks out an
+/// arbitrary branch, so whatever that branch ships — `.csbu-workmate/skills`,
+/// `.aionrs/skills`, `.aionrs.toml` — must stay as inert as in any other
+/// workspace when a conversation runs inside the linked worktree.
+#[tokio::test]
+async fn linked_worktree_checkout_skills_and_aionrs_toml_are_not_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    if fixture_git(&repo, &["init", "-q", "-b", "main"]).is_none() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+    fs::write(repo.join("README.md"), "hello\n").unwrap();
+    fixture_git(&repo, &["add", "."]).unwrap();
+    fixture_git(&repo, &["commit", "-q", "-m", "init"]).unwrap();
+    // The untrusted branch carries the payloads.
+    fixture_git(&repo, &["checkout", "-q", "-b", "untrusted"]).unwrap();
+    write_project_skill(&repo, ".csbu-workmate", "evil-branded", "EVIL_BRANDED_BODY");
+    write_project_skill(&repo, ".aionrs", "evil-legacy", "EVIL_LEGACY_BODY");
+    fs::write(repo.join(".aionrs.toml"), MALICIOUS_WORKSPACE_AIONRS_TOML).unwrap();
+    fixture_git(&repo, &["add", "."]).unwrap();
+    fixture_git(&repo, &["commit", "-q", "-m", "payload"]).unwrap();
+    fixture_git(&repo, &["checkout", "-q", "main"]).unwrap();
+    // Linked worktree on the untrusted branch, outside the main checkout,
+    // the way `aionui-worktree` lays them out.
+    let worktree = tmp.path().join("worktrees").join("abcd1234").join("ef567890");
+    fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    fixture_git(
+        &repo,
+        &["worktree", "add", "-q", worktree.to_str().unwrap(), "untrusted"],
+    )
+    .unwrap();
+    assert!(worktree.join(".git").is_file(), "linked worktree has a .git file");
+    assert!(worktree.join(".csbu-workmate/skills/evil-branded/SKILL.md").is_file());
+    assert!(worktree.join(".aionrs.toml").is_file());
+
+    // Skills: only the conversation's isolated root is visible.
+    let data_dir = tempfile::tempdir().unwrap();
+    let source = data_dir.path().join("user-skills").join("enabled-skill");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: enabled-skill\ndescription: enabled skill\n---\nENABLED_SKILL_BODY\n",
+    )
+    .unwrap();
+    let root = aionui_extension::skill_view::rebuild_aionrs_skill_root(
+        data_dir.path(),
+        "user_a",
+        "conv_worktree_skills",
+        &[aionui_extension::ResolvedAgentSkill {
+            name: "enabled-skill".into(),
+            source_path: source,
+        }],
+    )
+    .await
+    .unwrap();
+    let mut config = resolve_aionui_config(&make_cli_args(worktree.clone(), "openai", "gpt-test")).unwrap();
+    config.session.enabled = false;
+    config.tools.auto_approve = true;
+    let provider = Arc::new(SkillProbeProvider::invoking_skills(&[
+        "enabled-skill",
+        "evil-branded",
+        "evil-legacy",
+    ]));
+    let mut engine = isolate_session_skills(
+        AgentBootstrap::new(config, worktree.to_string_lossy(), Arc::new(NullSink)).provider(provider.clone()),
+        vec![root],
+    )
+    .build()
+    .await
+    .unwrap()
+    .engine;
+    engine.run("use the skills", "worktree-skill-isolation").await.unwrap();
+    let results = provider.tool_results.lock().unwrap().clone();
+    assert!(
+        results
+            .iter()
+            .any(|(is_error, content)| !*is_error && content.contains("ENABLED_SKILL_BODY")),
+        "{results:?}"
+    );
+    assert!(
+        !results.iter().any(|(_, content)| content.contains("EVIL_")),
+        "{results:?}"
+    );
+    let prompts = provider.system_prompts.lock().unwrap();
+    assert!(
+        prompts
+            .iter()
+            .all(|prompt| !prompt.contains("evil-branded") && !prompt.contains("evil-legacy"))
+    );
+    drop(prompts);
+
+    // `.aionrs.toml` from the checked-out branch: no auto-approve, hooks or MCP.
+    let embedded = resolve_aionui_config(&make_cli_args(worktree.clone(), "openai", "gpt-test")).unwrap();
+    assert!(!embedded.tools.auto_approve);
+    assert!(embedded.hooks.pre_tool_use.is_empty());
+    assert!(embedded.mcp.servers.is_empty());
+    let sessions = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.session_directory = sessions.path().to_path_buf();
+    let agent = AionrsAgentManager::new(
+        "conv-worktree-iso".into(),
+        worktree.to_string_lossy().into_owned(),
+        config,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!agent.auto_approve.load(Ordering::SeqCst));
+    assert!(agent.mcp_managers.is_empty());
+}
+
 /// An empty root list (view unavailable) must still isolate: the workspace skill
 /// stays invisible rather than the loader falling back to scanning it.
 #[tokio::test]

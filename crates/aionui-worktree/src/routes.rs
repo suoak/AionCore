@@ -17,8 +17,8 @@ use aionui_common::ApiError;
 use crate::error::WorktreeError;
 use crate::service::WorktreeService;
 use crate::types::{
-    CreateWorktreeRequest, GitCapabilityResponse, ListWorktreesQuery, PruneResponse, RemoveWorktreeQuery,
-    WorktreeResponse,
+    CreateWorktreeRequest, DiffQuery, DiffResponse, DiffStatResponse, GitCapabilityResponse, ListWorktreesQuery,
+    PruneResponse, RemoveWorktreeQuery, WorktreeResponse,
 };
 
 #[derive(Clone)]
@@ -59,6 +59,8 @@ pub fn worktree_routes(state: WorktreeRouterState) -> Router {
         .route("/api/worktrees/{id}", get(get_worktree).delete(remove_worktree))
         .route("/api/worktrees/{id}/cancel", post(cancel_worktree))
         .route("/api/worktrees/{id}/retry", post(retry_worktree))
+        .route("/api/worktrees/{id}/diff-stat", get(diff_stat))
+        .route("/api/worktrees/{id}/diff", get(diff_file))
         .with_state(state)
 }
 
@@ -124,4 +126,24 @@ async fn prune_worktrees(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<PruneResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(state.service.prune(&user.id).await?)))
+}
+
+async fn diff_stat(
+    State(state): State<WorktreeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<DiffStatResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(state.service.diff_stat(&user.id, &id).await?)))
+}
+
+async fn diff_file(
+    State(state): State<WorktreeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<DiffQuery>,
+) -> Result<Json<ApiResponse<DiffResponse>>, ApiError> {
+    let path = query.path.unwrap_or_default();
+    Ok(Json(ApiResponse::ok(
+        state.service.diff_file(&user.id, &id, &path).await?,
+    )))
 }

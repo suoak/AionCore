@@ -192,6 +192,8 @@ async fn agent_tokens_are_denied_on_every_worktree_route() {
         ("DELETE", format!("/api/worktrees/{id}?branch=force&force_dir=true")),
         ("POST", format!("/api/worktrees/{id}/cancel")),
         ("POST", format!("/api/worktrees/{id}/retry")),
+        ("GET", format!("/api/worktrees/{id}/diff-stat")),
+        ("GET", format!("/api/worktrees/{id}/diff?path=README.md")),
     ] {
         let resp = app
             .clone()
@@ -212,4 +214,70 @@ async fn agent_tokens_are_denied_on_every_worktree_route() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn desktop_user_reads_diff_stat_and_file_diff_over_http() {
+    require_git!();
+    let h = harness().await;
+    let wt = h
+        .service
+        .create(
+            USER,
+            aionui_worktree::types::CreateWorktreeRequest {
+                repo_path: h.repo.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let wt = h.wait_status(&wt.id, "ready").await;
+    std::fs::write(std::path::Path::new(&wt.path).join("README.md"), "hello\nworld\n").unwrap();
+    let app = app(&h);
+
+    let resp = app
+        .clone()
+        .oneshot(user_request(
+            "GET",
+            &format!("/api/worktrees/{}/diff-stat", wt.id),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json(resp).await;
+    assert_eq!(body["data"]["files_changed"], 1);
+    assert_eq!(body["data"]["files"][0]["path"], "README.md");
+    assert_eq!(body["data"]["files"][0]["additions"], 1);
+
+    let resp = app
+        .clone()
+        .oneshot(user_request(
+            "GET",
+            &format!("/api/worktrees/{}/diff?path=README.md", wt.id),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json(resp).await;
+    assert_eq!(body["data"]["status"], "modified");
+    assert!(body["data"]["patch"].as_str().unwrap().contains("+world"));
+
+    for bad in ["..%2Fetc%2Fpasswd", ".git%2Fconfig", ""] {
+        let resp = app
+            .clone()
+            .oneshot(user_request(
+                "GET",
+                &format!("/api/worktrees/{}/diff?path={bad}", wt.id),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "path {bad:?}");
+    }
+
+    // Another user's id is indistinguishable from a missing one.
+    let other = h.service.diff_stat(OTHER_USER, &wt.id).await.unwrap_err();
+    assert_eq!(other.code(), "WORKTREE_NOT_FOUND");
 }

@@ -25,6 +25,7 @@ fn repository(is_worktree: bool, worktree_of: Option<&str>) -> ScmRepository {
         head: None,
         is_worktree,
         worktree_of: worktree_of.map(str::to_owned),
+        managed_worktree_id: None,
         capabilities: ScmCapabilities {
             staging: true,
             local_branches: true,

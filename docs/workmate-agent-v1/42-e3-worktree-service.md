@@ -1,4 +1,4 @@
-# E3-1: managed git worktrees (Core)
+# E3-1 / E3-2: managed git worktrees (Core)
 
 ## Status
 
@@ -76,14 +76,66 @@ SCM       = unchanged: scm/* protocol and git_provider are not touched
 - Migration 066: once applied, older Core builds show the existing
   `database.newer_than_app` dialog (no downgrade to ≤ 0.2.20).
 
+## E3-2: conversations in a worktree (Core)
+
+- `POST /api/conversations` takes a top-level `worktree_id`. The worktree must
+  belong to the caller, be `ready` (or `unbound`, i.e. its previous
+  conversation was deleted) and hold no conversation; the server then writes
+  `extra.workspace = worktree.path`, `extra.worktree_id`, and
+  `extra.fanout_group_id` / `extra.fanout_slot` when set. A client workspace is
+  overridden; no temp workspace is created; project bind runs as usual.
+  Errors: 404 `WORKTREE_NOT_FOUND`, 409 `WORKTREE_INVALID_STATE` /
+  `WORKTREE_ALREADY_BOUND`, 400 when the worktree service is not wired.
+- Binding is a compare-and-set on `task_worktrees.conversation_id` after the
+  conversation row exists (FK). Losing the race deletes the new conversation
+  and returns 409, so no half-bound conversation is left behind.
+- Protected keys `worktree_id`, `fanout_group_id`, `fanout_slot`: stripped from
+  every client create body (forged values never bind), rejected on PATCH
+  (400). Echoing the stored value back is allowed, like the team keys.
+- Workspace lock: when `extra.worktree_id` is set, `PATCH` and the internal
+  `update_extra` both refuse to change `extra.workspace`
+  (400 `WORKSPACE_LOCKED`). Clone and fork never inherit the binding (clone
+  drops `worktree_id`; both strip the keys on create).
+- Delete: an `OnConversationDelete` hook (runs before the row delete) moves
+  every `ready` worktree held by the conversation to `unbound`, broadcasts
+  `worktree.changed`, and never touches the directory or branch.
+  `conversation_id` is left for the FK (`ON DELETE SET NULL`) to clear when the
+  delete commits. Failure fallback: if the delete does not commit, the row is
+  `unbound` but still names a live conversation; reads more than 30 s after
+  the unbind (grace for the in-flight delete) flip it back to `ready`
+  (`worktree.rebound` log). Hook errors are logged, never fail the delete.
+- An `unbound` worktree can be bound again by a new conversation. A `ready`
+  worktree that is bound cannot be removed (409 `WORKTREE_INVALID_STATE`);
+  delete the conversation first.
+- `GET /api/worktrees/{id}/diff-stat`: committed + staged + unstaged +
+  untracked changes against `base_commit` (git2; ignored files excluded;
+  renames detected; binary flagged; capped at 2000 listed files with totals
+  still complete). `GET /api/worktrees/{id}/diff?path=`: one file's unified
+  diff (untracked against `/dev/null`), `unchanged` when equal, cut at 1 MiB.
+  Paths must be plain relative paths (no `..`, absolute, or `.git/`);
+  pathspec magic is not interpreted. git2 never runs repository-configured
+  diff / textconv / filter drivers. Both are user-only (agent tokens 403).
+- `ScmRepository.managed_worktree_id` (optional, omitted when absent):
+  `ScmRuntime` back-fills it during discover through
+  `IManagedWorktreeLookup`, which the app implements by exact path match
+  against live `task_worktrees` rows. The git provider and `scm/*` frames are
+  otherwise unchanged.
+- TaskSession: `task_session_id` on worktree create is ownership-checked
+  (400 otherwise). `worktree.created`, `worktree.bound`, `worktree.unbound`
+  and `worktree.removed` are appended to `task_trace_events` on the session's
+  latest run; with no run yet there is nowhere to attach them (the table needs
+  `run_id`), so they are skipped (structured `tracing` logs always exist).
+- Skill isolation regression: a linked worktree checked out on a branch that
+  ships `.csbu-workmate/skills`, `.aionrs/skills` and a malicious
+  `.aionrs.toml` loads none of them (aionrs agent test).
+
 ## Deferred to later E3 PRs
 
-- E3-2: `POST /api/conversations` `worktree_id`, protected extra keys,
-  workspace lock, delete hook → `unbound`, `ScmRepository.managed_worktree_id`,
-  `diff-stat` / `diff` routes, skill-isolation regression in worktrees,
-  `task_trace_events` (`worktree.created`) when a TaskSession is linked.
 - E3-3 (UI): Worktree toggle, Start-from picker, progress / cancel / retry,
-  delete dialog, preserved-branch review.
-- E3-4: `FanoutService` and `/api/fanout-groups*` (table already in 066).
+  delete dialog, preserved-branch review, `managed_worktree_id` label in the
+  SCM tree, diff-stat view.
+- E3-4: `FanoutService` and `/api/fanout-groups*` (table already in 066);
+  `fanout.adopted` trace event; fan-out conversations pass `worktree_id` per
+  slot.
 - E3-7 (M8): remote `fetch` before create, `size_bytes`, disk quotas, Windows
   deepest-path pre-check.

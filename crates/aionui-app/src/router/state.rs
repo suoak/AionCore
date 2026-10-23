@@ -362,6 +362,7 @@ pub async fn build_module_states(
             agent_center: Arc::downgrade(&agent_center.service),
         }));
     let worktree = build_module_state_phase(&boot, "worktree", || build_worktree_state(services));
+    crate::router::worktree_adapters::wire_worktree_bindings(services, &worktree.service);
     if let Err(error) = worktree.service.recover_on_boot().await {
         tracing::warn!(error = %error, "worktree: startup recovery failed");
     }

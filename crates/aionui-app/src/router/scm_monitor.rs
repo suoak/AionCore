@@ -70,11 +70,16 @@ impl ScmWirePush for WsManagerPush {
 pub fn spawn_scm_monitor(
     project: Arc<ProjectService>,
     manager: Arc<WebSocketManager>,
+    managed_worktrees: Option<Arc<dyn aionui_project::scm::IManagedWorktreeLookup>>,
 ) -> Option<Arc<dyn MessageRouter>> {
     let push: Arc<dyn ScmWirePush> = Arc::new(WsManagerPush { manager });
     let (inbound, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
     match ScmActor::new(Arc::clone(&project), push) {
         Ok(actor) => {
+            let actor = match managed_worktrees {
+                Some(lookup) => actor.with_managed_worktrees(lookup),
+                None => actor,
+            };
             // Direct wiring (乙), not an event bus (甲): source control is the only
             // subscriber to project-explorer root changes, so feeding the service's
             // attach/detach notifications straight into this actor's inbound is

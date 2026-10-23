@@ -9,10 +9,11 @@
 //! finish" and retry never destroys a healthy worktree.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aionui_common::now_ms;
+use aionui_db::{AppendTaskTraceEventParams, ITaskSessionRepository};
 use dashmap::DashMap;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -31,6 +32,9 @@ use crate::types::*;
 const CHECKOUT_TIMEOUT: Duration = FETCH_TIMEOUT;
 /// How long `cancel` waits for the background task to unwind.
 const CANCEL_WAIT: Duration = Duration::from_secs(60);
+/// An `unbound` row whose conversation still exists this long after the
+/// unbind is a rolled-back delete (see `reconcile_unbound`).
+const UNBIND_SETTLE_MS: i64 = 30_000;
 /// Windows only: conservative cap on the managed worktree path itself.
 #[cfg(windows)]
 const WINDOWS_MAX_WORKTREE_PATH: usize = 200;
@@ -54,6 +58,9 @@ struct Inner {
     events: WorktreeEvents,
     inflight: DashMap<String, Inflight>,
     git_version: Mutex<Option<GitVersion>>,
+    /// Optional: when set, `task_session_id` is ownership-checked and
+    /// lifecycle events are mirrored into `task_trace_events`.
+    task_sessions: OnceLock<Arc<dyn ITaskSessionRepository>>,
 }
 
 #[derive(Clone)]
@@ -71,12 +78,62 @@ impl WorktreeService {
                 events: config.events,
                 inflight: DashMap::new(),
                 git_version: Mutex::new(None),
+                task_sessions: OnceLock::new(),
             }),
         }
     }
 
     pub fn root_dir(&self) -> &Path {
         &self.inner.root_dir
+    }
+
+    /// Wire the TaskSession repository (first call wins).
+    pub fn set_task_sessions(&self, repo: Arc<dyn ITaskSessionRepository>) {
+        let _ = self.inner.task_sessions.set(repo);
+    }
+
+    /// Mirror a lifecycle event into the linked TaskSession's latest run.
+    /// Best-effort: a TaskSession without any run yet has nowhere to put a
+    /// trace event (the table requires `run_id`), so the event is skipped.
+    async fn trace(&self, row: &WorktreeRow, event_type: &str, extra: serde_json::Value) {
+        let (Some(repo), Some(task_session_id)) = (self.inner.task_sessions.get(), row.task_session_id.as_deref())
+        else {
+            return;
+        };
+        let runs = match repo.list_runs(&row.user_id, task_session_id).await {
+            Ok(runs) => runs,
+            Err(error) => {
+                tracing::warn!(worktree_id = %row.id, task_session_id, error = %error, "worktree trace: list runs failed");
+                return;
+            }
+        };
+        let Some(run) = runs.first() else {
+            tracing::debug!(worktree_id = %row.id, task_session_id, event_type, "worktree trace skipped: no task run yet");
+            return;
+        };
+        let mut payload = serde_json::json!({
+            "worktree_id": row.id,
+            "branch": row.branch,
+            "base_commit": row.base_commit,
+            "path": row.path,
+        });
+        if let (Some(target), serde_json::Value::Object(more)) = (payload.as_object_mut(), extra) {
+            target.extend(more);
+        }
+        let payload = payload.to_string();
+        if let Err(error) = repo
+            .append_trace_event(&AppendTaskTraceEventParams {
+                user_id: &row.user_id,
+                task_session_id,
+                run_id: &run.id,
+                event_type,
+                timestamp: now_ms(),
+                payload: &payload,
+            })
+            .await
+        {
+            tracing::warn!(worktree_id = %row.id, task_session_id, event_type, error = %error, "worktree trace append failed");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -151,6 +208,17 @@ impl WorktreeService {
             return Err(WorktreeError::BranchExists(branch));
         }
 
+        let task_session_id = req.task_session_id.filter(|s| !s.trim().is_empty());
+        if let (Some(repo_ts), Some(ts)) = (self.inner.task_sessions.get(), task_session_id.as_deref())
+            && repo_ts
+                .get(user_id, ts)
+                .await
+                .map_err(|e| WorktreeError::Database(e.to_string()))?
+                .is_none()
+        {
+            return Err(WorktreeError::BadRequest("unknown task_session_id".into()));
+        }
+
         let path = self.allocate_path(&repo.common_dir, &id8)?;
         let now = now_ms();
         let row = self
@@ -165,7 +233,7 @@ impl WorktreeService {
                 branch,
                 base_ref,
                 base_commit,
-                task_session_id: req.task_session_id.filter(|s| !s.trim().is_empty()),
+                task_session_id,
                 now,
             })
             .await?;
@@ -291,6 +359,8 @@ impl WorktreeService {
                     "worktree ready"
                 );
                 self.inner.events.changed(&row.user_id, &row.id, STATUS_READY);
+                self.trace(&row, "worktree.created", serde_json::json!({ "retry": is_retry }))
+                    .await;
             }
             Err(err) => {
                 let err = if cancel.is_cancelled() {
@@ -474,6 +544,14 @@ impl WorktreeService {
                 action: "remove",
             });
         }
+        // A conversation is running in it: delete the conversation first
+        // (which unbinds it), so its agent never loses its cwd mid-turn.
+        if prev == STATUS_READY && row.conversation_id.is_some() {
+            return Err(WorktreeError::InvalidState {
+                status: "bound".into(),
+                action: "remove",
+            });
+        }
         let path = PathBuf::from(&row.path);
         if path.is_dir() {
             self.ensure_git().await?;
@@ -528,6 +606,12 @@ impl WorktreeService {
                     "worktree removed"
                 );
                 self.inner.events.changed(&row.user_id, &row.id, STATUS_REMOVED);
+                self.trace(
+                    &row,
+                    "worktree.removed",
+                    serde_json::json!({ "branch_preserved": preserved }),
+                )
+                .await;
             }
             Err(err) => {
                 let message = err.to_string();
@@ -738,8 +822,14 @@ impl WorktreeService {
         Some((parts.next()??, parts.next()??))
     }
 
-    /// A live worktree whose directory vanished becomes `orphaned`.
+    /// Reconcile a row read from the store:
+    /// - a live worktree whose directory vanished becomes `orphaned`;
+    /// - an `unbound` row that still names a conversation which still exists
+    ///   is a rolled-back conversation delete (the unbind hook runs before the
+    ///   row delete; a successful delete nulls `conversation_id` through the
+    ///   FK), so it goes back to `ready`.
     async fn refresh_orphan(&self, row: WorktreeRow) -> Result<WorktreeRow, WorktreeError> {
+        let row = self.reconcile_unbound(row).await?;
         if [STATUS_READY, STATUS_UNBOUND].contains(&row.status.as_str()) && !Path::new(&row.path).exists() {
             let changed = self
                 .inner
@@ -752,6 +842,209 @@ impl WorktreeService {
             return Ok(self.inner.store.get_any(&row.id).await?.unwrap_or(row));
         }
         Ok(row)
+    }
+
+    async fn reconcile_unbound(&self, row: WorktreeRow) -> Result<WorktreeRow, WorktreeError> {
+        let Some(conversation_id) = row.conversation_id.as_deref() else {
+            return Ok(row);
+        };
+        // Grace period: the hook flips the status a moment before the row
+        // delete commits; reading in between must not undo a delete that is
+        // about to succeed.
+        if row.status != STATUS_UNBOUND
+            || now_ms().saturating_sub(row.updated_at) < UNBIND_SETTLE_MS
+            || !self.inner.store.conversation_exists(conversation_id).await?
+        {
+            return Ok(row);
+        }
+        let changed = self
+            .inner
+            .store
+            .set_status(&row.id, &[STATUS_UNBOUND], STATUS_READY, None, None, now_ms())
+            .await?;
+        if changed {
+            tracing::info!(
+                event = "worktree.rebound",
+                worktree_id = %row.id,
+                conversation_id,
+                "conversation delete did not complete; worktree bound again"
+            );
+            self.inner.events.changed(&row.user_id, &row.id, STATUS_READY);
+        }
+        Ok(self.inner.store.get_any(&row.id).await?.unwrap_or(row))
+    }
+
+    // ------------------------------------------------------------------
+    // Conversation binding (E3-2)
+    // ------------------------------------------------------------------
+
+    /// The row a conversation create wants to bind, reconciled. Ownership is
+    /// enforced (another user's id is `NotFound`); state checks are the
+    /// caller's, against the returned row.
+    pub async fn binding_candidate(&self, user_id: &str, id: &str) -> Result<WorktreeRow, WorktreeError> {
+        let row = self.inner.store.get(user_id, id).await?;
+        self.refresh_orphan(row).await
+    }
+
+    /// Attach `conversation_id` (compare-and-set). `Ok(false)`: the worktree
+    /// is no longer bindable (taken, or left `ready`/`unbound`).
+    pub async fn bind_conversation(
+        &self,
+        user_id: &str,
+        id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, WorktreeError> {
+        let bound = self
+            .inner
+            .store
+            .bind_conversation(user_id, id, conversation_id, now_ms())
+            .await?;
+        if bound {
+            let row = self.inner.store.get(user_id, id).await?;
+            tracing::info!(
+                event = "worktree.bound",
+                worktree_id = %id,
+                user_id = %user_id,
+                conversation_id,
+                "worktree bound to conversation"
+            );
+            self.inner.events.changed(user_id, id, STATUS_READY);
+            self.trace(
+                &row,
+                "worktree.bound",
+                serde_json::json!({ "conversation_id": conversation_id }),
+            )
+            .await;
+        }
+        Ok(bound)
+    }
+
+    /// Conversation delete hook: every `ready` worktree held by the
+    /// conversation becomes `unbound`. The directory and branch are never
+    /// touched — they may hold uncommitted work the user cleans up from the
+    /// worktree manager. `conversation_id` is left for the FK to null when the
+    /// row delete commits; if that delete fails, the next read sees a live
+    /// conversation and reverts to `ready` ([`Self::reconcile_unbound`]).
+    /// Never fails: errors are logged and the read path reconciles.
+    pub async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+        let rows = match self.inner.store.list_by_conversation(user_id, conversation_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(user_id, conversation_id, error = %error, "worktree unbind: lookup failed");
+                return;
+            }
+        };
+        for row in rows {
+            if row.status != STATUS_READY {
+                continue;
+            }
+            match self
+                .inner
+                .store
+                .set_status(&row.id, &[STATUS_READY], STATUS_UNBOUND, None, None, now_ms())
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        event = "worktree.unbound",
+                        worktree_id = %row.id,
+                        user_id,
+                        conversation_id,
+                        path = %row.path,
+                        "conversation deleted; worktree kept as unbound"
+                    );
+                    self.inner.events.changed(user_id, &row.id, STATUS_UNBOUND);
+                    self.trace(
+                        &row,
+                        "worktree.unbound",
+                        serde_json::json!({ "conversation_id": conversation_id }),
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(worktree_id = %row.id, conversation_id, error = %error, "worktree unbind failed");
+                }
+            }
+        }
+    }
+
+    /// The live managed worktree whose directory is `path` (SCM discover
+    /// back-fills `ScmRepository.managed_worktree_id` with it).
+    pub async fn managed_id_for_path(&self, path: &Path) -> Option<String> {
+        let mut candidates = vec![path_string(path)];
+        if let Ok(canonical) = dunce::canonicalize(path) {
+            let canonical = path_string(&canonical);
+            if !candidates.contains(&canonical) {
+                candidates.push(canonical);
+            }
+        }
+        for candidate in candidates {
+            match self.inner.store.find_live_by_path(&candidate).await {
+                Ok(Some(row)) => return Some(row.id),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(error = %error, "managed worktree lookup failed");
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    // ------------------------------------------------------------------
+    // Diff (read-only, git2)
+    // ------------------------------------------------------------------
+
+    async fn diffable(&self, user_id: &str, id: &str) -> Result<WorktreeRow, WorktreeError> {
+        let row = self.inner.store.get(user_id, id).await?;
+        let row = self.refresh_orphan(row).await?;
+        if ![STATUS_READY, STATUS_UNBOUND].contains(&row.status.as_str()) {
+            return Err(WorktreeError::InvalidState {
+                status: row.status,
+                action: "diff",
+            });
+        }
+        self.check_contained(Path::new(&row.path))?;
+        Ok(row)
+    }
+
+    pub async fn diff_stat(&self, user_id: &str, id: &str) -> Result<DiffStatResponse, WorktreeError> {
+        let row = self.diffable(user_id, id).await?;
+        let path = PathBuf::from(&row.path);
+        let base = row.base_commit.clone();
+        let stat = tokio::task::spawn_blocking(move || crate::diff::diff_stat(&path, &base))
+            .await
+            .map_err(|e| WorktreeError::Io(format!("diff task failed: {e}")))??;
+        Ok(DiffStatResponse {
+            worktree_id: row.id,
+            base_commit: row.base_commit,
+            files: stat.files,
+            files_changed: stat.files_changed,
+            additions: stat.additions,
+            deletions: stat.deletions,
+            truncated: stat.truncated,
+        })
+    }
+
+    pub async fn diff_file(&self, user_id: &str, id: &str, rel_path: &str) -> Result<DiffResponse, WorktreeError> {
+        let rel = crate::diff::validate_relative_path(rel_path)?;
+        let row = self.diffable(user_id, id).await?;
+        let path = PathBuf::from(&row.path);
+        let base = row.base_commit.clone();
+        let spec = rel.clone();
+        let diff = tokio::task::spawn_blocking(move || crate::diff::file_diff(&path, &base, &spec))
+            .await
+            .map_err(|e| WorktreeError::Io(format!("diff task failed: {e}")))??;
+        Ok(DiffResponse {
+            worktree_id: row.id,
+            base_commit: row.base_commit,
+            path: rel,
+            status: diff.status,
+            binary: diff.binary,
+            patch: diff.patch,
+            truncated: diff.truncated,
+        })
     }
 
     // ------------------------------------------------------------------

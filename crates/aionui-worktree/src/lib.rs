@@ -7,10 +7,14 @@
 //! - [`service`]: worktree lifecycle and state machine.
 //! - [`routes`]: `/api/worktrees*` (user identity only; agent tokens denied).
 //! - [`events`]: `worktree.progress` / `worktree.changed`.
+//! - [`diff`]: read-only diff-stat / per-file diff against `base_commit`
+//!   (git2; never runs repository-configured drivers).
 //!
-//! Read-only SCM (status/diff via git2) stays in `aionui-project`; this crate
-//! never changes the `scm/*` protocol.
+//! Conversation binding (E3-2): a conversation created with `worktree_id`
+//! holds the worktree (`conversation_id`); deleting the conversation marks
+//! it `unbound` and keeps the directory.
 
+pub mod diff;
 pub mod error;
 pub mod events;
 pub mod git_cli;

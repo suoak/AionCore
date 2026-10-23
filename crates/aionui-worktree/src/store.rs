@@ -225,4 +225,73 @@ impl WorktreeStore {
             .map_err(map_err)?;
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Conversation binding (E3-2)
+    // ------------------------------------------------------------------
+
+    /// Attach `conversation_id` to a bindable worktree (compare-and-set): the
+    /// row must belong to `user_id`, be `ready` or `unbound`, and hold no
+    /// conversation. Binding moves an `unbound` worktree back to `ready`.
+    pub async fn bind_conversation(
+        &self,
+        user_id: &str,
+        id: &str,
+        conversation_id: &str,
+        now: i64,
+    ) -> Result<bool, WorktreeError> {
+        let result = sqlx::query(
+            "UPDATE task_worktrees SET conversation_id = ?, status = 'ready', error_code = NULL, \
+             error_message = NULL, updated_at = ? \
+             WHERE id = ? AND user_id = ? AND conversation_id IS NULL AND status IN ('ready', 'unbound')",
+        )
+        .bind(conversation_id)
+        .bind(now)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Live worktrees bound to `conversation_id`.
+    pub async fn list_by_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<WorktreeRow>, WorktreeError> {
+        sqlx::query_as::<_, WorktreeRow>(&format!(
+            "SELECT {COLUMNS} FROM task_worktrees WHERE user_id = ? AND conversation_id = ? AND status <> 'removed'"
+        ))
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_err)
+    }
+
+    /// Whether the conversation row still exists. Used to tell an `unbound`
+    /// worktree whose conversation delete was rolled back from one whose
+    /// delete is merely still in flight.
+    pub async fn conversation_exists(&self, conversation_id: &str) -> Result<bool, WorktreeError> {
+        let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_err)?;
+        Ok(found.is_some())
+    }
+
+    /// The live managed worktree at exactly `path`, if any (any owner).
+    pub async fn find_live_by_path(&self, path: &str) -> Result<Option<WorktreeRow>, WorktreeError> {
+        sqlx::query_as::<_, WorktreeRow>(&format!(
+            "SELECT {COLUMNS} FROM task_worktrees WHERE path = ? AND status NOT IN ('removed', 'failed') \
+             ORDER BY created_at DESC LIMIT 1"
+        ))
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_err)
+    }
 }
