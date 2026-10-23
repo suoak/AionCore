@@ -1,7 +1,7 @@
 // `ApiError` is the intended error type at this HTTP boundary.
 #![allow(clippy::disallowed_types)]
 
-//! `/api/review-threads*` (design §6.1). User identity only: the prefix is
+//! `/api/review-threads*` and `/api/review-batches` (design §6.1). User identity only: the prefix is
 //! not in the agent-token allow-list, so agent tokens are denied (403) by
 //! `aionui-auth`'s agent scope before reaching these handlers. The routes
 //! deliberately live outside `/api/conversations/{id}/…` so they never fall
@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 
+use crate::batch::{ListReviewBatchesQuery, ReviewBatch, SendReviewBatchRequest, SendReviewBatchResponse};
 use crate::error::ReviewError;
 use crate::service::ReviewService;
 use crate::types::{
@@ -39,6 +40,7 @@ pub fn review_routes(state: ReviewRouterState) -> Router {
         .route("/api/review-threads/{id}/resolve", post(resolve_thread))
         .route("/api/review-threads/{id}/reopen", post(reopen_thread))
         .route("/api/review-threads/{id}/comments", post(add_comment))
+        .route("/api/review-batches", get(list_batches).post(send_batch))
         .with_state(state)
 }
 
@@ -64,6 +66,28 @@ fn to_api_error(error: ReviewError) -> ApiError {
             )
         }
     }
+}
+
+async fn send_batch(
+    State(state): State<ReviewRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<SendReviewBatchRequest>,
+) -> Result<Json<ApiResponse<SendReviewBatchResponse>>, ApiError> {
+    let sent = state.service.send_batch(&user.id, req).await.map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(sent)))
+}
+
+async fn list_batches(
+    State(state): State<ReviewRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<ListReviewBatchesQuery>,
+) -> Result<Json<ApiResponse<Vec<ReviewBatch>>>, ApiError> {
+    let batches = state
+        .service
+        .list_batches(&user.id, &query.target_conversation_id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(batches)))
 }
 
 type ThreadResponse = Result<Json<ApiResponse<ReviewThread>>, ApiError>;

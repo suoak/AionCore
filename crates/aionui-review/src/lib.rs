@@ -7,17 +7,26 @@
 //!   is outside the agent-token allow-list, so agent tokens get 403
 //!   (`aionui-auth::agent_scope`).
 //!
-//! Sending annotations to an agent (`review_batches`) is E4-3; commit / push /
-//! PR delivery (`scm_deliveries`) is E4-4/E4-5.
+//! - [`ReviewService::send_batch`]: `/api/review-batches`, one `[[AION_REVIEW]]`
+//!   input per batch through the conversation input queue ([`prompt`]).
+//!
+//! Commit / push / PR delivery (`scm_deliveries`) is E4-4/E4-5.
 
 pub mod anchor;
+mod batch;
 mod error;
+pub mod prompt;
 mod resolver;
 pub mod routes;
 mod service;
 mod types;
 
+pub use batch::{
+    ListReviewBatchesQuery, MAX_BATCH_THREADS, ReviewBatch, ReviewDeliveryMode, ReviewInputAccepted, ReviewInputError,
+    ReviewInputSink, SendReviewBatchRequest, SendReviewBatchResponse,
+};
 pub use error::ReviewError;
+pub use prompt::{REVIEW_BLOCK_MAX_BYTES, render_review_block};
 pub use resolver::{
     AllowedRootsResolver, PE_SCOPE_PREFIX, ProjectDirResolver, ScopeContentResolver, parse_pe_scope, pe_scope_id,
 };
