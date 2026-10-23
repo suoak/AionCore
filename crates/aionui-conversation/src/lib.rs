@@ -35,6 +35,8 @@ mod stream_persistence;
 pub mod stream_relay;
 pub mod task_options;
 mod task_trace;
+#[cfg(test)]
+mod test_log_capture;
 mod tool_event_pipeline;
 mod trace_redaction;
 mod trajectory_projection;

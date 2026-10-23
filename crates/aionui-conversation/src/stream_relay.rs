@@ -1497,43 +1497,13 @@ mod tests {
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
     use aionui_db::DbError;
     use aionui_db::models::MessageRow;
-    use std::io::Write;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tracing::Level;
-    use tracing_subscriber::fmt;
 
     // ── run() async tests ─────────────────────────────────────────
 
-    #[derive(Clone)]
-    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedLogBuffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log buffer lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_logs(level: Level, f: impl FnOnce()) -> String {
-        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let make_writer = {
-            let buffer = Arc::clone(&buffer);
-            move || SharedLogBuffer(Arc::clone(&buffer))
-        };
-        let subscriber = fmt::Subscriber::builder()
-            .with_max_level(level)
-            .with_writer(make_writer)
-            .with_ansi(false)
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, f);
-        String::from_utf8(buffer.lock().expect("log buffer lock").clone()).expect("utf8 logs")
-    }
+    use crate::test_log_capture::capture_logs;
 
     #[test]
     fn attachment_delivery_system_frame_has_a_dedicated_journal_kind() {
