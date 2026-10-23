@@ -54,6 +54,42 @@ pub enum ScmError {
     /// Local IO failed outside the engine (e.g. moving a file to the trash).
     #[error("io error on {path}: {message}")]
     Io { path: String, message: String },
+
+    // ── commit / push (M7 E4-4) ──────────────────────────────────────────
+    // `message` / `output` fields below are already redacted (credentials in
+    // URLs and token-shaped strings removed) and length-capped by the producer.
+    /// `scm/commit` with an empty staging area.
+    #[error("nothing staged to commit")]
+    CommitNothingStaged,
+
+    /// No usable author / committer identity (`user.name` / `user.email`).
+    #[error("commit identity missing: {message}")]
+    CommitIdentityMissing { message: String },
+
+    /// A repository hook (pre-commit, commit-msg, ...) rejected the commit.
+    /// `output` is the hook's combined stdout/stderr.
+    #[error("commit hook failed: {output}")]
+    CommitHookFailed { output: String },
+
+    /// The remote refused the update (non-fast-forward, protected branch,
+    /// pre-receive hook).
+    #[error("push rejected: {message}")]
+    PushRejected { message: String },
+
+    /// The remote could not be authenticated against (no credentials, bad
+    /// token, permission denied). Interactive prompts are disabled, so this is
+    /// also what a missing credential helper looks like.
+    #[error("push authentication failed: {message}")]
+    PushAuthFailed { message: String },
+
+    /// The branch has no upstream and the request did not ask to set one; the
+    /// client confirms "push to `{remote}/{branch}` and set upstream" first.
+    #[error("no upstream for {branch} (remote {remote})")]
+    PushNoUpstream { remote: String, branch: String },
+
+    /// The system `git` executable is missing or too old.
+    #[error("git not available: {message}")]
+    GitNotAvailable { message: String },
 }
 
 impl ScmError {

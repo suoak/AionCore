@@ -128,7 +128,8 @@ async fn discover_reports_identity_capabilities_and_head() {
     assert!(found.capabilities.staging, "git has a staging area");
     assert!(found.capabilities.local_branches);
     assert!(!found.capabilities.history_graph, "stage 2, not advertised yet");
-    assert!(!found.capabilities.remote_ops, "stage 2, not advertised yet");
+    assert!(found.capabilities.remote_ops, "push / remoteInfo (M7 E4-4)");
+    assert!(found.capabilities.commit, "commit (M7 E4-4)");
     assert_eq!(found.state, ScmRepositoryState::Idle);
     assert!(!found.is_worktree, "a primary clone is not a worktree");
     assert!(
@@ -868,6 +869,7 @@ fn staged_anchor_is_refused_without_the_staging_capability() {
         local_branches: false,
         history_graph: false,
         remote_ops: false,
+        commit: false,
     };
 
     let err = check_anchor(caps, ContentRef::Staged).expect_err("staged anchor needs staging");

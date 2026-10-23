@@ -16,8 +16,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use git2::{Delta, DiffOptions, ErrorClass, ErrorCode, Repository, Status, StatusOptions, StatusShow};
 
+use aionui_worktree::GitCli;
+
 use super::error::ScmError;
-use super::provider::{IScmProvider, IScmStaging};
+use super::provider::{IScmCommit, IScmProvider, IScmRemote, IScmStaging};
 use super::trash_sink::{PlatformTrash, TrashSink};
 use super::types::{
     ContentRef, DiffContent, FileRef, RepoRef, ResolvedRoot, ScmActionFailure, ScmActionOutcome, ScmCapabilities,
@@ -68,6 +70,10 @@ pub struct GitScmProvider {
     /// Where discarded untracked files go. Injectable so the "never delete
     /// outright" guarantee is testable; production always uses the platform trash.
     trash: Arc<dyn TrashSink>,
+    /// System `git` for the operations git2 cannot do faithfully — commit
+    /// (hooks, signing) and push (credential helpers, ssh). Injectable so tests
+    /// pin the environment the child sees.
+    git: GitCli,
 }
 
 impl GitScmProvider {
@@ -82,6 +88,7 @@ impl GitScmProvider {
         Self {
             repos: std::sync::RwLock::new(HashMap::new()),
             trash,
+            git: GitCli::default(),
         }
     }
 
@@ -116,6 +123,15 @@ impl GitScmProvider {
     /// outlive the repository it describes.
     pub(super) fn forget(&self, repo_id: &str) {
         self.repos.write().expect("scm repo registry poisoned").remove(repo_id);
+    }
+
+    pub(super) fn git(&self) -> &GitCli {
+        &self.git
+    }
+
+    /// Work-tree root of a discovered repository, for the CLI-backed operations.
+    pub(super) fn workdir_of(&self, repo: &RepoRef) -> Result<PathBuf, ScmError> {
+        self.entry(repo).map(|entry| entry.workdir)
     }
 
     fn entry(&self, repo: &RepoRef) -> Result<RepoEntry, ScmError> {
@@ -201,18 +217,43 @@ fn read_head(repo: &Repository) -> Option<ScmHead> {
     match repo.head() {
         Ok(head) => {
             let detached = repo.head_detached().unwrap_or(false);
+            let tracking = if detached { None } else { read_tracking(repo, &head) };
             Some(ScmHead {
                 // git2 0.21: Reference::shorthand() returns Result (was Option in
                 // 0.20). `.ok()` keeps the prior "unreadable/unborn head → None"
                 // semantics — an unborn head is a normal state, not an error to log.
                 name: head.shorthand().ok().map(str::to_owned),
                 detached: detached.then_some(true),
+                upstream: tracking.as_ref().map(|t| t.0.clone()),
+                ahead: tracking.as_ref().map(|t| t.1),
+                behind: tracking.as_ref().map(|t| t.2),
             })
         }
         // Unborn head (fresh repo, no commit yet) is a normal state, not an
         // error: the repository exists and has a change list.
         Err(_) => Some(ScmHead::default()),
     }
+}
+
+/// The branch's upstream (`origin/main`) and its ahead / behind counts, read
+/// locally from the remote-tracking ref (no network). `None` when the branch has
+/// no upstream or the tracking ref is missing (never fetched or pushed).
+fn read_tracking(repo: &Repository, head: &git2::Reference<'_>) -> Option<(String, u32, u32)> {
+    let local = head.target()?;
+    let refname = head.name().ok()?;
+    let upstream_ref = repo.branch_upstream_name(refname).ok()?;
+    let upstream_ref = upstream_ref.as_str().ok()?.to_owned();
+    let upstream = repo.find_reference(&upstream_ref).ok()?.target()?;
+    let (ahead, behind) = repo.graph_ahead_behind(local, upstream).ok()?;
+    let short = upstream_ref
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(&upstream_ref)
+        .to_owned();
+    Some((
+        short,
+        u32::try_from(ahead).unwrap_or(u32::MAX),
+        u32::try_from(behind).unwrap_or(u32::MAX),
+    ))
 }
 
 /// The plain, `Send` data one opened repository contributes to discovery. Kept
@@ -927,10 +968,12 @@ impl IScmProvider for GitScmProvider {
         ScmCapabilities {
             staging: true,
             local_branches: true,
-            // Stage 2: the engine could serve these (revwalk / network), but the
-            // contract must not advertise what the protocol does not expose yet.
+            // Stage 2: the engine could serve this (revwalk), but the contract
+            // must not advertise what the protocol does not expose yet.
             history_graph: false,
-            remote_ops: false,
+            // Push and remote info (M7 E4-4) through the system git CLI.
+            remote_ops: true,
+            commit: true,
         }
     }
 
@@ -1116,6 +1159,14 @@ impl IScmProvider for GitScmProvider {
     }
 
     fn staging(&self) -> Option<&dyn IScmStaging> {
+        Some(self)
+    }
+
+    fn commit(&self) -> Option<&dyn IScmCommit> {
+        Some(self)
+    }
+
+    fn remote(&self) -> Option<&dyn IScmRemote> {
         Some(self)
     }
 }

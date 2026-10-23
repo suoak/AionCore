@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 
+use super::commit_types::{CommitRequest, CommitResult, PushRequest, PushResult, RemoteInfo, ScmProgressFn};
 use super::error::ScmError;
 use super::types::{
     ContentRef, DiffContent, FileRef, RepoRef, ResolvedRoot, ScmActionOutcome, ScmCapabilities, ScmRepository,
@@ -83,6 +84,16 @@ pub trait IScmProvider: Send + Sync {
 
     /// History/commit-graph operations, or `None` when unsupported. Stage 2;
     /// every stage-0 provider returns `None`.
+    /// Commit support, present iff [`ScmCapabilities::commit`] is set.
+    fn commit(&self) -> Option<&dyn IScmCommit> {
+        None
+    }
+
+    /// Remote operations, present iff [`ScmCapabilities::remote_ops`] is set.
+    fn remote(&self) -> Option<&dyn IScmRemote> {
+        None
+    }
+
     fn history(&self) -> Option<&dyn IScmHistory> {
         None
     }
@@ -101,6 +112,35 @@ pub trait IScmStaging: Send + Sync {
 
     /// Remove changes from the staging area, keeping the working tree as-is.
     async fn unstage(&self, repo: &RepoRef, files: &[FileRef]) -> Result<ScmActionOutcome, ScmError>;
+}
+
+/// Record the staging area as a new commit (M7 E4-4).
+///
+/// Commits exactly what is staged — never an implicit "stage everything"; the
+/// client asks the user and stages first. Repository hooks run unless the
+/// request opts out.
+#[async_trait]
+pub trait IScmCommit: Send + Sync {
+    async fn commit(&self, repo: &RepoRef, request: &CommitRequest) -> Result<CommitResult, ScmError>;
+}
+
+/// Publish the current branch and describe its remotes (M7 E4-4).
+///
+/// Push sends the current branch only and never forces. Credentials are the
+/// system's (credential helper, ssh agent): nothing is prompted for and nothing
+/// is read by WorkMate.
+#[async_trait]
+pub trait IScmRemote: Send + Sync {
+    async fn push(
+        &self,
+        repo: &RepoRef,
+        request: &PushRequest,
+        progress: Option<ScmProgressFn>,
+    ) -> Result<PushResult, ScmError>;
+
+    /// Remotes (credential-free URLs), upstream and ahead / behind, read
+    /// locally without touching the network.
+    async fn remote_info(&self, repo: &RepoRef) -> Result<RemoteInfo, ScmError>;
 }
 
 /// Commit-graph / history reads. Stage 2 — declared here so adding it later is
