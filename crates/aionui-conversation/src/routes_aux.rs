@@ -24,6 +24,9 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/context-breakdown", get(get_context_breakdown))
         .route("/api/usage", get(list_usage_events).delete(clear_usage_events))
         .route("/api/usage/summary", get(summarize_usage))
+        .route("/api/inbox", get(list_inbox))
+        .route("/api/inbox/read-all", post(mark_all_inbox_read))
+        .route("/api/inbox/{id}/read", post(mark_inbox_read))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
         .route("/api/conversations/{id}/transcript", get(get_event_transcript))
         .route("/api/conversations/{id}/trajectory", get(get_trajectory))
@@ -183,6 +186,47 @@ async fn list_usage_events(
         state
             .service
             .list_usage_events(&user.id, query)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn list_inbox(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<aionui_api_types::InboxListQuery>,
+) -> Result<Json<ApiResponse<aionui_api_types::InboxListResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_inbox(&user.id, query)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn mark_inbox_read(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::InboxMarkReadResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .mark_inbox_read(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn mark_all_inbox_read(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<aionui_api_types::InboxMarkReadResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .mark_all_inbox_read(&user.id)
             .await
             .map_err(ApiError::from)?,
     )))

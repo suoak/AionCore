@@ -479,6 +479,25 @@ mod tests {
     }
 
     #[test]
+    fn inbox_routes_are_denied() {
+        // M7 E5-4: the inbox is the user's attention queue; agents never read or ack it.
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            for path in [
+                "/api/inbox",
+                "/api/inbox?unread_only=true",
+                "/api/inbox/read-all",
+                "/api/inbox/i1/read",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn task_retry_policy_and_execution_routes_are_denied() {
         // M7 E5-5: retry policy decides how often an approval may be
         // re-executed; an agent must never be able to widen it or re-run.

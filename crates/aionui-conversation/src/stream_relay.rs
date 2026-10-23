@@ -186,6 +186,7 @@ pub struct StreamRelay {
     event_journal: Option<CanonicalEventJournal>,
     permission_auto_reject: Option<PermissionAutoReject>,
     usage_event_repo: Option<Arc<dyn IUsageEventRepository>>,
+    inbox: Option<crate::inbox::InboxSink>,
     task_trace: Option<crate::task_trace::TaskTraceContext>,
     last_model_id: Option<String>,
     /// Set once the provider reported usage for this turn (M7 E5-2).
@@ -227,6 +228,7 @@ impl StreamRelay {
             event_journal: None,
             permission_auto_reject: None,
             usage_event_repo: None,
+            inbox: None,
             task_trace: None,
             last_model_id: None,
             usage_reported: false,
@@ -294,6 +296,12 @@ impl StreamRelay {
 
     pub(crate) fn with_usage_event_repo(mut self, repo: Option<Arc<dyn IUsageEventRepository>>) -> Self {
         self.usage_event_repo = repo;
+        self
+    }
+
+    /// M7 E5-4: pending approvals surface in the user's inbox.
+    pub(crate) fn with_inbox(mut self, inbox: Option<crate::inbox::InboxSink>) -> Self {
+        self.inbox = inbox;
         self
     }
 
@@ -964,8 +972,27 @@ impl StreamRelay {
             .replay(&self.user_id, &self.conversation_id)
             .await
             .unwrap_or_default();
-        if crate::approval_audit::fold_approval_policy(&events) == aionui_ai_agent::shared_kernel::ApprovalPolicy::Never
-        {
+        let never = crate::approval_audit::fold_approval_policy(&events)
+            == aionui_ai_agent::shared_kernel::ApprovalPolicy::Never;
+        if !never && let Some(inbox) = &self.inbox {
+            let task = self.task_trace.as_ref().map(|trace| crate::inbox::InboxTaskRef {
+                task_session_id: &trace.task_id,
+                run_id: &trace.run_id,
+            });
+            inbox
+                .approval_asked(
+                    &self.user_id,
+                    &self.conversation_id,
+                    task,
+                    &call_id,
+                    payload
+                        .pointer("/title")
+                        .or_else(|| payload.pointer("/data/title"))
+                        .and_then(serde_json::Value::as_str),
+                )
+                .await;
+        }
+        if never {
             if let Some(hook) = &self.permission_auto_reject {
                 hook(&call_id);
             }

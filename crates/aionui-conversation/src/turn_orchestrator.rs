@@ -310,6 +310,7 @@ impl ConversationTurnOrchestrator {
             .with_event_journal(self.service.canonical_event_journal())
             .with_task_trace(input.task_trace.clone())
             .with_usage_event_repo(self.service.usage_event_repo())
+            .with_inbox(self.service.inbox_sink())
             .with_permission_auto_reject({
                 let agent = agent.clone();
                 Arc::new(move |call_id: &str| {
@@ -510,6 +511,7 @@ impl ConversationTurnOrchestrator {
         let mut final_error_message;
         let mut final_assistant_output = None;
         let mut auth_failure = false;
+        let mut final_blocked = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -649,6 +651,7 @@ impl ConversationTurnOrchestrator {
                                 .await;
                         }
                     }
+                    final_blocked = crate::inbox::error_code_blocks_on_user(attempt_result.outcome.terminal.code());
                     break ConversationTurnStatus::Failed;
                 }
             }
@@ -698,6 +701,29 @@ impl ConversationTurnOrchestrator {
                     final_assistant_output.as_deref(),
                 )
                 .await;
+            if let Some(inbox) = self.service.inbox_sink() {
+                let kind = if auth_failure || (final_failed && final_blocked) {
+                    crate::inbox::TurnInboxKind::Blocked
+                } else if final_failed {
+                    crate::inbox::TurnInboxKind::Failed
+                } else {
+                    crate::inbox::TurnInboxKind::Completed
+                };
+                let task = input.task_trace.as_ref().map(|trace| crate::inbox::InboxTaskRef {
+                    task_session_id: &trace.task_id,
+                    run_id: &trace.run_id,
+                });
+                inbox
+                    .turn_settled(
+                        &input.user_id,
+                        &conv_id,
+                        &input.conversation.name,
+                        task,
+                        kind,
+                        final_error_message.as_deref(),
+                    )
+                    .await;
+            }
         }
 
         ConversationTurnResult {

@@ -539,6 +539,9 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     service.with_usage_event_repo(Arc::new(aionui_db::SqliteUsageEventRepository::new(
         deps.database.pool().clone(),
     )));
+    service.with_inbox_repo(Arc::new(aionui_db::SqliteInboxRepository::new(
+        deps.database.pool().clone(),
+    )));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),
     )));
