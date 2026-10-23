@@ -75,6 +75,10 @@ pub(crate) struct BackgroundStreamWatcher {
     /// Expiry for a pending `MessageLifecycle{Started}` (see
     /// [`PENDING_STARTED_TTL`]); injectable so tests can use a short bound.
     pub pending_started_ttl: std::time::Duration,
+    /// M7 E5-4: CLI-initiated turns surface in the inbox like user turns do
+    /// (approvals while running; completed / failed / blocked once settled).
+    /// `None` when the inbox store is not wired (older hosts, tests).
+    pub inbox: Option<crate::inbox::InboxSink>,
 }
 
 impl BackgroundStreamWatcher {
@@ -422,7 +426,8 @@ impl BackgroundStreamWatcher {
         )
         .with_runtime_state(Arc::clone(&self.runtime_state))
         .with_persistence(self.persistence.clone())
-        .with_usage_event_repo(self.usage_event_repo.clone());
+        .with_usage_event_repo(self.usage_event_repo.clone())
+        .with_inbox(self.inbox.clone());
 
         let (feed_tx, feed_rx) = broadcast::channel::<AgentStreamEvent>(256);
         let mut relay_task = tokio::spawn(relay.consume(feed_rx));
@@ -467,12 +472,15 @@ impl BackgroundStreamWatcher {
             }
         };
         match outcome {
-            Ok(outcome) => info!(
-                conversation_id = %self.conversation_id,
-                turn_id = %turn_id,
-                terminal = ?outcome.terminal,
-                "background stream: CLI-initiated turn finished"
-            ),
+            Ok(outcome) => {
+                info!(
+                    conversation_id = %self.conversation_id,
+                    turn_id = %turn_id,
+                    terminal = ?outcome.terminal,
+                    "background stream: CLI-initiated turn finished"
+                );
+                self.settle_orphan_turn_in_inbox(&outcome.terminal).await;
+            }
             Err(e) => warn!(
                 conversation_id = %self.conversation_id,
                 turn_id = %turn_id,
@@ -480,6 +488,55 @@ impl BackgroundStreamWatcher {
                 "background stream: orphan relay task failed"
             ),
         }
+    }
+}
+
+impl BackgroundStreamWatcher {
+    /// M7 E5-4: record a settled CLI-initiated turn in the inbox. A turn that
+    /// merely lost its feed (idle timeout, instance torn down, a user turn
+    /// taking over) has no outcome worth reporting and is skipped.
+    async fn settle_orphan_turn_in_inbox(&self, terminal: &crate::stream_relay::RelayTerminal) {
+        let Some(inbox) = &self.inbox else {
+            return;
+        };
+        let kind = match terminal_inbox_kind(terminal) {
+            Some(kind) => kind,
+            None => return,
+        };
+        let name = match self.repo.get(&self.user_id, &self.conversation_id).await {
+            Ok(Some(row)) => row.name,
+            Ok(None) => return, // deleted meanwhile — nothing to point at
+            Err(error) => {
+                warn!(conversation_id = %self.conversation_id, error = %error, "background stream: inbox lookup failed");
+                String::new()
+            }
+        };
+        let error_code = terminal
+            .code()
+            .and_then(|code| serde_json::to_value(code).ok())
+            .and_then(|value| value.as_str().map(str::to_owned));
+        inbox
+            .turn_settled(
+                &self.user_id,
+                &self.conversation_id,
+                &name,
+                None,
+                kind,
+                error_code.as_deref(),
+            )
+            .await;
+    }
+}
+
+fn terminal_inbox_kind(terminal: &crate::stream_relay::RelayTerminal) -> Option<crate::inbox::TurnInboxKind> {
+    use crate::stream_relay::RelayTerminal;
+    match terminal {
+        RelayTerminal::Finish => Some(crate::inbox::TurnInboxKind::Completed),
+        RelayTerminal::Error { code, .. } if crate::inbox::error_code_blocks_on_user(*code) => {
+            Some(crate::inbox::TurnInboxKind::Blocked)
+        }
+        RelayTerminal::Error { .. } => Some(crate::inbox::TurnInboxKind::Failed),
+        RelayTerminal::ChannelClosed => None,
     }
 }
 
@@ -522,6 +579,7 @@ mod tests {
 
     struct Rig {
         user_id: String,
+        inbox_repo: Arc<aionui_db::SqliteInboxRepository>,
         repo: Arc<SqliteConversationRepository>,
         bus: Arc<aionui_realtime::BroadcastEventBus>,
         runtime_state: Arc<ConversationRuntimeStateService>,
@@ -538,6 +596,10 @@ mod tests {
     }
 
     async fn rig_with_opts(title_only: bool, pending_started_ttl: std::time::Duration) -> Rig {
+        rig_full(title_only, pending_started_ttl, false).await
+    }
+
+    async fn rig_full(title_only: bool, pending_started_ttl: std::time::Duration, with_inbox: bool) -> Rig {
         let db = init_database_memory().await.unwrap();
         let user_repo = SqliteUserRepository::new(db.pool().clone());
         let user = user_repo.create_user("user-1", "hash").await.unwrap();
@@ -565,6 +627,13 @@ mod tests {
         let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
         let runtime_state = Arc::new(ConversationRuntimeStateService::default());
         let (tx, _) = broadcast::channel(64);
+        let inbox_repo = Arc::new(aionui_db::SqliteInboxRepository::new(db.pool().clone()));
+        let inbox = with_inbox.then(|| {
+            crate::inbox::InboxSink::new(
+                inbox_repo.clone() as Arc<dyn aionui_db::IInboxRepository>,
+                bus.clone() as Arc<dyn EventBroadcaster>,
+            )
+        });
         let watcher = BackgroundStreamWatcher {
             conversation_id: "conv-1".into(),
             user_id: user.id.clone(),
@@ -575,10 +644,12 @@ mod tests {
             title_only,
             usage_event_repo: None,
             pending_started_ttl,
+            inbox,
         };
         let handle = tokio::spawn(watcher.run(tx.subscribe()));
         Rig {
             user_id: user.id,
+            inbox_repo,
             repo,
             bus,
             runtime_state,
@@ -1280,5 +1351,102 @@ mod tests {
         }
         let msg = forwarded.expect("an out-of-turn acp_mode_info must be forwarded to the frontend");
         assert_eq!(msg.data["data"]["current_mode_id"], "plan");
+    }
+
+    async fn inbox_items(rig: &Rig) -> Vec<aionui_db::models::InboxItemRow> {
+        use aionui_db::IInboxRepository;
+        rig.inbox_repo
+            .list(
+                &rig.user_id,
+                &aionui_db::InboxFilter {
+                    unread_only: false,
+                    before: None,
+                    limit: 50,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// M7 E5-4: a CLI-initiated turn that finishes lands in the inbox as
+    /// `completed`, announced with `inbox.changed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_initiated_turn_completion_lands_in_inbox() {
+        let rig = rig_full(false, PENDING_STARTED_TTL, true).await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "BG_DONE".into(),
+            }))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let items = eventually(async || {
+            let items = inbox_items(&rig).await;
+            (!items.is_empty()).then_some(items)
+        })
+        .await
+        .expect("the settled orphan turn must reach the inbox");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "completed");
+        assert_eq!(items[0].conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(items[0].title, "test");
+
+        let mut saw_changed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !saw_changed {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), ws.recv()).await {
+                Ok(Ok(evt)) => {
+                    saw_changed |= evt.name == crate::inbox::EVENT_INBOX_CHANGED && evt.data["kind"] == "completed";
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_changed, "inbox.changed announces the new item");
+    }
+
+    /// A user-blocking error in a CLI-initiated turn is `blocked` (carrying the
+    /// error code); a generic error is `failed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_initiated_turn_errors_land_in_inbox_as_blocked_or_failed() {
+        use aionui_ai_agent::protocol::events::ErrorEventData;
+        use aionui_api_types::AgentErrorCode;
+        fn error(code: AgentErrorCode) -> AgentStreamEvent {
+            AgentStreamEvent::Error(ErrorEventData {
+                message: "boom".into(),
+                code: Some(code),
+                ownership: None,
+                detail: None,
+                workspace_path: None,
+                retryable: Some(false),
+                feedback_recommended: None,
+                resolution: None,
+            })
+        }
+
+        let rig = rig_full(false, PENDING_STARTED_TTL, true).await;
+        rig.tx.send(error(AgentErrorCode::UserAgentAuthRequired)).unwrap();
+        let blocked = eventually(async || inbox_items(&rig).await.into_iter().next())
+            .await
+            .expect("blocked item");
+        assert_eq!(blocked.kind, "blocked");
+        assert_eq!(blocked.summary.as_deref(), Some("USER_AGENT_AUTH_REQUIRED"));
+
+        let rig = rig_full(false, PENDING_STARTED_TTL, true).await;
+        rig.tx.send(error(AgentErrorCode::UnknownUpstreamError)).unwrap();
+        let failed = eventually(async || inbox_items(&rig).await.into_iter().next())
+            .await
+            .expect("failed item");
+        assert_eq!(failed.kind, "failed");
+    }
+
+    #[test]
+    fn lost_feed_is_not_reported_to_the_inbox() {
+        assert_eq!(
+            terminal_inbox_kind(&crate::stream_relay::RelayTerminal::ChannelClosed),
+            None
+        );
     }
 }

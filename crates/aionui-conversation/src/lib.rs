@@ -8,6 +8,7 @@ mod background_stream;
 mod context_breakdown;
 mod convert;
 pub mod error;
+mod inbox;
 mod journal_compaction;
 mod journal_fork;
 mod journal_transcript;

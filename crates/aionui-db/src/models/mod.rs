@@ -6,6 +6,7 @@ mod client_preference;
 mod conversation;
 mod conversation_artifact;
 mod cron_job;
+mod inbox_item;
 mod mcp_server;
 mod message;
 mod oauth_token;
@@ -41,6 +42,7 @@ pub use conversation::{
 };
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
+pub use inbox_item::InboxItemRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
