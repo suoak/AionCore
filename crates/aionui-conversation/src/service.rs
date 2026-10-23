@@ -31,11 +31,11 @@ use aionui_api_types::{
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
     StartAutomaticPlanningRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME,
     TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse,
-    TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunResponse,
-    TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, TeamMcpSelection,
-    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
-    VerifyAcceptanceCriterionRequest, WebSocketMessage, assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
+    TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse, TaskReviewSummary, TaskRunReplayQuery,
+    TaskRunReplayResponse, TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus,
+    TaskTraceEventResponse, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, PromptAttachmentV1, SessionRef};
 use aionui_common::{
@@ -381,6 +381,50 @@ fn task_run_response(row: TaskRunRow) -> Result<TaskRunResponse, ConversationErr
         result_summary: row.result_summary,
         usage,
     })
+}
+
+pub(crate) const TASK_REPLAY_DEFAULT_LIMIT: u32 = 200;
+pub(crate) const TASK_REPLAY_MAX_LIMIT: u32 = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayPageBounds {
+    pub next_after_sequence: i64,
+    pub has_more: bool,
+    pub retention_gap: bool,
+}
+
+/// Compute cursor / gap flags for one replay page. Sequences are allocated
+/// densely from 1, so any hole in `(after_sequence, last_returned]` — or an
+/// empty page below `latest_sequence` — means events were not retained.
+pub(crate) fn replay_page_bounds(
+    after_sequence: i64,
+    latest_sequence: i64,
+    limit: i64,
+    rows: &[TaskTraceEventRow],
+) -> ReplayPageBounds {
+    let mut expected = after_sequence + 1;
+    let mut retention_gap = false;
+    for row in rows {
+        if row.sequence != expected {
+            retention_gap = true;
+        }
+        expected = row.sequence + 1;
+    }
+    let full_page = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= limit;
+    let mut next_after_sequence = rows.last().map_or(after_sequence, |last| last.sequence);
+    if !full_page && next_after_sequence < latest_sequence {
+        // Sequence allocation and insert share one transaction, so a short
+        // page ending below the allocated high-water mark means the tail was
+        // not retained. Skip the hole so callers make progress.
+        retention_gap = true;
+        next_after_sequence = latest_sequence;
+    }
+    let has_more = full_page && next_after_sequence < latest_sequence;
+    ReplayPageBounds {
+        next_after_sequence,
+        has_more,
+        retention_gap,
+    }
 }
 
 fn task_trace_event_response(row: TaskTraceEventRow) -> Result<TaskTraceEventResponse, ConversationError> {
@@ -1578,6 +1622,74 @@ impl ConversationService {
             .into_iter()
             .map(task_trace_event_response)
             .collect()
+    }
+
+    /// Paged, sanitized replay of one run (M7 E5-2).
+    pub async fn replay_task_run(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+        query: TaskRunReplayQuery,
+    ) -> Result<TaskRunReplayResponse, ConversationError> {
+        let after_sequence = query.after_sequence.unwrap_or(0);
+        if after_sequence < 0 {
+            return Err(ConversationError::bad_request("after_sequence must be >= 0"));
+        }
+        let limit = i64::from(
+            query
+                .limit
+                .unwrap_or(TASK_REPLAY_DEFAULT_LIMIT)
+                .clamp(1, TASK_REPLAY_MAX_LIMIT),
+        );
+        let repo = self.task_session_repo()?;
+        let run_row = repo
+            .get_run(user_id, task_session_id, run_id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task run '{run_id}' not found")))?;
+        let latest_sequence = run_row.next_trace_sequence.max(0);
+        let rows = repo
+            .list_trace_events_page(user_id, task_session_id, run_id, after_sequence, limit)
+            .await?;
+        let page = replay_page_bounds(after_sequence, latest_sequence, limit, &rows);
+        let events = rows
+            .into_iter()
+            .map(task_trace_event_response)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let (approvals, evidence) = if after_sequence == 0 {
+            let approvals = repo
+                .list_approvals(user_id, task_session_id)
+                .await?
+                .into_iter()
+                .filter(|approval| {
+                    approval.run_id.as_deref() == Some(run_id)
+                        || run_row.approval_id.as_deref() == Some(approval.id.as_str())
+                        || run_row.goal_artifact_id.as_deref() == Some(approval.artifact_id.as_str())
+                })
+                .map(task_approval_response)
+                .collect::<Result<Vec<_>, _>>()?;
+            let evidence = repo
+                .list_evidence(user_id, task_session_id, run_id)
+                .await?
+                .into_iter()
+                .map(task_evidence_response)
+                .collect::<Result<Vec<_>, _>>()?;
+            (Some(approvals), Some(evidence))
+        } else {
+            (None, None)
+        };
+
+        Ok(TaskRunReplayResponse {
+            run: task_run_response(run_row)?,
+            events,
+            next_after_sequence: page.next_after_sequence,
+            has_more: page.has_more,
+            latest_sequence,
+            retention_gap: page.retention_gap,
+            approvals,
+            evidence,
+        })
     }
 
     pub async fn get_task_run_evidence(
@@ -8843,5 +8955,91 @@ mod tests {
         assert!(policy.http);
         assert!(policy.streamable_http);
         assert!(!policy.sse);
+    }
+}
+
+#[cfg(test)]
+mod replay_page_tests {
+    use super::{ReplayPageBounds, replay_page_bounds};
+    use aionui_db::models::TaskTraceEventRow;
+
+    fn rows(sequences: &[i64]) -> Vec<TaskTraceEventRow> {
+        sequences
+            .iter()
+            .map(|sequence| TaskTraceEventRow {
+                id: format!("trace-{sequence}"),
+                task_session_id: "t1".into(),
+                run_id: "r1".into(),
+                sequence: *sequence,
+                event_type: "tool.completed".into(),
+                timestamp: *sequence,
+                payload: "{}".into(),
+            })
+            .collect()
+    }
+
+    fn page(after: i64, latest: i64, limit: i64, retained: &[i64]) -> (Vec<i64>, ReplayPageBounds) {
+        let selected: Vec<i64> = retained
+            .iter()
+            .copied()
+            .filter(|sequence| *sequence > after)
+            .take(usize::try_from(limit).unwrap())
+            .collect();
+        let bounds = replay_page_bounds(after, latest, limit, &rows(&selected));
+        (selected, bounds)
+    }
+
+    fn stitch(latest: i64, limit: i64, retained: &[i64]) -> (Vec<i64>, bool) {
+        let mut cursor = 0;
+        let mut out = Vec::new();
+        let mut gap = false;
+        for _ in 0..100 {
+            let (selected, bounds) = page(cursor, latest, limit, retained);
+            out.extend(selected);
+            gap |= bounds.retention_gap;
+            assert!(bounds.next_after_sequence >= cursor);
+            cursor = bounds.next_after_sequence;
+            if !bounds.has_more {
+                return (out, gap);
+            }
+        }
+        panic!("replay paging did not terminate");
+    }
+
+    #[test]
+    fn dense_trace_stitches_without_duplicates_or_gaps() {
+        let all: Vec<i64> = (1..=23).collect();
+        for limit in [1, 2, 5, 23, 50] {
+            let (stitched, gap) = stitch(23, limit, &all);
+            assert_eq!(stitched, all, "limit {limit}");
+            assert!(!gap, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn missing_sequences_are_flagged_and_skipped() {
+        // Head, middle and tail pruned.
+        let retained = [3, 4, 5, 8, 9];
+        let (stitched, gap) = stitch(12, 2, &retained);
+        assert_eq!(stitched, retained);
+        assert!(gap);
+        let (_, bounds) = page(9, 12, 2, &retained);
+        assert!(bounds.retention_gap);
+        assert_eq!(bounds.next_after_sequence, 12);
+        assert!(!bounds.has_more);
+    }
+
+    #[test]
+    fn caught_up_cursor_is_stable() {
+        let (selected, bounds) = page(7, 7, 10, &[1, 2, 3, 4, 5, 6, 7]);
+        assert!(selected.is_empty());
+        assert_eq!(
+            bounds,
+            ReplayPageBounds {
+                next_after_sequence: 7,
+                has_more: false,
+                retention_gap: false,
+            }
+        );
     }
 }

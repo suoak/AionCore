@@ -31,7 +31,7 @@ use aionui_conversation::{
     ConversationRuntimeRouterState, conversation_ops_routes, conversation_routes, conversation_runtime_routes,
 };
 use aionui_cron::cron_routes;
-use aionui_extension::{extension_routes, hub_routes, skill_routes};
+use aionui_extension::{extension_asset_session_routes, extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
@@ -337,6 +337,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Extension routes protected by auth middleware
+    // Settings-tab asset sessions: the short-lived path token is the
+    // credential (one user, one extension, read-only assets), so no auth
+    // middleware here.
+    let extension_asset_sessions = extension_asset_session_routes(states.extension.clone());
     let extension_authenticated =
         extension_routes(states.extension).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
@@ -455,6 +459,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(sidebar_authenticated)
         .merge(mcp_authenticated)
         .merge(extension_authenticated)
+        .merge(extension_asset_sessions)
         .merge(hub_authenticated)
         .merge(skill_authenticated)
         .merge(skill_runtime)

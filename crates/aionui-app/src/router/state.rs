@@ -1480,9 +1480,7 @@ pub async fn build_extension_states(
         services.skill_repo.clone(),
     );
 
-    let ext_state = ExtensionRouterState {
-        registry: registry.clone(),
-    };
+    let ext_state = ExtensionRouterState::new(registry.clone());
 
     let hub_state = HubRouterState {
         index_manager,

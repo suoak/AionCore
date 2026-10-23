@@ -896,6 +896,29 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .await?)
     }
 
+    async fn list_trace_events_page(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        run_id: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<TaskTraceEventRow>, DbError> {
+        Ok(sqlx::query_as::<_, TaskTraceEventRow>(
+            "SELECT event.* FROM task_trace_events event \
+             JOIN task_sessions task ON task.id = event.task_session_id \
+             WHERE task.user_id = ? AND task.id = ? AND event.run_id = ? AND event.sequence > ? \
+             ORDER BY event.sequence LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(task_session_id)
+        .bind(run_id)
+        .bind(after_sequence)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn create_checkpoint(&self, params: &CreateTaskCheckpointParams<'_>) -> Result<TaskCheckpointRow, DbError> {
         let owned: bool = sqlx::query_scalar(
             "SELECT COUNT(*) > 0 FROM task_sessions task JOIN task_runs run ON run.task_session_id = task.id \
@@ -2063,6 +2086,29 @@ mod tests {
         assert_eq!(
             trace.iter().map(|event| event.sequence).collect::<Vec<_>>(),
             (1..=28).collect::<Vec<_>>()
+        );
+
+        // M7 E5-2: paging by sequence cursor stitches back to the full trace.
+        let mut stitched = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let page = repo
+                .list_trace_events_page(USER, &task.id, &run.id, cursor, 5)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= 5);
+            cursor = page.last().unwrap().sequence;
+            stitched.extend(page.into_iter().map(|event| event.id));
+        }
+        assert_eq!(stitched, trace.iter().map(|event| event.id.clone()).collect::<Vec<_>>());
+        assert!(
+            repo.list_trace_events_page("someone-else", &task.id, &run.id, 0, 50)
+                .await
+                .unwrap()
+                .is_empty()
         );
 
         db.pool().close().await;

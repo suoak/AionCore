@@ -266,8 +266,9 @@ pub use task_session::{
     RuntimeBindingResponse, RuntimeBindingState, StartAutomaticPlanningRequest, SubmitTaskArtifactRequest,
     SubmitTaskArtifactResponse, TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind,
     TaskArtifactResponse, TaskArtifactStatus, TaskCheckpointResponse, TaskEvidenceResponse, TaskReviewResponse,
-    TaskReviewSummary, TaskRunResponse, TaskRunStatus, TaskSessionMode, TaskSessionResponse, TaskSessionStatus,
-    TaskTraceEventResponse, ToolCapability, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
+    TaskReviewSummary, TaskRunReplayQuery, TaskRunReplayResponse, TaskRunResponse, TaskRunStatus, TaskSessionMode,
+    TaskSessionResponse, TaskSessionStatus, TaskTraceEventResponse, ToolCapability, UpdateTaskSessionRequest,
+    VerifyAcceptanceCriterionRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,

@@ -3,6 +3,7 @@
 //! Extension registry: manifest parsing, hub installer, skill scanning, and lifecycle hooks.
 
 mod asset_paths;
+pub mod asset_tokens;
 pub mod classifier;
 pub mod constants;
 pub mod dependency;
@@ -51,7 +52,7 @@ pub use watcher::ExtensionWatcher;
 pub use external_paths::ExternalPathsManager;
 pub use hub::{HubIndexManager, HubInstaller};
 pub use hub_routes::{HubRouterState, hub_routes};
-pub use routes::{ExtensionRouterState, extension_routes};
+pub use routes::{ExtensionRouterState, extension_asset_session_routes, extension_routes};
 pub use skill_registry::{SkillHubClient, SkillRegistryService};
 pub use skill_routes::{SkillRouterState, skill_routes};
 pub use skill_service::{
