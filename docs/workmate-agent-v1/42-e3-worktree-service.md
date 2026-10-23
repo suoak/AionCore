@@ -171,7 +171,7 @@ Adopt (`strategy` default `branch_only`):
   `ADOPT_CONFLICT` (409) with the conflicted paths; the group stays in
   `comparing`.
 - Adopt commits (snapshot, squash commit, `--no-ff` merge commit) pass
-  `--no-verify`: repository hooks are not run by WorkMate in M7 (design §8
+  `--no-verify`: repository hooks are not run by WorkMate in M7 (design §7
   item 10); signing and the rest of the user's `.gitconfig` still apply. A
   snapshot commit stays on the slot branch even when the merge then
   conflicts, so no work is lost.
