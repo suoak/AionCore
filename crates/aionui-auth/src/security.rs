@@ -9,7 +9,12 @@ fn allows_embedding(path: &str) -> bool {
     let mut segments = path.trim_start_matches('/').split('/');
     matches!(
         (segments.next(), segments.next(), segments.next(), segments.next(),),
-        (Some("api"), Some("extensions"), Some(_extension_name), Some("assets"))
+        (
+            Some("api"),
+            Some("extensions"),
+            Some(_extension_name),
+            Some("assets" | "asset-session")
+        )
     )
 }
 
