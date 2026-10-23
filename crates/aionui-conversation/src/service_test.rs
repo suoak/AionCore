@@ -6242,12 +6242,15 @@ async fn send_message_broadcasts_user_created_event() {
 #[tokio::test]
 async fn send_message_returns_before_cold_agent_build_completes() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
-    let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(500)));
+    // The build is far slower than the send deadline, and the deadline is
+    // generous enough that a loaded CI runner (nextest runs thousands of
+    // tests in parallel) cannot miss it. A 50ms deadline flaked there.
+    let slow_task_mgr = Arc::new(SlowBuildTaskManager::new(Duration::from_secs(5)));
     let task_mgr: Arc<dyn IWorkerTaskManager> = slow_task_mgr.clone();
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let response = tokio::time::timeout(
-        Duration::from_millis(50),
+        Duration::from_millis(1_000),
         svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr),
     )
     .await
