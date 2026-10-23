@@ -3881,6 +3881,10 @@ struct ScriptedAgent {
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
     send_error: Option<AgentSendError>,
+    /// "Stuck" mode: accepts the message, never emits an event, and ignores
+    /// cancel and kill, like a wedged agent process.
+    stuck: bool,
+    cancel_calls: AtomicUsize,
 }
 
 impl ScriptedAgent {
@@ -3894,7 +3898,16 @@ impl ScriptedAgent {
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
             send_error: None,
+            stuck: false,
+            cancel_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// An agent that hangs on every turn and ignores cancel/kill.
+    fn stuck(conversation_id: &str) -> Self {
+        let mut agent = Self::new(conversation_id, vec![]);
+        agent.stuck = true;
+        agent
     }
 
     fn with_agent_type(mut self, agent_type: AgentType) -> Self {
@@ -3945,6 +3958,9 @@ impl IAgentTask for ScriptedAgent {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.sent_contents.lock().unwrap().push(data.content);
+        if self.stuck {
+            return Ok(());
+        }
         let script = self
             .scripts
             .lock()
@@ -3961,6 +3977,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     async fn cancel(&self) -> Result<(), AgentError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -11213,4 +11230,211 @@ async fn failed_execution_retries_once_when_policy_allows_and_links_the_chain() 
         Some(run.id.as_str()),
         "claim moved to the last attempt"
     );
+}
+
+/// An approved plan task bound to an aionrs conversation, ready to execute.
+async fn approved_plan_task_for_supervision(
+    service: &ConversationService,
+    db: &aionui_db::Database,
+    workspace: &std::path::Path,
+    max_attempts: i64,
+    timeout_ms: Option<i64>,
+) -> (String, String, ExecuteApprovedPlanRequest) {
+    let conversation = service
+        .create(
+            "user_1",
+            serde_json::from_value(json!({
+                "type": "aionrs",
+                "extra": { "workspace": workspace },
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, 'user_1', 'Supervised execution', 'aionrs', 1, 1)",
+    )
+    .bind(&conversation.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let task = service
+        .create_task_session(
+            "user_1",
+            CreateTaskSessionRequest {
+                title: "Supervised execution".into(),
+                project_id: None,
+                conversation_id: Some(conversation.id.clone()),
+                mode: TaskSessionMode::Plan,
+                objective: "Do it".into(),
+                acceptance_criteria: Vec::new(),
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .update_task_retry_policy(
+            "user_1",
+            &task.id,
+            aionui_api_types::UpdateTaskRetryPolicyRequest {
+                max_attempts,
+                timeout_ms,
+            },
+        )
+        .await
+        .unwrap();
+    let plan = service
+        .submit_task_artifact(
+            "user_1",
+            &task.id,
+            SubmitTaskArtifactRequest {
+                kind: TaskArtifactKind::Plan,
+                content: "Do the thing".into(),
+                acceptance_criteria: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .decide_task_approval(
+            "user_1",
+            &task.id,
+            &plan.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: plan.artifact.id.clone(),
+                artifact_hash: plan.artifact.content_hash.clone(),
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    let request = ExecuteApprovedPlanRequest {
+        approval_id: plan.approval.id.clone(),
+        artifact_id: plan.artifact.id.clone(),
+        artifact_hash: plan.artifact.content_hash.clone(),
+    };
+    (conversation.id, task.id, request)
+}
+
+#[tokio::test]
+async fn stuck_execution_is_killed_and_failed_after_timeout_and_grace() {
+    // M7 E5-5 follow-up: an agent that ignores the timeout cancel must not
+    // wedge the execution forever. After the stop grace the agent is killed
+    // and the run is failed, and the conversation's turn slot is freed.
+    let workspace = unique_test_workspace_path("execution-stuck-timeout");
+    let stuck = Arc::new(ScriptedAgent::stuck("placeholder").with_agent_type(AgentType::Aionrs));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(
+        stuck.clone(),
+    )]));
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    service.set_task_execution_stop_grace(Duration::from_millis(300));
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    service.with_task_session_repo(Arc::new(SqliteTaskSessionRepository::new(db.pool().clone())));
+    let (conversation_id, task_id, request) =
+        approved_plan_task_for_supervision(&service, &db, &workspace, 1, Some(1_000)).await;
+
+    let started = std::time::Instant::now();
+    let run = tokio::time::timeout(
+        Duration::from_secs(20),
+        service.execute_approved_plan("user_1", &task_id, request),
+    )
+    .await
+    .expect("a stuck agent must not wedge the execution")
+    .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(1_000));
+    assert_eq!(run.status, aionui_api_types::TaskRunStatus::Failed);
+    assert_eq!(
+        run.error_message.as_deref(),
+        Some("Execution timed out after 1000 ms; agent did not stop and was terminated")
+    );
+    assert!(task_mgr.kill_count() >= 1, "the hard cap kills the agent");
+    assert_eq!(stuck.sent_contents().len(), 1);
+    assert!(
+        service.runtime_state().active_turn_id_for(&conversation_id).is_none(),
+        "the abandoned turn releases its slot"
+    );
+    let task = service.get_task_session("user_1", &task_id).await.unwrap();
+    assert_eq!(task.status, TaskSessionStatus::Failed);
+}
+
+#[tokio::test]
+async fn user_cancel_missing_the_turn_still_stops_execution_and_blocks_retry() {
+    // M7 E5-5 follow-up: a cancel whose turn id does not match (as in the gap
+    // between a failed attempt and its retry) is recorded on the task. The
+    // supervisor applies it, the stuck agent is killed after the grace, and
+    // the policy's remaining attempt is never started.
+    let workspace = unique_test_workspace_path("execution-cancel-recorded");
+    let stuck = Arc::new(ScriptedAgent::stuck("placeholder").with_agent_type(AgentType::Aionrs));
+    let never_used = Arc::new(
+        ScriptedAgent::new(
+            "placeholder",
+            vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+        )
+        .with_agent_type(AgentType::Aionrs),
+    );
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(stuck.clone()),
+        AgentInstance::Mock(never_used.clone()),
+    ]));
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    service.set_task_execution_stop_grace(Duration::from_millis(300));
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    service.with_task_session_repo(Arc::new(SqliteTaskSessionRepository::new(db.pool().clone())));
+    let (conversation_id, task_id, request) =
+        approved_plan_task_for_supervision(&service, &db, &workspace, 2, None).await;
+
+    let execution = {
+        let service = service.clone();
+        let task_id = task_id.clone();
+        tokio::spawn(async move { service.execute_approved_plan("user_1", &task_id, request).await })
+    };
+    // Wait until the stuck attempt holds the turn, then cancel with an id that
+    // does not match it: the live-turn path ignores it, the task records it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.runtime_state().active_turn_id_for(&conversation_id).is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("execution turn starts");
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    service
+        .cancel("user_1", &conversation_id, "not-the-live-turn", &task_mgr_dyn)
+        .await
+        .unwrap();
+
+    let run = tokio::time::timeout(Duration::from_secs(20), execution)
+        .await
+        .expect("cancel must stop a stuck execution")
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, aionui_api_types::TaskRunStatus::Cancelled);
+    assert_eq!(run.attempt, 1);
+    assert!(task_mgr.kill_count() >= 1);
+    assert!(never_used.sent_contents().is_empty(), "no retry after a user cancel");
+    let runs = service.list_task_runs("user_1", &task_id).await.unwrap();
+    assert_eq!(runs.len(), 1);
 }

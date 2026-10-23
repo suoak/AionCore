@@ -139,7 +139,8 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         let updated_at = aionui_common::now_ms();
         sqlx::query(
             "UPDATE task_sessions SET title = ?, project_id = ?, conversation_id = ?, mode = ?, objective = ?, \
-             acceptance_criteria = ?, status = ?, agent_type = ?, agent_session_id = ?, updated_at = ? \
+             acceptance_criteria = ?, status = ?, agent_type = ?, agent_session_id = ?, updated_at = ?, \
+             cancel_requested_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancel_requested_at END \
              WHERE user_id = ? AND id = ?",
         )
         .bind(params.title.unwrap_or(&existing.title))
@@ -151,6 +152,9 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .bind(params.status.unwrap_or(&existing.status))
         .bind(params.agent_type.unwrap_or(&existing.agent_type))
         .bind(params.agent_session_id.or(existing.agent_session_id.as_deref()))
+        .bind(updated_at)
+        // Cancelling the task stops any retry chain still in flight.
+        .bind(params.status.unwrap_or(""))
         .bind(updated_at)
         .bind(user_id)
         .bind(id)
@@ -675,7 +679,7 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .bind(params.task_session_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE task_sessions SET status = 'running', updated_at = ? WHERE id = ? AND user_id = ?")
+        sqlx::query("UPDATE task_sessions SET status = 'running', cancel_requested_at = NULL, updated_at = ? WHERE id = ? AND user_id = ?")
             .bind(params.started_at)
             .bind(params.task_session_id)
             .bind(params.user_id)
@@ -849,6 +853,7 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
                  AND previous.finished_at IS NOT NULL \
                  AND task.conversation_id = previous.conversation_id \
                  AND previous.attempt < task.retry_max_attempts \
+                 AND task.cancel_requested_at IS NULL \
                  AND NOT EXISTS (SELECT 1 FROM task_runs retry WHERE retry.retry_of_run_id = previous.id) \
              ) \
              AND EXISTS ( \
@@ -964,6 +969,35 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
             .await?;
         tx.commit().await?;
         Ok(row)
+    }
+
+    async fn request_execution_cancel(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        requested_at: TimestampMs,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE task_sessions SET cancel_requested_at = ?, updated_at = ? \
+             WHERE user_id = ? AND conversation_id = ? AND status IN ('running', 'failed')",
+        )
+        .bind(requested_at)
+        .bind(requested_at)
+        .bind(user_id)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn execution_cancel_requested(&self, user_id: &str, task_session_id: &str) -> Result<bool, DbError> {
+        let requested: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT cancel_requested_at FROM task_sessions WHERE id = ? AND user_id = ?")
+                .bind(task_session_id)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(matches!(requested, Some((Some(_),))))
     }
 
     async fn set_retry_policy(
@@ -2477,6 +2511,103 @@ mod tests {
             Err(DbError::Conflict(_))
         ));
         assert_eq!(fixture.repo.list_runs(USER, &fixture.task_id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_cancel_between_attempts_blocks_the_retry_until_a_new_execution() {
+        let fixture = retry_fixture(3).await;
+        // Cancel while the first attempt is still running is recorded too.
+        assert_eq!(
+            fixture
+                .repo
+                .request_execution_cancel(USER, "conversation-retry", 25)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            fixture
+                .repo
+                .execution_cancel_requested(USER, &fixture.task_id)
+                .await
+                .unwrap()
+        );
+        finish_as(&fixture, &fixture.run_id, "failed").await;
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
+        assert_eq!(
+            claim_holder(&fixture).await.as_deref(),
+            Some(fixture.run_id.as_str()),
+            "a refused retry leaves the claim on the failed run"
+        );
+        // Another user's cancel never touches this task.
+        sqlx::query("UPDATE task_sessions SET cancel_requested_at = NULL WHERE id = ?")
+            .bind(&fixture.task_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .repo
+                .request_execution_cancel("someone-else", "conversation-retry", 26)
+                .await
+                .unwrap(),
+            0
+        );
+        // The gap case: the attempt already failed (task status `failed`),
+        // no turn is live, the user cancels -> no further attempt.
+        assert_eq!(
+            fixture
+                .repo
+                .request_execution_cancel(USER, "conversation-retry", 27)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
+        // Cancelling the task itself (PATCH status) records the request too.
+        sqlx::query("UPDATE task_sessions SET cancel_requested_at = NULL WHERE id = ?")
+            .bind(&fixture.task_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        fixture
+            .repo
+            .update(
+                USER,
+                &fixture.task_id,
+                &UpdateTaskSessionParams {
+                    status: Some("cancelled"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .repo
+                .execution_cancel_requested(USER, &fixture.task_id)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            fixture
+                .repo
+                .create_retry_run(&retry_params(&fixture, &fixture.run_id))
+                .await,
+            Err(DbError::Conflict(_))
+        ));
     }
 
     #[tokio::test]

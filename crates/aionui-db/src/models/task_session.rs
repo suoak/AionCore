@@ -21,6 +21,10 @@ pub struct TaskSessionRow {
     pub retry_max_attempts: i64,
     /// Per-attempt timeout snapshotted onto each new execution run.
     pub retry_timeout_ms: Option<i64>,
+    /// Set when the user asked to cancel the execution; blocks further retries
+    /// until a new execution is started.
+    #[serde(default)]
+    pub cancel_requested_at: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
