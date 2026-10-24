@@ -35,7 +35,16 @@ pub struct UpdateTaskBoardParams<'a> {
     pub priority: Option<i64>,
     pub labels: Option<&'a [String]>,
     pub updated_at: TimestampMs,
+    /// Optimistic concurrency guard: when set, the update applies only if the
+    /// row's `updated_at` still equals this value. A mismatch on an existing
+    /// row fails with `DbError::Conflict` starting with
+    /// [`BOARD_STALE_CONFLICT_PREFIX`].
+    pub expected_updated_at: Option<TimestampMs>,
 }
+
+/// Message prefix of the `DbError::Conflict` returned when
+/// `UpdateTaskBoardParams::expected_updated_at` no longer matches.
+pub const BOARD_STALE_CONFLICT_PREFIX: &str = "stale board item";
 
 #[derive(Debug, Clone)]
 pub struct AppendTaskCommentParams<'a> {

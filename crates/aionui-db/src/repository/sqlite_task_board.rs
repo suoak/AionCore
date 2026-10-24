@@ -10,7 +10,7 @@ use crate::models::{
     TASK_COMMENT_KINDS, TaskBoardItemRow, TaskCommentRow,
 };
 use crate::repository::task_board::{
-    AppendTaskCommentParams, ITaskBoardRepository, TaskBoardFilter, UpdateTaskBoardParams,
+    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, ITaskBoardRepository, TaskBoardFilter, UpdateTaskBoardParams,
 };
 
 const BOARD_COLUMNS: &str = "id, user_id, title, project_id, conversation_id, mode, status, board_status, \
@@ -139,8 +139,19 @@ impl ITaskBoardRepository for SqliteTaskBoardRepository {
             .push_bind(task_session_id)
             .push(" AND user_id = ")
             .push_bind(user_id);
+        if let Some(expected) = params.expected_updated_at {
+            query.push(" AND updated_at = ").push_bind(expected);
+        }
         let result = query.build().execute(&self.pool).await?;
         if result.rows_affected() == 0 {
+            if let Some(expected) = params.expected_updated_at
+                && let Some(current) = self.get_board_item(user_id, task_session_id).await?
+            {
+                return Err(DbError::Conflict(format!(
+                    "{BOARD_STALE_CONFLICT_PREFIX}: expected updated_at {expected}, current {}",
+                    current.updated_at
+                )));
+            }
             return Err(DbError::NotFound(format!("Task session '{task_session_id}' not found")));
         }
         self.get_board_item(user_id, task_session_id)
@@ -338,6 +349,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expected_updated_at_guards_the_update() {
+        let (_db, tasks, board) = setup().await;
+        let id = create_task(&tasks, "a").await;
+        let current = board.get_board_item(USER, &id).await.unwrap().unwrap();
+        let stale = board
+            .update_board(
+                USER,
+                &id,
+                &UpdateTaskBoardParams {
+                    priority: Some(1),
+                    updated_at: current.updated_at + 5,
+                    expected_updated_at: Some(current.updated_at - 1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&stale, DbError::Conflict(message) if message.starts_with(BOARD_STALE_CONFLICT_PREFIX)),
+            "{stale:?}"
+        );
+        let unchanged = board.get_board_item(USER, &id).await.unwrap().unwrap();
+        assert_eq!(unchanged.priority, 0);
+        let item = board
+            .update_board(
+                USER,
+                &id,
+                &UpdateTaskBoardParams {
+                    priority: Some(1),
+                    updated_at: current.updated_at + 5,
+                    expected_updated_at: Some(current.updated_at),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(item.priority, 1);
+        assert_eq!(item.updated_at, current.updated_at + 5);
+        // A missing row is still NotFound, not a stale conflict.
+        let missing = board
+            .update_board(
+                USER,
+                "nope",
+                &UpdateTaskBoardParams {
+                    priority: Some(1),
+                    updated_at: 1,
+                    expected_updated_at: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, DbError::NotFound(_)));
+    }
+
+    #[tokio::test]
     async fn partial_update_changes_only_given_fields_and_clears_assignee() {
         let (_db, tasks, board) = setup().await;
         let id = create_task(&tasks, "a").await;
@@ -356,6 +423,7 @@ mod tests {
                     priority: Some(3),
                     labels: Some(&labels),
                     updated_at: 10,
+                    expected_updated_at: None,
                 },
             )
             .await

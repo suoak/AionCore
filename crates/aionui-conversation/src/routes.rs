@@ -112,6 +112,12 @@ impl From<ConversationError> for ApiError {
                 reason,
                 Some(serde_json::json!({ "from": from, "to": to, "reason": code })),
             ),
+            ConversationError::BoardItemStale { id, expected, current } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "board_item_stale",
+                format!("Board item {id} was changed by someone else; reload and retry"),
+                Some(serde_json::json!({ "expected_updated_at": expected, "current_updated_at": current })),
+            ),
             ConversationError::CapabilityUnsupported { capability } => ApiError::coded(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "capability_unsupported",
