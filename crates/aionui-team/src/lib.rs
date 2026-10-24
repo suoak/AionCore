@@ -43,10 +43,10 @@ pub use message_projection::{
 };
 pub use ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, NativeSlashCommandPort,
-    NoopNativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition, TeamAssistantCatalogEntry,
-    TeamAssistantCatalogPort, TeamConversationBindingLookup, TeamConversationLookupPort, TeamToolCapabilityPort,
-    UnknownTeamToolCapabilityPort,
+    AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, BoardWorkItemTimelinePort,
+    NativeSlashCommandPort, NoopBoardWorkItemTimelinePort, NoopNativeSlashCommandPort, SlashCatalogSource,
+    SlashCommandRecognition, TeamAssistantCatalogEntry, TeamAssistantCatalogPort, TeamConversationBindingLookup,
+    TeamConversationLookupPort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 
 pub use prompt_dump::TeamPromptDumpConfig;

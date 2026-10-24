@@ -37,7 +37,7 @@ use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
-use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
     MAX_MESSAGE_DELIVERY_FAILURES, ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
@@ -576,6 +576,9 @@ impl TeamSession {
 
         let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
 
+        // M8 E7-5: Leader round → work-item timeline (gated by begin_finalize above).
+        self.maybe_record_leader_eval(&slot_id).await;
+
         // Clear the dedup window unconditionally once finalize has run.
         self.scheduler.clear_finalized_turn(conversation_id);
 
@@ -591,6 +594,67 @@ impl TeamSession {
         }
 
         Ok(wake_target)
+    }
+
+    /// M8 E7-5: after a Leader turn finalizes, append an eval comment on the
+    /// linked work-item timeline (`kind=comment`, `author_kind=agent`).
+    /// Best-effort: missing work item / port / non-Lead → no-op; errors logged.
+    pub async fn maybe_record_leader_eval(&self, slot_id: &str) {
+        let agent = match self.scheduler.get_agent(slot_id).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::debug!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    error = %error,
+                    "leader eval skipped: agent lookup failed"
+                );
+                return;
+            }
+        };
+        if agent.role != TeammateRole::Lead {
+            return;
+        }
+        if !self.scheduler.begin_leader_eval(&agent.conversation_id) {
+            return;
+        }
+        let Some(service) = self.service.upgrade() else {
+            return;
+        };
+        let work_item_id = match service.team_work_item_id(self.team_id()).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    team_id = %self.team.id,
+                    error = %error,
+                    "leader eval skipped: work_item lookup failed"
+                );
+                return;
+            }
+        };
+        let Some(port) = service.board_timeline_port() else {
+            return;
+        };
+        let agents = self.scheduler.list_agents().await;
+        let tasks = self.scheduler.list_tasks().await.unwrap_or_default();
+        let body = build_leader_eval_body(&agents, &tasks);
+        let author = agent
+            .assistant_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(slot_id);
+        if let Err(error) = port
+            .append_leader_eval_comment(self.user_id(), &work_item_id, author, &body)
+            .await
+        {
+            tracing::warn!(
+                team_id = %self.team.id,
+                work_item_id = %work_item_id,
+                error = %error,
+                "leader eval timeline write failed"
+            );
+        }
     }
 
     /// Write a user message to the lead's mailbox and trigger a wake.
@@ -2431,6 +2495,141 @@ async fn cleanup_stale_attach(
         error_classification = "stale_attach_completion",
         "stale team member runtime attach completion rejected"
     );
+}
+
+/// M8 E7-5: plain-text Leader eval body for the work-item timeline.
+pub(crate) fn build_leader_eval_body(agents: &[TeamAgent], tasks: &[TeamTask]) -> String {
+    use crate::types::TaskStatus;
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("本轮评估：".to_owned());
+
+    let mut member_bits: Vec<String> = Vec::new();
+    for agent in agents.iter().filter(|a| a.role != TeammateRole::Lead) {
+        let status = agent
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
+        member_bits.push(format!("{}={status}", agent.name));
+    }
+    if member_bits.is_empty() {
+        lines.push("成员：无".to_owned());
+    } else {
+        lines.push(format!("成员：{}", member_bits.join("；")));
+    }
+
+    let pending = tasks.iter().filter(|t| t.status == TaskStatus::Pending).count();
+    let in_progress = tasks.iter().filter(|t| t.status == TaskStatus::InProgress).count();
+    let completed = tasks.iter().filter(|t| t.status == TaskStatus::Completed).count();
+    lines.push(format!(
+        "任务：{pending} pending / {in_progress} in_progress / {completed} completed"
+    ));
+
+    let active: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Pending || t.status == TaskStatus::InProgress)
+        .take(5)
+        .map(|t| {
+            let owner = t.owner.as_deref().unwrap_or("-");
+            format!("@{owner}: {}", truncate_eval_subject(&t.subject, 40))
+        })
+        .collect();
+    if !active.is_empty() {
+        lines.push(format!("进行中：{}", active.join("；")));
+    }
+
+    let next = if in_progress > 0 {
+        "下一步：等待成员完成当前任务"
+    } else if pending > 0 {
+        "下一步：继续派发待办"
+    } else if completed > 0 && pending == 0 && in_progress == 0 {
+        "下一步：汇总结果并判断是否提交 review"
+    } else {
+        "下一步：根据目标继续拆分或收束"
+    };
+    lines.push(next.to_owned());
+    lines.join("\n")
+}
+
+fn truncate_eval_subject(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    if trimmed.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(test)]
+mod leader_eval_body_tests {
+    use super::{build_leader_eval_body, truncate_eval_subject};
+    use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+
+    fn agent(slot: &str, name: &str, role: TeammateRole, status: TeammateStatus) -> TeamAgent {
+        TeamAgent {
+            slot_id: slot.into(),
+            name: name.into(),
+            role,
+            conversation_id: format!("c-{slot}"),
+            backend: "claude".into(),
+            model: "x".into(),
+            assistant_id: None,
+            status: Some(status),
+            conversation_type: None,
+            cli_path: None,
+        }
+    }
+
+    fn task(id: &str, subject: &str, status: TaskStatus, owner: Option<&str>) -> TeamTask {
+        TeamTask {
+            id: id.into(),
+            team_id: "t1".into(),
+            subject: subject.into(),
+            description: None,
+            status,
+            owner: owner.map(str::to_owned),
+            blocked_by: vec![],
+            blocks: vec![],
+            metadata: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn leader_eval_body_summarizes_members_and_tasks() {
+        let agents = vec![
+            agent("lead", "Lead", TeammateRole::Lead, TeammateStatus::Idle),
+            agent("w1", "frontend", TeammateRole::Teammate, TeammateStatus::Working),
+            agent("w2", "backend", TeammateRole::Teammate, TeammateStatus::Idle),
+        ];
+        let tasks = vec![
+            task("tk1", "Implement API", TaskStatus::InProgress, Some("w1")),
+            task("tk2", "Write tests", TaskStatus::Pending, Some("w2")),
+            task("tk3", "Done thing", TaskStatus::Completed, Some("w1")),
+        ];
+        let body = build_leader_eval_body(&agents, &tasks);
+        assert!(body.starts_with("本轮评估："), "{body}");
+        assert!(body.contains("frontend=working"), "{body}");
+        assert!(body.contains("backend=idle"), "{body}");
+        assert!(body.contains("1 pending / 1 in_progress / 1 completed"), "{body}");
+        assert!(body.contains("@w1: Implement API"), "{body}");
+        assert!(body.contains("下一步：等待成员完成当前任务"), "{body}");
+        assert!(!body.contains("Lead="), "lead omitted from members: {body}");
+    }
+
+    #[test]
+    fn leader_eval_body_next_step_when_all_done() {
+        let agents = vec![agent("lead", "Lead", TeammateRole::Lead, TeammateStatus::Idle)];
+        let tasks = vec![task("tk1", "Done", TaskStatus::Completed, Some("w1"))];
+        let body = build_leader_eval_body(&agents, &tasks);
+        assert!(body.contains("下一步：汇总结果并判断是否提交 review"), "{body}");
+    }
+
+    #[test]
+    fn truncate_eval_subject_adds_ellipsis() {
+        assert_eq!(truncate_eval_subject("abcd", 3), "abc…");
+        assert_eq!(truncate_eval_subject("ab", 3), "ab");
+    }
 }
 
 #[cfg(test)]

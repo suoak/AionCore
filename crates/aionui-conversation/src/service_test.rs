@@ -12264,3 +12264,51 @@ async fn e6_5_completed_with_artifacts_moves_to_in_review() {
     let bare_col = still.columns.iter().find(|c| c.board_status == S::InProgress).unwrap();
     assert!(bare_col.items.iter().any(|i| i.id == bare));
 }
+
+#[tokio::test]
+async fn e7_5_append_agent_board_comment_writes_agent_comment() {
+    use aionui_api_types::TaskCommentKind;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+
+    let comment = service
+        .append_agent_board_comment("user_1", &id, "lead-asst", "本轮评估：\n成员：frontend=idle")
+        .await
+        .unwrap();
+    assert_eq!(comment.kind, TaskCommentKind::Comment);
+    assert_eq!(comment.author_kind, "agent");
+    assert_eq!(comment.author_id, "lead-asst");
+    assert!(comment.body.starts_with("本轮评估："), "{}", comment.body);
+
+    let timeline = service.list_task_comments("user_1", &id).await.unwrap();
+    assert!(
+        timeline.iter().any(|c| c.author_kind == "agent"
+            && c.kind == TaskCommentKind::Comment
+            && c.body.starts_with("本轮评估：")),
+        "{timeline:?}"
+    );
+}
+
+#[tokio::test]
+async fn e7_5_append_agent_board_comment_rejects_empty_and_missing() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+
+    assert!(
+        service
+            .append_agent_board_comment("user_1", &id, "lead", "   ")
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .append_agent_board_comment("user_1", "missing-item", "lead", "本轮评估：x")
+            .await
+            .is_err()
+    );
+}

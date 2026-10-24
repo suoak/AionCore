@@ -254,3 +254,35 @@ pub trait AgentTurnCancellationPort: Send + Sync {
         turn_id: &str,
     ) -> Result<(), AgentTurnExecutionError>;
 }
+
+/// M8 E7-5: write Leader round evaluations onto the linked E6 work-item timeline.
+/// Implemented by the composition layer over `ConversationService` (this crate
+/// does not depend on `aionui-conversation`).
+#[async_trait]
+pub trait BoardWorkItemTimelinePort: Send + Sync {
+    /// Append `task_comments(kind=comment, author_kind=agent)` for a work item.
+    /// Callers treat failures as best-effort (log + continue the turn).
+    async fn append_leader_eval_comment(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+        author_agent_id: &str,
+        body: &str,
+    ) -> Result<(), TeamError>;
+}
+
+/// Default no-op for tests / construction without the board wired.
+pub struct NoopBoardWorkItemTimelinePort;
+
+#[async_trait]
+impl BoardWorkItemTimelinePort for NoopBoardWorkItemTimelinePort {
+    async fn append_leader_eval_comment(
+        &self,
+        _user_id: &str,
+        _work_item_id: &str,
+        _author_agent_id: &str,
+        _body: &str,
+    ) -> Result<(), TeamError> {
+        Ok(())
+    }
+}

@@ -805,6 +805,41 @@ impl ConversationService {
         Ok(comment)
     }
 
+    /// M8 E7-5: Leader (or other agent) round evaluation as a timeline comment.
+    /// `kind=comment`, `author_kind=agent`. Verifies the work item belongs to the user.
+    pub async fn append_agent_board_comment(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+        author_agent_id: &str,
+        body: &str,
+    ) -> Result<TaskCommentResponse, ConversationError> {
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(ConversationError::bad_request("comment body required"));
+        }
+        let Some(_) = self.task_board_repo()?.get_board_item(user_id, work_item_id).await? else {
+            return Err(ConversationError::not_found_reason("task board item not found"));
+        };
+        let now = now_ms();
+        let row = self
+            .task_board_repo()?
+            .append_comment(&AppendTaskCommentParams {
+                user_id,
+                task_session_id: work_item_id,
+                author_kind: "agent",
+                author_id: author_agent_id,
+                kind: "comment",
+                body,
+                created_at: now,
+            })
+            .await
+            .map_err(|error| map_db(work_item_id, error))?;
+        let comment = comment_response(row);
+        self.publish_comment(EVENT_TASK_COMMENT_CREATED, user_id, comment.clone());
+        Ok(comment)
+    }
+
     /// Author-only body correction within the edit window; otherwise 409.
     pub async fn edit_task_comment(
         &self,

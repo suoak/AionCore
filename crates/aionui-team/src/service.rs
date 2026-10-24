@@ -45,8 +45,8 @@ use crate::member_runtime::{
 };
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    TeamAssistantCatalogPort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, BoardWorkItemTimelinePort, NativeSlashCommandPort,
+    NoopNativeSlashCommandPort, TeamAssistantCatalogPort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
@@ -163,6 +163,9 @@ pub struct TeamSessionService {
     /// the service that owns it. Set once during [`TeamSessionService::new`]
     /// via [`Arc::new_cyclic`].
     self_ref: Weak<TeamSessionService>,
+    /// M8 E7-5: optional port to append Leader eval comments on the E6 board.
+    /// `None` until the composition layer wires ConversationService.
+    board_timeline: Arc<RwLock<Option<Arc<dyn BoardWorkItemTimelinePort>>>>,
 }
 
 impl TeamSessionService {
@@ -283,6 +286,7 @@ impl TeamSessionService {
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
+            board_timeline: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -313,6 +317,17 @@ impl TeamSessionService {
         if let Ok(mut guard) = self.user_order.write() {
             *guard = Some(user_order);
         }
+    }
+
+    /// M8 E7-5: wire the work-item timeline writer (Leader eval comments).
+    pub fn with_board_timeline_port(&self, port: Arc<dyn BoardWorkItemTimelinePort>) {
+        if let Ok(mut guard) = self.board_timeline.write() {
+            *guard = Some(port);
+        }
+    }
+
+    pub(crate) fn board_timeline_port(&self) -> Option<Arc<dyn BoardWorkItemTimelinePort>> {
+        self.board_timeline.read().ok().and_then(|guard| guard.clone())
     }
 
     /// Best-effort cascade of a removed team's `user_order` row (design §4.3,
