@@ -731,6 +731,7 @@ mod aionrs_config_option_tests {
             runtime_env: Vec::new(),
             prompt_dump_dir: None,
             tool_policy: Default::default(),
+            squad_tool_profile: None,
         }
     }
 

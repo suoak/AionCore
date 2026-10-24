@@ -107,6 +107,7 @@ impl ProviderHealthCheckService {
             runtime_env: Vec::new(),
             prompt_dump_dir: None,
             tool_policy: Default::default(),
+            squad_tool_profile: None,
         })
     }
 }

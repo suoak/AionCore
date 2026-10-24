@@ -266,6 +266,9 @@ pub struct SessionInit {
     /// `--strict-mcp-config`, and an empty set becomes `{"mcpServers":{}}` so the
     /// session sees NO MCP tools. `false` (default) keeps the pre-B-09 behavior.
     pub strict_mcp: bool,
+    /// M8 E7-4: backend-native tool names the session must not expose
+    /// (claude `--disallowedTools`). Empty = no restriction.
+    pub disallowed_tools: Vec<String>,
     /// Skill ids/names to surface to the agent on the first turn (acp/aionrs
     /// deliver these via the first prompt, not a `session/new` param).
     ///

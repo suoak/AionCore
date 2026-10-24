@@ -191,6 +191,9 @@ pub struct AionrsResolvedConfig {
     pub prompt_dump_dir: Option<PathBuf>,
     /// Mandatory host policy applied before any Aion tool approval path.
     pub tool_policy: AionrsRuntimeToolPolicy,
+    /// E7-4 Squad profile; `RouteOnlyLeader` narrows an unrestricted policy
+    /// to the route-only allow-list (see `apply_squad_tool_profile`).
+    pub squad_tool_profile: Option<aionui_api_types::SquadToolProfile>,
 }
 
 #[cfg(test)]

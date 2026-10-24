@@ -7,12 +7,22 @@ impl TeamSessionService {
             agents.push(self.build_agent_response(user_id, &team.id, agent).await?);
         }
 
+        // M8 E7-4: Squad instances expose their template id (UI board).
+        let squad_template_id = self
+            .repo
+            .team_squad_template_id(&team.id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(team_id = %team.id, %error, "squad_template_id lookup failed");
+                None
+            });
         Ok(TeamResponse {
             id: team.id.clone(),
             name: team.name.clone(),
             workspace: team.workspace.clone(),
             assistants: agents,
             leader_assistant_id: team.lead_agent_id.clone(),
+            squad_template_id,
             created_at: team.created_at,
             updated_at: team.updated_at,
         })

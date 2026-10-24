@@ -2171,6 +2171,8 @@ pub async fn build_antigravity_instance(
     let init = SessionInit {
         mcp_servers,
         strict_mcp: managed_mcp_surface(config),
+        // antigravity has no native tool exclusion (Squad: unenforceable).
+        disallowed_tools: Vec::new(),
         skills: config.skills.clone(),
         // The COMPOSED block (preset context + skills index + dual-channel
         // instructions), not the raw preset context: agy has no prompt pipeline,
@@ -2316,6 +2318,10 @@ pub async fn build_session_instance(
     let init = SessionInit {
         mcp_servers,
         strict_mcp: managed_mcp_surface(config),
+        disallowed_tools: config
+            .squad_tool_profile
+            .map(aionui_api_types::claude_disallowed_tools)
+            .unwrap_or_default(),
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
         // Layer 1. `Some` only for a protocol vendor (codex): the backend has to

@@ -109,6 +109,7 @@ fn make_aionrs_config() -> AionrsResolvedConfig {
         runtime_env: Vec::new(),
         prompt_dump_dir: None,
         tool_policy: Default::default(),
+        squad_tool_profile: None,
     }
 }
 

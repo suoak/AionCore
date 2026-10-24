@@ -331,6 +331,22 @@ impl TeamSession {
         TeamMcpStdioServerSpec::from_config(binary_path.as_ref(), &self.mcp_stdio_config(slot_id))
     }
 
+    /// M8 E7-4: Squad prompt section for this role (router prompt for a
+    /// route_only Leader, member rules for every Squad member).
+    async fn squad_prompt_suffix(&self, role: TeammateRole) -> Option<&'static str> {
+        let service = self.service.upgrade()?;
+        match role {
+            TeammateRole::Lead => service
+                .squad_leader_route_only(&self.team.id)
+                .await
+                .then_some(aionui_team_prompts::SQUAD_ROUTER_PROMPT),
+            TeammateRole::Teammate => service
+                .is_squad_team(&self.team.id)
+                .await
+                .then_some(aionui_team_prompts::SQUAD_MEMBER_PROMPT),
+        }
+    }
+
     async fn team_tool_transport_for_agent(&self, agent: &TeamAgent) -> Result<TeamToolTransport, TeamError> {
         let Some(service) = self.service.upgrade() else {
             return Ok(TeamToolTransport::Mcp);
@@ -462,6 +478,10 @@ impl TeamSession {
                                 let members = self.scheduler.list_agents().await;
                                 build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
                             }
+                        };
+                        let role_prompt = match self.squad_prompt_suffix(agent.role).await {
+                            Some(suffix) => format!("{role_prompt}\n\n{suffix}"),
+                            None => role_prompt,
                         };
                         format!("{role_prompt}\n\n{wake_body}")
                     } else {

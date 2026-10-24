@@ -329,7 +329,7 @@ async fn handle_method(
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
-        "tools/list" => handle_tools_list(request.id, scheduler, team_id, caller_slot_id, prompt_dump).await,
+        "tools/list" => handle_tools_list(request.id, scheduler, service, team_id, caller_slot_id, prompt_dump).await,
         "tools/call" => handle_tools_call(request, scheduler, service, team_id, caller_slot_id).await,
         _ => JsonRpcResponse::error(
             request.id,
@@ -350,13 +350,15 @@ async fn caller_role_for_tools_list(scheduler: &TeammateManager, caller_slot_id:
 async fn handle_tools_list(
     id: Option<u64>,
     scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
     team_id: &str,
     caller_slot_id: &str,
     prompt_dump: &TeamPromptDumpConfig,
 ) -> JsonRpcResponse {
     let caller_role = caller_role_for_tools_list(scheduler, caller_slot_id).await;
-    let empty_service = Weak::new();
-    let executor = TeamToolExecutor::new(scheduler, &empty_service);
+    // E7-4: stdio/TCP tools/list goes through the same runtime filter as the
+    // HTTP path, so a route_only Squad Leader never sees forbidden tools.
+    let executor = TeamToolExecutor::new(scheduler, service);
     let context = TeamToolContext {
         team_id: team_id.to_owned(),
         caller_slot_id: caller_slot_id.to_owned(),
@@ -365,7 +367,7 @@ async fn handle_tools_list(
         conversation_id: None,
         transport: aionui_api_types::TeamToolTransport::Mcp,
     };
-    let tools = executor.list_tools(&context);
+    let tools = executor.list_tools_runtime(&context).await;
     let tools_for_dump = tool_descriptors_to_mcp_json(&tools);
     if let Err(error) = dump_team_tools_list(
         prompt_dump,

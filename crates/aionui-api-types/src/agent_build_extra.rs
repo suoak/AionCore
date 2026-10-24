@@ -98,6 +98,9 @@ pub struct AcpBuildExtra {
     /// older conversations (= `false`, the pre-B-09 ambient behavior).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mcp_strict: bool,
+    /// M8 E7-4: Squad participant native tool restriction (absent = none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad_tool_profile: Option<crate::squad::SquadToolProfile>,
     #[serde(default)]
     pub user_id: Option<String>,
     /// Present only on a forked conversation (see [`ForkSpec`]). Consumed by
@@ -111,6 +114,10 @@ pub struct AcpBuildExtra {
 pub struct AionrsBuildExtra {
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// E7-4: stamped on Squad conversations; `RouteOnlyLeader` narrows the
+    /// aionrs tool policy to [`crate::aionrs_route_only_leader_allowed_tools`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad_tool_profile: Option<crate::squad::SquadToolProfile>,
     #[serde(default)]
     pub preset_rules: Option<String>,
     #[serde(default)]

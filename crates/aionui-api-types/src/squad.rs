@@ -166,6 +166,100 @@ pub struct SquadPreviewParticipant {
     /// Leader only, `route_only`: the Team MCP tools it keeps. `None` = unrestricted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_tools: Option<Vec<String>>,
+    /// M8 E7-4: native tool profile applied at launch.
+    pub tool_profile: SquadToolProfile,
+    /// M8 E7-4: whether the backend honours `tool_profile` (`unenforceable` =
+    /// the backend's own sub-agent/write/exec tools stay available).
+    pub native_tool_enforcement: NativeToolEnforcement,
+}
+
+/// M8 E7-4: backend-native tool restriction applied to a Squad participant's
+/// conversation (`extra.squad_tool_profile`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SquadToolProfile {
+    /// route_only Leader: no native sub-agent, file-write or exec tools.
+    RouteOnlyLeader,
+    /// Member: no native sub-agent tool.
+    Member,
+}
+
+/// Whether CSBU WorkMate can strip a backend's native tools at launch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolEnforcement {
+    Enforced,
+    /// The backend has no launch-time tool exclusion WorkMate can drive
+    /// (codex, antigravity, other ACP; gemini/aionrs pending, see m8-s5.md).
+    Unenforceable,
+}
+
+/// 400 code: a route_only Leader was put on a backend whose native
+/// sub-agent / write / exec tools cannot be removed.
+pub const SQUAD_LEADER_BACKEND_UNENFORCEABLE: &str = "squad_leader_backend_unenforceable";
+
+/// Native claude tool names: sub-agent (`Task`, renamed `Agent` in newer CLIs).
+pub const CLAUDE_SUBAGENT_TOOLS: &[&str] = &["Task", "Agent"];
+/// Native claude file-write and exec tools.
+pub const CLAUDE_WRITE_EXEC_TOOLS: &[&str] = &[
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "KillBash",
+];
+
+/// Whether Core can strip the backend's *native* tools for `profile`
+/// (E7-4). claude: `--disallowedTools` (both profiles). aionrs: exact-name
+/// `ToolPolicy::AllowOnly` — only usable for the route_only Leader, because a
+/// Member allow-list would need the MCP tool names that only exist after
+/// bootstrap. Everything else (gemini — `--exclude-tools` is not honoured by
+/// ACP sessions in gemini-cli 0.65 —, codex, agy, other ACP) is unenforceable.
+pub fn squad_native_tool_enforcement(backend: &str, profile: SquadToolProfile) -> NativeToolEnforcement {
+    match (backend, profile) {
+        ("claude", _) => NativeToolEnforcement::Enforced,
+        ("aionrs", SquadToolProfile::RouteOnlyLeader) => NativeToolEnforcement::Enforced,
+        _ => NativeToolEnforcement::Unenforceable,
+    }
+}
+
+/// D7-1 `route_only`: the Team MCP tools a Squad Leader keeps.
+pub const SQUAD_ROUTE_ONLY_LEADER_TOOLS: &[&str] = &[
+    "team_send_message",
+    "team_task_update",
+    "team_task_list",
+    "team_describe_assistant",
+];
+
+/// aionrs built-ins a route_only Leader keeps (read-only + ToolSearch, which
+/// only loads schemas; policy still gates the loaded tool).
+pub const AIONRS_ROUTE_ONLY_LEADER_BUILTINS: &[&str] = &["Read", "Grep", "Glob", "ViewImage", "ToolSearch"];
+
+/// Full aionrs `AllowOnly` set for a route_only Leader: read-only built-ins
+/// plus the Team MCP route tools under both names aionrs may expose them as
+/// (bare, or `mcp__{server}_{tool}` on a name collision).
+pub fn aionrs_route_only_leader_allowed_tools(route_tools: &[&str]) -> Vec<String> {
+    let mut tools: Vec<String> = AIONRS_ROUTE_ONLY_LEADER_BUILTINS
+        .iter()
+        .map(|t| (*t).to_owned())
+        .collect();
+    for tool in route_tools {
+        tools.push((*tool).to_owned());
+        tools.push(format!("mcp__{}_{tool}", crate::TEAM_MCP_SERVER_NAME));
+    }
+    tools
+}
+
+/// claude `--disallowedTools` for a profile.
+pub fn claude_disallowed_tools(profile: SquadToolProfile) -> Vec<String> {
+    let mut tools: Vec<String> = CLAUDE_SUBAGENT_TOOLS.iter().map(|t| (*t).to_owned()).collect();
+    if profile == SquadToolProfile::RouteOnlyLeader {
+        tools.extend(CLAUDE_WRITE_EXEC_TOOLS.iter().map(|t| (*t).to_owned()));
+    }
+    tools
 }
 
 /// `GET /api/squads/{id}/preview`.
@@ -205,4 +299,66 @@ pub struct SquadInstantiateInput {
 pub struct SquadInstantiateResponse {
     pub squad_template_id: String,
     pub team: crate::TeamResponse,
+}
+
+#[cfg(test)]
+mod e7_4_tests {
+    use super::*;
+
+    #[test]
+    fn enforcement_matrix_is_backend_and_profile_aware() {
+        use NativeToolEnforcement::*;
+        use SquadToolProfile::*;
+        assert_eq!(squad_native_tool_enforcement("claude", RouteOnlyLeader), Enforced);
+        assert_eq!(squad_native_tool_enforcement("claude", Member), Enforced);
+        assert_eq!(squad_native_tool_enforcement("aionrs", RouteOnlyLeader), Enforced);
+        assert_eq!(squad_native_tool_enforcement("aionrs", Member), Unenforceable);
+        for backend in ["gemini", "codex", "agy", "qwen", "opencode", ""] {
+            assert_eq!(
+                squad_native_tool_enforcement(backend, RouteOnlyLeader),
+                Unenforceable,
+                "{backend}"
+            );
+            assert_eq!(
+                squad_native_tool_enforcement(backend, Member),
+                Unenforceable,
+                "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_profiles_and_aionrs_leader_allow_list() {
+        assert_eq!(claude_disallowed_tools(SquadToolProfile::Member), vec!["Task", "Agent"]);
+        let leader = claude_disallowed_tools(SquadToolProfile::RouteOnlyLeader);
+        assert!(leader.iter().any(|t| t == "Bash") && leader.iter().any(|t| t == "Write"));
+
+        let allowed = aionrs_route_only_leader_allowed_tools(SQUAD_ROUTE_ONLY_LEADER_TOOLS);
+        for denied in [
+            "Spawn",
+            "Write",
+            "Edit",
+            "ExecCommand",
+            "Skill",
+            "EnterPlanMode",
+            "team_spawn_agent",
+        ] {
+            assert!(!allowed.iter().any(|t| t == denied), "{denied} must not be allowed");
+        }
+        assert!(allowed.iter().any(|t| t == "team_send_message"));
+        assert!(allowed.iter().any(|t| t == "mcp__aionui-team_team_send_message"));
+        assert!(allowed.iter().any(|t| t == "Read"));
+    }
+
+    #[test]
+    fn tool_profile_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(SquadToolProfile::RouteOnlyLeader).unwrap(),
+            "route_only_leader"
+        );
+        assert_eq!(
+            serde_json::to_value(NativeToolEnforcement::Unenforceable).unwrap(),
+            "unenforceable"
+        );
+    }
 }
