@@ -70,6 +70,13 @@ pub trait ITeamRepository: Send + Sync {
         Ok(None)
     }
 
+    /// M8 E7-3: `leader_mode` of the Squad template a Team was instantiated
+    /// from (`None` for plain Teams). Read at tool-dispatch time so the
+    /// route_only restriction is enforced at runtime, not only in config.
+    async fn team_squad_leader_mode(&self, _team_id: &str) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
     /// Returns a single team for startup/session restore.
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError>;
 

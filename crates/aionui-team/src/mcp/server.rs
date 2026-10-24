@@ -1473,7 +1473,7 @@ async fn http_mcp_loop(
                                 conversation_id: None,
                                 transport: aionui_api_types::TeamToolTransport::Mcp,
                             };
-                            let descriptors = TeamToolExecutor::new(&sched, &svc).list_tools(&context);
+                            let descriptors = TeamToolExecutor::new(&sched, &svc).list_tools_runtime(&context).await;
                             let tools: Vec<Value> = tool_descriptors_to_mcp_json(&descriptors);
                             if let Err(error) = dump_team_tools_list(
                                 &dump,
