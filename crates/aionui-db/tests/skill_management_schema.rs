@@ -23,6 +23,10 @@ async fn migration_creates_skill_management_tables() {
             "deleted_at",
             "created_at",
             "updated_at",
+            // E10-1 (migration 073) governance columns.
+            "visibility",
+            "team_id",
+            "review_status",
         ]
     );
 
