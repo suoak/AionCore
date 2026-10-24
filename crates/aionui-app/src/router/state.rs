@@ -435,6 +435,13 @@ pub async fn build_module_states(
     };
     // M8 E7-2: Squad instantiation provisions through the shared Team service.
     states.squad.teams = Some(states.team.service.clone());
+    // M8 E7-6: board cards show the run state of the linked Squad instance.
+    // Weak: the team service already holds the conversation service.
+    services
+        .conversation_service
+        .with_board_squad_run_port(Arc::new(TeamBoardSquadRun {
+            teams: Arc::downgrade(&states.team.service),
+        }));
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
@@ -1261,6 +1268,30 @@ pub async fn build_channel_state(
 #[derive(Clone)]
 pub(crate) struct AssistantServiceTeamCatalog {
     assistant_service: Arc<AssistantService>,
+}
+
+/// M8 E7-6: [`aionui_conversation::board::BoardSquadRunPort`] over the team
+/// service.
+struct TeamBoardSquadRun {
+    teams: std::sync::Weak<TeamSessionService>,
+}
+
+#[async_trait::async_trait]
+impl aionui_conversation::board::BoardSquadRunPort for TeamBoardSquadRun {
+    async fn squad_run_for_work_item(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+    ) -> Option<aionui_api_types::SquadRunPayload> {
+        let teams = self.teams.upgrade()?;
+        match teams.squad_run_for_work_item(user_id, work_item_id).await {
+            Ok(run) => run,
+            Err(error) => {
+                tracing::warn!(work_item_id, %error, "board squad_run lookup failed");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]

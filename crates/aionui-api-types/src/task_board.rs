@@ -93,6 +93,11 @@ pub struct TaskBoardItemResponse {
     pub external_ref: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// M8 E7-6: run state of the newest Squad instance started for this item
+    /// (`POST /api/squads/{id}/instantiate` with `work_item_id`). Omitted when
+    /// the item is not assigned to a Squad or no instance has anything to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad_run: Option<crate::SquadRunPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

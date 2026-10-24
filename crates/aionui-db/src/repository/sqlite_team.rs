@@ -102,6 +102,26 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(row.map(|(members,)| members))
     }
 
+    async fn latest_team_for_work_item(&self, user_id: &str, work_item_id: &str) -> Result<Option<String>, DbError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM teams WHERE user_id = ? AND work_item_id = ? AND squad_template_id IS NOT NULL \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(work_item_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
+    async fn team_work_item_id(&self, team_id: &str) -> Result<Option<String>, DbError> {
+        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT work_item_id FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|(id,)| id))
+    }
+
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
         let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE id = ?")
             .bind(team_id)

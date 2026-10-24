@@ -21,6 +21,9 @@
 //! pushes `task.comment.created`; comment edits push `task.comment.updated`.
 //! Events are published only after the write succeeded.
 //!
+//! Squad cards (M8 E7-6): items assigned to a Squad carry `squad_run` from
+//! the newest instance started for them, via [`BoardSquadRunPort`].
+//!
 //! Concurrency: `UpdateTaskBoardRequest::expected_updated_at` is an optional
 //! optimistic lock. When given, the row must still carry that `updated_at`
 //! (checked before the state machine and again atomically in the UPDATE);
@@ -28,7 +31,7 @@
 //! stays last-write-wins.
 
 use aionui_api_types::{
-    EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED, TaskBoardChange,
+    EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED, SquadRunPayload, TaskBoardChange,
     TaskBoardUpdatedEvent, TaskCommentEvent, WebSocketMessage,
 };
 use aionui_api_types::{
@@ -183,6 +186,7 @@ fn item_response(row: TaskBoardItemRow) -> Result<TaskBoardItemResponse, Convers
         external_ref: row.external_ref,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        squad_run: None,
     })
 }
 
@@ -262,7 +266,33 @@ fn validate_labels(labels: &[String]) -> Result<Vec<String>, ConversationError> 
     Ok(out)
 }
 
+/// M8 E7-6: lets board cards show the run state of the Squad instance
+/// started for a work item. Implemented by the composition layer over the
+/// team service (this crate does not depend on `aionui-team`).
+#[async_trait::async_trait]
+pub trait BoardSquadRunPort: Send + Sync {
+    /// `None` when no instance is linked or it has nothing to show. Lookup
+    /// failures are logged by the implementation and answer `None`.
+    async fn squad_run_for_work_item(&self, user_id: &str, work_item_id: &str) -> Option<SquadRunPayload>;
+}
+
+fn assigned_to_squad(item: &TaskBoardItemResponse) -> bool {
+    item.assignee
+        .as_ref()
+        .is_some_and(|assignee| assignee.kind == TaskAssigneeKind::Squad)
+}
+
 impl ConversationService {
+    /// Fills `squad_run` on cards assigned to a Squad.
+    async fn decorate_squad_run(&self, user_id: &str, item: &mut TaskBoardItemResponse) {
+        if !assigned_to_squad(item) {
+            return;
+        }
+        if let Some(port) = self.board_squad_run_port() {
+            item.squad_run = port.squad_run_for_work_item(user_id, &item.id).await;
+        }
+    }
+
     async fn board_item(&self, user_id: &str, id: &str) -> Result<TaskBoardItemRow, ConversationError> {
         self.task_board_repo()?
             .get_board_item(user_id, id)
@@ -357,7 +387,8 @@ impl ConversationService {
             })
             .collect();
         for row in rows {
-            let item = item_response(row)?;
+            let mut item = item_response(row)?;
+            self.decorate_squad_run(user_id, &mut item).await;
             if let Some(column) = columns
                 .iter_mut()
                 .find(|column| column.board_status == item.board_status)
@@ -491,7 +522,8 @@ impl ConversationService {
                 .await?;
             }
         }
-        let item = item_response(row)?;
+        let mut item = item_response(row)?;
+        self.decorate_squad_run(user_id, &mut item).await;
         self.publish_board_updated(user_id, TaskBoardChange::Board, from, &item);
         Ok(item)
     }
@@ -546,7 +578,8 @@ impl ConversationService {
                 now,
             )
             .await?;
-        let item = item_response(row)?;
+        let mut item = item_response(row)?;
+        self.decorate_squad_run(user_id, &mut item).await;
         self.publish_board_updated(user_id, TaskBoardChange::Review, from, &item);
         Ok(TaskBoardReviewResponse {
             item,

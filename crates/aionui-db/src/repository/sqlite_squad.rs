@@ -5,7 +5,7 @@ use crate::error::DbError;
 use crate::models::{SQUAD_LEADER_MODES, SQUAD_VISIBILITIES, SquadTemplateRow};
 use crate::repository::squad::{
     CreateSquadTemplateParams, ISquadTemplateRepository, SQUAD_NAME_CONFLICT_PREFIX, SQUAD_STALE_CONFLICT_PREFIX,
-    UpdateSquadTemplateParams,
+    UpdateSquadTemplateParams, WorkItemAssignment,
 };
 
 /// SQLite-backed implementation of [`ISquadTemplateRepository`].
@@ -172,6 +172,40 @@ impl ISquadTemplateRepository for SqliteSquadTemplateRepository {
         }
         Ok(())
     }
+
+    async fn work_item_assignment(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+    ) -> Result<Option<WorkItemAssignment>, DbError> {
+        let row: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT assignee_kind, assignee_id, board_status FROM task_sessions WHERE id = ? AND user_id = ?",
+        )
+        .bind(work_item_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(
+            row.map(|(assignee_kind, assignee_id, board_status)| WorkItemAssignment {
+                assignee_kind,
+                assignee_id,
+                board_status,
+            }),
+        )
+    }
+
+    async fn bind_team_work_item(&self, user_id: &str, team_id: &str, work_item_id: &str) -> Result<(), DbError> {
+        let done = sqlx::query("UPDATE teams SET work_item_id = ? WHERE id = ? AND user_id = ?")
+            .bind(work_item_id)
+            .bind(team_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team {team_id}")));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +225,74 @@ mod tests {
             visibility: "private",
             now: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn work_item_link_is_owner_scoped_and_latest_instance_wins() {
+        use crate::repository::team::ITeamRepository;
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool();
+        for user in ["u1", "u2"] {
+            sqlx::query(
+                "INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES (?, ?, 'x', 0, 0)",
+            )
+            .bind(user)
+            .bind(user)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO task_sessions (id, user_id, title, mode, status, agent_type, created_at, updated_at, \
+             board_status, assignee_kind, assignee_id) \
+             VALUES ('w1', 'u1', 't', 'agent', 'draft', 'claude', 1, 1, 'todo', 'squad', 's1')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (id, at) in [("t1", 1), ("t2", 2)] {
+            sqlx::query(
+                "INSERT INTO teams (id, user_id, name, agents, created_at, updated_at) VALUES (?, 'u1', 'n', '[]', ?, ?)",
+            )
+            .bind(id)
+            .bind(at)
+            .bind(at)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let repo = SqliteSquadTemplateRepository::new(pool.clone());
+        let teams = crate::SqliteTeamRepository::new(pool.clone());
+        assert_eq!(
+            repo.work_item_assignment("u1", "w1").await.unwrap(),
+            Some(WorkItemAssignment {
+                assignee_kind: Some("squad".into()),
+                assignee_id: Some("s1".into()),
+                board_status: "todo".into(),
+            })
+        );
+        assert_eq!(repo.work_item_assignment("u2", "w1").await.unwrap(), None);
+        assert!(matches!(
+            repo.bind_team_work_item("u2", "t1", "w1").await,
+            Err(DbError::NotFound(_))
+        ));
+        // Linked but not a Squad instance yet: not reported.
+        repo.bind_team_work_item("u1", "t1", "w1").await.unwrap();
+        assert_eq!(teams.latest_team_for_work_item("u1", "w1").await.unwrap(), None);
+        assert_eq!(teams.team_work_item_id("t1").await.unwrap().as_deref(), Some("w1"));
+        for id in ["t1", "t2"] {
+            repo.bind_team_instance("u1", id, "s1").await.unwrap();
+        }
+        assert_eq!(
+            teams.latest_team_for_work_item("u1", "w1").await.unwrap().as_deref(),
+            Some("t1")
+        );
+        repo.bind_team_work_item("u1", "t2", "w1").await.unwrap();
+        assert_eq!(
+            teams.latest_team_for_work_item("u1", "w1").await.unwrap().as_deref(),
+            Some("t2")
+        );
+        assert_eq!(teams.latest_team_for_work_item("u2", "w1").await.unwrap(), None);
     }
 
     #[tokio::test]
