@@ -55,6 +55,7 @@ pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
+pub use repository::task_board::{AppendTaskCommentParams, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams};
 pub use repository::task_session::{
     AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateRetryTaskRunParams,
     CreateTaskArtifactParams, CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams,
@@ -71,7 +72,7 @@ pub use repository::{
     IClientPreferenceRepository, IConversationRepository, ICronRepository, IExperienceArticleRepository,
     IFeedbackDiagnosticsRepository, IInboxRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore,
     IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillEvolutionProposalRepository,
-    ISkillEvolutionSettingsRepository, ISkillRepository, ITaskSessionRepository, ITeamRepository,
+    ISkillEvolutionSettingsRepository, ISkillRepository, ITaskBoardRepository, ITaskSessionRepository, ITeamRepository,
     IUsageEventRepository, IUserOrderStore, IUserRepository, InboxFilter, InsertUsageEventParams, MoveOutcome,
     OrderItemRef, PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams,
     SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository,
@@ -82,8 +83,9 @@ pub use repository::{
     SqliteExperienceArticleRepository, SqliteFeedbackDiagnosticsRepository, SqliteInboxRepository,
     SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillEvolutionProposalRepository,
-    SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteTaskSessionRepository, SqliteTeamRepository,
-    SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository, UpsertInboxItemParams, UsageEventFilter,
+    SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteTaskBoardRepository,
+    SqliteTaskSessionRepository, SqliteTeamRepository, SqliteUsageEventRepository, SqliteUserOrderStore,
+    SqliteUserRepository, UpsertInboxItemParams, UsageEventFilter,
 };
 
 // Re-export sqlx pool type for downstream crates
