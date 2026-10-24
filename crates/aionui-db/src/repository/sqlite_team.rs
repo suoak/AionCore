@@ -80,6 +80,17 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(row.and_then(|(id,)| id))
     }
 
+    async fn team_squad_leader_mode(&self, team_id: &str) -> Result<Option<String>, DbError> {
+        // Soft-deleted templates still govern already-instantiated Teams.
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT s.leader_mode FROM teams t JOIN squad_templates s ON s.id = t.squad_template_id WHERE t.id = ?",
+        )
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(mode,)| mode))
+    }
+
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
         let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE id = ?")
             .bind(team_id)

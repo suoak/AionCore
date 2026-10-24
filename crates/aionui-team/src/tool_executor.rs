@@ -37,9 +37,30 @@ impl<'a> TeamToolExecutor<'a> {
         aionui_api_types::team_tool_descriptors_for_role(team_tool_role(context.caller_role))
     }
 
+    /// Runtime tool list: like `list_tools`, but trims a route_only Squad
+    /// Leader down to the routing tools (needs a live service).
+    pub async fn list_tools_runtime(&self, context: &TeamToolContext) -> Vec<TeamToolDescriptor> {
+        let tools = self.list_tools(context);
+        if context.caller_role == TeammateRole::Lead
+            && let Some(service) = self.service.upgrade()
+            && service.squad_leader_route_only(&context.team_id).await
+        {
+            return filter_squad_route_only(tools);
+        }
+        tools
+    }
+
     pub async fn execute(&self, context: &TeamToolContext, call: TeamToolCall) -> Result<Value, TeamToolErrorPayload> {
         let started = Instant::now();
         let tool = call.tool.as_str();
+        if context.caller_role == TeammateRole::Lead
+            && !squad_route_only_allows(tool)
+            && let Some(service) = self.service.upgrade()
+            && service.squad_leader_route_only(&context.team_id).await
+        {
+            warn!(team_id = %context.team_id, caller_slot_id = %context.caller_slot_id, tool, "Squad route_only Leader tool call rejected");
+            return Err(squad_route_only_error(&context.team_id, tool));
+        }
         let result = crate::mcp::server::dispatch_tool(
             tool,
             &call.arguments,
@@ -88,6 +109,32 @@ pub fn team_tool_call_from_name(tool_name: &str, arguments: Value) -> Result<Tea
     Ok(TeamToolCall { tool, arguments })
 }
 
+/// M8 E7-3: whether a route_only Squad Leader may call `tool`.
+pub fn squad_route_only_allows(tool: &str) -> bool {
+    crate::squad::SQUAD_ROUTE_ONLY_LEADER_TOOLS.contains(&tool)
+}
+
+/// Drop tools a route_only Squad Leader may not use from a tool list.
+pub fn filter_squad_route_only(tools: Vec<TeamToolDescriptor>) -> Vec<TeamToolDescriptor> {
+    tools
+        .into_iter()
+        .filter(|descriptor| squad_route_only_allows(descriptor.name.as_str()))
+        .collect()
+}
+
+fn squad_route_only_error(team_id: &str, tool: &str) -> TeamToolErrorPayload {
+    TeamToolErrorPayload::new(
+        TeamToolErrorCode::PermissionDenied,
+        format!("Squad Leader is route_only; tool {tool} is not allowed"),
+    )
+    .with_details(serde_json::json!({
+        "code": "squad_route_only_tool_forbidden",
+        "team_id": team_id,
+        "tool": tool,
+        "allowed": crate::squad::SQUAD_ROUTE_ONLY_LEADER_TOOLS,
+    }))
+}
+
 fn team_tool_role(role: TeammateRole) -> TeamToolRole {
     match role {
         TeammateRole::Lead => TeamToolRole::Lead,
@@ -133,5 +180,20 @@ mod tests {
         let err = team_tool_call_from_name("missing_tool", json!({})).unwrap_err();
         assert_eq!(err.code, TeamToolErrorCode::UnknownTool);
         assert!(err.message.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn squad_route_only_allows_only_routing_tools() {
+        for tool in crate::squad::SQUAD_ROUTE_ONLY_LEADER_TOOLS {
+            assert!(squad_route_only_allows(tool));
+        }
+        assert!(!squad_route_only_allows("team_spawn_agent"));
+        let lead = aionui_api_types::team_tool_descriptors_for_role(TeamToolRole::Lead);
+        let filtered = filter_squad_route_only(lead.clone());
+        assert!(filtered.len() < lead.len());
+        assert!(filtered.iter().all(|d| squad_route_only_allows(d.name.as_str())));
+        let err = squad_route_only_error("t1", "team_spawn_agent");
+        assert_eq!(err.code, TeamToolErrorCode::PermissionDenied);
+        assert_eq!(err.details.unwrap()["code"], "squad_route_only_tool_forbidden");
     }
 }

@@ -830,6 +830,18 @@ impl TeamSessionService {
         Ok(())
     }
 
+    /// M8 E7-3: true when the Team is a Squad instance whose Leader is
+    /// `route_only` (D7-1 default). Lookup failures fail closed.
+    pub async fn squad_leader_route_only(&self, team_id: &str) -> bool {
+        match self.repo.team_squad_leader_mode(team_id).await {
+            Ok(mode) => mode.as_deref() == Some("route_only"),
+            Err(error) => {
+                tracing::warn!(team_id, %error, "squad leader_mode lookup failed; enforcing route_only");
+                true
+            }
+        }
+    }
+
     pub async fn add_agent(
         &self,
         user_id: &str,

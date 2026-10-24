@@ -645,6 +645,16 @@ pub(crate) mod workspace_harness {
             Ok(self.squad_bindings.lock().unwrap().get(team_id).cloned())
         }
 
+        async fn team_squad_leader_mode(&self, team_id: &str) -> Result<Option<String>, DbError> {
+            // Mock: every bound Squad uses the D7-1 default.
+            Ok(self
+                .squad_bindings
+                .lock()
+                .unwrap()
+                .get(team_id)
+                .map(|_| "route_only".to_owned()))
+        }
+
         async fn list_teams_for_restore(&self) -> Result<Vec<TeamRow>, DbError> {
             Ok(self.teams.lock().unwrap().clone())
         }
