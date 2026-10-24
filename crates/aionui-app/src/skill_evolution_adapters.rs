@@ -154,6 +154,9 @@ impl SkillEvolutionLlmPort for ProviderLlmAdapter {
 pub struct SkillHubApplyAdapter {
     pub skill_paths: SkillPaths,
     pub skill_repo: Arc<dyn ISkillRepository>,
+    /// E10-2: when set, every Skills Hub write is recorded as a new
+    /// `skill_versions` row (created_by = evolution) with its files under `.versions/`.
+    pub source_repo: Option<Arc<dyn aionui_db::ISkillSourceRepository>>,
 }
 
 #[async_trait]
@@ -188,6 +191,26 @@ impl SkillEvolutionApplyPort for SkillHubApplyAdapter {
                 import_skill_with_repo_for_user(&self.skill_paths, self.skill_repo.as_ref(), user_id, &skill_dir)
                     .await
                     .map_err(|e| AssistantError::BadRequest(format!("导入 Skills Hub 失败：{e}")))?;
+            if let (Some(source_repo), Some(skill_id)) = (self.source_repo.as_ref(), imported.skill_id.as_deref()) {
+                match self.skill_repo.find_by_name_any_for_user(user_id, &imported.name).await {
+                    Ok(Some(row)) => {
+                        if let Err(e) = aionui_extension::skill_governance::record_skill_version(
+                            &self.skill_paths,
+                            source_repo.as_ref(),
+                            skill_id,
+                            std::path::Path::new(&row.path),
+                            None,
+                            "evolution",
+                        )
+                        .await
+                        {
+                            tracing::warn!(skill_id, error = %e, "recording evolution skill version failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(skill_id, error = %e, "skill lookup for version record failed"),
+                }
+            }
             skills_hub_path = Some(format!("skills/{}/SKILL.md", imported.name));
         }
 

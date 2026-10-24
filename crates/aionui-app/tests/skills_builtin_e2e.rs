@@ -80,6 +80,7 @@ async fn fixture_embedded() -> Fixture {
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
         registry_service: None,
+        governance: None,
     };
     aionui_extension::sync_skill_catalog_into_repo(&states.skill.skill_paths, skill_repo.as_ref())
         .await

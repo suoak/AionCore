@@ -66,6 +66,8 @@ pub trait ISkillSourceRepository: Send + Sync {
     async fn latest_version(&self, skill_id: &str) -> Result<Option<SkillVersionRow>, DbError>;
 
     async fn governance(&self, skill_id: &str) -> Result<Option<SkillGovernanceRow>, DbError>;
+    /// Skills owned by `user_id` waiting for review (`review_status = 'pending'`), newest first.
+    async fn list_pending_reviews_for_user(&self, user_id: &str) -> Result<Vec<SkillGovernanceRow>, DbError>;
     /// Set the review state. Who may approve (owner vs team admin, D10-3) is
     /// decided by the service; this layer only validates the value.
     async fn set_review_status(&self, skill_id: &str, status: &str, now: TimestampMs) -> Result<(), DbError>;

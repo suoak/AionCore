@@ -188,10 +188,21 @@ impl ISkillSourceRepository for SqliteSkillSourceRepository {
 
     async fn governance(&self, skill_id: &str) -> Result<Option<SkillGovernanceRow>, DbError> {
         Ok(sqlx::query_as::<_, SkillGovernanceRow>(
-            "SELECT id, visibility, team_id, review_status FROM skills WHERE id = ?",
+            "SELECT id, user_id, name, visibility, team_id, review_status FROM skills WHERE id = ?",
         )
         .bind(skill_id)
         .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn list_pending_reviews_for_user(&self, user_id: &str) -> Result<Vec<SkillGovernanceRow>, DbError> {
+        Ok(sqlx::query_as::<_, SkillGovernanceRow>(
+            "SELECT id, user_id, name, visibility, team_id, review_status FROM skills \
+             WHERE review_status = 'pending' AND deleted_at IS NULL AND user_id = ? \
+             ORDER BY updated_at DESC, id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
         .await?)
     }
 
@@ -284,6 +295,26 @@ mod tests {
         assert_eq!(gov.visibility, "private");
         assert_eq!(gov.team_id, None);
         assert_eq!(gov.review_status, "none");
+        assert_eq!(gov.name, "imported");
+    }
+
+    #[tokio::test]
+    async fn pending_queue_lists_only_owner_pending_skills() {
+        let (_db, _skills, repo, skill_id) = setup().await;
+        let owner = repo.governance(&skill_id).await.unwrap().unwrap().user_id.unwrap();
+        assert!(repo.list_pending_reviews_for_user(&owner).await.unwrap().is_empty());
+        repo.append_version(version("v1", &skill_id, "h1", true)).await.unwrap();
+        let queue = repo.list_pending_reviews_for_user(&owner).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id, skill_id);
+        assert!(
+            repo.list_pending_reviews_for_user("someone-else")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        repo.set_review_status(&skill_id, "approved", 20).await.unwrap();
+        assert!(repo.list_pending_reviews_for_user(&owner).await.unwrap().is_empty());
     }
 
     #[tokio::test]

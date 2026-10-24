@@ -2033,7 +2033,7 @@ async fn collect_skill_dirs_recursive(dir: &Path, result: &mut Vec<PathBuf>) -> 
     Ok(())
 }
 
-fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), ExtensionError> {
+pub(crate) fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), ExtensionError> {
     extract_zip_archive_with_limits(archive_path, destination, skill_import_limits())
 }
 

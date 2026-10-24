@@ -57,6 +57,8 @@ pub struct SkillRouterState {
     #[allow(clippy::type_complexity)]
     pub assistant_dispatcher: Option<Arc<dyn AssistantRuleDispatcher>>,
     pub registry_service: Option<SkillRegistryService>,
+    /// E10-2 source import / refresh / review / visibility routes. `None` disables them.
+    pub governance: Option<crate::skill_governance::SkillGovernanceState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +70,7 @@ pub struct SkillRouterState {
 /// All routes require authentication (applied by the caller).
 pub fn skill_routes(state: SkillRouterState) -> Router {
     let registry_service = state.registry_service.clone();
+    let governance = state.governance.clone();
     let routes = Router::new()
         // Skill listing & info
         .route("/api/skills", get(list_skills))
@@ -107,10 +110,14 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         .route("/api/skills/market/enable", post(enable_skills_market))
         .route("/api/skills/market/disable", post(disable_skills_market))
         .with_state(state);
-    if let Some(service) = registry_service {
+    let routes = if let Some(service) = registry_service {
         routes.merge(skill_registry_routes(service))
     } else {
         routes
+    };
+    match governance {
+        Some(g) => routes.merge(crate::skill_governance::skill_governance_routes(g)),
+        None => routes,
     }
 }
 
@@ -654,6 +661,7 @@ mod tests {
             external_paths_manager: ext_mgr,
             assistant_dispatcher: None,
             registry_service: None,
+            governance: None,
         }
     }
 
