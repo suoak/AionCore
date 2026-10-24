@@ -293,6 +293,28 @@ impl ConversationService {
         }
     }
 
+    /// M8 E7-6: pushes `task.board.updated` (`change: "squad_run"`) after the
+    /// linked Squad instance changed state. `squad_run` is the fresh value
+    /// computed by the caller. Skipped (returns `false`) when the item is gone
+    /// or no longer assigned to a Squad.
+    pub async fn publish_squad_run_changed(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+        squad_run: Option<SquadRunPayload>,
+    ) -> Result<bool, ConversationError> {
+        let Some(row) = self.task_board_repo()?.get_board_item(user_id, work_item_id).await? else {
+            return Ok(false);
+        };
+        let mut item = item_response(row)?;
+        if !assigned_to_squad(&item) {
+            return Ok(false);
+        }
+        item.squad_run = squad_run;
+        self.publish_board_updated(user_id, TaskBoardChange::SquadRun, item.board_status, &item);
+        Ok(true)
+    }
+
     async fn board_item(&self, user_id: &str, id: &str) -> Result<TaskBoardItemRow, ConversationError> {
         self.task_board_repo()?
             .get_board_item(user_id, id)

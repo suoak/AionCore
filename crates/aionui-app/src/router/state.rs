@@ -442,6 +442,11 @@ pub async fn build_module_states(
         .with_board_squad_run_port(Arc::new(TeamBoardSquadRun {
             teams: Arc::downgrade(&states.team.service),
         }));
+    crate::squad_board_relay::spawn(
+        &services.event_bus,
+        Arc::downgrade(&states.team.service),
+        services.conversation_service.clone(),
+    );
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"

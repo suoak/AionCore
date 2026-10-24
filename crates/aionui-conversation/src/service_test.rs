@@ -11906,3 +11906,74 @@ async fn board_squad_cards_carry_squad_run_and_others_do_not() {
     // Only Squad cards hit the port.
     assert!(port.calls.lock().unwrap().iter().all(|id| *id == squad_item));
 }
+
+#[tokio::test]
+async fn squad_run_change_pushes_board_updated_for_squad_cards_only() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskAssignee, TaskAssigneeKind, UpdateTaskBoardRequest};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = board_service_with(&db, broadcaster.clone());
+    let squad_item = board_task(&service, TaskSessionMode::Agent).await;
+    let plain_item = board_task(&service, TaskSessionMode::Agent).await;
+    service
+        .update_task_board(
+            "user_1",
+            &squad_item,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                assignee: Some(Some(TaskAssignee {
+                    kind: TaskAssigneeKind::Squad,
+                    id: "sq1".into(),
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    broadcaster.take_events();
+
+    let run = aionui_api_types::SquadRunPayload {
+        team_id: "team-1".into(),
+        state: aionui_api_types::SquadRunState::Finished,
+        leader_conversation_id: None,
+        leader_mode: None,
+        updated_at: 9,
+    };
+    assert!(
+        service
+            .publish_squad_run_changed("user_1", &squad_item, Some(run))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !service
+            .publish_squad_run_changed("user_1", &plain_item, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !service
+            .publish_squad_run_changed("user_1", "missing", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !service
+            .publish_squad_run_changed("user_2", &squad_item, None)
+            .await
+            .unwrap(),
+        "owner scoped"
+    );
+
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "task.board.updated");
+    let data = &events[0].data;
+    assert_eq!(data["change"], "squad_run");
+    assert_eq!(data["from_board_status"], data["item"]["board_status"]);
+    assert_eq!(data["item"]["squad_run"]["state"], "finished");
+    assert_eq!(data["item"]["squad_run"]["team_id"], "team-1");
+}

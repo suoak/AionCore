@@ -165,6 +165,9 @@ pub enum TaskBoardChange {
     Board,
     /// `POST /api/task-sessions/{id}/review`.
     Review,
+    /// M8 E7-6: the linked Squad instance's `squad_run` changed state; the
+    /// card did not move (`from_board_status == item.board_status`).
+    SquadRun,
 }
 
 /// `task.board.updated` payload: the item after the change.
