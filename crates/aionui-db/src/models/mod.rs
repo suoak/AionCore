@@ -16,6 +16,7 @@ mod remote_agent;
 mod skill;
 mod skill_evolution;
 mod system_settings;
+mod task_board;
 mod task_session;
 mod team;
 mod usage_event;
@@ -55,6 +56,10 @@ pub use skill_evolution::{
     SkillEvolutionSettingsRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
 };
 pub use system_settings::SystemSettings;
+pub use task_board::{
+    BOARD_ASSIGNEE_KINDS, BOARD_MAX_PRIORITY, BOARD_STATUSES, TASK_COMMENT_AUTHOR_KINDS, TASK_COMMENT_EDIT_WINDOW_MS,
+    TASK_COMMENT_KINDS, TaskBoardItemRow, TaskCommentRow,
+};
 pub use task_session::{
     ContextSnapshotArtifactRow, ContextSnapshotRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow,
     TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow, TaskTraceEventRow,
