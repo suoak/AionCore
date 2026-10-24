@@ -406,6 +406,8 @@ async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
             "scheduler turn finalization failed"
         ),
     }
+    // M8 E7-5: Leader eval → work-item timeline (no-op for non-Lead / no work item).
+    ctx.session.maybe_record_leader_eval(&ctx.slot_id).await;
 }
 
 async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {

@@ -127,6 +127,9 @@ pub struct TeammateManager {
     pub(crate) wake_timeouts: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
     /// M8 E7-4: in-flight (work_item, member, task) dispatches.
     pub(crate) active_dispatches: Arc<DashMap<String, ()>>,
+    /// M8 E7-5: dedup Leader timeline eval writes per conversation (same window
+    /// as finalize) so event_loop + on_agent_finish cannot double-comment.
+    pub(crate) leader_eval_turns: Arc<DashMap<String, Instant>>,
 }
 
 impl TeammateManager {
@@ -162,6 +165,7 @@ impl TeammateManager {
             finalized_turns: Arc::new(DashMap::new()),
             wake_timeouts: Arc::new(DashMap::new()),
             active_dispatches: Arc::new(DashMap::new()),
+            leader_eval_turns: Arc::new(DashMap::new()),
         }
     }
 

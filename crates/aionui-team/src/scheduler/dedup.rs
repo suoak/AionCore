@@ -25,6 +25,27 @@ impl TeammateManager {
         self.finalized_turns.remove(conversation_id);
     }
 
+    /// M8 E7-5: claim the Leader timeline-eval slot for this conversation.
+    /// Same window as `begin_finalize`; separate map so finalize and timeline
+    /// dedup do not block each other incorrectly.
+    pub fn begin_leader_eval(&self, conversation_id: &str) -> bool {
+        let now = Instant::now();
+        let should_proceed = !matches!(
+            self.leader_eval_turns.get(conversation_id),
+            Some(entry) if now.duration_since(*entry.value()) < FINALIZE_DEDUP_WINDOW
+        );
+        if should_proceed {
+            self.leader_eval_turns.insert(conversation_id.to_owned(), now);
+            let map = self.leader_eval_turns.clone();
+            let key = conversation_id.to_owned();
+            tokio::spawn(async move {
+                tokio::time::sleep(FINALIZE_DEDUP_WINDOW).await;
+                map.remove(&key);
+            });
+        }
+        should_proceed
+    }
+
     /// M8 E7-4: hold a dispatch lock for `(work_item, member, task)`.
     /// Returns `false` when that triple is already in progress (caller should
     /// answer "already in progress" and not wake the member again).

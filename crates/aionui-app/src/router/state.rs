@@ -60,9 +60,9 @@ use aionui_system::{
     VersionCheckService,
 };
 use aionui_team::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, TeamAssistantCatalogEntry,
-    TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
-    TeamSessionService,
+    AgentTurnCancellationPort, AgentTurnExecutionPort, BoardWorkItemTimelinePort, NativeSlashCommandPort,
+    TeamAssistantCatalogEntry, TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore,
+    TeamRouterState, TeamSessionService,
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
@@ -441,6 +441,13 @@ pub async fn build_module_states(
         .conversation_service
         .with_board_squad_run_port(Arc::new(TeamBoardSquadRun {
             teams: Arc::downgrade(&states.team.service),
+        }));
+    // M8 E7-5: Leader eval comments on the linked work-item timeline.
+    states
+        .team
+        .service
+        .with_board_timeline_port(Arc::new(ConversationBoardTimeline {
+            conversation: services.conversation_service.clone(),
         }));
     crate::squad_board_relay::spawn(
         &services.event_bus,
@@ -1305,6 +1312,28 @@ impl aionui_conversation::board::BoardSquadRunPort for TeamBoardSquadRun {
         if let Err(error) = teams.pause_squad_for_work_item(user_id, work_item_id).await {
             tracing::warn!(work_item_id, %error, "board squad pause on backlog failed");
         }
+    }
+}
+
+/// M8 E7-5: [`BoardWorkItemTimelinePort`] over ConversationService.
+struct ConversationBoardTimeline {
+    conversation: ConversationService,
+}
+
+#[async_trait::async_trait]
+impl BoardWorkItemTimelinePort for ConversationBoardTimeline {
+    async fn append_leader_eval_comment(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+        author_agent_id: &str,
+        body: &str,
+    ) -> Result<(), aionui_team::TeamError> {
+        self.conversation
+            .append_agent_board_comment(user_id, work_item_id, author_agent_id, body)
+            .await
+            .map(|_| ())
+            .map_err(|error| aionui_team::TeamError::InvalidRequest(format!("board timeline write failed: {error}")))
     }
 }
 
