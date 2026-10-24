@@ -16,6 +16,33 @@ impl TeamSessionService {
                 tracing::warn!(team_id = %team.id, %error, "squad_template_id lookup failed");
                 None
             });
+        // M8 E7-6: Squad extras (leader mode, run state, role titles). Lookup
+        // failures degrade to "no extras" rather than failing the Team read.
+        let (squad_leader_mode, squad_run) = if squad_template_id.is_some() {
+            let leader_mode = self
+                .repo
+                .team_squad_leader_mode(&team.id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(team_id = %team.id, %error, "squad leader_mode lookup failed");
+                    None
+                });
+            let run = self
+                .squad_run_for_team(user_id, team, leader_mode.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(team_id = %team.id, %error, "squad_run derivation failed");
+                    None
+                });
+            let members = self.repo.team_squad_members(&team.id).await.unwrap_or_else(|error| {
+                tracing::warn!(team_id = %team.id, %error, "squad members lookup failed");
+                None
+            });
+            apply_squad_role_titles(&mut agents, members.as_deref());
+            (leader_mode, run)
+        } else {
+            (None, None)
+        };
         Ok(TeamResponse {
             id: team.id.clone(),
             name: team.name.clone(),
@@ -23,6 +50,8 @@ impl TeamSessionService {
             assistants: agents,
             leader_assistant_id: team.lead_agent_id.clone(),
             squad_template_id,
+            squad_leader_mode,
+            squad_run,
             created_at: team.created_at,
             updated_at: team.updated_at,
         })
@@ -152,6 +181,29 @@ impl TeamSessionService {
     }
 }
 
+/// M8 E7-6: label Squad agents with their template role. The lead is always
+/// `"Leader"` (same as the preview); teammates match by `assistant_id`, which
+/// is unique within a template (`squad_member_duplicate`). Members are read
+/// live from the template (D7-2 reference semantics), so a later template
+/// edit relabels existing instances; unmatched agents keep `None`.
+pub(crate) fn apply_squad_role_titles(agents: &mut [aionui_api_types::TeamAgentResponse], members_json: Option<&str>) {
+    let members: Vec<aionui_api_types::SquadMember> = members_json
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    for agent in agents.iter_mut() {
+        agent.squad_role_title = if agent.role == TeammateRole::Lead.to_string() {
+            Some("Leader".to_owned())
+        } else {
+            agent.assistant_id.as_deref().and_then(|id| {
+                members
+                    .iter()
+                    .find(|m| m.assistant_id == id)
+                    .map(|m| m.role_title.clone())
+            })
+        };
+    }
+}
+
 fn assistant_icon(assistant_id: &str, avatar_type: &str, avatar_value: Option<&str>) -> Option<String> {
     aionui_api_types::assistant_avatar_response_value(avatar_type, avatar_value, assistant_id)
 }
@@ -178,6 +230,44 @@ mod tests {
             assistant_icon("assistant-1", "user_asset", Some("https://example.invalid/avatar.png")).as_deref(),
             Some("/api/assistants/assistant-1/avatar")
         );
+    }
+
+    fn agent(role: &str, assistant_id: Option<&str>) -> aionui_api_types::TeamAgentResponse {
+        let mut a = TeamAgent {
+            slot_id: format!("slot-{role}"),
+            conversation_id: "c".into(),
+            role: if role == "lead" {
+                TeammateRole::Lead
+            } else {
+                TeammateRole::Teammate
+            },
+            backend: "claude".into(),
+            name: role.into(),
+            model: String::new(),
+            assistant_id: assistant_id.map(str::to_owned),
+            status: None,
+            conversation_type: None,
+            cli_path: None,
+        }
+        .to_response();
+        a.squad_role_title = Some("stale".into());
+        a
+    }
+
+    #[test]
+    fn squad_role_titles_label_lead_and_match_members_by_assistant() {
+        let mut agents = vec![
+            agent("lead", Some("L")),
+            agent("teammate", Some("a")),
+            agent("teammate", Some("zz")),
+        ];
+        let members = r#"[{"assistant_id":"a","role_title":"Frontend","role_description":"","max_parallel":1}]"#;
+        apply_squad_role_titles(&mut agents, Some(members));
+        assert_eq!(agents[0].squad_role_title.as_deref(), Some("Leader"));
+        assert_eq!(agents[1].squad_role_title.as_deref(), Some("Frontend"));
+        assert_eq!(agents[2].squad_role_title, None);
+        apply_squad_role_titles(&mut agents, Some("not json"));
+        assert_eq!(agents[1].squad_role_title, None);
     }
 
     #[test]

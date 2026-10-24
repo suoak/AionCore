@@ -1092,6 +1092,32 @@ mod tests {
         assert_eq!(api.error_code(), "squad_spawn_forbidden");
     }
 
+    /// M8 E7-6: `GET /api/teams/{id}` carries Squad extras only for Squads.
+    #[tokio::test]
+    async fn team_response_exposes_squad_extras_only_for_squads() {
+        let (svc, team_repo, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user1", single_agent_team_request("Squad Extras"))
+            .await
+            .unwrap();
+        let plain = svc.get_team("user1", &created.id).await.unwrap();
+        assert_eq!(plain.squad_leader_mode, None);
+        assert_eq!(plain.squad_run, None);
+        assert!(plain.assistants.iter().all(|a| a.squad_role_title.is_none()));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("squad_leader_mode").is_none() && json.get("squad_run").is_none());
+
+        team_repo.bind_squad(&created.id, "sq1");
+        team_repo.set_squad_members(&created.id, "[]");
+        let squad = svc.get_team("user1", &created.id).await.unwrap();
+        assert_eq!(squad.squad_template_id.as_deref(), Some("sq1"));
+        assert_eq!(squad.squad_leader_mode.as_deref(), Some("route_only"));
+        // No tasks and no run yet: nothing to show.
+        assert_eq!(squad.squad_run, None);
+        let lead = squad.assistants.iter().find(|a| a.role == "lead").expect("lead agent");
+        assert_eq!(lead.squad_role_title.as_deref(), Some("Leader"));
+    }
+
     #[tokio::test]
     async fn add_agent_rejects_assistant_missing_from_team_selectable_catalog() {
         let svc = service_with_selectable_catalog(vec![], vec![assistant_definition("word-creator", "aionrs")]);

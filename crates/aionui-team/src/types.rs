@@ -145,6 +145,7 @@ impl TeamAgent {
                     availability: TeamContextResetAvailability::Unsupported,
                 }
             },
+            squad_role_title: None,
         }
     }
 }
@@ -305,6 +306,8 @@ impl Team {
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
             squad_template_id: None,
+            squad_leader_mode: None,
+            squad_run: None,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }

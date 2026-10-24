@@ -48,6 +48,19 @@ impl TeamSessionService {
             return Err(TeamError::TeamNotSquad(team_id.to_owned()));
         }
         let leader_mode = self.repo.team_squad_leader_mode(team_id).await?;
+        self.squad_run_for_team(user_id, &team, leader_mode).await
+    }
+
+    /// Shared by `GET /squad-run` and the embedded `TeamResponse.squad_run`.
+    /// Caller has already checked that `team` is a Squad instance owned by
+    /// `user_id`.
+    pub(crate) async fn squad_run_for_team(
+        &self,
+        user_id: &str,
+        team: &Team,
+        leader_mode: Option<String>,
+    ) -> Result<Option<SquadRunPayload>, TeamError> {
+        let team_id = team.id.as_str();
         let rows = self.repo.list_tasks(user_id, team_id).await?;
         let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         let latest_run = self.sessions.get(team_id).and_then(|entry| {

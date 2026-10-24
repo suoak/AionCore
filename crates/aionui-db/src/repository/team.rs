@@ -77,6 +77,13 @@ pub trait ITeamRepository: Send + Sync {
         Ok(None)
     }
 
+    /// M8 E7-6: raw `members` JSON of the Squad template a Team was
+    /// instantiated from (`None` for plain Teams). Used to label each Team
+    /// agent with its Squad role title.
+    async fn team_squad_members(&self, _team_id: &str) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
     /// Returns a single team for startup/session restore.
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError>;
 

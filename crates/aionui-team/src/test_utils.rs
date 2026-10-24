@@ -615,6 +615,7 @@ pub(crate) mod workspace_harness {
         messages: Mutex<Vec<aionui_db::models::MailboxMessageRow>>,
         /// M8 E7: team_id -> squad_template_id.
         squad_bindings: Mutex<std::collections::HashMap<String, String>>,
+        squad_members: Mutex<std::collections::HashMap<String, String>>,
     }
 
     impl FullMockTeamRepo {
@@ -623,6 +624,7 @@ pub(crate) mod workspace_harness {
                 teams: Mutex::new(Vec::new()),
                 messages: Mutex::new(Vec::new()),
                 squad_bindings: Mutex::new(std::collections::HashMap::new()),
+                squad_members: Mutex::new(std::collections::HashMap::new()),
             }
         }
 
@@ -631,6 +633,14 @@ pub(crate) mod workspace_harness {
                 .lock()
                 .unwrap()
                 .insert(team_id.to_owned(), template_id.to_owned());
+        }
+
+        /// M8 E7-6: template `members` JSON returned for a bound team.
+        pub(crate) fn set_squad_members(&self, team_id: &str, members_json: &str) {
+            self.squad_members
+                .lock()
+                .unwrap()
+                .insert(team_id.to_owned(), members_json.to_owned());
         }
     }
 
@@ -653,6 +663,10 @@ pub(crate) mod workspace_harness {
                 .unwrap()
                 .get(team_id)
                 .map(|_| "route_only".to_owned()))
+        }
+
+        async fn team_squad_members(&self, team_id: &str) -> Result<Option<String>, DbError> {
+            Ok(self.squad_members.lock().unwrap().get(team_id).cloned())
         }
 
         async fn list_teams_for_restore(&self) -> Result<Vec<TeamRow>, DbError> {
