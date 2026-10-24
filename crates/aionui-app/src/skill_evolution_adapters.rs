@@ -211,6 +211,24 @@ impl SkillEvolutionApplyPort for SkillHubApplyAdapter {
             skill_key: key,
         })
     }
+
+    async fn target_has_scripts(&self, user_id: &str, skill_key: &str) -> bool {
+        let key = sanitize_skill_key(skill_key);
+        let row = match self.skill_repo.find_by_name_any_for_user(user_id, &key).await {
+            Ok(Some(row)) => row,
+            // A brand-new skill: the evolution draft is a lone SKILL.md.
+            Ok(None) => return false,
+            Err(_) => return true,
+        };
+        let path = PathBuf::from(row.path);
+        tokio::task::spawn_blocking(move || {
+            aionui_extension::skill_versions::snapshot_skill_dir(&path)
+                .map(|snap| snap.has_scripts)
+                .unwrap_or(true)
+        })
+        .await
+        .unwrap_or(true)
+    }
 }
 
 pub struct AgentCenterPinAdapter {

@@ -2020,6 +2020,10 @@ async fn collect_skill_dirs_recursive(dir: &Path, result: &mut Vec<PathBuf>) -> 
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let entry_path = entry.path();
+        // Version snapshots (E10) are never live skills.
+        if entry.file_name() == crate::skill_versions::SKILL_VERSIONS_DIR {
+            continue;
+        }
         if entry_path.is_dir() {
             Box::pin(collect_skill_dirs_recursive(&entry_path, result)).await?;
         }

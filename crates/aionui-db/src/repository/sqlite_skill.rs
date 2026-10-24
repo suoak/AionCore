@@ -29,7 +29,7 @@ impl ISkillRepository for SqliteSkillRepository {
     async fn list_for_user(&self, user_id: &str) -> Result<Vec<SkillRow>, DbError> {
         let rows = sqlx::query_as::<_, SkillRow>(
             "SELECT * FROM skills \
-             WHERE (user_id IS NULL OR user_id = ?) AND deleted_at IS NULL AND enabled = 1 \
+             WHERE (user_id IS NULL OR user_id = ?) AND deleted_at IS NULL AND enabled = 1 AND review_status IN ('none', 'approved') \
              ORDER BY updated_at DESC, name ASC",
         )
         .bind(user_id)
@@ -45,7 +45,7 @@ impl ISkillRepository for SqliteSkillRepository {
     async fn find_by_name_for_user(&self, user_id: &str, name: &str) -> Result<Option<SkillRow>, DbError> {
         let row = sqlx::query_as::<_, SkillRow>(
             "SELECT * FROM skills \
-             WHERE (user_id IS NULL OR user_id = ?) AND name = ? AND deleted_at IS NULL AND enabled = 1 \
+             WHERE (user_id IS NULL OR user_id = ?) AND name = ? AND deleted_at IS NULL AND enabled = 1 AND review_status IN ('none', 'approved') \
              ORDER BY user_id IS NULL ASC \
              LIMIT 1",
         )

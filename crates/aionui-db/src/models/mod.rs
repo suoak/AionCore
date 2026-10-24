@@ -15,6 +15,7 @@ mod provider;
 mod remote_agent;
 mod skill;
 mod skill_evolution;
+mod skill_source;
 mod system_settings;
 mod task_board;
 mod task_session;
@@ -54,6 +55,11 @@ pub use skill::{SkillImportRecordRow, SkillRegistryInstallRow, SkillRow};
 pub use skill_evolution::{
     CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, SkillEvolutionProposalRow,
     SkillEvolutionSettingsRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
+};
+pub use skill_source::{
+    SKILL_ORIGIN_APPS, SKILL_REVIEW_STATUSES, SKILL_SOURCE_KINDS, SKILL_TRUST_LEVELS, SKILL_VERSION_CREATORS,
+    SKILL_VISIBILITIES, SkillGovernanceRow, SkillSourceRow, SkillVersionRow, evolution_auto_apply_allowed,
+    review_status_is_live,
 };
 pub use system_settings::SystemSettings;
 pub use task_board::{

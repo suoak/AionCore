@@ -23,6 +23,7 @@ pub mod routes;
 pub mod skill_registry;
 pub mod skill_routes;
 pub mod skill_service;
+pub mod skill_versions;
 pub mod skill_view;
 pub mod startup_materialize;
 pub mod state;

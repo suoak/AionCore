@@ -17,6 +17,7 @@ mod settings;
 pub mod sidebar;
 pub mod skill;
 pub mod skill_evolution;
+pub mod skill_source;
 mod sqlite_acp_session;
 mod sqlite_agent_center;
 mod sqlite_agent_metadata;
@@ -36,6 +37,7 @@ mod sqlite_settings;
 mod sqlite_sidebar;
 mod sqlite_skill;
 mod sqlite_skill_evolution;
+mod sqlite_skill_source;
 mod sqlite_task_board;
 mod sqlite_task_session;
 mod sqlite_team;
@@ -102,6 +104,7 @@ pub use sqlite_skill::SqliteSkillRepository;
 pub use sqlite_skill_evolution::{
     SqliteExperienceArticleRepository, SqliteSkillEvolutionProposalRepository, SqliteSkillEvolutionSettingsRepository,
 };
+pub use sqlite_skill_source::SqliteSkillSourceRepository;
 pub use sqlite_task_board::SqliteTaskBoardRepository;
 pub use sqlite_task_session::SqliteTaskSessionRepository;
 pub use sqlite_team::SqliteTeamRepository;

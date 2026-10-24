@@ -1186,10 +1186,16 @@ impl SkillEvolutionService {
         };
 
         // auto_apply_on_pass: approve + apply when score passes high threshold
-        let proposal = if gate_mode == GateMode::AutoApplyOnPass
+        let gate_passed = gate_mode == GateMode::AutoApplyOnPass
             && gate.score >= settings.auto_threshold
-            && gate.recommendation == GateRecommendation::Approve
-        {
+            && gate.recommendation == GateRecommendation::Approve;
+        // D10-7 hard rule: a skill that ships scripts is never auto-applied;
+        // it always waits for a human review, whatever the score.
+        let script_blocked = gate_passed && self.target_has_scripts(user_id, &skill_key).await;
+        if script_blocked {
+            gate_note = Some("目标技能包含脚本：按规则必须人工审核，已跳过自动应用。".into());
+        }
+        let proposal = if gate_passed && !script_blocked {
             let pid = proposal.id.clone();
             let _ = self
                 .approve(
@@ -1277,6 +1283,14 @@ impl SkillEvolutionService {
             None
         } else {
             Some(chunks.join("\n"))
+        }
+    }
+
+    /// Unknown (no apply port) counts as "has scripts", so auto-apply stays off.
+    async fn target_has_scripts(&self, user_id: &str, skill_key: &str) -> bool {
+        match self.apply_port.as_ref() {
+            Some(port) => port.target_has_scripts(user_id, skill_key).await,
+            None => true,
         }
     }
 
