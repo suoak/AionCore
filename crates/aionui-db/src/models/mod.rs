@@ -1,6 +1,7 @@
 mod acp_session;
 mod agent_metadata;
 mod assistant;
+mod batch;
 mod channel;
 mod client_preference;
 mod conversation;
@@ -45,6 +46,7 @@ pub use conversation::{
 };
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
+pub use batch::{BatchItemRow, BatchJobRow};
 pub use inbox_item::InboxItemRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;

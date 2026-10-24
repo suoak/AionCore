@@ -1,6 +1,7 @@
 pub mod acp_session;
 pub mod agent_metadata;
 pub mod assistant;
+pub mod batch;
 pub mod channel;
 mod client_preference;
 pub mod conversation;
@@ -22,6 +23,7 @@ mod sqlite_acp_session;
 mod sqlite_agent_center;
 mod sqlite_agent_metadata;
 mod sqlite_assistant;
+mod sqlite_batch;
 mod sqlite_channel;
 mod sqlite_client_preference;
 mod sqlite_conversation;
@@ -55,6 +57,7 @@ pub mod user_order;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
+pub use batch::IBatchRepository;
 pub use assistant::{
     IAgentWorkflowRunRepository, IAssistantAgentCenterRepository, IAssistantDefinitionRepository,
     IAssistantDefinitionRevisionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
@@ -85,6 +88,7 @@ pub use sqlite_agent_center::{
     SqliteAgentWorkflowRunRepository, SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRevisionRepository,
 };
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
+pub use sqlite_batch::SqliteBatchRepository;
 pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository,

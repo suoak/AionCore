@@ -30,7 +30,7 @@ pub use models::{
     ContextSnapshotArtifactRow, ContextSnapshotRow, ConversationArtifactRow, ConversationAssistantSnapshotRow,
     ConversationCapabilitySnapshotRow, ConversationInputRow, CreateAgentWorkflowRunParams,
     CreateAssistantDefinitionRevisionParams, CreateAssistantParams, CreateExperienceArticleParams,
-    CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection, FolderRow, InboxItemRow,
+    CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection, BatchItemRow, BatchJobRow, FolderRow, InboxItemRow,
     JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
     SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillGovernanceRow, SkillImportRecordRow,
     SkillRegistryInstallRow, SkillRow, SkillSourceRow, SkillVersionRow, TaskAcceptanceCriterionRow, TaskApprovalRow,
@@ -72,13 +72,14 @@ pub use repository::task_session::{
     CreateTaskSessionParams, FinishTaskRunParams, LinkContextSnapshotArtifactParams, ResolveTaskApprovalParams,
     UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
 };
+pub use repository::batch::{BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
     ActivityCursor, ArchiveScope, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
     IAgentMetadataRepository, IAgentWorkflowRunRepository, IAssistantAgentCenterRepository,
-    IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
+    IAssistantDefinitionRepository, IAssistantDefinitionRevisionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IBatchRepository, IChannelRepository,
     IClientPreferenceRepository, IConversationRepository, ICronRepository, IExperienceArticleRepository,
     IFeedbackDiagnosticsRepository, IInboxRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore,
     IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillEvolutionProposalRepository,
@@ -87,8 +88,8 @@ pub use repository::{
     OrderItemRef, PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams,
     SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAgentWorkflowRunRepository, SqliteAssistantAgentCenterRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteBatchRepository,
     SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteExperienceArticleRepository, SqliteFeedbackDiagnosticsRepository, SqliteInboxRepository,
     SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
