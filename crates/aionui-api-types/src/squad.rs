@@ -301,9 +301,46 @@ pub struct SquadInstantiateResponse {
     pub team: crate::TeamResponse,
 }
 
+/// M8 E7-5: Squad run state shown on board cards / team page
+/// (`GET /api/teams/{id}/squad-run`). Derived from existing team task +
+/// team-run data; Core stores nothing extra.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SquadRunState {
+    /// Tasks exist but none has started and no run is active.
+    WaitingBacklog,
+    /// A team run is accepted/running/cancelling.
+    Running,
+    /// No active run, open (pending/in-progress) tasks remain.
+    Paused,
+    /// No active run and every live task is completed.
+    Finished,
+    /// The most recent team run failed and no run is active.
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SquadRunPayload {
+    pub team_id: String,
+    pub state: SquadRunState,
+    pub leader_conversation_id: Option<String>,
+    /// `route_only` | other template leader modes; `None` if unset.
+    pub leader_mode: Option<String>,
+    /// Epoch ms: newest task update, falling back to team `updated_at`.
+    pub updated_at: i64,
+}
+
 #[cfg(test)]
 mod e7_4_tests {
     use super::*;
+
+    #[test]
+    fn squad_run_state_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SquadRunState::WaitingBacklog).unwrap(),
+            "\"waiting_backlog\""
+        );
+    }
 
     #[test]
     fn enforcement_matrix_is_backend_and_profile_aware() {

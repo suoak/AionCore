@@ -60,6 +60,12 @@ impl From<TeamError> for ApiError {
                 format!("squad_spawn_forbidden: Squad teams have a fixed roster; {action} is not allowed"),
                 Some(serde_json::json!({ "team_id": team_id, "action": action })),
             ),
+            TeamError::TeamNotSquad(team_id) => ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "team_not_squad",
+                format!("team_not_squad: team {team_id} is not a Squad instance"),
+                Some(serde_json::json!({ "team_id": team_id })),
+            ),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
@@ -187,6 +193,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
         .route("/api/teams/{id}/run-state", get(get_run_state))
+        .route("/api/teams/{id}/squad-run", get(get_squad_run))
         .route("/api/teams/{id}/mailbox", get(list_mailbox))
         .route("/api/teams/{id}/tasks", get(list_tasks))
         .route("/api/teams/{id}/activity", get(list_activity))
@@ -334,6 +341,17 @@ async fn get_run_state(
 ) -> Result<Json<ApiResponse<TeamRunStateResponse>>, ApiError> {
     let run_state = state.service.get_run_state(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(run_state)))
+}
+
+/// M8 E7-5: Squad run status (`data: null` when the Squad has no tasks and no
+/// run yet; 404 `team_not_squad` for regular teams).
+async fn get_squad_run(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Option<aionui_api_types::SquadRunPayload>>>, ApiError> {
+    let run = state.service.get_squad_run(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(run)))
 }
 
 async fn remove_team(
@@ -837,6 +855,13 @@ mod tests {
         .into();
         assert_eq!(err.error_code(), "squad_spawn_forbidden");
         assert!(matches!(err, ApiError::Coded { status, .. } if status == StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn team_not_squad_maps_to_coded_404() {
+        let err: ApiError = TeamError::TeamNotSquad("t1".into()).into();
+        assert_eq!(err.error_code(), "team_not_squad");
+        assert!(matches!(err, ApiError::Coded { status, .. } if status == StatusCode::NOT_FOUND));
     }
 
     #[test]

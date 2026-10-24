@@ -269,8 +269,8 @@ pub use squad::{
     DeleteSquadResponse, ListSquadsQuery, NativeToolEnforcement, SQUAD_LEADER_BACKEND_UNENFORCEABLE,
     SQUAD_MAX_PARTICIPANTS, SQUAD_ROUTE_ONLY_LEADER_TOOLS, SQUAD_SUBAGENT_SPAWN_FORBIDDEN, SquadInstantiateInput,
     SquadInstantiateResponse, SquadLeaderMode, SquadMember, SquadPreview, SquadPreviewBlocker, SquadPreviewParticipant,
-    SquadTemplate, SquadTemplateInput, SquadTemplatePatch, SquadToolProfile, SquadVisibility,
-    aionrs_route_only_leader_allowed_tools, claude_disallowed_tools, squad_native_tool_enforcement,
+    SquadRunPayload, SquadRunState, SquadTemplate, SquadTemplateInput, SquadTemplatePatch, SquadToolProfile,
+    SquadVisibility, aionrs_route_only_leader_allowed_tools, claude_disallowed_tools, squad_native_tool_enforcement,
 };
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
