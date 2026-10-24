@@ -152,6 +152,10 @@ impl ISkillSourceRepository for SqliteSkillSourceRepository {
         } else {
             current_status
         };
+        if let Some(hook) = p.before_commit {
+            // Dropping `tx` without commit rolls back the insert and status change.
+            hook(version.version_no).map_err(|e| DbError::Init(format!("skill version files: {e}")))?;
+        }
         tx.commit().await?;
         Ok(AppendSkillVersionOutcome {
             version,
@@ -285,6 +289,7 @@ mod tests {
             source_ref: None,
             created_by: "import",
             now: 10,
+            before_commit: None,
         }
     }
 
@@ -478,5 +483,28 @@ mod tests {
             .unwrap();
         assert_eq!(repo.governance(&skill_id).await.unwrap().unwrap().team_id, None);
         assert!(repo.set_visibility("nope", "private", None, 4).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn before_commit_failure_rolls_back_row_and_status() {
+        let (_db, _skills, repo, skill_id) = setup().await;
+        let fail = |_: i64| -> Result<(), String> { Err("disk full".into()) };
+        let mut p = version("v1", &skill_id, "h1", true);
+        p.before_commit = Some(&fail);
+        assert!(repo.append_version(p).await.is_err());
+        assert!(repo.list_versions(&skill_id).await.unwrap().is_empty());
+        let gov = repo.governance(&skill_id).await.unwrap().unwrap();
+        assert_ne!(gov.review_status, "pending");
+
+        let seen = std::sync::Mutex::new(None);
+        let ok = |n: i64| -> Result<(), String> {
+            *seen.lock().unwrap() = Some(n);
+            Ok(())
+        };
+        let mut p = version("v1b", &skill_id, "h1", true);
+        p.before_commit = Some(&ok);
+        let out = repo.append_version(p).await.unwrap();
+        assert_eq!(out.version.version_no, 1);
+        assert_eq!(*seen.lock().unwrap(), Some(1));
     }
 }

@@ -208,6 +208,7 @@ fn fetch_err(e: FetchError) -> ApiError {
         FetchError::TooLarge { .. } => ApiError::PayloadTooLarge(e.to_string()),
         FetchError::Timeout => ApiError::Timeout(e.to_string()),
         FetchError::Failed(_) => ApiError::BadGateway(e.to_string()),
+        FetchError::GitUnsupported(_) => ApiError::BadRequest(e.to_string()),
     }
 }
 
@@ -355,32 +356,89 @@ pub async fn record_skill_version(
         .map_err(|e| ApiError::BadRequest(format!("skill_snapshot_failed: {e}")))?;
     let manifest = snapshot.manifest_json();
     let version_id = generate_prefixed_id("skver");
-    let outcome = source_repo
+    let has_scripts = snapshot.has_scripts;
+
+    // 1) Files first: stage a full copy before any DB row exists.
+    let root = paths.user_skills_dir.clone();
+    let staging = {
+        let (root, sid, tag, src) = (
+            root.clone(),
+            skill_id.to_string(),
+            version_id.clone(),
+            skill_dir.to_path_buf(),
+        );
+        tokio::task::spawn_blocking(move || skill_versions::stage_version_files(&root, &sid, &tag, &src))
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))
+            .and_then(|r| r.map_err(io_err))
+    };
+    let staging = match staging {
+        Ok(p) => p,
+        Err(e) => {
+            hold_for_review_on_failure(source_repo, skill_id, has_scripts).await;
+            return Err(e);
+        }
+    };
+    let discard_staging = |p: PathBuf| async move {
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(p)).await;
+    };
+
+    // 2) Insert the row; inside the same transaction (version_no now known) the
+    //    staged copy is renamed into place. A rename failure aborts the insert,
+    //    so a version row never exists without its files.
+    let placed: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    let hook = |version_no: i64| -> Result<(), String> {
+        let target =
+            skill_versions::commit_staged_version(&root, skill_id, version_no, &staging).map_err(|e| e.to_string())?;
+        *placed.lock().unwrap_or_else(|p| p.into_inner()) = Some(target);
+        Ok(())
+    };
+    let result = source_repo
         .append_version(AppendSkillVersionParams {
             id: &version_id,
             skill_id,
             content_hash: &snapshot.content_hash,
             manifest: &manifest,
-            has_scripts: snapshot.has_scripts,
+            has_scripts,
             source_ref,
             created_by,
             now: now_ms(),
+            before_commit: Some(&hook),
         })
-        .await
-        .map_err(db_err)?;
-    if outcome.created {
-        let root = paths.user_skills_dir.clone();
-        let (sid, no, src) = (
-            skill_id.to_string(),
-            outcome.version.version_no,
-            skill_dir.to_path_buf(),
-        );
-        tokio::task::spawn_blocking(move || skill_versions::store_version(&root, &sid, no, &src))
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .map_err(io_err)?;
+        .await;
+    let placed = placed.into_inner().unwrap_or_else(|p| p.into_inner());
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            // Files moved in but the commit failed: move them back out so the
+            // number stays free, then drop the staging copy.
+            if let Some(target) = placed {
+                let st = staging.clone();
+                let _ = tokio::task::spawn_blocking(move || std::fs::rename(&target, &st)).await;
+            }
+            discard_staging(staging).await;
+            hold_for_review_on_failure(source_repo, skill_id, has_scripts).await;
+            return Err(match e {
+                aionui_db::DbError::Init(msg) if msg.starts_with("skill version files:") => {
+                    ApiError::Internal(format!("skill_version_store_failed: {msg}"))
+                }
+                other => db_err(other),
+            });
+        }
+    };
+    if !outcome.created {
+        discard_staging(staging).await;
     }
     Ok((outcome.version, outcome.created))
+}
+
+/// When recording a version fails, the live skill dir may already hold the new
+/// content. If that content ships scripts, force `pending` so it can never be
+/// used unreviewed (D10-7), even though no version row was kept.
+async fn hold_for_review_on_failure(source_repo: &dyn ISkillSourceRepository, skill_id: &str, has_scripts: bool) {
+    if has_scripts && let Err(e) = source_repo.set_review_status(skill_id, "pending", now_ms()).await {
+        tracing::error!(skill_id, error = %e, "forcing pending after version failure failed");
+    }
 }
 
 async fn import_one(
@@ -1016,5 +1074,57 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn version_store_failure_leaves_no_row_and_keeps_scripts_pending() {
+        let f = fixture().await;
+        let dir = f.src_root.join("rollback");
+        write_skill(&dir, "rollback", false);
+        let me = CurrentUser::local_default();
+        let (st, body) = call(
+            &f.state,
+            me.clone(),
+            "POST",
+            "/api/skills/sources/import",
+            serde_json::json!({"kind": "local", "locator": dir.to_string_lossy()}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let skill_id = body["data"]["imported"][0]["skill"]["skill_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Make v2's target unusable: an existing non-empty dir blocks the rename.
+        let v2 = skill_versions::version_dir(&f.state.skill_paths.user_skills_dir, &skill_id, 2).unwrap();
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("squatter"), "x").unwrap();
+
+        // Upstream adds a script, refresh must fail without leaving a v2 row.
+        write_skill(&dir, "rollback", true);
+        let (st, body) = call(
+            &f.state,
+            me.clone(),
+            "POST",
+            &format!("/api/skills/id/{skill_id}/refresh"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let versions = f.state.source_repo.list_versions(&skill_id).await.unwrap();
+        assert_eq!(versions.len(), 1, "failed version row must be rolled back");
+        assert_eq!(versions[0].version_no, 1);
+        // The live dir now holds scripts, so it must not be usable unreviewed.
+        let gov = f.state.source_repo.governance(&skill_id).await.unwrap().unwrap();
+        assert_eq!(gov.review_status, "pending");
+        // No staging leftovers.
+        let parent = v2.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-"))
+            .collect();
+        assert!(leftovers.is_empty());
     }
 }

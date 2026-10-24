@@ -35,6 +35,69 @@ pub enum FetchError {
     Failed(String),
     #[error("source_fetch_timeout")]
     Timeout,
+    /// The local git cannot pin resolved addresses (`http.curloptResolve`
+    /// needs git >= 2.37), so git import is refused rather than run unpinned.
+    #[error("source_git_unsupported: {0}")]
+    GitUnsupported(String),
+}
+
+/// Minimum git that understands `http.curloptResolve` (added in 2.37.0).
+pub const MIN_GIT_FOR_PINNING: (u32, u32) = (2, 37);
+
+/// Parse `git version X.Y[.Z...]` output into (major, minor).
+pub fn parse_git_version(out: &str) -> Option<(u32, u32)> {
+    let v = out.trim().strip_prefix("git version ")?;
+    let mut it = v.split(|c: char| !c.is_ascii_digit());
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+async fn ensure_git_supports_pinning() -> Result<(), FetchError> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("--version")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+        .await
+        .map_err(|_| FetchError::GitUnsupported("`git --version` timed out".into()))?
+        .map_err(|e| FetchError::GitUnsupported(format!("git CLI not available: {e}")))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    match parse_git_version(&text) {
+        Some(v) if v >= MIN_GIT_FOR_PINNING => Ok(()),
+        Some((a, b)) => Err(FetchError::GitUnsupported(format!(
+            "git {a}.{b} cannot pin DNS (http.curloptResolve needs >= {}.{}); upgrade git to import from git",
+            MIN_GIT_FOR_PINNING.0, MIN_GIT_FOR_PINNING.1
+        ))),
+        None => Err(FetchError::GitUnsupported(format!(
+            "unrecognised `git --version` output: {}",
+            text.trim()
+        ))),
+    }
+}
+
+/// `http.curloptResolve` value pinning `host:port` to the vetted addresses
+/// (curl CURLOPT_RESOLVE syntax; IPv6 in brackets). `None` for IP-literal hosts,
+/// which need no resolution.
+pub fn curlopt_resolve_entry(url: &Url, addrs: &[SocketAddr]) -> Option<String> {
+    let host = match url.host()? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => return None,
+    };
+    let port = url.port_or_known_default().unwrap_or(443);
+    let mut ips: Vec<String> = Vec::new();
+    for a in addrs {
+        let ip = match a.ip() {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    Some(format!("{host}:{port}:{}", ips.join(",")))
 }
 
 /// Validate a remote locator: https, has a host, no credentials, not a blocked name.
@@ -134,6 +197,7 @@ pub async fn download_https(url: &Url) -> Result<Vec<u8>, FetchError> {
     let host = url.host_str().unwrap_or_default().to_string();
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve_to_addrs(&host, &addrs)
         .timeout(FETCH_TIMEOUT)
         .build()
@@ -202,6 +266,13 @@ fn hardened_git(cmd: &mut tokio::process::Command) {
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
+        // A proxy would resolve the host itself and defeat address pinning.
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("ALL_PROXY")
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -219,6 +290,8 @@ fn hardened_git(cmd: &mut tokio::process::Command) {
             "submodule.recurse=false",
             "-c",
             "credential.helper=",
+            "-c",
+            "http.proxy=",
         ])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -256,9 +329,15 @@ pub async fn git_clone(url: &Url, git_ref: Option<&str>, dest: &Path) -> Result<
     if let Some(r) = git_ref {
         validate_git_ref(r)?;
     }
-    resolve_public(url).await?;
+    ensure_git_supports_pinning().await?;
+    // Resolve + vet ourselves, then pin git/curl to exactly those addresses so a
+    // second (attacker-controlled) DNS answer cannot redirect it (DNS rebinding).
+    let addrs = resolve_public(url).await?;
     let mut cmd = tokio::process::Command::new("git");
     hardened_git(&mut cmd);
+    if let Some(entry) = curlopt_resolve_entry(url, &addrs) {
+        cmd.arg("-c").arg(format!("http.curloptResolve={entry}"));
+    }
     cmd.args([
         "clone",
         "--depth",
@@ -349,6 +428,28 @@ mod tests {
         }
         assert!(!is_blocked_ip("140.82.112.3".parse().unwrap()));
         assert!(!is_blocked_ip("2606:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn git_version_gate_and_resolve_entry() {
+        assert_eq!(parse_git_version("git version 2.47.3\n"), Some((2, 47)));
+        assert_eq!(parse_git_version("git version 2.39.5 (Apple Git-154)"), Some((2, 39)));
+        assert_eq!(parse_git_version("git version 2.45.1.windows.1"), Some((2, 45)));
+        assert!(parse_git_version("git version 2.36.0").unwrap() < MIN_GIT_FOR_PINNING);
+        assert_eq!(parse_git_version("nope"), None);
+
+        let url = Url::parse("https://example.com/a/b.git").unwrap();
+        let addrs: Vec<SocketAddr> = vec![
+            "93.184.216.34:443".parse().unwrap(),
+            "[2606:2800:220:1::1]:443".parse().unwrap(),
+            "93.184.216.34:443".parse().unwrap(),
+        ];
+        assert_eq!(
+            curlopt_resolve_entry(&url, &addrs).as_deref(),
+            Some("example.com:443:93.184.216.34,[2606:2800:220:1::1]")
+        );
+        let lit = Url::parse("https://93.184.216.34/x.git").unwrap();
+        assert_eq!(curlopt_resolve_entry(&lit, &addrs), None);
     }
 
     #[test]
