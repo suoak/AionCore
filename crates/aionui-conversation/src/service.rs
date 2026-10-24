@@ -1569,14 +1569,14 @@ impl ConversationService {
             )
             .await?;
         info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, "task session updated");
-        if request.status == Some(TaskSessionStatus::Completed) {
-            if let Err(error) = self.maybe_submit_board_for_review_on_completion(user_id, id).await {
-                warn!(
-                    task_session_id = %id,
-                    %error,
-                    "E6-5 auto in_review after task session completed failed"
-                );
-            }
+        if request.status == Some(TaskSessionStatus::Completed)
+            && let Err(error) = self.maybe_submit_board_for_review_on_completion(user_id, id).await
+        {
+            warn!(
+                task_session_id = %id,
+                %error,
+                "E6-5 auto in_review after task session completed failed"
+            );
         }
         self.task_session_response_with_runtime(user_id, row).await
     }
@@ -2330,17 +2330,16 @@ impl ConversationService {
             // M8 E6-5: completed run with artifacts → board in_review.
             // Failures leave the card on in_progress; Inbox is written by the
             // turn orchestrator when task_trace is present (D6-4).
-            if task_status == TaskSessionStatus::Completed {
-                if let Err(error) = self
+            if task_status == TaskSessionStatus::Completed
+                && let Err(error) = self
                     .maybe_submit_board_for_review_on_completion(user_id, task_session_id)
                     .await
-                {
-                    warn!(
-                        task_session_id,
-                        %error,
-                        "E6-5 auto in_review after completed run failed"
-                    );
-                }
+            {
+                warn!(
+                    task_session_id,
+                    %error,
+                    "E6-5 auto in_review after completed run failed"
+                );
             }
             return task_run_response(finished);
         }

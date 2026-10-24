@@ -352,27 +352,13 @@ impl ConversationService {
         body: serde_json::Value,
         now: i64,
     ) -> Result<TaskCommentRow, ConversationError> {
-        self.append_authored_event(user_id, id, "user", user_id, kind, body, now)
-            .await
-    }
-
-    async fn append_authored_event(
-        &self,
-        user_id: &str,
-        id: &str,
-        author_kind: &str,
-        author_id: &str,
-        kind: &str,
-        body: serde_json::Value,
-        now: i64,
-    ) -> Result<TaskCommentRow, ConversationError> {
         let body = body.to_string();
         self.task_board_repo()?
             .append_comment(&AppendTaskCommentParams {
                 user_id,
                 task_session_id: id,
-                author_kind,
-                author_id,
+                author_kind: "user",
+                author_id: user_id,
                 kind,
                 body: &body,
                 created_at: now,
