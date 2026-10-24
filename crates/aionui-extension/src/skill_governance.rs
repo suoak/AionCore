@@ -14,9 +14,12 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path as AxumPath, State};
 use axum::routing::{get, post, put};
-use serde::{Deserialize, Serialize};
 
-use aionui_api_types::ApiResponse;
+use aionui_api_types::{
+    ApiResponse, ImportFromSourceRequest, ImportFromSourceResponse, ImportSourceKind, ReviewDecision,
+    ReviewSkillRequest, SetVisibilityRequest, SkillGovernanceInfo, SkillSourceDetailResponse, SkillSourceInfo,
+    SkillSourceSyncResult, SkillVersionInfo,
+};
 use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, generate_prefixed_id, now_ms};
 use aionui_db::{
@@ -58,44 +61,17 @@ pub struct SkillGovernanceState {
 // API types (snake_case, same as the other /api/skills endpoints)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ImportSourceKind {
-    Url,
-    Git,
-    Local,
+/// Row -> wire type conversion (the wire types live in `aionui-api-types`).
+pub(crate) trait ToApi {
+    type Out;
+    fn to_api(self) -> Self::Out;
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ImportFromSourceRequest {
-    pub kind: ImportSourceKind,
-    /// https URL (url / git) or absolute local directory (local).
-    pub locator: String,
-    #[serde(default, rename = "ref")]
-    pub git_ref: Option<String>,
-    #[serde(default)]
-    pub subpath: Option<String>,
-    /// `claude` | `codex` for local snapshots.
-    #[serde(default)]
-    pub origin_app: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SkillSourceInfo {
-    pub kind: String,
-    pub locator: String,
-    #[serde(rename = "ref")]
-    pub git_ref: Option<String>,
-    pub subpath: Option<String>,
-    pub origin_app: Option<String>,
-    pub trust: String,
-    pub last_fetched_at: Option<i64>,
-    pub last_commit: Option<String>,
-}
-
-impl From<SkillSourceRow> for SkillSourceInfo {
-    fn from(r: SkillSourceRow) -> Self {
-        Self {
+impl ToApi for SkillSourceRow {
+    type Out = SkillSourceInfo;
+    fn to_api(self) -> SkillSourceInfo {
+        let r = self;
+        SkillSourceInfo {
             kind: r.kind,
             locator: r.locator,
             git_ref: r.git_ref,
@@ -108,21 +84,11 @@ impl From<SkillSourceRow> for SkillSourceInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SkillVersionInfo {
-    pub version_no: i64,
-    pub content_hash: String,
-    pub has_scripts: bool,
-    pub source_ref: Option<String>,
-    pub created_by: String,
-    pub created_at: i64,
-    /// Raw manifest JSON: `{ "files": [{path,size,sha256,script}], "scripts": [path] }`.
-    pub manifest: serde_json::Value,
-}
-
-impl From<SkillVersionRow> for SkillVersionInfo {
-    fn from(r: SkillVersionRow) -> Self {
-        Self {
+impl ToApi for SkillVersionRow {
+    type Out = SkillVersionInfo;
+    fn to_api(self) -> SkillVersionInfo {
+        let r = self;
+        SkillVersionInfo {
             version_no: r.version_no,
             content_hash: r.content_hash,
             has_scripts: r.has_scripts,
@@ -134,18 +100,11 @@ impl From<SkillVersionRow> for SkillVersionInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SkillGovernanceInfo {
-    pub skill_id: String,
-    pub name: String,
-    pub visibility: String,
-    pub team_id: Option<String>,
-    pub review_status: String,
-}
-
-impl From<SkillGovernanceRow> for SkillGovernanceInfo {
-    fn from(r: SkillGovernanceRow) -> Self {
-        Self {
+impl ToApi for SkillGovernanceRow {
+    type Out = SkillGovernanceInfo;
+    fn to_api(self) -> SkillGovernanceInfo {
+        let r = self;
+        SkillGovernanceInfo {
             skill_id: r.id,
             name: r.name,
             visibility: r.visibility,
@@ -153,49 +112,6 @@ impl From<SkillGovernanceRow> for SkillGovernanceInfo {
             review_status: r.review_status,
         }
     }
-}
-
-/// Result of one import / refresh of one skill.
-#[derive(Debug, Clone, Serialize)]
-pub struct SkillSourceSyncResult {
-    pub skill: SkillGovernanceInfo,
-    pub source: SkillSourceInfo,
-    pub version: SkillVersionInfo,
-    /// `false` when the content hash matched the latest version (no-op).
-    pub changed: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ImportFromSourceResponse {
-    pub imported: Vec<SkillSourceSyncResult>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SkillSourceDetailResponse {
-    pub skill: SkillGovernanceInfo,
-    pub source: Option<SkillSourceInfo>,
-    /// Newest first.
-    pub versions: Vec<SkillVersionInfo>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewDecision {
-    Approve,
-    Reject,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReviewSkillRequest {
-    pub decision: ReviewDecision,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SetVisibilityRequest {
-    /// `private` | `team`
-    pub visibility: String,
-    #[serde(default)]
-    pub team_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +348,34 @@ pub async fn record_skill_version(
     Ok((outcome.version, outcome.created))
 }
 
+/// Record a version for an already-imported skill identified by name (used by
+/// the legacy `/api/skills/import`). Missing rows are ignored.
+pub async fn record_version_for_named_skill(
+    state: &SkillGovernanceState,
+    user_id: &str,
+    name: &str,
+    created_by: &str,
+) -> Result<(), ApiError> {
+    let Some(row) = state
+        .skill_repo
+        .find_by_name_any_for_user(user_id, name)
+        .await
+        .map_err(db_err)?
+    else {
+        return Ok(());
+    };
+    record_skill_version(
+        &state.skill_paths,
+        state.source_repo.as_ref(),
+        &row.id,
+        Path::new(&row.path),
+        None,
+        created_by,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// When recording a version fails, the live skill dir may already hold the new
 /// content. If that content ships scripts, force `pending` so it can never be
 /// used unreviewed (D10-7), even though no version row was kept.
@@ -509,9 +453,9 @@ async fn import_one(
         .map_err(db_err)?
         .ok_or_else(|| ApiError::NotFound("skill_not_found".into()))?;
     Ok(SkillSourceSyncResult {
-        skill: gov.into(),
-        source: source.into(),
-        version: version.into(),
+        skill: gov.to_api(),
+        source: source.to_api(),
+        version: version.to_api(),
         changed,
     })
 }
@@ -642,17 +586,17 @@ async fn get_source_detail(
         .find_source(&skill_id)
         .await
         .map_err(db_err)?
-        .map(Into::into);
+        .map(ToApi::to_api);
     let versions = state
         .source_repo
         .list_versions(&skill_id)
         .await
         .map_err(db_err)?
         .into_iter()
-        .map(Into::into)
+        .map(ToApi::to_api)
         .collect();
     Ok(Json(ApiResponse::ok(SkillSourceDetailResponse {
-        skill: gov.into(),
+        skill: gov.to_api(),
         source,
         versions,
     })))
@@ -668,7 +612,7 @@ async fn list_pending_reviews(
         .list_pending_reviews_for_user(&user.id)
         .await
         .map_err(db_err)?;
-    Ok(Json(ApiResponse::ok(rows.into_iter().map(Into::into).collect())))
+    Ok(Json(ApiResponse::ok(rows.into_iter().map(ToApi::to_api).collect())))
 }
 
 /// `POST /api/skills/id/{skill_id}/review` — only a pending skill can be decided.
@@ -714,7 +658,7 @@ async fn review_skill(
         .await
         .map_err(db_err)?
         .ok_or_else(|| ApiError::NotFound("skill_not_found".into()))?;
-    Ok(Json(ApiResponse::ok(gov.into())))
+    Ok(Json(ApiResponse::ok(gov.to_api())))
 }
 
 /// `PUT /api/skills/id/{skill_id}/visibility` — owner only; publishing to a
@@ -746,7 +690,7 @@ async fn set_visibility(
         .await
         .map_err(db_err)?;
     let gov = owned(&state, &user.id, &skill_id).await?;
-    Ok(Json(ApiResponse::ok(gov.into())))
+    Ok(Json(ApiResponse::ok(gov.to_api())))
 }
 
 #[cfg(test)]
