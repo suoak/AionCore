@@ -1,0 +1,57 @@
+//! Squad template repository (M8 E7-1).
+
+use aionui_common::TimestampMs;
+
+use crate::error::DbError;
+use crate::models::SquadTemplateRow;
+
+/// `DbError::Conflict` prefix for an optimistic-concurrency mismatch.
+pub const SQUAD_STALE_CONFLICT_PREFIX: &str = "squad_stale";
+/// `DbError::Conflict` prefix for a duplicate live template name.
+pub const SQUAD_NAME_CONFLICT_PREFIX: &str = "squad_name_conflict";
+
+#[derive(Debug, Clone)]
+pub struct CreateSquadTemplateParams<'a> {
+    pub id: &'a str,
+    pub user_id: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub leader_assistant_id: &'a str,
+    pub leader_mode: &'a str,
+    /// JSON array text.
+    pub members: &'a str,
+    pub visibility: &'a str,
+    pub now: TimestampMs,
+}
+
+/// Full replacement of the editable fields (the service merges a PATCH onto
+/// the current row first) guarded by `expected_updated_at`.
+#[derive(Debug, Clone)]
+pub struct UpdateSquadTemplateParams<'a> {
+    pub user_id: &'a str,
+    pub id: &'a str,
+    pub expected_updated_at: TimestampMs,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub leader_assistant_id: &'a str,
+    pub leader_mode: &'a str,
+    pub members: &'a str,
+    pub visibility: &'a str,
+    pub now: TimestampMs,
+}
+
+#[async_trait::async_trait]
+pub trait ISquadTemplateRepository: Send + Sync {
+    async fn create(&self, p: CreateSquadTemplateParams<'_>) -> Result<SquadTemplateRow, DbError>;
+    async fn get(&self, user_id: &str, id: &str, include_deleted: bool) -> Result<Option<SquadTemplateRow>, DbError>;
+    async fn list(&self, user_id: &str, include_deleted: bool) -> Result<Vec<SquadTemplateRow>, DbError>;
+    /// `NotFound` when missing/soft-deleted; `Conflict("squad_stale...")` when
+    /// `expected_updated_at` does not match.
+    async fn update(&self, p: UpdateSquadTemplateParams<'_>) -> Result<SquadTemplateRow, DbError>;
+    /// Soft delete. Returns the new `deleted_at`, or `None` when the template
+    /// is missing or already deleted.
+    async fn soft_delete(&self, user_id: &str, id: &str, now: TimestampMs) -> Result<Option<TimestampMs>, DbError>;
+    /// Ids of Teams instantiated from this template (teams are hard-deleted
+    /// on removal, so every remaining row is a live instance).
+    async fn instance_team_ids(&self, template_id: &str) -> Result<Vec<String>, DbError>;
+}

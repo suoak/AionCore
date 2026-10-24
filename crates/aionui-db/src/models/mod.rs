@@ -16,6 +16,7 @@ mod remote_agent;
 mod skill;
 mod skill_evolution;
 mod skill_source;
+mod squad;
 mod system_settings;
 mod task_board;
 mod task_session;
@@ -61,6 +62,7 @@ pub use skill_source::{
     SKILL_VISIBILITIES, SkillGovernanceRow, SkillSourceRow, SkillVersionRow, evolution_auto_apply_allowed,
     review_status_is_live,
 };
+pub use squad::{SQUAD_LEADER_MODES, SQUAD_VISIBILITIES, SquadTemplateRow};
 pub use system_settings::SystemSettings;
 pub use task_board::{
     BOARD_ASSIGNEE_KINDS, BOARD_MAX_PRIORITY, BOARD_STATUSES, TASK_COMMENT_AUTHOR_KINDS, TASK_COMMENT_EDIT_WINDOW_MS,

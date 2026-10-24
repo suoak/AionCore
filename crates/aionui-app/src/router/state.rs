@@ -157,6 +157,7 @@ pub struct ModuleStates {
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
+    pub squad: aionui_team::squad::SquadRouterState,
     pub session_message: SessionMessageRouterState,
     pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
@@ -410,6 +411,14 @@ pub async fn build_module_states(
                 assistant.service.clone(),
             )
         }),
+        squad: aionui_team::squad::SquadRouterState {
+            repo: Arc::new(aionui_db::SqliteSquadTemplateRepository::new(
+                services.database.pool().clone(),
+            )),
+            catalog: Arc::new(AssistantServiceTeamCatalog {
+                assistant_service: assistant.service.clone(),
+            }),
+        },
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
@@ -1242,6 +1251,46 @@ pub async fn build_channel_state(
     (state, components)
 }
 
+/// Team-selectable Assistant catalog shared by Team spawn and Squad templates.
+#[derive(Clone)]
+pub(crate) struct AssistantServiceTeamCatalog {
+    assistant_service: Arc<AssistantService>,
+}
+
+#[async_trait::async_trait]
+impl TeamAssistantCatalogPort for AssistantServiceTeamCatalog {
+    async fn list_team_selectable_assistants(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TeamAssistantCatalogEntry>, aionui_team::TeamError> {
+        let assistants = self.assistant_service.list_for_user(user_id).await.map_err(|error| {
+            aionui_team::TeamError::InvalidRequest(format!("assistant catalog unavailable: {error}"))
+        })?;
+
+        Ok(assistants
+            .into_iter()
+            .filter(|assistant| assistant.team_selectable)
+            .filter_map(|assistant| {
+                let agent = assistant.agent?;
+                let backend = agent
+                    .acp_backend
+                    .unwrap_or_else(|| agent.r#type.serde_name().to_owned());
+                Some(TeamAssistantCatalogEntry {
+                    assistant_id: assistant.id,
+                    name: assistant.name,
+                    backend,
+                    description: assistant.description.unwrap_or_default(),
+                    skills: assistant
+                        .enabled_skills
+                        .into_iter()
+                        .chain(assistant.custom_skill_names)
+                        .collect(),
+                })
+            })
+            .collect())
+    }
+}
+
 /// Build the default `TeamRouterState` from application services.
 ///
 /// `backend_binary_path` is resolved once while constructing `AppServices` and
@@ -1253,45 +1302,6 @@ pub fn build_team_state(
     backend_binary_path: Arc<std::path::PathBuf>,
     assistant_service: Arc<AssistantService>,
 ) -> TeamRouterState {
-    #[derive(Clone)]
-    struct AssistantServiceTeamCatalog {
-        assistant_service: Arc<AssistantService>,
-    }
-
-    #[async_trait::async_trait]
-    impl TeamAssistantCatalogPort for AssistantServiceTeamCatalog {
-        async fn list_team_selectable_assistants(
-            &self,
-            user_id: &str,
-        ) -> Result<Vec<TeamAssistantCatalogEntry>, aionui_team::TeamError> {
-            let assistants = self.assistant_service.list_for_user(user_id).await.map_err(|error| {
-                aionui_team::TeamError::InvalidRequest(format!("assistant catalog unavailable: {error}"))
-            })?;
-
-            Ok(assistants
-                .into_iter()
-                .filter(|assistant| assistant.team_selectable)
-                .filter_map(|assistant| {
-                    let agent = assistant.agent?;
-                    let backend = agent
-                        .acp_backend
-                        .unwrap_or_else(|| agent.r#type.serde_name().to_owned());
-                    Some(TeamAssistantCatalogEntry {
-                        assistant_id: assistant.id,
-                        name: assistant.name,
-                        backend,
-                        description: assistant.description.unwrap_or_default(),
-                        skills: assistant
-                            .enabled_skills
-                            .into_iter()
-                            .chain(assistant.custom_skill_names)
-                            .collect(),
-                    })
-                })
-                .collect())
-        }
-    }
-
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
     let conv_service = services.conversation_service.clone();

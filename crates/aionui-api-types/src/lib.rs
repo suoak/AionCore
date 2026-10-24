@@ -39,6 +39,7 @@ mod skill;
 mod skill_delivery;
 mod skill_evolution;
 mod skill_runtime;
+mod squad;
 mod system;
 mod task_board;
 mod task_session;
@@ -256,6 +257,10 @@ pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,
     RuntimeSkillShowResponse, SKILL_RUNTIME_SCHEMA_VERSION, SkillRuntimeEnvelope, SkillRuntimeErrorCode,
     SkillRuntimeErrorPayload, SkillRuntimeMeta,
+};
+pub use squad::{
+    AssistantBrief, DeleteSquadResponse, ListSquadsQuery, SQUAD_MAX_PARTICIPANTS, SquadLeaderMode, SquadMember,
+    SquadTemplate, SquadTemplateInput, SquadTemplatePatch, SquadVisibility,
 };
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,

@@ -59,6 +59,10 @@ pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, Up
 pub use repository::skill_source::{
     AppendSkillVersionOutcome, AppendSkillVersionParams, ISkillSourceRepository, UpsertSkillSourceParams,
 };
+pub use repository::squad::{
+    CreateSquadTemplateParams, ISquadTemplateRepository, SQUAD_NAME_CONFLICT_PREFIX, SQUAD_STALE_CONFLICT_PREFIX,
+    UpdateSquadTemplateParams,
+};
 pub use repository::task_board::{
     AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams,
 };
@@ -90,8 +94,8 @@ pub use repository::{
     SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillEvolutionProposalRepository,
     SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteSkillSourceRepository,
-    SqliteTaskBoardRepository, SqliteTaskSessionRepository, SqliteTeamRepository, SqliteUsageEventRepository,
-    SqliteUserOrderStore, SqliteUserRepository, UpsertInboxItemParams, UsageEventFilter,
+    SqliteSquadTemplateRepository, SqliteTaskBoardRepository, SqliteTaskSessionRepository, SqliteTeamRepository,
+    SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository, UpsertInboxItemParams, UsageEventFilter,
 };
 
 // Re-export sqlx pool type for downstream crates
