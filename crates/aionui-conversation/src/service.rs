@@ -7489,7 +7489,10 @@ impl ConversationService {
         // Every conversation gets a helper-scoped token so the in-conversation
         // CLI (`aioncore config` / `diagnose`) can authenticate in AionPro
         // mode; team-bound conversations additionally get the team-tools scopes.
-        let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        // Write-capable helper surfaces are narrowed to the skills actually
+        // installed in this session (B-15, see `helper_scopes`).
+        let mut scopes =
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(build_opts.context.helper_skill_snapshot());
         if build_opts.context.team.is_some() {
             scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
         }

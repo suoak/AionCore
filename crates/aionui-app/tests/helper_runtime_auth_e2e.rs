@@ -69,7 +69,7 @@ async fn helper_token_channel_passes_auth_and_reaches_cron_domain() {
         user_id.as_str(),
         CONVERSATION_ID,
         TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        [RuntimeTokenScope::ConversationHelper],
+        aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
     );
 
     let resp = app
@@ -111,7 +111,7 @@ async fn helper_token_channel_reads_owned_conversation() {
         user_id.as_str(),
         CONVERSATION_ID,
         TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        [RuntimeTokenScope::ConversationHelper],
+        aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
     );
 
     let resp = app
@@ -159,7 +159,7 @@ async fn helper_token_bound_to_other_user_is_rejected() {
         user_id.as_str(),
         CONVERSATION_ID,
         TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        [RuntimeTokenScope::ConversationHelper],
+        aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
     );
 
     let resp = app
@@ -186,7 +186,7 @@ async fn helper_token_bound_to_other_conversation_is_rejected() {
         user_id.as_str(),
         "another-conversation",
         TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        [RuntimeTokenScope::ConversationHelper],
+        aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
     );
 
     let resp = app
@@ -240,7 +240,7 @@ async fn helper_write_request_is_exempt_from_csrf() {
         user_id.as_str(),
         CONVERSATION_ID,
         TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        [RuntimeTokenScope::ConversationHelper],
+        aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
     );
 
     // Invalid payload on purpose: the request must get PAST auth + CSRF. Agent

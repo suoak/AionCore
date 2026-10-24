@@ -4,7 +4,7 @@
 
 mod common;
 
-use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+use aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{body_json, build_app};
@@ -55,7 +55,7 @@ async fn runtime_create_is_mounted_and_creates_without_a_csrf_token() {
             USER,
             CALLER,
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::ConversationHelper],
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
         )
         .token;
 
@@ -93,7 +93,7 @@ async fn runtime_create_refuses_a_team_caller_through_the_real_router() {
             USER,
             "conv-team-caller",
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::ConversationHelper],
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
         )
         .token;
 

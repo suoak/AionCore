@@ -15,7 +15,8 @@ use crate::agent_approval::{
     AGENT_APPROVAL_ID_HEADER, AGENT_APPROVAL_REQUIRED_CODE, AgentActionApprovals, ApprovalCheck, request_fingerprint,
 };
 use crate::agent_scope::{
-    AgentRouteDecision, classify_agent_request, filter_conversation_list, is_rename_only_patch, redact_secrets,
+    AgentRouteDecision, HelperSkill, HelperSkillSet, classify_agent_request, filter_conversation_list,
+    is_rename_only_patch, redact_secrets, required_helper_skills,
 };
 use crate::extract::extract_token_from_headers;
 use crate::local_secret::LocalApiSecret;
@@ -58,6 +59,13 @@ pub const RUNTIME_CONVERSATION_ID_HEADER: &str = "x-aionui-conversation-id";
 /// token bound to exactly this (user_id, conversation_id) pair.
 pub trait IRuntimeTokenVerifier: Send + Sync {
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
+
+    /// Write-capable helper surfaces this (already verified) token may reach,
+    /// i.e. the owning skills installed in its session (B-15). The default —
+    /// every surface — is the behavior for sessions that exclude no skill.
+    fn helper_skills(&self, _token: &str, _user_id: &str, _conversation_id: &str) -> HelperSkillSet {
+        HelperSkillSet::all()
+    }
 }
 
 /// Port answering "may the agent running in `own` read conversation `target`?"
@@ -256,6 +264,18 @@ async fn runtime_token_channel(state: &AuthState, request: Request, next: Next) 
         ));
     }
 
+    if let Some(required) = required_helper_skills(request.method(), request.uri().path()) {
+        let granted = verifier.helper_skills(&token, &user_id, &conversation_id);
+        if !required.iter().any(|skill| granted.contains(*skill)) {
+            tracing::info!(
+                method = %request.method(),
+                path = request.uri().path(),
+                "agent token request to a skill surface the session does not have"
+            );
+            return Err(skill_not_enabled(required));
+        }
+    }
+
     let is_conversation_list = matches!(
         classify_agent_request(request.method(), request.uri().path(), &conversation_id),
         AgentRouteDecision::AllowConversationList
@@ -284,6 +304,21 @@ async fn runtime_token_channel(state: &AuthState, request: Request, next: Next) 
     } else {
         Ok(response)
     }
+}
+
+fn skill_not_enabled(required: &[HelperSkill]) -> ApiError {
+    let names: Vec<&str> = required.iter().map(|skill| skill.skill_name()).collect();
+    let listed = names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "AGENT_SKILL_NOT_ENABLED",
+        format!("Skill {listed} is not enabled in this conversation, so its helper token may not call this route."),
+        serde_json::json!({ "required_skills": names }),
+    )
 }
 
 fn scope_denied(message: &str) -> ApiError {

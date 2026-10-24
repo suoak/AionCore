@@ -600,6 +600,35 @@ impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
             )
             .is_ok()
     }
+
+    fn helper_skills(&self, token: &str, user_id: &str, conversation_id: &str) -> aionui_auth::HelperSkillSet {
+        aionui_auth::HelperSkill::ALL
+            .into_iter()
+            .filter(|skill| {
+                self.runtime_token_service
+                    .validate(
+                        Some(token),
+                        user_id,
+                        conversation_id,
+                        helper_skill_token_scope(*skill),
+                        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+                    )
+                    .is_ok()
+            })
+            .collect()
+    }
+}
+
+/// Token scope backing each helper skill surface (B-15). Kept next to the
+/// verifier so the auth-side enum and the agent-side scopes cannot drift
+/// without a compile error here.
+fn helper_skill_token_scope(skill: aionui_auth::HelperSkill) -> RuntimeTokenScope {
+    match skill {
+        aionui_auth::HelperSkill::Config => RuntimeTokenScope::HelperConfig,
+        aionui_auth::HelperSkill::Cron => RuntimeTokenScope::HelperCron,
+        aionui_auth::HelperSkill::ConversationCreate => RuntimeTokenScope::HelperConversationCreate,
+        aionui_auth::HelperSkill::SessionMessage => RuntimeTokenScope::HelperSessionMessage,
+    }
 }
 
 /// Agent-token read access beyond the token's own conversation: exactly the

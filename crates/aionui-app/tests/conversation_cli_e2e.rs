@@ -7,7 +7,7 @@ mod common;
 
 use std::process::Stdio;
 
-use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+use aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION;
 use common::build_app;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -77,7 +77,7 @@ async fn create_through_the_binary_returns_the_new_conversation_id() {
             USER,
             "conv-cli-caller",
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::ConversationHelper],
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
         )
         .token;
     let (base_url, handle) = serve(app).await;
@@ -113,7 +113,7 @@ async fn a_team_caller_gets_exit_3_and_the_caller_is_team_envelope() {
             USER,
             "conv-cli-team",
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::ConversationHelper],
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
         )
         .token;
     let (base_url, handle) = serve(app).await;

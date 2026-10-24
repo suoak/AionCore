@@ -165,6 +165,106 @@ pub fn classify_agent_request(method: &Method, path: &str, own_conversation_id: 
     AgentRouteDecision::Deny
 }
 
+/// Auto-inject skill that owns a write-capable helper surface (B-15).
+///
+/// A conversation-helper token carries the set of these skills actually
+/// installed in its session; requests to a surface whose skill is missing are
+/// refused with a reason. The read-only diagnostic surface, own-conversation
+/// reads/rename and the approval status route stay on the base scope because
+/// `aioncore diagnose` is used by several non-auto-inject skills and assistant
+/// rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HelperSkill {
+    /// `aionui-config`
+    Config,
+    /// `cron`
+    Cron,
+    /// `conversation-create`
+    ConversationCreate,
+    /// `session-message`
+    SessionMessage,
+}
+
+impl HelperSkill {
+    pub const ALL: [HelperSkill; 4] = [
+        HelperSkill::Config,
+        HelperSkill::Cron,
+        HelperSkill::ConversationCreate,
+        HelperSkill::SessionMessage,
+    ];
+
+    /// The builtin skill name, as stored in `conversation.extra.skills`.
+    pub fn skill_name(self) -> &'static str {
+        match self {
+            Self::Config => "aionui-config",
+            Self::Cron => "cron",
+            Self::ConversationCreate => "conversation-create",
+            Self::SessionMessage => "session-message",
+        }
+    }
+
+    fn bit(self) -> u8 {
+        match self {
+            Self::Config => 1,
+            Self::Cron => 2,
+            Self::ConversationCreate => 4,
+            Self::SessionMessage => 8,
+        }
+    }
+}
+
+/// Set of [`HelperSkill`]s granted to a helper token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelperSkillSet(u8);
+
+impl HelperSkillSet {
+    /// Every helper surface — the behavior for sessions that exclude nothing.
+    pub fn all() -> Self {
+        Self(HelperSkill::ALL.iter().fold(0, |acc, skill| acc | skill.bit()))
+    }
+
+    pub fn empty() -> Self {
+        Self(0)
+    }
+
+    #[must_use]
+    pub fn with(self, skill: HelperSkill) -> Self {
+        Self(self.0 | skill.bit())
+    }
+
+    pub fn contains(self, skill: HelperSkill) -> bool {
+        self.0 & skill.bit() != 0
+    }
+}
+
+impl FromIterator<HelperSkill> for HelperSkillSet {
+    fn from_iter<I: IntoIterator<Item = HelperSkill>>(iter: I) -> Self {
+        iter.into_iter().fold(Self::empty(), Self::with)
+    }
+}
+
+const CRON_PREFIXES: &[&str] = &["/api/cron", "/api/internal/conversation-cron"];
+
+/// Skills any one of which must be installed for an agent-token request to
+/// reach its route; `None` means the base helper scope suffices.
+///
+/// Only write-capable surfaces are gated: config writes (approval routes) and
+/// the provider/MCP probe POSTs need `aionui-config`; cron writes need
+/// `aionui-config` or `cron`. Reads stay on the base scope.
+pub fn required_helper_skills(method: &Method, path: &str) -> Option<&'static [HelperSkill]> {
+    if method == Method::GET || method == Method::HEAD {
+        return None;
+    }
+    let path = normalized_path(path)?;
+    if CRON_PREFIXES.iter().any(|prefix| has_prefix(path, prefix)) {
+        return Some(&[HelperSkill::Config, HelperSkill::Cron]);
+    }
+    if READ_LIKE_POSTS.contains(&path) || APPROVAL_PREFIXES.iter().any(|(prefix, _)| has_prefix(path, prefix)) {
+        return Some(&[HelperSkill::Config]);
+    }
+    None
+}
+
 /// Keep only the conversations an agent token may read in a
 /// `GET /api/conversations` response (`{ data: { items: [...], total } }`).
 ///
@@ -253,6 +353,54 @@ pub fn redact_secrets(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn helper_skill_gate_only_applies_to_write_surfaces() {
+        for path in [
+            "/api/mcp/servers",
+            "/api/providers",
+            "/api/cron/jobs",
+            "/api/conversations",
+        ] {
+            assert_eq!(required_helper_skills(&Method::GET, path), None, "{path}");
+        }
+        assert_eq!(
+            required_helper_skills(&Method::POST, "/api/mcp/servers"),
+            Some(&[HelperSkill::Config][..])
+        );
+        assert_eq!(
+            required_helper_skills(&Method::POST, "/api/providers/fetch-models"),
+            Some(&[HelperSkill::Config][..])
+        );
+        assert_eq!(
+            required_helper_skills(&Method::DELETE, "/api/skills/foo"),
+            Some(&[HelperSkill::Config][..])
+        );
+        assert_eq!(
+            required_helper_skills(&Method::POST, "/api/cron/jobs"),
+            Some(&[HelperSkill::Config, HelperSkill::Cron][..])
+        );
+        assert_eq!(
+            required_helper_skills(&Method::PUT, "/api/internal/conversation-cron/x"),
+            Some(&[HelperSkill::Config, HelperSkill::Cron][..])
+        );
+        // Base surface: own rename and anything that is not a skill-owned write.
+        assert_eq!(required_helper_skills(&Method::PATCH, "/api/conversations/c1"), None);
+        assert_eq!(required_helper_skills(&Method::POST, "/api/agent-approvals/x"), None);
+    }
+
+    #[test]
+    fn helper_skill_set_all_contains_every_skill() {
+        let all = HelperSkillSet::all();
+        for skill in HelperSkill::ALL {
+            assert!(all.contains(skill));
+            assert!(!HelperSkillSet::empty().contains(skill));
+        }
+        let set: HelperSkillSet = [HelperSkill::Cron].into_iter().collect();
+        assert!(set.contains(HelperSkill::Cron));
+        assert!(!set.contains(HelperSkill::Config));
+        assert_eq!(HelperSkill::Config.skill_name(), "aionui-config");
+    }
     use super::*;
     use serde_json::json;
 

@@ -80,6 +80,23 @@ fn runtime_caller(
         .map_err(|_| SessionMessageError::SchemaValidation {
             reason: "runtime auth failed".to_owned(),
         })?;
+    // B-15: a valid helper token only reaches the session-message surface when
+    // the session actually has the `session-message` skill installed.
+    if state
+        .runtime_token_service
+        .validate(
+            Some(&token),
+            &user_id,
+            &conversation_id,
+            RuntimeTokenScope::HelperSessionMessage,
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        )
+        .is_err()
+    {
+        return Err(SessionMessageError::SkillNotEnabled {
+            skill: "session-message".to_owned(),
+        });
+    }
     Ok(RuntimeCaller {
         user_id,
         conversation_id,
@@ -106,6 +123,7 @@ async fn send(
     let command = Some("session send-message".to_owned());
     let caller = match runtime_caller(&state, &headers) {
         Ok(caller) => caller,
+        Err(error @ SessionMessageError::SkillNotEnabled { .. }) => return envelope_failure(error, command),
         Err(_) => return unauthorized(command),
     };
     match state
@@ -126,6 +144,7 @@ async fn targets(
     let command = Some("session list".to_owned());
     let caller = match runtime_caller(&state, &headers) {
         Ok(caller) => caller,
+        Err(error @ SessionMessageError::SkillNotEnabled { .. }) => return envelope_failure(error, command),
         Err(_) => return unauthorized(command),
     };
     if let Err(error) = state

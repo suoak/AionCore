@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+use aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION;
 use common::body_json;
 
 const CONVERSATION_ID: &str = "conv-agent-outsider";
@@ -76,7 +76,7 @@ async fn agent_token_cannot_see_teams_it_is_not_a_member_of() {
         user_id.as_str(),
         CONVERSATION_ID,
         TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        [RuntimeTokenScope::ConversationHelper],
+        aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
     );
     let get = |uri: &str| {
         Request::builder()

@@ -1039,15 +1039,29 @@ fn scoped_agent_app(
     user_repo: Arc<dyn IUserRepository>,
     approvals: Option<Arc<aionui_auth::AgentActionApprovals>>,
 ) -> Router {
+    scoped_agent_app_with_verifier(
+        jwt_service,
+        user_repo,
+        approvals,
+        Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        }),
+    )
+}
+
+fn scoped_agent_app_with_verifier(
+    jwt_service: Arc<JwtService>,
+    user_repo: Arc<dyn IUserRepository>,
+    approvals: Option<Arc<aionui_auth::AgentActionApprovals>>,
+    verifier: Arc<dyn IRuntimeTokenVerifier>,
+) -> Router {
     let state = AuthState {
         jwt_service,
         user_repo,
         identity_mode: AuthIdentityMode::Local,
-        runtime_token_verifier: Some(Arc::new(MatchVerifier {
-            token: "tok-1",
-            user_id: "system_default_user",
-            conversation_id: "conv-1",
-        })),
+        runtime_token_verifier: Some(verifier),
         local_secret: Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
         agent_approvals: approvals,
         agent_conversation_access: Some(Arc::new(MentionGrant)),
@@ -1065,6 +1079,7 @@ fn scoped_agent_app(
             .post(ok_json),
         )
         .route("/api/mcp/servers", post(ok_json))
+        .route("/api/cron/jobs", get(ok_json).post(ok_json))
         .route(
             "/api/conversations/{id}",
             get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
@@ -1324,4 +1339,118 @@ async fn agent_token_conversation_list_is_filtered_to_readable_ones() {
         .await
         .unwrap();
     assert_eq!(json_body(resp).await["data"]["items"].as_array().unwrap().len(), 3);
+}
+
+// ============================================================
+// B-15: helper token narrowed to the session's installed skills
+// ============================================================
+
+/// `MatchVerifier` whose token only carries the given helper skills, as for a
+/// session that excluded the others.
+struct NarrowVerifier {
+    skills: aionui_auth::HelperSkillSet,
+}
+
+impl IRuntimeTokenVerifier for NarrowVerifier {
+    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
+        token == "tok-1" && user_id == "system_default_user" && conversation_id == "conv-1"
+    }
+
+    fn helper_skills(&self, _token: &str, _user_id: &str, _conversation_id: &str) -> aionui_auth::HelperSkillSet {
+        self.skills
+    }
+}
+
+async fn narrow_agent_app(skills: aionui_auth::HelperSkillSet) -> (Router, Arc<aionui_auth::AgentActionApprovals>) {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let store = Arc::new(aionui_auth::AgentActionApprovals::new());
+    let app = scoped_agent_app_with_verifier(
+        jwt_service,
+        repo,
+        Some(store.clone()),
+        Arc::new(NarrowVerifier { skills }),
+    );
+    (app, store)
+}
+
+#[tokio::test]
+async fn helper_token_without_config_skill_is_refused_config_writes_with_reason() {
+    let (app, store) = narrow_agent_app(aionui_auth::HelperSkillSet::empty()).await;
+
+    for (method, path) in [
+        ("POST", "/api/mcp/servers"),
+        ("POST", "/api/providers"),
+        ("POST", "/api/cron/jobs"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(agent_request(method, path, "{}", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let json = json_body(resp).await;
+        assert_eq!(json["code"], "AGENT_SKILL_NOT_ENABLED", "{method} {path}");
+        assert!(
+            json["details"]["required_skills"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("aionui-config"))
+        );
+    }
+    // Refused before the approval prompt: the user is never asked.
+    assert!(store.list_pending("system_default_user").is_empty());
+
+    // The base surface is untouched: reads and own rename still work.
+    let resp = app
+        .clone()
+        .oneshot(agent_request("GET", "/api/providers", "", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .oneshot(agent_request(
+            "PATCH",
+            "/api/conversations/conv-1",
+            r#"{"name":"x"}"#,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn helper_token_with_only_cron_skill_reaches_cron_approval_but_not_other_config() {
+    let skills: aionui_auth::HelperSkillSet = [aionui_auth::HelperSkill::Cron].into_iter().collect();
+    let (app, _store) = narrow_agent_app(skills).await;
+
+    let resp = app
+        .clone()
+        .oneshot(agent_request("POST", "/api/cron/jobs", "{}", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["code"], "AGENT_ACTION_APPROVAL_REQUIRED");
+
+    let resp = app
+        .oneshot(agent_request("POST", "/api/mcp/servers", "{}", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = json_body(resp).await;
+    assert_eq!(json["code"], "AGENT_SKILL_NOT_ENABLED");
+    assert!(json["error"].as_str().unwrap().contains("aionui-config"));
+}
+
+#[tokio::test]
+async fn helper_token_with_every_skill_keeps_existing_approval_flow() {
+    let (app, _store) = narrow_agent_app(aionui_auth::HelperSkillSet::all()).await;
+    let resp = app
+        .oneshot(agent_request("POST", "/api/mcp/servers", "{}", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["code"], "AGENT_ACTION_APPROVAL_REQUIRED");
 }
