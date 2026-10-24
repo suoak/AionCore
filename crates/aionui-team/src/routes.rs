@@ -66,6 +66,28 @@ impl From<TeamError> for ApiError {
                 format!("team_not_squad: team {team_id} is not a Squad instance"),
                 Some(serde_json::json!({ "team_id": team_id })),
             ),
+            TeamError::SquadSelfTrigger { team_id, slot_id } => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "squad_self_trigger",
+                format!("squad_self_trigger: agents cannot message themselves ({slot_id})"),
+                Some(serde_json::json!({ "team_id": team_id, "slot_id": slot_id })),
+            ),
+            TeamError::SquadDispatchInProgress {
+                work_item_id,
+                member,
+                task_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "squad_dispatch_in_progress",
+                format!(
+                    "squad_dispatch_in_progress: member {member} is already handling task {task_id}"
+                ),
+                Some(serde_json::json!({
+                    "work_item_id": work_item_id,
+                    "member": member,
+                    "task_id": task_id,
+                })),
+            ),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
@@ -862,6 +884,29 @@ mod tests {
         let err: ApiError = TeamError::TeamNotSquad("t1".into()).into();
         assert_eq!(err.error_code(), "team_not_squad");
         assert!(matches!(err, ApiError::Coded { status, .. } if status == StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn squad_self_trigger_maps_to_bad_request() {
+        let err: ApiError = TeamError::SquadSelfTrigger {
+            team_id: "t1".into(),
+            slot_id: "worker-1".into(),
+        }
+        .into();
+        assert_eq!(err.error_code(), "squad_self_trigger");
+        assert!(matches!(err, ApiError::Coded { status, .. } if status == StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn squad_dispatch_in_progress_maps_to_conflict() {
+        let err: ApiError = TeamError::SquadDispatchInProgress {
+            work_item_id: "w1".into(),
+            member: "worker-1".into(),
+            task_id: "tk1".into(),
+        }
+        .into();
+        assert_eq!(err.error_code(), "squad_dispatch_in_progress");
+        assert!(matches!(err, ApiError::Coded { status, .. } if status == StatusCode::CONFLICT));
     }
 
     #[test]

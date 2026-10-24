@@ -1,4 +1,4 @@
-//! M8 E7-5: `GET /api/teams/{id}/squad-run`. The state is derived only from
+//! M8 E7-6: `GET /api/teams/{id}/squad-run`. The state is derived only from
 //! data Core already has — the team task board and the in-memory team-run
 //! manager — so nothing new is persisted.
 
@@ -42,6 +42,61 @@ pub fn derive_squad_run_state(tasks: &[TaskStatus], latest_run: Option<TeamRunSt
 }
 
 impl TeamSessionService {
+    /// Linked E6 work item for a team (`teams.work_item_id`), if any.
+    pub async fn team_work_item_id(&self, team_id: &str) -> Result<Option<String>, TeamError> {
+        Ok(self.repo.team_work_item_id(team_id).await?)
+    }
+
+    /// M8 E7-4: when a work item is dragged back to backlog, pause every live
+    /// slot on the newest Squad instance started for it. No-op when there is
+    /// no linked Squad, no live session, or no active team run.
+    pub async fn pause_squad_for_work_item(&self, user_id: &str, work_item_id: &str) -> Result<(), TeamError> {
+        let Some(team_id) = self.repo.latest_team_for_work_item(user_id, work_item_id).await? else {
+            return Ok(());
+        };
+        if self.repo.team_squad_template_id(&team_id).await?.is_none() {
+            return Ok(());
+        }
+        self.load_owned_team(user_id, &team_id).await?;
+        let Some(entry) = self.sessions.get(&team_id) else {
+            tracing::info!(
+                %team_id,
+                %work_item_id,
+                "squad pause skipped: no live session"
+            );
+            return Ok(());
+        };
+        let session = Arc::clone(&entry.session);
+        let Some(run_id) = session.team_run_manager().current_active_run_id() else {
+            tracing::info!(
+                %team_id,
+                %work_item_id,
+                "squad pause skipped: no active team run"
+            );
+            return Ok(());
+        };
+        let agents = session.scheduler().list_agents().await;
+        for agent in agents {
+            if let Err(error) = session
+                .pause_slot_work(
+                    &run_id,
+                    &agent.slot_id,
+                    Some("work_item_backlog".to_owned()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    %team_id,
+                    %work_item_id,
+                    slot_id = %agent.slot_id,
+                    %error,
+                    "failed to pause squad slot after backlog"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub async fn get_squad_run(&self, user_id: &str, team_id: &str) -> Result<Option<SquadRunPayload>, TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         if self.repo.team_squad_template_id(team_id).await?.is_none() {

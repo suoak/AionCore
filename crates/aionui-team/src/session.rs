@@ -876,6 +876,13 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
+        // M8 E7-4: never let a member's own send wake itself.
+        if crate::scheduler::is_self_trigger(from_slot_id, to_slot_id) {
+            return Err(TeamError::SquadSelfTrigger {
+                team_id: self.team.id.clone(),
+                slot_id: from_slot_id.to_owned(),
+            });
+        }
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
         // Agent-triggered delivery: lazily wake a dormant teammate. On failure
