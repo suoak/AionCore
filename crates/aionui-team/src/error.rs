@@ -19,6 +19,11 @@ pub enum TeamError {
     #[error("Leader-only action: {0}")]
     LeaderOnly(String),
 
+    /// M8 E7 D7-4 hard rule: a Squad's roster is fixed by its template, so no
+    /// participant (Leader or member) may spawn/add another agent at runtime.
+    #[error("squad_spawn_forbidden: Squad teams have a fixed roster; {action} is not allowed")]
+    SquadSpawnForbidden { team_id: String, action: String },
+
     #[error("Forbidden: {0}")]
     Forbidden(String),
 

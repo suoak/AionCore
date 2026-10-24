@@ -1821,6 +1821,11 @@ impl TeamSession {
         // but this method is exposed on TeamSession so every entry point
         // (including future direct service callers) re-checks.
         let caller = self.scheduler.get_agent(caller_slot_id).await?;
+        // M8 E7 D7-4 hard rule, checked before the Lead gate so a Squad member
+        // gets the specific code: Squad rosters are fixed, nobody spawns.
+        if let Some(service) = self.service.upgrade() {
+            service.ensure_not_squad(&self.team.id, "spawn_agent").await?;
+        }
         if caller.role != TeammateRole::Lead {
             return Err(TeamError::LeaderOnly("spawn_agent".into()));
         }

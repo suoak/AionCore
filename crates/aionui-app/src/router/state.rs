@@ -379,7 +379,7 @@ pub async fn build_module_states(
     let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
         build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
     });
-    let states = ModuleStates {
+    let mut states = ModuleStates {
         system,
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
@@ -418,6 +418,7 @@ pub async fn build_module_states(
             catalog: Arc::new(AssistantServiceTeamCatalog {
                 assistant_service: assistant.service.clone(),
             }),
+            teams: None,
         },
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
@@ -432,6 +433,8 @@ pub async fn build_module_states(
         worktree,
         fanout,
     };
+    // M8 E7-2: Squad instantiation provisions through the shared Team service.
+    states.squad.teams = Some(states.team.service.clone());
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"

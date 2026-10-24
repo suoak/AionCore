@@ -15,8 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, AssistantBrief, DeleteSquadResponse, ListSquadsQuery, SQUAD_MAX_PARTICIPANTS, SquadLeaderMode,
-    SquadMember, SquadTemplate, SquadTemplateInput, SquadTemplatePatch, SquadVisibility,
+    ApiResponse, AssistantBrief, DeleteSquadResponse, ListSquadsQuery, SQUAD_MAX_PARTICIPANTS,
+    SQUAD_SUBAGENT_SPAWN_FORBIDDEN, SquadInstantiateInput, SquadInstantiateResponse, SquadLeaderMode, SquadMember,
+    SquadPreview, SquadPreviewBlocker, SquadPreviewParticipant, SquadTemplate, SquadTemplateInput, SquadTemplatePatch,
+    SquadVisibility, TeamAgentInput,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, generate_id, now_ms};
@@ -29,7 +31,7 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde_json::json;
 
 use crate::ports::{TeamAssistantCatalogEntry, TeamAssistantCatalogPort};
@@ -44,7 +46,19 @@ pub const SQUAD_MAX_PARALLEL_LIMIT: u32 = 4;
 pub struct SquadRouterState {
     pub repo: Arc<dyn ISquadTemplateRepository>,
     pub catalog: Arc<dyn TeamAssistantCatalogPort>,
+    /// Team service used by `POST /api/squads/{id}/instantiate`. `None` (unit
+    /// tests) answers 503 `squad_instantiate_unavailable`.
+    pub teams: Option<Arc<crate::service::TeamSessionService>>,
 }
+
+/// D7-1 `route_only`: the Team MCP tools a Squad Leader keeps (E7-3 enforces
+/// this at MCP dispatch; the preview reports it).
+pub const SQUAD_ROUTE_ONLY_LEADER_TOOLS: &[&str] = &[
+    "team_send_message",
+    "team_task_update",
+    "team_task_list",
+    "team_describe_assistant",
+];
 
 pub fn squad_routes(state: SquadRouterState) -> Router {
     Router::new()
@@ -53,6 +67,8 @@ pub fn squad_routes(state: SquadRouterState) -> Router {
             "/api/squads/{id}",
             get(get_squad).patch(update_squad).delete(delete_squad),
         )
+        .route("/api/squads/{id}/preview", get(preview_squad))
+        .route("/api/squads/{id}/instantiate", post(instantiate_squad))
         .with_state(state)
 }
 
@@ -435,6 +451,190 @@ async fn delete_squad(
     Ok(Json(ApiResponse::ok(DeleteSquadResponse { id, deleted_at })))
 }
 
+// ---------------------------------------------------------------------------
+// M8 E7-2: preview + instantiate
+// ---------------------------------------------------------------------------
+
+fn build_preview(row: &SquadTemplateRow, catalog: &HashMap<String, TeamAssistantCatalogEntry>) -> SquadPreview {
+    let leader_mode = SquadLeaderMode::parse(&row.leader_mode).unwrap_or_default();
+    let members: Vec<SquadMember> = serde_json::from_str(&row.members).unwrap_or_default();
+    let mut used = HashSet::new();
+    let mut unique = |base: &str| {
+        let base = if base.trim().is_empty() { "Agent" } else { base.trim() };
+        let mut name = base.to_owned();
+        let mut n = 2;
+        while !used.insert(name.to_lowercase()) {
+            name = format!("{base} {n}");
+            n += 1;
+        }
+        name
+    };
+    let mut participants = Vec::with_capacity(members.len() + 1);
+    let mut blocking = Vec::new();
+    let leader_brief = brief(&row.leader_assistant_id, catalog);
+    let leader_entry = catalog.get(&row.leader_assistant_id);
+    participants.push(SquadPreviewParticipant {
+        assistant_id: row.leader_assistant_id.clone(),
+        agent_name: unique(&leader_brief.name),
+        role: "lead".into(),
+        role_title: "Leader".into(),
+        role_description: String::new(),
+        max_parallel: 1,
+        backend: leader_entry.map(|e| e.backend.clone()),
+        eligible: leader_entry.is_some(),
+        subagent_spawn: SQUAD_SUBAGENT_SPAWN_FORBIDDEN.into(),
+        team_tools: (leader_mode == SquadLeaderMode::RouteOnly)
+            .then(|| SQUAD_ROUTE_ONLY_LEADER_TOOLS.iter().map(|t| (*t).to_owned()).collect()),
+        assistant: leader_brief,
+    });
+    for m in &members {
+        let entry = catalog.get(&m.assistant_id);
+        participants.push(SquadPreviewParticipant {
+            assistant_id: m.assistant_id.clone(),
+            agent_name: unique(&m.role_title),
+            role: "teammate".into(),
+            role_title: m.role_title.clone(),
+            role_description: m.role_description.clone(),
+            max_parallel: m.max_parallel,
+            backend: entry.map(|e| e.backend.clone()),
+            eligible: entry.is_some(),
+            subagent_spawn: SQUAD_SUBAGENT_SPAWN_FORBIDDEN.into(),
+            team_tools: None,
+            assistant: brief(&m.assistant_id, catalog),
+        });
+    }
+    for p in &participants {
+        if !p.eligible {
+            blocking.push(SquadPreviewBlocker {
+                code: "squad_assistant_not_eligible".into(),
+                assistant_id: Some(p.assistant_id.clone()),
+            });
+        }
+    }
+    if row.visibility == "team" {
+        blocking.push(SquadPreviewBlocker {
+            code: "squad_team_visibility_unavailable".into(),
+            assistant_id: None,
+        });
+    }
+    SquadPreview {
+        squad_template_id: row.id.clone(),
+        name: row.name.clone(),
+        leader_mode,
+        can_instantiate: blocking.is_empty(),
+        participants,
+        blocking,
+    }
+}
+
+async fn load_live(state: &SquadRouterState, user_id: &str, id: &str) -> Result<SquadTemplateRow, ApiError> {
+    state
+        .repo
+        .get(user_id, id, false)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| not_found(id))
+}
+
+async fn preview_squad(
+    State(state): State<SquadRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<SquadPreview>>, ApiError> {
+    let row = load_live(&state, &user.id, &id).await?;
+    let catalog = catalog_map(state.catalog.as_ref(), &user.id).await?;
+    Ok(Json(ApiResponse::ok(build_preview(&row, &catalog))))
+}
+
+async fn instantiate_squad(
+    State(state): State<SquadRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Option<Json<SquadInstantiateInput>>,
+) -> Result<(StatusCode, Json<ApiResponse<SquadInstantiateResponse>>), ApiError> {
+    let input = body.map(|Json(v)| v).unwrap_or_default();
+    let row = load_live(&state, &user.id, &id).await?;
+    let catalog = catalog_map(state.catalog.as_ref(), &user.id).await?;
+    let preview = build_preview(&row, &catalog);
+    if let Some(first) = preview.blocking.first() {
+        let status = if first.code == "squad_team_visibility_unavailable" {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return Err(coded(
+            status,
+            if first.code == "squad_team_visibility_unavailable" {
+                "squad_team_visibility_unavailable"
+            } else {
+                "squad_assistant_not_eligible"
+            },
+            "squad cannot be instantiated",
+            Some(json!({ "assistant_id": first.assistant_id, "blocking": preview.blocking })),
+        ));
+    }
+    let Some(teams) = state.teams.clone() else {
+        return Err(coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "squad_instantiate_unavailable",
+            "team service is not available",
+            None,
+        ));
+    };
+    let name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(&row.name)
+        .to_owned();
+    // Same backend/model resolution as Leader `team_spawn_agent`: assistant's
+    // fixed model, else the backend default.
+    let mut agents = Vec::with_capacity(preview.participants.len());
+    for p in &preview.participants {
+        let fallback_backend = p.backend.clone().unwrap_or_default();
+        let (backend, model) = teams
+            .resolve_spawn_backend_and_model(&user.id, Some(&p.assistant_id), None, &fallback_backend, "")
+            .await
+            .map_err(ApiError::from)?;
+        agents.push(TeamAgentInput {
+            name: p.agent_name.clone(),
+            role: p.role.clone(),
+            backend: Some(backend),
+            model,
+            assistant_id: Some(p.assistant_id.clone()),
+            conversation_id: None,
+        });
+    }
+    let req = aionui_api_types::CreateTeamRequest {
+        name,
+        agents,
+        workspace: input.workspace,
+    };
+    let team = teams.create_team(&user.id, req).await.map_err(|e| {
+        let api: ApiError = e.into();
+        api
+    })?;
+    // Stamp provenance immediately: from here on the runtime roster guard
+    // (`TeamSessionService::ensure_not_squad`) refuses spawn/add for this team.
+    if let Err(err) = state.repo.bind_team_instance(&user.id, &team.id, &row.id).await {
+        tracing::error!(team_id = %team.id, squad = %row.id, error = %err, "failed to bind squad instance");
+        return Err(coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "squad_store_failed",
+            "team created but squad binding failed",
+            Some(json!({ "team_id": team.id })),
+        ));
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(SquadInstantiateResponse {
+            squad_template_id: row.id,
+            team,
+        })),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +667,7 @@ mod tests {
         let state = SquadRouterState {
             repo: Arc::new(aionui_db::SqliteSquadTemplateRepository::new(db.pool().clone())),
             catalog: Arc::new(Catalog(ids)),
+            teams: None,
         };
         (squad_routes(state).layer(Extension(CurrentUser::local_default())), db)
     }
@@ -621,6 +822,78 @@ mod tests {
                     .starts_with("squad_name_conflict:"),
             "{v}"
         );
+    }
+
+    #[tokio::test]
+    async fn preview_lists_participants_with_enforced_restrictions() {
+        let (app, _db) = app(vec!["lead", "a", "b"]).await;
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/squads",
+            Some(json!({
+                "name": "p",
+                "leader_assistant_id": "lead",
+                "members": [member("a"), { "assistant_id": "b", "role_title": "role-a", "max_parallel": 2 }]
+            })),
+        )
+        .await;
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        let (status, v) = call(&app, "GET", &format!("/api/squads/{id}/preview"), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let d = &v["data"];
+        assert_eq!(d["can_instantiate"], true);
+        let ps = d["participants"].as_array().unwrap();
+        assert_eq!(ps.len(), 3);
+        assert_eq!(ps[0]["role"], "lead");
+        assert_eq!(ps[0]["agent_name"], "name-lead");
+        assert_eq!(
+            ps[0]["team_tools"].as_array().unwrap().len(),
+            SQUAD_ROUTE_ONLY_LEADER_TOOLS.len()
+        );
+        assert_eq!(ps[1]["agent_name"], "role-a");
+        assert_eq!(
+            ps[2]["agent_name"], "role-a 2",
+            "duplicate role titles get unique slot names"
+        );
+        assert_eq!(ps[2]["max_parallel"], 2);
+        assert!(ps.iter().all(|p| p["subagent_spawn"] == "forbidden"));
+        assert!(ps[1].get("team_tools").is_none());
+
+        // Unit-test state has no Team service: instantiate answers a coded 503.
+        let (status, v) = call(&app, "POST", &format!("/api/squads/{id}/instantiate"), Some(json!({}))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["code"], "squad_instantiate_unavailable");
+        let (status, v) = call(&app, "GET", "/api/squads/nope/preview", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(v["code"], "squad_not_found");
+    }
+
+    #[tokio::test]
+    async fn preview_and_instantiate_block_on_ineligible_assistant() {
+        let (app, db) = app(vec!["lead", "a"]).await;
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/squads",
+            Some(json!({ "name": "q", "leader_assistant_id": "lead", "members": [member("a")] })),
+        )
+        .await;
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        // Same DB, catalog without "a" (assistant unpublished after save).
+        let state = SquadRouterState {
+            repo: Arc::new(aionui_db::SqliteSquadTemplateRepository::new(db.pool().clone())),
+            catalog: Arc::new(Catalog(vec!["lead"])),
+            teams: None,
+        };
+        let app2 = squad_routes(state).layer(Extension(CurrentUser::local_default()));
+        let (_, v) = call(&app2, "GET", &format!("/api/squads/{id}/preview"), None).await;
+        assert_eq!(v["data"]["can_instantiate"], false);
+        assert_eq!(v["data"]["blocking"][0]["code"], "squad_assistant_not_eligible");
+        assert_eq!(v["data"]["blocking"][0]["assistant_id"], "a");
+        let (status, v) = call(&app2, "POST", &format!("/api/squads/{id}/instantiate"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "squad_assistant_not_eligible");
     }
 
     #[tokio::test]

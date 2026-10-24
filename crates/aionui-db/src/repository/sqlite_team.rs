@@ -72,6 +72,14 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(row)
     }
 
+    async fn team_squad_template_id(&self, team_id: &str) -> Result<Option<String>, DbError> {
+        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT squad_template_id FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|(id,)| id))
+    }
+
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
         let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE id = ?")
             .bind(team_id)
