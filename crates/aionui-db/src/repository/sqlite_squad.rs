@@ -159,6 +159,19 @@ impl ISquadTemplateRepository for SqliteSquadTemplateRepository {
             .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
+
+    async fn bind_team_instance(&self, user_id: &str, team_id: &str, template_id: &str) -> Result<(), DbError> {
+        let done = sqlx::query("UPDATE teams SET squad_template_id = ? WHERE id = ? AND user_id = ?")
+            .bind(template_id)
+            .bind(team_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team {team_id}")));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +191,29 @@ mod tests {
             visibility: "private",
             now: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn bind_team_instance_is_owner_scoped_and_visible_to_team_repo() {
+        use crate::repository::team::ITeamRepository;
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteSquadTemplateRepository::new(db.pool().clone());
+        repo.create(params("s1", "u1", "web")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO teams (id, user_id, name, agents, created_at, updated_at) VALUES ('t1', 'u1', 'n', '[]', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let teams = crate::SqliteTeamRepository::new(db.pool().clone());
+        assert_eq!(teams.team_squad_template_id("t1").await.unwrap(), None);
+        assert!(matches!(
+            repo.bind_team_instance("u2", "t1", "s1").await,
+            Err(DbError::NotFound(_))
+        ));
+        repo.bind_team_instance("u1", "t1", "s1").await.unwrap();
+        assert_eq!(teams.team_squad_template_id("t1").await.unwrap().as_deref(), Some("s1"));
+        assert_eq!(repo.instance_team_ids("s1").await.unwrap(), vec!["t1".to_string()]);
     }
 
     #[tokio::test]

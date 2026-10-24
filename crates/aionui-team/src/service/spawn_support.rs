@@ -211,6 +211,7 @@ impl TeamSessionService {
         caller_slot_id: &str,
         req: crate::session::SpawnAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
+        self.ensure_not_squad(team_id, "spawn_agent").await?;
         let entry = self
             .sessions
             .get(team_id)
@@ -1039,6 +1040,56 @@ mod tests {
             matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("not available for team mode")),
             "expected team-selectable assistant error, got {err:?}"
         );
+    }
+
+    /// M8 E7 D7-4: the roster guard is enforced at runtime for every entry
+    /// point (HTTP add-agent and MCP/CLI `spawn_agent`), for Leader and members.
+    #[tokio::test]
+    async fn squad_teams_refuse_add_and_spawn_at_runtime() {
+        let (svc, team_repo, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user1", single_agent_team_request("Squad"))
+            .await
+            .unwrap();
+        // Plain team: guard passes.
+        svc.ensure_not_squad(&created.id, "add_agent").await.unwrap();
+
+        team_repo.bind_squad(&created.id, "sq1");
+        let err = svc
+            .add_agent(
+                "user1",
+                &created.id,
+                aionui_api_types::AddAgentRequest {
+                    name: "Worker".into(),
+                    role: "teammate".into(),
+                    backend: None,
+                    model: "gpt-5-mini".into(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .expect_err("squad roster is fixed");
+        assert!(
+            matches!(&err, TeamError::SquadSpawnForbidden { action, .. } if action == "add_agent"),
+            "got {err:?}"
+        );
+        let err = svc
+            .spawn_agent_in_session(
+                &created.id,
+                "any-slot",
+                crate::session::SpawnAgentRequest {
+                    name: "Sub".into(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .expect_err("squad members/leader cannot spawn");
+        assert!(
+            matches!(&err, TeamError::SquadSpawnForbidden { action, .. } if action == "spawn_agent"),
+            "got {err:?}"
+        );
+        let api: aionui_common::ApiError = err.into();
+        assert_eq!(api.error_code(), "squad_spawn_forbidden");
     }
 
     #[tokio::test]

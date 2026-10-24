@@ -63,6 +63,13 @@ pub trait ITeamRepository: Send + Sync {
     /// Returns a single team owned by `user_id`, or `None` if not found.
     async fn get_team(&self, user_id: &str, team_id: &str) -> Result<Option<TeamRow>, DbError>;
 
+    /// M8 E7: Squad template this team was instantiated from (`None` for a
+    /// plain Team). Default impl keeps test doubles compiling; they behave as
+    /// plain Teams.
+    async fn team_squad_template_id(&self, _team_id: &str) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
     /// Returns a single team for startup/session restore.
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError>;
 

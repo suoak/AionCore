@@ -54,6 +54,12 @@ impl From<TeamError> for ApiError {
                 }
             }
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
+            TeamError::SquadSpawnForbidden { team_id, action } => ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "squad_spawn_forbidden",
+                format!("squad_spawn_forbidden: Squad teams have a fixed roster; {action} is not allowed"),
+                Some(serde_json::json!({ "team_id": team_id, "action": action })),
+            ),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
@@ -820,6 +826,17 @@ mod tests {
     fn leader_only_maps_to_forbidden() {
         let err: ApiError = TeamError::LeaderOnly("spawn_agent".into()).into();
         assert!(matches!(err, ApiError::Forbidden(msg) if msg == "spawn_agent"));
+    }
+
+    #[test]
+    fn squad_spawn_forbidden_maps_to_coded_403() {
+        let err: ApiError = TeamError::SquadSpawnForbidden {
+            team_id: "t1".into(),
+            action: "spawn_agent".into(),
+        }
+        .into();
+        assert_eq!(err.error_code(), "squad_spawn_forbidden");
+        assert!(matches!(err, ApiError::Coded { status, .. } if status == StatusCode::FORBIDDEN));
     }
 
     #[test]

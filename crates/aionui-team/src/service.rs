@@ -817,6 +817,19 @@ impl TeamSessionService {
         Ok(())
     }
 
+    /// M8 E7 D7-4: refuse roster growth on Squad-instantiated teams. Enforced
+    /// in the service (not only the template/prompt), so every entry point —
+    /// HTTP add-agent, MCP `team_spawn_agent`, CLI fallback — hits it.
+    pub async fn ensure_not_squad(&self, team_id: &str, action: &str) -> Result<(), TeamError> {
+        if self.repo.team_squad_template_id(team_id).await?.is_some() {
+            return Err(TeamError::SquadSpawnForbidden {
+                team_id: team_id.to_owned(),
+                action: action.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn add_agent(
         &self,
         user_id: &str,
@@ -831,6 +844,7 @@ impl TeamSessionService {
         let _guard = lock.lock().await;
 
         let row = self.load_owned_team_row(user_id, team_id).await?;
+        self.ensure_not_squad(team_id, "add_agent").await?;
         let mut team = Team::from_row(&row)?;
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 

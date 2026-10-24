@@ -54,4 +54,8 @@ pub trait ISquadTemplateRepository: Send + Sync {
     /// Ids of Teams instantiated from this template (teams are hard-deleted
     /// on removal, so every remaining row is a live instance).
     async fn instance_team_ids(&self, template_id: &str) -> Result<Vec<String>, DbError>;
+
+    /// M8 E7-2: stamp `teams.squad_template_id` on a freshly created Team owned
+    /// by `user_id`. Returns `DbError::NotFound` when no such team.
+    async fn bind_team_instance(&self, user_id: &str, team_id: &str, template_id: &str) -> Result<(), DbError>;
 }

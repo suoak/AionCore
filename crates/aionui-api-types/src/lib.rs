@@ -265,8 +265,9 @@ pub use skill_runtime::{
     SkillRuntimeErrorPayload, SkillRuntimeMeta,
 };
 pub use squad::{
-    AssistantBrief, DeleteSquadResponse, ListSquadsQuery, SQUAD_MAX_PARTICIPANTS, SquadLeaderMode, SquadMember,
-    SquadTemplate, SquadTemplateInput, SquadTemplatePatch, SquadVisibility,
+    AssistantBrief, DeleteSquadResponse, ListSquadsQuery, SQUAD_MAX_PARTICIPANTS, SQUAD_SUBAGENT_SPAWN_FORBIDDEN,
+    SquadInstantiateInput, SquadInstantiateResponse, SquadLeaderMode, SquadMember, SquadPreview, SquadPreviewBlocker,
+    SquadPreviewParticipant, SquadTemplate, SquadTemplateInput, SquadTemplatePatch, SquadVisibility,
 };
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,

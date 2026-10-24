@@ -137,3 +137,72 @@ pub struct DeleteSquadResponse {
     pub id: String,
     pub deleted_at: i64,
 }
+
+// ---------------------------------------------------------------------------
+// M8 E7-2: member-config preview + instantiation
+// ---------------------------------------------------------------------------
+
+/// Hard rule D7-4 as surfaced to clients: no participant of a Squad team may
+/// spawn/add agents. Always `"forbidden"`; there is no template field for it.
+pub const SQUAD_SUBAGENT_SPAWN_FORBIDDEN: &str = "forbidden";
+
+/// One participant as it would be provisioned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SquadPreviewParticipant {
+    pub assistant_id: String,
+    /// Agent slot name the Team will use (role_title for members, de-duplicated).
+    pub agent_name: String,
+    /// `"lead"` | `"teammate"`.
+    pub role: String,
+    pub role_title: String,
+    pub role_description: String,
+    pub max_parallel: u32,
+    pub assistant: AssistantBrief,
+    pub backend: Option<String>,
+    /// `false` when the assistant is no longer in the team-selectable catalog.
+    pub eligible: bool,
+    /// Always [`SQUAD_SUBAGENT_SPAWN_FORBIDDEN`].
+    pub subagent_spawn: String,
+    /// Leader only, `route_only`: the Team MCP tools it keeps. `None` = unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_tools: Option<Vec<String>>,
+}
+
+/// `GET /api/squads/{id}/preview`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SquadPreview {
+    pub squad_template_id: String,
+    pub name: String,
+    pub leader_mode: SquadLeaderMode,
+    /// Leader first, then members in template order.
+    pub participants: Vec<SquadPreviewParticipant>,
+    pub can_instantiate: bool,
+    /// Stable codes explaining why `can_instantiate` is false
+    /// (e.g. `squad_assistant_not_eligible`).
+    pub blocking: Vec<SquadPreviewBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SquadPreviewBlocker {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+}
+
+/// `POST /api/squads/{id}/instantiate` body (all optional).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SquadInstantiateInput {
+    /// Team name; defaults to the template name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Shared workspace; defaults to the Team provisioning default.
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+/// `POST /api/squads/{id}/instantiate` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct SquadInstantiateResponse {
+    pub squad_template_id: String,
+    pub team: crate::TeamResponse,
+}

@@ -613,6 +613,8 @@ pub(crate) mod workspace_harness {
     pub(crate) struct FullMockTeamRepo {
         teams: Mutex<Vec<TeamRow>>,
         messages: Mutex<Vec<aionui_db::models::MailboxMessageRow>>,
+        /// M8 E7: team_id -> squad_template_id.
+        squad_bindings: Mutex<std::collections::HashMap<String, String>>,
     }
 
     impl FullMockTeamRepo {
@@ -620,7 +622,15 @@ pub(crate) mod workspace_harness {
             Self {
                 teams: Mutex::new(Vec::new()),
                 messages: Mutex::new(Vec::new()),
+                squad_bindings: Mutex::new(std::collections::HashMap::new()),
             }
+        }
+
+        pub(crate) fn bind_squad(&self, team_id: &str, template_id: &str) {
+            self.squad_bindings
+                .lock()
+                .unwrap()
+                .insert(team_id.to_owned(), template_id.to_owned());
         }
     }
 
@@ -629,6 +639,10 @@ pub(crate) mod workspace_harness {
         async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
             self.teams.lock().unwrap().push(row.clone());
             Ok(())
+        }
+
+        async fn team_squad_template_id(&self, team_id: &str) -> Result<Option<String>, DbError> {
+            Ok(self.squad_bindings.lock().unwrap().get(team_id).cloned())
         }
 
         async fn list_teams_for_restore(&self) -> Result<Vec<TeamRow>, DbError> {
