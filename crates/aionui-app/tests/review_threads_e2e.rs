@@ -11,7 +11,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+use aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION;
 use common::{body_json, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
 fn write_lines(path: &std::path::Path, lines: &[String]) {
@@ -339,7 +339,7 @@ async fn agent_tokens_are_denied_on_every_review_route() {
         user_id.as_str(),
         CONVERSATION_ID,
         TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        [RuntimeTokenScope::ConversationHelper],
+        aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
     );
     let create_body = json!({
         "scope_kind": "task_run", "scope_id": "run-1", "conversation_id": CONVERSATION_ID,

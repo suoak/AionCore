@@ -140,6 +140,9 @@ pub enum SessionToolErrorCode {
     RateLimited,
     FeatureDisabled,
     RuntimeAuthFailed,
+    /// The runtime token is valid but the session does not have the
+    /// `session-message` skill installed (B-15).
+    SkillNotEnabled,
     SchemaValidationFailed,
     TransportUnavailable,
 }
@@ -378,6 +381,7 @@ mod tests {
             SessionToolErrorCode::RateLimited,
             SessionToolErrorCode::FeatureDisabled,
             SessionToolErrorCode::RuntimeAuthFailed,
+            SessionToolErrorCode::SkillNotEnabled,
             SessionToolErrorCode::SchemaValidationFailed,
             SessionToolErrorCode::TransportUnavailable,
         ];

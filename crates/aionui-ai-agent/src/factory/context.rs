@@ -53,6 +53,7 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            has_skill_snapshot: false,
             runtime_env: vec![("AIONUI_USER_ID".into(), "user-1".into())],
             team: None,
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {

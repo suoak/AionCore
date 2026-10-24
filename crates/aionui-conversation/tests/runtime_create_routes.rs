@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::agent_task::AgentInstance;
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{AgentError, IWorkerTaskManager, RuntimeTokenScope, RuntimeTokenService};
+use aionui_ai_agent::{AgentError, IWorkerTaskManager, RuntimeTokenService};
 use aionui_api_types::WebSocketMessage;
 use aionui_common::{AgentKillReason, TimestampMs};
 use aionui_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
@@ -195,7 +195,7 @@ impl Ctx {
                 user_id,
                 conversation_id,
                 aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-                [RuntimeTokenScope::ConversationHelper],
+                aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
             )
             .token
     }
@@ -422,4 +422,30 @@ async fn a_deleted_caller_is_503_transport_unavailable() {
     let (status, envelope) = call(&ctx, create_request(USER, "conv_a", Some(&token), r#"{"name":"x"}"#)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{envelope}");
     assert_eq!(envelope["error"]["code"], serde_json::json!("transport_unavailable"));
+}
+
+// ── B-15: helper token narrowed to the session's installed skills ───
+
+#[tokio::test]
+async fn a_helper_token_without_the_conversation_create_skill_is_403_skill_not_enabled() {
+    let ctx = setup().await;
+    ctx.caller("conv_a").await;
+    let token = ctx
+        .tokens
+        .issue(
+            USER,
+            "conv_a",
+            aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(Some(&["session-message".to_owned()])),
+        )
+        .token;
+    let (status, envelope) = call(&ctx, create_request(USER, "conv_a", Some(&token), r#"{"name":"x"}"#)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{envelope}");
+    assert_eq!(envelope["error"]["code"], serde_json::json!("skill_not_enabled"));
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conversation-create")
+    );
 }

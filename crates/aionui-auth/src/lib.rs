@@ -77,7 +77,7 @@ pub use agent_approval::{
     AGENT_APPROVAL_ID_HEADER, APPROVAL_EVENT, AgentActionApprovals, AgentApprovalRecord, ApprovalNotifier,
     ApprovalStatus, agent_approval_routes,
 };
-pub use agent_scope::{AgentActionKind, AgentRouteDecision};
+pub use agent_scope::{AgentActionKind, AgentRouteDecision, HelperSkill, HelperSkillSet};
 pub use middleware::{
     AgentPrincipal, AuthIdentityMode, AuthState, CurrentUser, IAgentConversationAccess, IRuntimeTokenVerifier,
     RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware,

@@ -119,6 +119,7 @@ fn make_aionrs_options(
         },
         model,
         skills: vec![],
+        has_skill_snapshot: false,
         runtime_env: vec![],
         team: None,
         kind: AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {

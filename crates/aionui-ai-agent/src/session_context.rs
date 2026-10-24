@@ -14,6 +14,10 @@ pub struct AgentSessionContext {
     pub workspace: WorkspaceContext,
     pub model: ProviderWithModel,
     pub skills: Vec<String>,
+    /// Whether `skills` came from a persisted `conversation.extra.skills`
+    /// snapshot. `false` for legacy rows without one; helper-token scopes
+    /// are only narrowed by skill when a snapshot exists (B-15).
+    pub has_skill_snapshot: bool,
     pub runtime_env: Vec<(String, String)>,
     pub team: Option<TeamSessionBinding>,
     pub kind: AgentSessionKind,
@@ -83,5 +87,11 @@ impl AgentSessionContext {
 
     pub fn agent_type(&self) -> AgentType {
         self.conversation.agent_type
+    }
+
+    /// Skill snapshot used to narrow the conversation-helper token, or `None`
+    /// when the conversation has no persisted snapshot.
+    pub fn helper_skill_snapshot(&self) -> Option<&[String]> {
+        self.has_skill_snapshot.then_some(self.skills.as_slice())
     }
 }

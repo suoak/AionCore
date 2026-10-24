@@ -16,6 +16,15 @@ pub enum RuntimeTokenScope {
     /// bound user's identity on ordinary API routes via the auth middleware's
     /// runtime-token channel — it does NOT grant team-tools access.
     ConversationHelper,
+    /// Helper surface of the `aionui-config` skill (`aioncore config ...`
+    /// writes and provider/MCP probes). See [`crate::helper_scopes`].
+    HelperConfig,
+    /// Helper surface of the `cron` skill (`aioncore config cron ...`).
+    HelperCron,
+    /// Helper surface of the `conversation-create` skill.
+    HelperConversationCreate,
+    /// Helper surface of the `session-message` skill.
+    HelperSessionMessage,
 }
 
 impl RuntimeTokenScope {
@@ -24,8 +33,40 @@ impl RuntimeTokenScope {
             Self::TeamContext => "team:context",
             Self::TeamCall => "team:call",
             Self::ConversationHelper => "conversation:helper",
+            Self::HelperConfig => "helper:config",
+            Self::HelperCron => "helper:cron",
+            Self::HelperConversationCreate => "helper:conversation-create",
+            Self::HelperSessionMessage => "helper:session-message",
         }
     }
+}
+
+impl RuntimeTokenScope {
+    /// Per-skill helper scopes (B-15). A conversation-helper token carries the
+    /// subset matching the skills actually installed in the session.
+    pub const HELPER_SKILL_SCOPES: [RuntimeTokenScope; 4] = [
+        Self::HelperConfig,
+        Self::HelperCron,
+        Self::HelperConversationCreate,
+        Self::HelperSessionMessage,
+    ];
+
+    pub fn is_helper_skill_scope(self) -> bool {
+        Self::HELPER_SKILL_SCOPES.contains(&self)
+    }
+}
+
+/// A conversation-helper request may only reuse a live token whose per-skill
+/// helper scopes are exactly the requested ones; otherwise a token minted
+/// before a skill was removed would keep the wider grant. Requests that do not
+/// ask for the helper scope (team-tools only) keep the plain subset rule.
+fn helper_skill_scopes_match(requested: &HashSet<RuntimeTokenScope>, existing: &HashSet<RuntimeTokenScope>) -> bool {
+    if !requested.contains(&RuntimeTokenScope::ConversationHelper) {
+        return true;
+    }
+    RuntimeTokenScope::HELPER_SKILL_SCOPES
+        .iter()
+        .all(|scope| requested.contains(scope) == existing.contains(scope))
 }
 
 #[derive(Clone)]
@@ -125,6 +166,7 @@ impl RuntimeTokenService {
                 && claims.conversation_id == conversation_id
                 && claims.session_generation == session_generation
                 && scopes.is_subset(&claims.scopes)
+                && helper_skill_scopes_match(scopes, &claims.scopes)
             {
                 Some(RuntimeTokenIssue {
                     token: token_entry.token.clone(),
@@ -370,6 +412,57 @@ mod tests {
             ),
             Err(RuntimeTokenError::Unknown)
         );
+    }
+
+    #[test]
+    fn narrowed_helper_issue_does_not_reuse_wider_helper_token() {
+        let service = RuntimeTokenService::new();
+        let wide = service.issue(
+            "user-1",
+            "conv-1",
+            "gen-1",
+            [RuntimeTokenScope::ConversationHelper, RuntimeTokenScope::HelperCron],
+        );
+        let narrow = service.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::ConversationHelper]);
+
+        assert_ne!(wide.token, narrow.token);
+        assert_eq!(
+            service.validate(
+                Some(&narrow.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::HelperCron,
+                "gen-1"
+            ),
+            Err(RuntimeTokenError::ScopeMissing)
+        );
+        assert_eq!(
+            service.validate(
+                Some(&wide.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::ConversationHelper,
+                "gen-1"
+            ),
+            Err(RuntimeTokenError::Unknown)
+        );
+    }
+
+    #[test]
+    fn team_only_issue_still_reuses_helper_token_with_skill_scopes() {
+        let service = RuntimeTokenService::new();
+        let helper = service.issue(
+            "user-1",
+            "conv-1",
+            "gen-1",
+            [
+                RuntimeTokenScope::ConversationHelper,
+                RuntimeTokenScope::HelperConfig,
+                RuntimeTokenScope::TeamContext,
+            ],
+        );
+        let team = service.issue("user-1", "conv-1", "gen-1", [RuntimeTokenScope::TeamContext]);
+        assert_eq!(helper.token, team.token);
     }
 
     #[test]

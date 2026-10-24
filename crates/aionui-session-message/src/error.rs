@@ -36,6 +36,9 @@ pub enum SessionMessageError {
 
     #[error("delivery transport unavailable: {reason}")]
     TransportUnavailable { reason: String },
+
+    #[error("skill `{skill}` is not enabled in this conversation, so its helper token may not call this route")]
+    SkillNotEnabled { skill: String },
 }
 
 impl SessionMessageError {
@@ -51,6 +54,7 @@ impl SessionMessageError {
             Self::FeatureDisabled => SessionToolErrorCode::FeatureDisabled,
             Self::SchemaValidation { .. } => SessionToolErrorCode::SchemaValidationFailed,
             Self::TransportUnavailable { .. } => SessionToolErrorCode::TransportUnavailable,
+            Self::SkillNotEnabled { .. } => SessionToolErrorCode::SkillNotEnabled,
         }
     }
 
@@ -60,7 +64,8 @@ impl SessionMessageError {
             Self::TargetIsTeam { .. }
             | Self::SenderIsTeam { .. }
             | Self::TargetNotSelected { .. }
-            | Self::FeatureDisabled => 403,
+            | Self::FeatureDisabled
+            | Self::SkillNotEnabled { .. } => 403,
             Self::TargetIsSelf { .. } | Self::SchemaValidation { .. } => 400,
             Self::QueueFull | Self::TransportUnavailable { .. } => 409,
             Self::RateLimited => 429,
@@ -118,6 +123,13 @@ mod tests {
                 SessionMessageError::TransportUnavailable { reason: "r".into() },
                 SessionToolErrorCode::TransportUnavailable,
                 409,
+            ),
+            (
+                SessionMessageError::SkillNotEnabled {
+                    skill: "session-message".into(),
+                },
+                SessionToolErrorCode::SkillNotEnabled,
+                403,
             ),
         ];
         for (error, code, status) in cases {

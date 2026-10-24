@@ -46,7 +46,37 @@ struct RuntimeCaller {
     conversation_id: String,
 }
 
-fn runtime_caller(state: &ConversationRuntimeRouterState, headers: &HeaderMap) -> Option<RuntimeCaller> {
+enum RuntimeCallerError {
+    /// Missing or invalid token — 401.
+    Unauthenticated,
+    /// Valid helper token, but the session lacks the `conversation-create`
+    /// skill (B-15) — 403 with the reason.
+    SkillNotEnabled,
+}
+
+fn runtime_caller(
+    state: &ConversationRuntimeRouterState,
+    headers: &HeaderMap,
+) -> Result<RuntimeCaller, RuntimeCallerError> {
+    let caller = authenticated_caller(state, headers).ok_or(RuntimeCallerError::Unauthenticated)?;
+    if let Some(token) = required_header(headers, HEADER_RUNTIME_TOKEN)
+        && state
+            .runtime_token_service
+            .validate(
+                Some(&token),
+                &caller.user_id,
+                &caller.conversation_id,
+                RuntimeTokenScope::HelperConversationCreate,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .is_ok()
+    {
+        return Ok(caller);
+    }
+    Err(RuntimeCallerError::SkillNotEnabled)
+}
+
+fn authenticated_caller(state: &ConversationRuntimeRouterState, headers: &HeaderMap) -> Option<RuntimeCaller> {
     let user_id = required_header(headers, HEADER_USER_ID)?;
     let conversation_id = required_header(headers, HEADER_CONVERSATION_ID)?;
     let token = required_header(headers, HEADER_RUNTIME_TOKEN)?;
@@ -84,17 +114,34 @@ async fn create(
     headers: HeaderMap,
     body: Result<Json<ConversationCreateRequest>, JsonRejection>,
 ) -> Reply {
-    let Some(caller) = runtime_caller(&state, &headers) else {
-        // No header values are logged — the token must never reach the logs.
-        warn!(
-            outcome = "rejected",
-            error_code = "runtime_auth_failed",
-            "agent conversation create refused"
-        );
-        return failure(
-            StatusCode::UNAUTHORIZED,
-            ConversationToolErrorPayload::new(ConversationToolErrorCode::RuntimeAuthFailed, "runtime auth failed"),
-        );
+    let caller = match runtime_caller(&state, &headers) {
+        Ok(caller) => caller,
+        Err(RuntimeCallerError::Unauthenticated) => {
+            // No header values are logged — the token must never reach the logs.
+            warn!(
+                outcome = "rejected",
+                error_code = "runtime_auth_failed",
+                "agent conversation create refused"
+            );
+            return failure(
+                StatusCode::UNAUTHORIZED,
+                ConversationToolErrorPayload::new(ConversationToolErrorCode::RuntimeAuthFailed, "runtime auth failed"),
+            );
+        }
+        Err(RuntimeCallerError::SkillNotEnabled) => {
+            warn!(
+                outcome = "rejected",
+                error_code = "skill_not_enabled",
+                "agent conversation create refused"
+            );
+            return failure(
+                StatusCode::FORBIDDEN,
+                ConversationToolErrorPayload::new(
+                    ConversationToolErrorCode::SkillNotEnabled,
+                    "skill `conversation-create` is not enabled in this conversation, so its helper token may not call this route",
+                ),
+            );
+        }
     };
     // Body parsing is deliberately AFTER auth so an unauthenticated caller
     // learns nothing about the schema; `deny_unknown_fields` on the request

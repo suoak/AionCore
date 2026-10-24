@@ -3,7 +3,6 @@
 
 mod common;
 
-use aionui_ai_agent::RuntimeTokenScope;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -31,7 +30,7 @@ fn mint_token(ctx: &Ctx, user_id: &str, conversation_id: &str) -> String {
             user_id,
             conversation_id,
             aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            [RuntimeTokenScope::ConversationHelper],
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
         )
         .token
 }
@@ -449,4 +448,35 @@ async fn a_broadcast_attempt_maps_to_400_schema_validation_failed() {
         json_body(response).await["error"]["code"],
         serde_json::json!("schema_validation_failed")
     );
+}
+
+// ── B-15: helper token narrowed to the session's installed skills ───
+
+#[tokio::test]
+async fn a_helper_token_without_the_session_message_skill_is_403_skill_not_enabled() {
+    let ctx = setup().await;
+    let token = ctx
+        .runtime_token_service
+        .issue(
+            USER,
+            "conv_a",
+            aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            aionui_ai_agent::helper_scopes::conversation_helper_scopes(Some(&["cron".to_owned()])),
+        )
+        .token;
+    for request in [
+        send_request(USER, "conv_a", &token, r#"{"to":"conv_b","message":"hi"}"#),
+        targets_request(USER, "conv_a", &token),
+    ] {
+        let response = router(&ctx).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let envelope = json_body(response).await;
+        assert_eq!(envelope["error"]["code"], serde_json::json!("skill_not_enabled"));
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session-message")
+        );
+    }
 }

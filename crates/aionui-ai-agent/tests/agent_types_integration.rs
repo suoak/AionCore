@@ -222,6 +222,7 @@ async fn collect_idle_ignores_aionrs_agent_type() {
                 use_model: None,
             },
             skills: vec![],
+            has_skill_snapshot: false,
             runtime_env: vec![],
             team: None,
             kind,

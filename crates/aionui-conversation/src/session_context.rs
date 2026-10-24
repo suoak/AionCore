@@ -82,7 +82,9 @@ impl<'a> SessionContextBuilder<'a> {
         let extra = parse_extra(row)?;
         let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
         let model = provider_model_from_conversation_row(row);
-        let skills = parse_string_array(extra.get("skills").cloned()).unwrap_or_default();
+        let skill_snapshot = parse_string_array(extra.get("skills").cloned());
+        let has_skill_snapshot = skill_snapshot.is_some();
+        let skills = skill_snapshot.unwrap_or_default();
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
             reason: format!("Invalid Team runtime context: {e}"),
         })?;
@@ -98,6 +100,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
+            has_skill_snapshot,
             runtime_env: Vec::new(),
             team,
             kind,

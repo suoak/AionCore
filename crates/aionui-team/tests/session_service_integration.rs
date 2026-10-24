@@ -679,6 +679,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 use_model: None,
             },
             skills: config.skills.clone(),
+            has_skill_snapshot: false,
             runtime_env: Vec::new(),
             team: team.clone(),
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
@@ -1503,6 +1504,7 @@ fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTa
             use_model: None,
         },
         skills: Vec::new(),
+        has_skill_snapshot: false,
         runtime_env: Vec::new(),
         team: None,
         kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {

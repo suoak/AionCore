@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::active_lease::ActiveLeaseRegistry;
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
+use crate::helper_scopes::conversation_helper_scopes;
 use crate::runtime_token::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use crate::types::{AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions, RuntimeCapabilities};
 
@@ -145,8 +146,9 @@ impl WorkerTaskManagerImpl {
         let Some(service) = &self.runtime_token_service else {
             return;
         };
-        // Helper scope for every conversation; team scopes only when team-bound.
-        let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        // Helper scope for every conversation, narrowed per installed skill
+        // (B-15); team scopes only when team-bound.
+        let mut scopes = conversation_helper_scopes(options.context.helper_skill_snapshot());
         if options.context.team.is_some() {
             scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
         }
@@ -540,6 +542,7 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            has_skill_snapshot: false,
             runtime_env: vec![],
             team: None,
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
@@ -784,6 +787,62 @@ mod tests {
                 TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             )
             .unwrap();
+    }
+
+    /// Token issued on a capability rebuild (the task-manager issuance site).
+    fn issued_runtime_token(mut options: BuildTaskOptions) -> (Arc<RuntimeTokenService>, String) {
+        let runtime_tokens = Arc::new(RuntimeTokenService::new());
+        let factory: AgentFactory = Arc::new(|opts: BuildTaskOptions| {
+            async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory).with_runtime_token_service(Arc::clone(&runtime_tokens));
+        mgr.refresh_runtime_token_for_new_task(&mut options);
+        let token = options
+            .context
+            .runtime_env
+            .iter()
+            .find(|(key, _)| key == AIONUI_RUNTIME_TOKEN_ENV)
+            .map(|(_, token)| token.clone())
+            .expect("runtime token injected");
+        (runtime_tokens, token)
+    }
+
+    fn has_scope(service: &RuntimeTokenService, token: &str, scope: RuntimeTokenScope) -> bool {
+        service
+            .validate(
+                Some(token),
+                "user-1",
+                "conv-1",
+                scope,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .is_ok()
+    }
+
+    #[test]
+    fn helper_token_without_skill_snapshot_keeps_every_helper_scope() {
+        let (service, token) = issued_runtime_token(make_options("conv-1"));
+        assert!(has_scope(&service, &token, RuntimeTokenScope::ConversationHelper));
+        for scope in RuntimeTokenScope::HELPER_SKILL_SCOPES {
+            assert!(has_scope(&service, &token, scope), "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn helper_token_is_narrowed_to_the_installed_skill_snapshot() {
+        let mut options = make_options("conv-1");
+        options.context.has_skill_snapshot = true;
+        options.context.skills = vec!["aionui-config".into(), "session-message".into(), "officecli".into()];
+        let (service, token) = issued_runtime_token(options);
+        assert!(has_scope(&service, &token, RuntimeTokenScope::ConversationHelper));
+        assert!(has_scope(&service, &token, RuntimeTokenScope::HelperConfig));
+        assert!(has_scope(&service, &token, RuntimeTokenScope::HelperSessionMessage));
+        assert!(!has_scope(&service, &token, RuntimeTokenScope::HelperCron));
+        assert!(!has_scope(
+            &service,
+            &token,
+            RuntimeTokenScope::HelperConversationCreate
+        ));
     }
 
     #[tokio::test]

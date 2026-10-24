@@ -110,6 +110,9 @@ pub enum ConversationToolErrorCode {
     AssistantDisabled,
     AssistantModelUnresolved,
     RuntimeAuthFailed,
+    /// The runtime token is valid but the session does not have the
+    /// `conversation-create` skill installed (B-15).
+    SkillNotEnabled,
     SchemaValidationFailed,
     TransportUnavailable,
 }
@@ -126,6 +129,7 @@ impl ConversationToolErrorCode {
             Self::AssistantDisabled => "assistant_disabled",
             Self::AssistantModelUnresolved => "assistant_model_unresolved",
             Self::RuntimeAuthFailed => "runtime_auth_failed",
+            Self::SkillNotEnabled => "skill_not_enabled",
             Self::SchemaValidationFailed => "schema_validation_failed",
             Self::TransportUnavailable => "transport_unavailable",
         }
@@ -277,6 +281,7 @@ mod tests {
             ConversationToolErrorCode::AssistantDisabled,
             ConversationToolErrorCode::AssistantModelUnresolved,
             ConversationToolErrorCode::RuntimeAuthFailed,
+            ConversationToolErrorCode::SkillNotEnabled,
             ConversationToolErrorCode::SchemaValidationFailed,
             ConversationToolErrorCode::TransportUnavailable,
         ];

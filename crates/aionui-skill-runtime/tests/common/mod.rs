@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use aionui_ai_agent::runtime_token::{RuntimeTokenScope, RuntimeTokenService};
+use aionui_ai_agent::runtime_token::RuntimeTokenService;
 use aionui_api_types::SKILL_RUNTIME_SCHEMA_VERSION;
 use aionui_db::models::ConversationRow;
 use aionui_db::{
@@ -160,7 +160,7 @@ impl TestHarness {
                 user_id,
                 conversation_id,
                 SESSION_GENERATION,
-                [RuntimeTokenScope::ConversationHelper],
+                aionui_ai_agent::helper_scopes::conversation_helper_scopes(None),
             )
             .token
     }
