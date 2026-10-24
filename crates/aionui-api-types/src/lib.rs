@@ -40,6 +40,7 @@ mod skill_delivery;
 mod skill_evolution;
 mod skill_runtime;
 mod system;
+mod task_board;
 mod task_session;
 mod team;
 mod team_mcp;
@@ -260,6 +261,12 @@ pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
     FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
     FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
+};
+pub use task_board::{
+    CreateTaskCommentRequest, EditTaskCommentRequest, TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind,
+    TaskBoardColumnResponse, TaskBoardItemResponse, TaskBoardQuery, TaskBoardResponse, TaskBoardReviewDecision,
+    TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus, TaskCommentKind, TaskCommentResponse,
+    UpdateTaskBoardRequest,
 };
 pub use task_session::{
     AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,

@@ -106,6 +106,12 @@ impl From<ConversationError> for ApiError {
                 })),
             ),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
+            ConversationError::BoardTransitionRejected { from, to, code, reason } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "board_transition_rejected",
+                reason,
+                Some(serde_json::json!({ "from": from, "to": to, "reason": code })),
+            ),
             ConversationError::CapabilityUnsupported { capability } => ApiError::coded(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "capability_unsupported",
@@ -139,6 +145,17 @@ impl From<ConversationError> for ApiError {
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/task-sessions", post(create_task_session).get(list_task_sessions))
+        .route("/api/task-sessions/board", get(get_task_board))
+        .route("/api/task-sessions/{id}/board", patch(update_task_board))
+        .route(
+            "/api/task-sessions/{id}/comments",
+            get(list_task_comments).post(create_task_comment),
+        )
+        .route(
+            "/api/task-sessions/{id}/comments/{comment_id}",
+            patch(edit_task_comment),
+        )
+        .route("/api/task-sessions/{id}/review", post(review_task_board))
         .route(
             "/api/task-sessions/{id}",
             get(get_task_session).patch(update_task_session),
@@ -288,6 +305,79 @@ async fn update_task_session(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(session)))
+}
+
+async fn get_task_board(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<aionui_api_types::TaskBoardQuery>,
+) -> Result<Json<ApiResponse<aionui_api_types::TaskBoardResponse>>, ApiError> {
+    let board = state.service.task_board(&user.id, query).await?;
+    Ok(Json(ApiResponse::ok(board)))
+}
+
+/// Board routes are user-only: agent runtime tokens are denied on
+/// `/api/task-sessions/*` by the agent scope, so the actor here is the user.
+async fn update_task_board(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::UpdateTaskBoardRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::TaskBoardItemResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let item = state
+        .service
+        .update_task_board(&user.id, &id, crate::board::BoardActor::User, request)
+        .await?;
+    Ok(Json(ApiResponse::ok(item)))
+}
+
+async fn review_task_board(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::TaskBoardReviewRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::TaskBoardReviewResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .review_task_board(&user.id, &id, crate::board::BoardActor::User, request)
+        .await?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn list_task_comments(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<aionui_api_types::TaskCommentResponse>>>, ApiError> {
+    let comments = state.service.list_task_comments(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(comments)))
+}
+
+async fn create_task_comment(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::CreateTaskCommentRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_api_types::TaskCommentResponse>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let comment = state.service.create_task_comment(&user.id, &id, &request.body).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(comment))))
+}
+
+async fn edit_task_comment(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, comment_id)): Path<(String, String)>,
+    body: Result<Json<aionui_api_types::EditTaskCommentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::TaskCommentResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let comment = state
+        .service
+        .edit_task_comment(&user.id, &id, &comment_id, &request.body)
+        .await?;
+    Ok(Json(ApiResponse::ok(comment)))
 }
 
 async fn update_task_retry_policy(
