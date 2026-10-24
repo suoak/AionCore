@@ -1739,7 +1739,7 @@ mod tests {
             repo.list_context_snapshots(USER, &task.id, "context-run")
                 .await
                 .unwrap(),
-            [snapshot.clone()]
+            std::slice::from_ref(&snapshot)
         );
         assert!(
             repo.list_context_snapshots("other-user", &task.id, "context-run")
@@ -2119,10 +2119,9 @@ mod tests {
             [left.is_ok(), right.is_ok()].into_iter().filter(|value| *value).count(),
             1
         );
-        let rejected = if left.is_err() {
-            left.unwrap_err()
-        } else {
-            right.unwrap_err()
+        let rejected = match left {
+            Err(error) => error,
+            Ok(_) => right.unwrap_err(),
         };
         assert!(matches!(rejected, DbError::Conflict(_)), "unexpected error: {rejected}");
         let stored = repo.get_approval(USER, &task.id, &approval.id).await.unwrap().unwrap();
@@ -2194,10 +2193,9 @@ mod tests {
             [left.is_ok(), right.is_ok()].into_iter().filter(|value| *value).count(),
             1
         );
-        let rejected = if left.is_err() {
-            left.unwrap_err()
-        } else {
-            right.unwrap_err()
+        let rejected = match left {
+            Err(error) => error,
+            Ok(_) => right.unwrap_err(),
         };
         assert!(matches!(rejected, DbError::Conflict(_)), "unexpected error: {rejected}");
         assert_eq!(repo.list_runs(USER, &task.id).await.unwrap().len(), 1);
