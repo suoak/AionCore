@@ -55,7 +55,9 @@ pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
-pub use repository::task_board::{AppendTaskCommentParams, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams};
+pub use repository::task_board::{
+    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams,
+};
 pub use repository::task_session::{
     AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateRetryTaskRunParams,
     CreateTaskArtifactParams, CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams,

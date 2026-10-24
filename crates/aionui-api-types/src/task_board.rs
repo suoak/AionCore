@@ -139,6 +139,47 @@ pub struct UpdateTaskBoardRequest {
     pub priority: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
+    /// Optimistic concurrency: the `updated_at` the client last saw. When it
+    /// no longer matches, the update is refused with 409 `board_item_stale`.
+    /// Omit it to keep last-write-wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_updated_at: Option<i64>,
+}
+
+/// WebSocket event names for the board (M8 E6). Every payload carries
+/// `user_id` (routing) and `task_session_id`.
+pub const EVENT_TASK_BOARD_UPDATED: &str = "task.board.updated";
+pub const EVENT_TASK_COMMENT_CREATED: &str = "task.comment.created";
+pub const EVENT_TASK_COMMENT_UPDATED: &str = "task.comment.updated";
+
+/// What caused a `task.board.updated` event.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskBoardChange {
+    /// `PATCH /api/task-sessions/{id}/board`.
+    Board,
+    /// `POST /api/task-sessions/{id}/review`.
+    Review,
+}
+
+/// `task.board.updated` payload: the item after the change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskBoardUpdatedEvent {
+    pub user_id: String,
+    pub task_session_id: String,
+    pub change: TaskBoardChange,
+    /// Column before the change (equal to `item.board_status` when it did not move).
+    pub from_board_status: TaskBoardStatus,
+    pub item: TaskBoardItemResponse,
+}
+
+/// `task.comment.created` / `task.comment.updated` payload. Timeline events
+/// (`status_change`, `assignment`, `review_decision`) are comments too.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskCommentEvent {
+    pub user_id: String,
+    pub task_session_id: String,
+    pub comment: TaskCommentResponse,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

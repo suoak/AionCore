@@ -71,6 +71,13 @@ pub enum ConversationError {
     #[error("Team runtime is required for conversation: {conversation_id}")]
     TeamRuntimeRequired { conversation_id: String, team_id: String },
 
+    #[error("Board item {id} changed since updated_at {expected}")]
+    BoardItemStale {
+        id: String,
+        expected: i64,
+        current: Option<i64>,
+    },
+
     #[error("Board transition rejected ({from} -> {to}): {reason}")]
     BoardTransitionRejected {
         from: String,
@@ -142,6 +149,7 @@ impl ConversationError {
             }
             Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
             Self::BoardTransitionRejected { reason, .. } => AgentError::conflict(reason.clone()),
+            Self::BoardItemStale { .. } => AgentError::conflict(self.to_string()),
             Self::CapabilityUnsupported { capability } => {
                 AgentError::bad_request(format!("Capability '{capability}' is not supported"))
             }
@@ -178,6 +186,7 @@ impl ConversationError {
             Self::TeamRuntimeRequired { .. } => "TEAM_RUNTIME_REQUIRED",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
             Self::BoardTransitionRejected { .. } => "board_transition_rejected",
+            Self::BoardItemStale { .. } => "board_item_stale",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",
             Self::RuntimeRetired { .. } => "runtime_retired",

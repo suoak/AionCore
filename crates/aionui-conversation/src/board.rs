@@ -15,7 +15,22 @@
 //!   `in_progress`.
 //! - Review reject sends the item back to `todo` (D6-5) with a mandatory
 //!   comment.
+//!
+//! Realtime: every successful board change pushes `task.board.updated`, and
+//! every timeline entry (comments and the status/assignment/review events)
+//! pushes `task.comment.created`; comment edits push `task.comment.updated`.
+//! Events are published only after the write succeeded.
+//!
+//! Concurrency: `UpdateTaskBoardRequest::expected_updated_at` is an optional
+//! optimistic lock. When given, the row must still carry that `updated_at`
+//! (checked before the state machine and again atomically in the UPDATE);
+//! otherwise the call fails with 409 `board_item_stale`. Omitted, the update
+//! stays last-write-wins.
 
+use aionui_api_types::{
+    EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED, TaskBoardChange,
+    TaskBoardUpdatedEvent, TaskCommentEvent, WebSocketMessage,
+};
 use aionui_api_types::{
     TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind, TaskBoardColumnResponse, TaskBoardItemResponse, TaskBoardQuery,
     TaskBoardResponse, TaskBoardReviewDecision, TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus,
@@ -23,7 +38,10 @@ use aionui_api_types::{
 };
 use aionui_common::now_ms;
 use aionui_db::models::{TaskBoardItemRow, TaskCommentRow};
-use aionui_db::{AppendTaskCommentParams, BoardAssignee, DbError, TaskBoardFilter, UpdateTaskBoardParams};
+use aionui_db::{
+    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, BoardAssignee, DbError, TaskBoardFilter,
+    UpdateTaskBoardParams,
+};
 
 use crate::error::ConversationError;
 use crate::service::ConversationService;
@@ -194,6 +212,14 @@ fn task_not_found(id: &str) -> ConversationError {
     ConversationError::not_found_reason(format!("Task session '{id}' not found"))
 }
 
+fn stale_error(id: &str, expected: i64, current: Option<i64>) -> ConversationError {
+    ConversationError::BoardItemStale {
+        id: id.to_owned(),
+        expected,
+        current,
+    }
+}
+
 fn map_db(id: &str, error: DbError) -> ConversationError {
     match error {
         DbError::NotFound(_) => task_not_found(id),
@@ -272,6 +298,41 @@ impl ConversationService {
             })
             .await
             .map_err(|error| map_db(id, error))
+            .inspect(|row| self.publish_comment(EVENT_TASK_COMMENT_CREATED, user_id, comment_response(row.clone())))
+    }
+
+    fn publish_board_updated(
+        &self,
+        user_id: &str,
+        change: TaskBoardChange,
+        from: TaskBoardStatus,
+        item: &TaskBoardItemResponse,
+    ) {
+        let event = TaskBoardUpdatedEvent {
+            user_id: user_id.to_owned(),
+            task_session_id: item.id.clone(),
+            change,
+            from_board_status: from,
+            item: item.clone(),
+        };
+        match serde_json::to_value(event) {
+            Ok(data) => self
+                .broadcaster()
+                .broadcast(WebSocketMessage::new(EVENT_TASK_BOARD_UPDATED, data)),
+            Err(error) => tracing::warn!(%error, "failed to serialize task.board.updated"),
+        }
+    }
+
+    fn publish_comment(&self, name: &str, user_id: &str, comment: TaskCommentResponse) {
+        let event = TaskCommentEvent {
+            user_id: user_id.to_owned(),
+            task_session_id: comment.task_session_id.clone(),
+            comment,
+        };
+        match serde_json::to_value(event) {
+            Ok(data) => self.broadcaster().broadcast(WebSocketMessage::new(name, data)),
+            Err(error) => tracing::warn!(%error, name, "failed to serialize task comment event"),
+        }
     }
 
     /// `GET /api/task-sessions/board`.
@@ -317,6 +378,11 @@ impl ConversationService {
         request: UpdateTaskBoardRequest,
     ) -> Result<TaskBoardItemResponse, ConversationError> {
         let current = self.board_item(user_id, id).await?;
+        if let Some(expected) = request.expected_updated_at
+            && expected != current.updated_at
+        {
+            return Err(stale_error(id, expected, Some(current.updated_at)));
+        }
         let from = TaskBoardStatus::parse(&current.board_status)
             .ok_or_else(|| ConversationError::internal("Unknown board_status"))?;
         if actor == BoardActor::Agent
@@ -369,7 +435,12 @@ impl ConversationService {
             return Err(ConversationError::bad_request("assignee.id must not be empty"));
         }
         let labels = request.labels.as_deref().map(validate_labels).transpose()?;
-        let now = now_ms();
+        // With a lock the new value must differ from the guarded one, or two
+        // writes in the same millisecond would both pass the next guard.
+        let now = match request.expected_updated_at {
+            Some(expected) => now_ms().max(expected + 1),
+            None => now_ms(),
+        };
         let params = UpdateTaskBoardParams {
             board_status: request.board_status.map(TaskBoardStatus::as_str),
             board_rank: request.board_rank.as_ref().map(|rank| rank.as_deref()),
@@ -382,12 +453,18 @@ impl ConversationService {
             priority: request.priority,
             labels: labels.as_deref(),
             updated_at: now,
+            expected_updated_at: request.expected_updated_at,
         };
         let row = self
             .task_board_repo()?
             .update_board(user_id, id, &params)
             .await
-            .map_err(|error| map_db(id, error))?;
+            .map_err(|error| match (error, request.expected_updated_at) {
+                (DbError::Conflict(message), Some(expected)) if message.starts_with(BOARD_STALE_CONFLICT_PREFIX) => {
+                    stale_error(id, expected, None)
+                }
+                (error, _) => map_db(id, error),
+            })?;
         if let Some(to) = request.board_status
             && to != from
         {
@@ -414,7 +491,9 @@ impl ConversationService {
                 .await?;
             }
         }
-        item_response(row)
+        let item = item_response(row)?;
+        self.publish_board_updated(user_id, TaskBoardChange::Board, from, &item);
+        Ok(item)
     }
 
     /// `POST /api/task-sessions/{id}/review` (user credential only).
@@ -467,8 +546,10 @@ impl ConversationService {
                 now,
             )
             .await?;
+        let item = item_response(row)?;
+        self.publish_board_updated(user_id, TaskBoardChange::Review, from, &item);
         Ok(TaskBoardReviewResponse {
-            item: item_response(row)?,
+            item,
             decision: comment_response(decision),
         })
     }
@@ -503,7 +584,9 @@ impl ConversationService {
             })
             .await
             .map_err(|error| map_db(id, error))?;
-        Ok(comment_response(row))
+        let comment = comment_response(row);
+        self.publish_comment(EVENT_TASK_COMMENT_CREATED, user_id, comment.clone());
+        Ok(comment)
     }
 
     /// Author-only body correction within the edit window; otherwise 409.
@@ -526,7 +609,9 @@ impl ConversationService {
                 DbError::Conflict(reason) => ConversationError::Busy { reason },
                 other => other.into(),
             })?;
-        Ok(comment_response(row))
+        let comment = comment_response(row);
+        self.publish_comment(EVENT_TASK_COMMENT_UPDATED, user_id, comment.clone());
+        Ok(comment)
     }
 }
 
