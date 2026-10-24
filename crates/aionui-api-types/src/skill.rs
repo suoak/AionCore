@@ -41,6 +41,10 @@ pub struct SkillListItemResponse {
     pub source: SkillSourceResponse,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_origin: Option<SkillRegistryOriginResponse>,
+    /// DB id of the skill (E10-2), for `/api/skills/id/{skill_id}/...`.
+    /// Absent for entries not backed by the skills table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -404,6 +408,7 @@ mod tests {
             is_custom: true,
             source: SkillSourceResponse::Custom,
             registry_origin: None,
+            skill_id: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["name"], "my-skill");
@@ -429,6 +434,7 @@ mod tests {
             is_custom: false,
             source: SkillSourceResponse::Builtin,
             registry_origin: None,
+            skill_id: None,
         };
         let json = serde_json::to_value(&item).unwrap();
         // Project-wide wire contract: relative_location stays snake_case.

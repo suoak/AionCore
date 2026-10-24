@@ -288,6 +288,9 @@ pub struct SkillListItem {
     pub is_custom: bool,
     pub source: SkillSource,
     pub registry_origin: Option<SkillRegistryOriginResponse>,
+    /// `skills.id` when the item comes from the DB catalog (E10-2: lets the UI
+    /// open `/api/skills/id/{skill_id}/source`). `None` for disk-only entries.
+    pub skill_id: Option<String>,
 }
 
 /// List all available skills (built-in + user custom), deduplicated.
@@ -387,6 +390,7 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 is_custom: false,
                 source: SkillSource::Builtin,
                 registry_origin: None,
+                skill_id: None,
             });
         }
     }
@@ -414,6 +418,7 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 is_custom: false,
                 source: SkillSource::Builtin,
                 registry_origin: None,
+                skill_id: None,
             });
         }
     }
@@ -1791,6 +1796,7 @@ fn skill_row_to_list_item(
     };
 
     SkillListItem {
+        skill_id: Some(row.id),
         name: row.name,
         description,
         location,
@@ -1842,6 +1848,7 @@ async fn list_user_skills_from_disk(paths: &SkillPaths) -> Result<Vec<SkillListI
             is_custom: true,
             source: SkillSource::Custom,
             registry_origin: None,
+            skill_id: None,
         })
         .collect())
 }
