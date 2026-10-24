@@ -54,6 +54,13 @@ pub trait SkillEvolutionApplyPort: Send + Sync {
         workspace_root: Option<&str>,
         write_to_skills_hub: bool,
     ) -> Result<SkillWriteOutcome, AssistantError>;
+
+    /// Whether the existing skill `skill_key` ships scripts (M8 E10, D10-7).
+    /// Evolution never auto-applies to such a skill. The default answers
+    /// `true` so an adapter that cannot tell keeps auto-apply off.
+    async fn target_has_scripts(&self, _user_id: &str, _skill_key: &str) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -65,4 +72,35 @@ pub trait SkillEvolutionPinPort: Send + Sync {
         skill_key: &str,
         version: &str,
     ) -> Result<(), AssistantError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct WriteOnly;
+
+    #[async_trait]
+    impl SkillEvolutionApplyPort for WriteOnly {
+        async fn write_skill(
+            &self,
+            _user_id: &str,
+            skill_key: &str,
+            _skill_md: &str,
+            _workspace_root: Option<&str>,
+            _write_to_skills_hub: bool,
+        ) -> Result<SkillWriteOutcome, AssistantError> {
+            Ok(SkillWriteOutcome {
+                skills_hub_path: None,
+                workspace_skill_path: None,
+                skill_key: skill_key.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_script_state_keeps_auto_apply_off() {
+        // D10-7: an adapter that cannot inspect the skill must not unlock auto-apply.
+        assert!(WriteOnly.target_has_scripts("u", "k").await);
+    }
 }

@@ -32,14 +32,15 @@ pub use models::{
     CreateAssistantDefinitionRevisionParams, CreateAssistantParams, CreateExperienceArticleParams,
     CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection, FolderRow, InboxItemRow,
     JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
-    SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillImportRecordRow, SkillRegistryInstallRow, SkillRow,
-    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
-    TaskSessionRow, TaskTraceEventRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpdateAssistantParams, UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams,
-    UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    UpsertConversationCapabilitySnapshotParams, UpsertJournalProjectionCheckpointParams, UpsertOverrideParams,
-    UpsertSkillEvolutionSettingsParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
+    SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillGovernanceRow, SkillImportRecordRow,
+    SkillRegistryInstallRow, SkillRow, SkillSourceRow, SkillVersionRow, TaskAcceptanceCriterionRow, TaskApprovalRow,
+    TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow, TaskSessionRow, TaskTraceEventRow,
+    UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams, UpsertAssistantAgentCenterParams,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+    UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
+    UpsertJournalProjectionCheckpointParams, UpsertOverrideParams, UpsertSkillEvolutionSettingsParams, UsageEventRow,
+    UserOrderRow, UserStatus, UserType, evolution_auto_apply_allowed, review_status_is_live,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -55,6 +56,9 @@ pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, UpsertSkillRegistryInstallParams};
+pub use repository::skill_source::{
+    AppendSkillVersionOutcome, AppendSkillVersionParams, ISkillSourceRepository, UpsertSkillSourceParams,
+};
 pub use repository::task_board::{AppendTaskCommentParams, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams};
 pub use repository::task_session::{
     AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateRetryTaskRunParams,
@@ -83,9 +87,9 @@ pub use repository::{
     SqliteExperienceArticleRepository, SqliteFeedbackDiagnosticsRepository, SqliteInboxRepository,
     SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillEvolutionProposalRepository,
-    SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteTaskBoardRepository,
-    SqliteTaskSessionRepository, SqliteTeamRepository, SqliteUsageEventRepository, SqliteUserOrderStore,
-    SqliteUserRepository, UpsertInboxItemParams, UsageEventFilter,
+    SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteSkillSourceRepository,
+    SqliteTaskBoardRepository, SqliteTaskSessionRepository, SqliteTeamRepository, SqliteUsageEventRepository,
+    SqliteUserOrderStore, SqliteUserRepository, UpsertInboxItemParams, UsageEventFilter,
 };
 
 // Re-export sqlx pool type for downstream crates
