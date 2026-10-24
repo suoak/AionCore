@@ -182,6 +182,12 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         args.push("--strict-mcp-config".to_string());
     }
 
+    // M8 E7-4: Squad tool profile → native tool removal.
+    if !config.init.disallowed_tools.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(config.init.disallowed_tools.join(","));
+    }
+
     // SECURITY (fail-CLOSED): ALWAYS pass --permission-mode. Omitting it makes claude
     // headless default to `bypassPermissions` — LIVE-PROBED: `system/init` reports
     // `permissionMode: bypassPermissions` and Write/Bash auto-run with NO `can_use_tool`
@@ -3870,6 +3876,46 @@ mod tests {
     /// `--strict-mcp-config` must NEVER appear without `--mcp-config` (stripping the
     /// machine's ambient `~/.claude` servers when we inject none would silently
     /// disable a user's machine-level config).
+    /// E7-4: a Squad profile strips native tools via `--disallowedTools`.
+    #[test]
+    fn build_claude_init_args_emits_disallowed_tools_for_squad_profiles() {
+        let leader = SessionConfig {
+            init: SessionInit {
+                disallowed_tools: ["Task", "Agent", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]
+                    .map(String::from)
+                    .to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_claude_init_args(&leader);
+        let i = args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("flag present");
+        let list: Vec<&str> = args[i + 1].split(',').collect();
+        for tool in ["Task", "Agent", "Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"] {
+            assert!(list.contains(&tool), "leader must disallow {tool}: {list:?}");
+        }
+
+        let member = SessionConfig {
+            init: SessionInit {
+                disallowed_tools: vec!["Task".into(), "Agent".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_claude_init_args(&member);
+        let i = args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("flag present");
+        assert_eq!(args[i + 1], "Task,Agent", "member loses only sub-agent tools");
+
+        let plain = build_claude_init_args(&SessionConfig::default());
+        assert!(!plain.iter().any(|a| a == "--disallowedTools"));
+    }
+
     #[test]
     fn build_claude_init_args_no_strict_without_mcp() {
         let config = SessionConfig {

@@ -148,6 +148,29 @@ fn apply_runtime_tool_policy(config: &mut Config, policy: AionrsRuntimeToolPolic
     }
 }
 
+/// E7-4: a route_only Squad Leader may not spawn sub-agents, write files or
+/// run commands. aionrs gates exact tool names both when advertising tools
+/// and before execution, so narrow an unrestricted policy to read-only
+/// built-ins + the Team route tools; hooks and plan tools are side-effect
+/// paths outside that gate, so they go too. A stricter policy already in
+/// force (StrictPlanning) is kept. Members are not narrowed here (their
+/// allow-list would need post-bootstrap MCP names) — the preview reports
+/// aionrs Members as `unenforceable`.
+pub(crate) fn apply_squad_tool_profile(
+    config: &mut Config,
+    policy: ToolPolicy,
+    profile: Option<aionui_api_types::SquadToolProfile>,
+) -> ToolPolicy {
+    if profile != Some(aionui_api_types::SquadToolProfile::RouteOnlyLeader) || policy != ToolPolicy::Unrestricted {
+        return policy;
+    }
+    config.hooks = Default::default();
+    config.plan.enabled = false;
+    let allowed =
+        aionui_api_types::aionrs_route_only_leader_allowed_tools(aionui_api_types::SQUAD_ROUTE_ONLY_LEADER_TOOLS);
+    ToolPolicy::allow_only(allowed.iter().map(String::as_str))
+}
+
 #[derive(Clone, Debug)]
 struct AionrsFinalInputDumpContext {
     dump_dir: PathBuf,
@@ -318,6 +341,7 @@ impl AionrsAgentManager {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
         }
         let tool_policy = apply_runtime_tool_policy(&mut config, config_extra.tool_policy);
+        let tool_policy = apply_squad_tool_profile(&mut config, tool_policy, config_extra.squad_tool_profile);
         allow_tool_search_without_approval(&mut config);
         // E2 (C-09): the MCP servers that actually start are exactly the ones in
         // this Core-assembled config (after the policy pass above).

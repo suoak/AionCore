@@ -830,6 +830,12 @@ impl TeamSessionService {
         Ok(())
     }
 
+    /// M8 E7-4: whether the Team is a Squad instance (lookup failure → false;
+    /// only used for prompt text, enforcement uses `ensure_not_squad`).
+    pub async fn is_squad_team(&self, team_id: &str) -> bool {
+        matches!(self.repo.team_squad_template_id(team_id).await, Ok(Some(_)))
+    }
+
     /// M8 E7-3: true when the Team is a Squad instance whose Leader is
     /// `route_only` (D7-1 default). Lookup failures fail closed.
     pub async fn squad_leader_route_only(&self, team_id: &str) -> bool {
@@ -838,6 +844,31 @@ impl TeamSessionService {
             Err(error) => {
                 tracing::warn!(team_id, %error, "squad leader_mode lookup failed; enforcing route_only");
                 true
+            }
+        }
+    }
+
+    /// M8 E7-4: write `extra.squad_tool_profile` onto every agent conversation
+    /// of a freshly instantiated Squad (Leader → `leader`, others → member).
+    /// Failures are logged; the Team MCP gate (E7-3) still applies.
+    pub async fn stamp_squad_tool_profiles(
+        &self,
+        team: &aionui_api_types::TeamResponse,
+        leader: aionui_api_types::SquadToolProfile,
+    ) {
+        for agent in &team.assistants {
+            let profile = if agent.role == "lead" {
+                leader
+            } else {
+                aionui_api_types::SquadToolProfile::Member
+            };
+            let patch = serde_json::json!({ "squad_tool_profile": profile });
+            if let Err(error) = self
+                .conversation_port
+                .patch_runtime_config(&agent.conversation_id, patch)
+                .await
+            {
+                tracing::warn!(team_id = %team.id, slot_id = %agent.slot_id, %error, "failed to stamp squad tool profile");
             }
         }
     }

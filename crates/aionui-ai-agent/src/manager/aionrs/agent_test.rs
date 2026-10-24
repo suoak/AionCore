@@ -125,6 +125,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         runtime_env: Vec::new(),
         prompt_dump_dir: None,
         tool_policy: Default::default(),
+        squad_tool_profile: None,
     }
 }
 
@@ -199,6 +200,69 @@ max_tokens = 42
         embedded.compat.default_max_tokens_for_model("claude-sonnet-4-6"),
         Some(128_000)
     );
+}
+
+/// E7-4: route_only Squad Leader on aionrs keeps only read-only built-ins and
+/// Team route tools; hooks and plan tools are disabled; Team MCP stays.
+#[test]
+fn squad_route_only_leader_profile_narrows_unrestricted_policy() {
+    let project = tempfile::tempdir().unwrap();
+    let mut config = resolve_aionui_config(&make_cli_args(project.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+    // Team MCP is injected by Core (extra_mcp_servers) before the policy pass.
+    config.mcp.servers.insert(
+        "aionui-team".to_owned(),
+        McpServerConfig {
+            transport: TransportType::Stdio,
+            command: Some("team-mcp".to_owned()),
+            args: None,
+            env: None,
+            url: None,
+            headers: None,
+            deferred: Some(false),
+            startup_timeout_ms: None,
+        },
+    );
+    let base = apply_runtime_tool_policy(&mut config, AionrsRuntimeToolPolicy::Unrestricted);
+    let policy = apply_squad_tool_profile(
+        &mut config,
+        base,
+        Some(aionui_api_types::SquadToolProfile::RouteOnlyLeader),
+    );
+
+    assert!(config.hooks.pre_tool_use.is_empty());
+    assert!(!config.plan.enabled);
+    assert!(config.mcp.servers.contains_key("aionui-team"), "Team MCP must survive");
+    for allowed in ["Read", "Grep", "team_send_message", "mcp__aionui-team_team_task_list"] {
+        assert!(policy.allows(allowed), "{allowed}");
+    }
+    for denied in [
+        "Spawn",
+        "Write",
+        "Edit",
+        "ExecCommand",
+        "Skill",
+        "team_spawn_agent",
+        "unknown",
+    ] {
+        assert!(!policy.allows(denied), "{denied}");
+    }
+
+    // Member / no profile: untouched.
+    let mut config = resolve_aionui_config(&make_cli_args(project.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+    let member = apply_squad_tool_profile(
+        &mut config,
+        ToolPolicy::Unrestricted,
+        Some(aionui_api_types::SquadToolProfile::Member),
+    );
+    assert_eq!(member, ToolPolicy::Unrestricted);
+    // A stricter policy already in force is kept.
+    let strict = ToolPolicy::allow_only(["Read"]);
+    let kept = apply_squad_tool_profile(
+        &mut config,
+        strict.clone(),
+        Some(aionui_api_types::SquadToolProfile::RouteOnlyLeader),
+    );
+    assert_eq!(kept, strict);
 }
 
 #[test]

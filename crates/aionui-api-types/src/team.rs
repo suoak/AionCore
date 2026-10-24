@@ -612,6 +612,9 @@ pub struct TeamResponse {
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    /// M8 E7-4: set when the Team was instantiated from a Squad template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad_template_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -1314,6 +1317,7 @@ mod tests {
                 },
             }],
             leader_assistant_id: Some("slot-1".into()),
+            squad_template_id: None,
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
@@ -1336,6 +1340,7 @@ mod tests {
             workspace: String::new(),
             assistants: vec![],
             leader_assistant_id: None,
+            squad_template_id: None,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
@@ -1486,6 +1491,7 @@ mod tests {
                 },
             ],
             leader_assistant_id: Some("s1".into()),
+            squad_template_id: None,
             created_at: 1000,
             updated_at: 2000,
         };

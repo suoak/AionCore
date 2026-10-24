@@ -304,6 +304,7 @@ impl Team {
             workspace: self.workspace.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
+            squad_template_id: None,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }

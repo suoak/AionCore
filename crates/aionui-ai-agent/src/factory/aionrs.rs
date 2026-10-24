@@ -259,6 +259,7 @@ pub(super) async fn build(
         runtime_env: ctx.runtime_env,
         prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
         tool_policy,
+        squad_tool_profile: overrides.squad_tool_profile,
     };
 
     if let Some(system_prompt) = config.system_prompt.as_deref()

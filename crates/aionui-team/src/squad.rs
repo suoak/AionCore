@@ -15,10 +15,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, AssistantBrief, DeleteSquadResponse, ListSquadsQuery, SQUAD_MAX_PARTICIPANTS,
-    SQUAD_SUBAGENT_SPAWN_FORBIDDEN, SquadInstantiateInput, SquadInstantiateResponse, SquadLeaderMode, SquadMember,
-    SquadPreview, SquadPreviewBlocker, SquadPreviewParticipant, SquadTemplate, SquadTemplateInput, SquadTemplatePatch,
-    SquadVisibility, TeamAgentInput,
+    ApiResponse, AssistantBrief, DeleteSquadResponse, ListSquadsQuery, NativeToolEnforcement,
+    SQUAD_LEADER_BACKEND_UNENFORCEABLE, SQUAD_MAX_PARTICIPANTS, SQUAD_SUBAGENT_SPAWN_FORBIDDEN, SquadInstantiateInput,
+    SquadInstantiateResponse, SquadLeaderMode, SquadMember, SquadPreview, SquadPreviewBlocker, SquadPreviewParticipant,
+    SquadTemplate, SquadTemplateInput, SquadTemplatePatch, SquadToolProfile, SquadVisibility, TeamAgentInput,
+    squad_native_tool_enforcement,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, generate_id, now_ms};
@@ -53,12 +54,7 @@ pub struct SquadRouterState {
 
 /// D7-1 `route_only`: the Team MCP tools a Squad Leader keeps (E7-3 enforces
 /// this at MCP dispatch; the preview reports it).
-pub const SQUAD_ROUTE_ONLY_LEADER_TOOLS: &[&str] = &[
-    "team_send_message",
-    "team_task_update",
-    "team_task_list",
-    "team_describe_assistant",
-];
+pub const SQUAD_ROUTE_ONLY_LEADER_TOOLS: &[&str] = aionui_api_types::SQUAD_ROUTE_ONLY_LEADER_TOOLS;
 
 pub fn squad_routes(state: SquadRouterState) -> Router {
     Router::new()
@@ -455,6 +451,20 @@ async fn delete_squad(
 // M8 E7-2: preview + instantiate
 // ---------------------------------------------------------------------------
 
+fn leader_tool_profile(mode: SquadLeaderMode) -> SquadToolProfile {
+    if mode == SquadLeaderMode::RouteOnly {
+        SquadToolProfile::RouteOnlyLeader
+    } else {
+        SquadToolProfile::Member
+    }
+}
+
+fn enforcement_for(backend: Option<&str>, profile: SquadToolProfile) -> NativeToolEnforcement {
+    backend
+        .map(|b| squad_native_tool_enforcement(b, profile))
+        .unwrap_or(NativeToolEnforcement::Unenforceable)
+}
+
 fn build_preview(row: &SquadTemplateRow, catalog: &HashMap<String, TeamAssistantCatalogEntry>) -> SquadPreview {
     let leader_mode = SquadLeaderMode::parse(&row.leader_mode).unwrap_or_default();
     let members: Vec<SquadMember> = serde_json::from_str(&row.members).unwrap_or_default();
@@ -485,6 +495,11 @@ fn build_preview(row: &SquadTemplateRow, catalog: &HashMap<String, TeamAssistant
         subagent_spawn: SQUAD_SUBAGENT_SPAWN_FORBIDDEN.into(),
         team_tools: (leader_mode == SquadLeaderMode::RouteOnly)
             .then(|| SQUAD_ROUTE_ONLY_LEADER_TOOLS.iter().map(|t| (*t).to_owned()).collect()),
+        tool_profile: leader_tool_profile(leader_mode),
+        native_tool_enforcement: enforcement_for(
+            leader_entry.map(|e| e.backend.as_str()),
+            leader_tool_profile(leader_mode),
+        ),
         assistant: leader_brief,
     });
     for m in &members {
@@ -500,6 +515,8 @@ fn build_preview(row: &SquadTemplateRow, catalog: &HashMap<String, TeamAssistant
             eligible: entry.is_some(),
             subagent_spawn: SQUAD_SUBAGENT_SPAWN_FORBIDDEN.into(),
             team_tools: None,
+            tool_profile: SquadToolProfile::Member,
+            native_tool_enforcement: enforcement_for(entry.map(|e| e.backend.as_str()), SquadToolProfile::Member),
             assistant: brief(&m.assistant_id, catalog),
         });
     }
@@ -510,6 +527,18 @@ fn build_preview(row: &SquadTemplateRow, catalog: &HashMap<String, TeamAssistant
                 assistant_id: Some(p.assistant_id.clone()),
             });
         }
+    }
+    // M8 E7-4: a route_only Leader must sit on a backend whose native
+    // sub-agent / write / exec tools WorkMate can actually remove.
+    if leader_mode == SquadLeaderMode::RouteOnly
+        && let Some(leader) = participants.first()
+        && leader.eligible
+        && leader.native_tool_enforcement == NativeToolEnforcement::Unenforceable
+    {
+        blocking.push(SquadPreviewBlocker {
+            code: SQUAD_LEADER_BACKEND_UNENFORCEABLE.into(),
+            assistant_id: Some(leader.assistant_id.clone()),
+        });
     }
     if row.visibility == "team" {
         blocking.push(SquadPreviewBlocker {
@@ -564,10 +593,10 @@ async fn instantiate_squad(
         };
         return Err(coded(
             status,
-            if first.code == "squad_team_visibility_unavailable" {
-                "squad_team_visibility_unavailable"
-            } else {
-                "squad_assistant_not_eligible"
+            match first.code.as_str() {
+                "squad_team_visibility_unavailable" => "squad_team_visibility_unavailable",
+                SQUAD_LEADER_BACKEND_UNENFORCEABLE => SQUAD_LEADER_BACKEND_UNENFORCEABLE,
+                _ => "squad_assistant_not_eligible",
             },
             "squad cannot be instantiated",
             Some(json!({ "assistant_id": first.assistant_id, "blocking": preview.blocking })),
@@ -597,6 +626,17 @@ async fn instantiate_squad(
             .resolve_spawn_backend_and_model(&user.id, Some(&p.assistant_id), None, &fallback_backend, "")
             .await
             .map_err(ApiError::from)?;
+        if p.role == "lead"
+            && p.tool_profile == SquadToolProfile::RouteOnlyLeader
+            && squad_native_tool_enforcement(&backend, p.tool_profile) == NativeToolEnforcement::Unenforceable
+        {
+            return Err(coded(
+                StatusCode::BAD_REQUEST,
+                SQUAD_LEADER_BACKEND_UNENFORCEABLE,
+                "route_only Leader backend cannot remove native sub-agent/write/exec tools",
+                Some(json!({ "assistant_id": p.assistant_id, "backend": backend })),
+            ));
+        }
         agents.push(TeamAgentInput {
             name: p.agent_name.clone(),
             role: p.role.clone(),
@@ -626,6 +666,11 @@ async fn instantiate_squad(
             Some(json!({ "team_id": team.id })),
         ));
     }
+    // M8 E7-4: persist each participant's native tool profile before any
+    // session launches (sessions start lazily on first message).
+    teams
+        .stamp_squad_tool_profiles(&team, leader_tool_profile(preview.leader_mode))
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::ok(SquadInstantiateResponse {
@@ -654,7 +699,15 @@ mod tests {
                 .map(|id| TeamAssistantCatalogEntry {
                     assistant_id: (*id).to_string(),
                     name: format!("name-{id}"),
-                    backend: "claude".into(),
+                    // E7-4: id prefix picks the backend so tests can mix
+                    // enforceable and unenforceable participants.
+                    backend: if id.starts_with("gem") {
+                        "gemini".into()
+                    } else if id.starts_with("aion") {
+                        "aionrs".into()
+                    } else {
+                        "claude".into()
+                    },
                     description: String::new(),
                     skills: vec![],
                 })
@@ -867,6 +920,39 @@ mod tests {
         let (status, v) = call(&app, "GET", "/api/squads/nope/preview", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(v["code"], "squad_not_found");
+    }
+
+    #[tokio::test]
+    async fn route_only_leader_on_unenforceable_backend_is_blocked() {
+        let (app, _db) = app(vec!["gem-lead", "aion-lead", "lead", "gem-a", "aion-a"]).await;
+        let mk = |leader: &str| json!({ "name": format!("sq-{leader}"), "leader_assistant_id": leader, "members": [member("gem-a"), member("aion-a")] });
+        // gemini leader: preview reports + blocks, instantiate answers 400.
+        let (_, v) = call(&app, "POST", "/api/squads", Some(mk("gem-lead"))).await;
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        let (_, v) = call(&app, "GET", &format!("/api/squads/{id}/preview"), None).await;
+        let d = &v["data"];
+        assert_eq!(d["can_instantiate"], false, "{v}");
+        assert_eq!(d["blocking"][0]["code"], SQUAD_LEADER_BACKEND_UNENFORCEABLE);
+        assert_eq!(d["blocking"][0]["assistant_id"], "gem-lead");
+        let ps = d["participants"].as_array().unwrap();
+        assert_eq!(ps[0]["tool_profile"], "route_only_leader");
+        assert_eq!(ps[0]["native_tool_enforcement"], "unenforceable");
+        // Members on unenforceable backends are labelled, not blocked.
+        assert_eq!(ps[1]["tool_profile"], "member");
+        assert_eq!(ps[1]["native_tool_enforcement"], "unenforceable");
+        assert_eq!(ps[2]["native_tool_enforcement"], "unenforceable", "aionrs member");
+        let (status, v) = call(&app, "POST", &format!("/api/squads/{id}/instantiate"), Some(json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], SQUAD_LEADER_BACKEND_UNENFORCEABLE);
+
+        // aionrs / claude leaders are enforceable.
+        for leader in ["aion-lead", "lead"] {
+            let (_, v) = call(&app, "POST", "/api/squads", Some(mk(leader))).await;
+            let id = v["data"]["id"].as_str().unwrap().to_string();
+            let (_, v) = call(&app, "GET", &format!("/api/squads/{id}/preview"), None).await;
+            assert_eq!(v["data"]["can_instantiate"], true, "{leader}: {v}");
+            assert_eq!(v["data"]["participants"][0]["native_tool_enforcement"], "enforced");
+        }
     }
 
     #[tokio::test]
