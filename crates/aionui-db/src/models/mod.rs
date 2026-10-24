@@ -37,6 +37,7 @@ pub use assistant::{
     UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
+pub use batch::{BatchItemRow, BatchJobRow};
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;
 pub use conversation::{
@@ -46,7 +47,6 @@ pub use conversation::{
 };
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
-pub use batch::{BatchItemRow, BatchJobRow};
 pub use inbox_item::InboxItemRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;

@@ -3,15 +3,12 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{BatchItemRow, BatchJobRow};
-use crate::repository::batch::{
-    BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams, IBatchRepository,
-};
+use crate::repository::batch::{BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams, IBatchRepository};
 
 const JOB_COLUMNS: &str = "id, user_id, title, project_id, template, agent_type, assistant_id, mode, \
      concurrency, item_timeout_sec, checks, status, trial_size, created_at, updated_at";
 
-const ITEM_COLUMNS: &str =
-    "id, batch_job_id, seq, target, task_session_id, attempt, status, check_results, error, \
+const ITEM_COLUMNS: &str = "id, batch_job_id, seq, target, task_session_id, attempt, status, check_results, error, \
      started_at, finished_at";
 
 #[derive(Clone, Debug)]
@@ -25,12 +22,11 @@ impl SqliteBatchRepository {
     }
 
     async fn owned_job_exists(&self, user_id: &str, batch_job_id: &str) -> Result<bool, DbError> {
-        let found: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM batch_jobs WHERE id = ? AND user_id = ?")
-                .bind(batch_job_id)
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM batch_jobs WHERE id = ? AND user_id = ?")
+            .bind(batch_job_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(found.is_some())
     }
 }
@@ -95,15 +91,13 @@ impl IBatchRepository for SqliteBatchRepository {
         status: &str,
         updated_at: TimestampMs,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "UPDATE batch_jobs SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-        )
-        .bind(status)
-        .bind(updated_at)
-        .bind(id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("UPDATE batch_jobs SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+            .bind(status)
+            .bind(updated_at)
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -154,9 +148,7 @@ impl IBatchRepository for SqliteBatchRepository {
         if !self.owned_job_exists(user_id, batch_job_id).await? {
             return Err(DbError::NotFound(format!("batch job '{batch_job_id}'")));
         }
-        let sql = format!(
-            "SELECT {ITEM_COLUMNS} FROM batch_items WHERE batch_job_id = ? ORDER BY seq ASC, id ASC"
-        );
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM batch_items WHERE batch_job_id = ? ORDER BY seq ASC, id ASC");
         Ok(sqlx::query_as::<_, BatchItemRow>(&sql)
             .bind(batch_job_id)
             .fetch_all(&self.pool)
@@ -226,7 +218,13 @@ mod tests {
         assert_eq!(a.concurrency, 4);
 
         let listed = repo
-            .list_jobs("u1", &BatchJobListFilter { before_updated_at: None, limit: 10 })
+            .list_jobs(
+                "u1",
+                &BatchJobListFilter {
+                    before_updated_at: None,
+                    limit: 10,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(listed.len(), 2);

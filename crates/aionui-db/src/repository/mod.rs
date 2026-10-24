@@ -57,12 +57,12 @@ pub mod user_order;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
-pub use batch::IBatchRepository;
 pub use assistant::{
     IAgentWorkflowRunRepository, IAssistantAgentCenterRepository, IAssistantDefinitionRepository,
     IAssistantDefinitionRevisionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository,
 };
+pub use batch::IBatchRepository;
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
 pub use conversation::IConversationRepository;
@@ -88,11 +88,11 @@ pub use sqlite_agent_center::{
     SqliteAgentWorkflowRunRepository, SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRevisionRepository,
 };
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
-pub use sqlite_batch::SqliteBatchRepository;
 pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
 };
+pub use sqlite_batch::SqliteBatchRepository;
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;
 pub use sqlite_conversation::SqliteConversationRepository;
