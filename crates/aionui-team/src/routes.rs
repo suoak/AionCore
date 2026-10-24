@@ -79,9 +79,7 @@ impl From<TeamError> for ApiError {
             } => ApiError::coded(
                 StatusCode::CONFLICT,
                 "squad_dispatch_in_progress",
-                format!(
-                    "squad_dispatch_in_progress: member {member} is already handling task {task_id}"
-                ),
+                format!("squad_dispatch_in_progress: member {member} is already handling task {task_id}"),
                 Some(serde_json::json!({
                     "work_item_id": work_item_id,
                     "member": member,

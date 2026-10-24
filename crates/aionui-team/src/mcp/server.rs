@@ -1303,8 +1303,7 @@ async fn exec_task_update(
     // A (re)assignment to a teammate notifies the new owner.
     let mut dispatch_status = None;
     if reassigned {
-        let woken =
-            maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "reassign").await;
+        let woken = maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "reassign").await;
         if !woken
             && let Some(owner) = task.owner.as_deref()
             && scheduler.is_dispatch_active(&work_item_id, owner, &task.id)

@@ -78,11 +78,7 @@ impl TeamSessionService {
         let agents = session.scheduler().list_agents().await;
         for agent in agents {
             if let Err(error) = session
-                .pause_slot_work(
-                    &run_id,
-                    &agent.slot_id,
-                    Some("work_item_backlog".to_owned()),
-                )
+                .pause_slot_work(&run_id, &agent.slot_id, Some("work_item_backlog".to_owned()))
                 .await
             {
                 tracing::warn!(

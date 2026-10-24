@@ -11998,7 +11998,6 @@ fn assign_agent(agent_id: &str) -> aionui_api_types::UpdateTaskBoardRequest {
     }
 }
 
-
 #[tokio::test]
 async fn e7_4_backlog_transition_pauses_linked_squad() {
     use crate::board::BoardActor;

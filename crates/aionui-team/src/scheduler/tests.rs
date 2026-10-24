@@ -1645,7 +1645,6 @@ async fn notify_shutdown_rejected_noop_when_sender_is_lead() {
     assert!(lead_msgs.is_empty());
 }
 
-
 #[tokio::test]
 async fn dispatch_dedup_rejects_second_begin_until_end() {
     let (mgr, _bc) = make_manager(&make_team_agents());
