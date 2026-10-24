@@ -30,6 +30,8 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
         "assistant_definition_id",
         "assistant_definitions",
     ),
+    // M8 E8-1 batch items inherit ownership from batch_jobs.user_id.
+    ("batch_items", "batch_job_id", "batch_jobs"),
     ("conversation_artifacts", "conversation_id", "conversations"),
     ("conversation_assistant_snapshots", "conversation_id", "conversations"),
     ("context_snapshot_artifacts", "task_session_id", "task_sessions"),
