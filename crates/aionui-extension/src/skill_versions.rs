@@ -134,6 +134,64 @@ pub fn version_dir(skills_root: &Path, skill_id: &str, version_no: i64) -> io::R
 /// a temporary sibling first and is renamed into place, so a crash never leaves
 /// a half-written version behind.
 pub fn store_version(skills_root: &Path, skill_id: &str, version_no: i64, src_dir: &Path) -> io::Result<PathBuf> {
+    version_dir(skills_root, skill_id, version_no)?;
+    let staging = stage_version_files(
+        skills_root,
+        skill_id,
+        &format!("{version_no}-{}", std::process::id()),
+        src_dir,
+    )?;
+    match commit_staged_version(skills_root, skill_id, version_no, &staging) {
+        Ok(target) => Ok(target),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// Copy `src_dir` into a hidden staging directory next to the version dirs of
+/// `skill_id` (`.versions/<skill_id>/.staging-<tag>`). Used to put the files on
+/// disk BEFORE the version row is inserted, so a disk failure never leaves a
+/// version row without files.
+pub fn stage_version_files(skills_root: &Path, skill_id: &str, tag: &str, src_dir: &Path) -> io::Result<PathBuf> {
+    let probe = version_dir(skills_root, skill_id, 1)?;
+    let parent = probe.parent().expect("version dir has a parent");
+    if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid staging tag"));
+    }
+    std::fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(".staging-{tag}"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    let result = (|| {
+        let mut paths = Vec::new();
+        collect_files(src_dir, src_dir, &mut paths)?;
+        for rel in &paths {
+            let dst = staging.join(rel);
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::copy(src_dir.join(rel), &dst)?;
+        }
+        std::fs::create_dir_all(&staging)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    Ok(staging)
+}
+
+/// Atomically move a staged copy into `.versions/<skill_id>/<version_no>`.
+/// Refuses to overwrite: versions are append-only.
+pub fn commit_staged_version(
+    skills_root: &Path,
+    skill_id: &str,
+    version_no: i64,
+    staging: &Path,
+) -> io::Result<PathBuf> {
     let target = version_dir(skills_root, skill_id, version_no)?;
     if target.exists() {
         return Err(io::Error::new(
@@ -141,23 +199,7 @@ pub fn store_version(skills_root: &Path, skill_id: &str, version_no: i64, src_di
             format!("skill version {skill_id}/{version_no} already stored"),
         ));
     }
-    let parent = target.parent().expect("version dir has a parent");
-    std::fs::create_dir_all(parent)?;
-    let staging = parent.join(format!(".{version_no}.staging-{}", std::process::id()));
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
-    }
-    let mut paths = Vec::new();
-    collect_files(src_dir, src_dir, &mut paths)?;
-    for rel in &paths {
-        let dst = staging.join(rel);
-        if let Some(p) = dst.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-        std::fs::copy(src_dir.join(rel), &dst)?;
-    }
-    std::fs::create_dir_all(&staging)?;
-    std::fs::rename(&staging, &target)?;
+    std::fs::rename(staging, &target)?;
     Ok(target)
 }
 

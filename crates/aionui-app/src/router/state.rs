@@ -881,6 +881,9 @@ pub fn build_skill_evolution_state(
     let apply_port: Arc<dyn aionui_assistant::SkillEvolutionApplyPort> = Arc::new(SkillHubApplyAdapter {
         skill_paths: services.skill_paths.as_ref().clone(),
         skill_repo: services.skill_repo.clone(),
+        source_repo: Some(Arc::new(aionui_db::SqliteSkillSourceRepository::new(
+            services.database.pool().clone(),
+        ))),
     });
     let pin_port: Arc<dyn aionui_assistant::SkillEvolutionPinPort> = Arc::new(AgentCenterPinAdapter { agent_center });
     let service = Arc::new(
@@ -1503,6 +1506,14 @@ pub async fn build_extension_states(
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None,
         registry_service: Some(skill_registry_service),
+        governance: Some(aionui_extension::skill_governance::SkillGovernanceState {
+            skill_paths: services.skill_paths.as_ref().clone(),
+            skill_repo: services.skill_repo.clone(),
+            source_repo: Arc::new(aionui_db::SqliteSkillSourceRepository::new(
+                services.database.pool().clone(),
+            )),
+            team_roles: Arc::new(aionui_extension::skill_governance::NoTeamRoles),
+        }),
     };
 
     (ext_state, hub_state, skill_state)
