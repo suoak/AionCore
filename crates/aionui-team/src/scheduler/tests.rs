@@ -1644,3 +1644,19 @@ async fn notify_shutdown_rejected_noop_when_sender_is_lead() {
     let lead_msgs = mailbox.read_unread("t1", "lead-1").await.unwrap();
     assert!(lead_msgs.is_empty());
 }
+
+#[tokio::test]
+async fn dispatch_dedup_rejects_second_begin_until_end() {
+    let (mgr, _bc) = make_manager(&make_team_agents());
+    assert!(mgr.try_begin_dispatch("w1", "worker-1", "tk1"));
+    assert!(mgr.is_dispatch_active("w1", "worker-1", "tk1"));
+    assert!(
+        !mgr.try_begin_dispatch("w1", "worker-1", "tk1"),
+        "same triple must be rejected while active"
+    );
+    assert!(mgr.try_begin_dispatch("w1", "worker-1", "tk2"));
+    assert!(mgr.try_begin_dispatch("w1", "worker-2", "tk1"));
+    mgr.end_dispatch("w1", "worker-1", "tk1");
+    assert!(!mgr.is_dispatch_active("w1", "worker-1", "tk1"));
+    assert!(mgr.try_begin_dispatch("w1", "worker-1", "tk1"));
+}

@@ -842,9 +842,29 @@ async fn exec_send_message(
             .map_err(ToolCallError::from_message)?
     };
 
+    // M8 E7-4: reject an explicit self-target before any wake/mailbox write.
+    // (`*` already filters the caller out of the fan-out list.)
+    if resolved_to != "*" && crate::scheduler::is_self_trigger(caller_slot_id, &resolved_to) {
+        return Err(ToolCallError::from_message(format!(
+            "squad_self_trigger: agents cannot message themselves ({caller_slot_id})"
+        )));
+    }
+
     let service = service
         .upgrade()
         .ok_or_else(|| ToolCallError::from_message("Team service not available; cannot wake target"))?;
+
+    let work_item_id = service
+        .team_work_item_id(team_id)
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let task_id = input
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
 
     let targets = if resolved_to == "*" {
         scheduler
@@ -857,6 +877,20 @@ async fn exec_send_message(
     } else {
         vec![resolved_to.clone()]
     };
+
+    // Single-target + task_id: apply (work_item, member, task) dispatch dedup.
+    if let (Some(task_id), [target]) = (task_id.as_deref(), targets.as_slice())
+        && !scheduler.try_begin_dispatch(&work_item_id, target, task_id)
+    {
+        return Ok(json!({
+            "status": "already_in_progress",
+            "work_item_id": work_item_id,
+            "member": target,
+            "task_id": task_id,
+        })
+        .to_string());
+    }
+
     let mut target_results = Vec::with_capacity(targets.len());
     for target in &targets {
         let result = service
@@ -1126,40 +1160,65 @@ async fn maybe_notify_task_owner(
     from_slot_id: &str,
     task: &TeamTask,
     trigger: &str,
-) {
+) -> bool {
     let Some(owner) = task.owner.as_deref() else {
-        return;
+        return false;
     };
     // Resolve the owner's role (None = removed/unknown slot) so the pure gate
     // can decide eligibility.
     let owner_role = scheduler.get_agent(owner).await.ok().map(|agent| agent.role);
     if !should_wake_task_owner(task, from_slot_id, owner_role) {
-        return;
+        return false;
     }
     let Some(service) = service.upgrade() else {
-        return;
+        return false;
     };
+
+    // M8 E7-4: (work_item, member, task) must not re-wake while in progress.
+    let work_item_id = service
+        .team_work_item_id(team_id)
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    if !scheduler.try_begin_dispatch(&work_item_id, owner, &task.id) {
+        info!(
+            team_id,
+            owner_slot = owner,
+            task_id = %task.id,
+            trigger,
+            "task owner wake skipped: dispatch already in progress"
+        );
+        return false;
+    }
 
     let notice = format_task_assignment_notice(task);
     match service
         .send_agent_message_from_agent(team_id, from_slot_id, owner, &notice, None)
         .await
     {
-        Ok(_) => info!(
-            team_id,
-            owner_slot = owner,
-            task_id = %task.id,
-            trigger,
-            "task owner notified and woken"
-        ),
-        Err(error) => warn!(
-            team_id,
-            owner_slot = owner,
-            task_id = %task.id,
-            trigger,
-            error = %error,
-            "failed to notify task owner"
-        ),
+        Ok(_) => {
+            info!(
+                team_id,
+                owner_slot = owner,
+                task_id = %task.id,
+                trigger,
+                "task owner notified and woken"
+            );
+            true
+        }
+        Err(error) => {
+            // Roll back the lock so a transient failure can retry.
+            scheduler.end_dispatch(&work_item_id, owner, &task.id);
+            warn!(
+                team_id,
+                owner_slot = owner,
+                task_id = %task.id,
+                trigger,
+                error = %error,
+                "failed to notify task owner"
+            );
+            false
+        }
     }
 }
 
@@ -1185,9 +1244,22 @@ async fn exec_task_create(
 
     // Assigning a task to a teammate notifies and wakes it (gated: skips blocked
     // tasks, which wake later via the upstream-completion unblock path).
-    maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "create").await;
+    let woken = maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "create").await;
 
-    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
+    let mut body = json!({ "status": "ok", "task": task_json(&task) });
+    if !woken && task.owner.is_some() {
+        // Distinguish "already in progress" when the lock is held for this task.
+        let work_item_id = match service.upgrade() {
+            Some(svc) => svc.team_work_item_id(team_id).await.unwrap_or(None).unwrap_or_default(),
+            None => String::new(),
+        };
+        if let Some(owner) = task.owner.as_deref()
+            && scheduler.is_dispatch_active(&work_item_id, owner, &task.id)
+        {
+            body["dispatch"] = json!("already_in_progress");
+        }
+    }
+    json_text(&body)
 }
 
 async fn exec_task_update(
@@ -1214,9 +1286,30 @@ async fn exec_task_update(
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
 
+    let work_item_id = match service.upgrade() {
+        Some(svc) => svc.team_work_item_id(team_id).await.unwrap_or(None).unwrap_or_default(),
+        None => String::new(),
+    };
+
+    // M8 E7-4: releasing the dispatch lock on terminal status so the same
+    // (work_item, member, task) can be re-dispatched later if needed.
+    let deleted = input.status.as_deref() == Some("deleted");
+    if (completed || deleted)
+        && let Some(owner) = task.owner.as_deref()
+    {
+        scheduler.end_dispatch(&work_item_id, owner, &task.id);
+    }
+
     // A (re)assignment to a teammate notifies the new owner.
+    let mut dispatch_status = None;
     if reassigned {
-        maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "reassign").await;
+        let woken = maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "reassign").await;
+        if !woken
+            && let Some(owner) = task.owner.as_deref()
+            && scheduler.is_dispatch_active(&work_item_id, owner, &task.id)
+        {
+            dispatch_status = Some("already_in_progress");
+        }
     }
 
     // Completing a task can unblock downstream tasks; wake each downstream owner
@@ -1226,11 +1319,15 @@ async fn exec_task_update(
         && let Ok(all_tasks) = scheduler.list_tasks().await
     {
         for downstream in all_tasks.iter().filter(|t| task.blocks.contains(&t.id)) {
-            maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, downstream, "unblock").await;
+            let _ = maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, downstream, "unblock").await;
         }
     }
 
-    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
+    let mut body = json!({ "status": "ok", "task": task_json(&task) });
+    if let Some(dispatch) = dispatch_status {
+        body["dispatch"] = json!(dispatch);
+    }
+    json_text(&body)
 }
 
 async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {

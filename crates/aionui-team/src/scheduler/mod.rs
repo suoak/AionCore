@@ -25,6 +25,7 @@ mod wake;
 mod tests;
 
 pub use crash_recovery::format_crash_testament;
+pub(crate) use dedup::is_self_trigger;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -124,6 +125,8 @@ pub struct TeammateManager {
     // and double-write the IdleNotification (aionui-audit 4.3, 8 #3).
     pub(crate) finalized_turns: Arc<DashMap<String, Instant>>,
     pub(crate) wake_timeouts: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
+    /// M8 E7-4: in-flight (work_item, member, task) dispatches.
+    pub(crate) active_dispatches: Arc<DashMap<String, ()>>,
 }
 
 impl TeammateManager {
@@ -158,6 +161,7 @@ impl TeammateManager {
             active_wakes: DashSet::new(),
             finalized_turns: Arc::new(DashMap::new()),
             wake_timeouts: Arc::new(DashMap::new()),
+            active_dispatches: Arc::new(DashMap::new()),
         }
     }
 

@@ -280,6 +280,10 @@ pub trait BoardSquadRunPort: Send + Sync {
     /// `None` when no instance is linked or it has nothing to show. Lookup
     /// failures are logged by the implementation and answer `None`.
     async fn squad_run_for_work_item(&self, user_id: &str, work_item_id: &str) -> Option<SquadRunPayload>;
+
+    /// M8 E7-4: work item dragged back to backlog → pause the linked Squad.
+    /// Default no-op so decoration-only test doubles stay unchanged.
+    async fn pause_for_work_item(&self, _user_id: &str, _work_item_id: &str) {}
 }
 
 fn assigned_to_squad(item: &TaskBoardItemResponse) -> bool {
@@ -306,6 +310,14 @@ impl ConversationService {
         if let Some(port) = self.board_squad_run_port() {
             item.squad_run = port.squad_run_for_work_item(user_id, &item.id).await;
         }
+    }
+
+    /// M8 E7-4: best-effort pause of the Squad linked to this work item.
+    async fn pause_squad_after_backlog(&self, user_id: &str, work_item_id: &str) {
+        let Some(port) = self.board_squad_run_port() else {
+            return;
+        };
+        port.pause_for_work_item(user_id, work_item_id).await;
     }
 
     /// M8 E7-6: pushes `task.board.updated` (`change: "squad_run"`) after the
@@ -576,6 +588,11 @@ impl ConversationService {
             item = self
                 .auto_start_after_agent_assign(user_id, id, &agent_id, &current.mode, item)
                 .await?;
+        }
+        // M8 E7-4: dragging an in-flight work item back to backlog pauses the
+        // linked Squad instance (instantiate already rejects backlog).
+        if request.board_status == Some(TaskBoardStatus::Backlog) && from != TaskBoardStatus::Backlog {
+            self.pause_squad_after_backlog(user_id, id).await;
         }
         self.decorate_squad_run(user_id, &mut item).await;
         self.publish_board_updated(user_id, TaskBoardChange::Board, from, &item);

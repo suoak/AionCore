@@ -11839,6 +11839,7 @@ async fn board_patch_honours_expected_updated_at() {
 
 struct FixedSquadRun {
     calls: std::sync::Mutex<Vec<String>>,
+    pauses: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -11856,6 +11857,10 @@ impl crate::board::BoardSquadRunPort for FixedSquadRun {
             leader_mode: Some("route_only".into()),
             updated_at: 7,
         })
+    }
+
+    async fn pause_for_work_item(&self, _user_id: &str, work_item_id: &str) {
+        self.pauses.lock().unwrap().push(work_item_id.to_owned());
     }
 }
 
@@ -11886,6 +11891,7 @@ async fn board_squad_cards_carry_squad_run_and_others_do_not() {
 
     let port = Arc::new(FixedSquadRun {
         calls: std::sync::Mutex::new(Vec::new()),
+        pauses: std::sync::Mutex::new(Vec::new()),
     });
     service.with_board_squad_run_port(port.clone());
     let item = service
@@ -11990,6 +11996,76 @@ fn assign_agent(agent_id: &str) -> aionui_api_types::UpdateTaskBoardRequest {
         })),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn e7_4_backlog_transition_pauses_linked_squad() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskAssignee, TaskAssigneeKind, TaskBoardStatus, UpdateTaskBoardRequest};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let item_id = board_task(&service, TaskSessionMode::Agent).await;
+
+    // Move to todo so we can later drag back to backlog (backlog→backlog is a no-op).
+    service
+        .update_task_board(
+            "user_1",
+            &item_id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                board_status: Some(TaskBoardStatus::Todo),
+                assignee: Some(Some(TaskAssignee {
+                    kind: TaskAssigneeKind::Squad,
+                    id: "sq1".into(),
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let port = Arc::new(FixedSquadRun {
+        calls: std::sync::Mutex::new(Vec::new()),
+        pauses: std::sync::Mutex::new(Vec::new()),
+    });
+    service.with_board_squad_run_port(port.clone());
+
+    service
+        .update_task_board(
+            "user_1",
+            &item_id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                board_status: Some(TaskBoardStatus::Backlog),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let pauses = port.pauses.lock().unwrap().clone();
+    assert_eq!(pauses, vec![item_id.clone()], "backlog must pause linked squad");
+
+    // Non-status PATCH while already on backlog must not re-pause.
+    service
+        .update_task_board(
+            "user_1",
+            &item_id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                priority: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        port.pauses.lock().unwrap().len(),
+        1,
+        "staying on backlog must not re-pause"
+    );
 }
 
 #[tokio::test]

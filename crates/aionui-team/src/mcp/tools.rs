@@ -46,6 +46,9 @@ pub struct SendMessageInput {
     pub message: String,
     #[serde(default)]
     pub files: Vec<String>,
+    /// M8 E7-4: optional subtask id for (work_item, member, task) dispatch dedup.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1297,6 +1297,15 @@ impl aionui_conversation::board::BoardSquadRunPort for TeamBoardSquadRun {
             }
         }
     }
+
+    async fn pause_for_work_item(&self, user_id: &str, work_item_id: &str) {
+        let Some(teams) = self.teams.upgrade() else {
+            return;
+        };
+        if let Err(error) = teams.pause_squad_for_work_item(user_id, work_item_id).await {
+            tracing::warn!(work_item_id, %error, "board squad pause on backlog failed");
+        }
+    }
 }
 
 #[async_trait::async_trait]

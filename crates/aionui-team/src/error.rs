@@ -28,6 +28,18 @@ pub enum TeamError {
     #[error("team_not_squad: {0}")]
     TeamNotSquad(String),
 
+    /// M8 E7-4: an agent may not `team_send_message` to itself (no self-trigger).
+    #[error("squad_self_trigger: agents cannot message themselves ({slot_id})")]
+    SquadSelfTrigger { team_id: String, slot_id: String },
+
+    /// M8 E7-4: same (work_item, member, task) dispatch is already in progress.
+    #[error("squad_dispatch_in_progress: member {member} is already handling task {task_id}")]
+    SquadDispatchInProgress {
+        work_item_id: String,
+        member: String,
+        task_id: String,
+    },
+
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
