@@ -61,7 +61,7 @@ pub use repository::skill_source::{
 };
 pub use repository::squad::{
     CreateSquadTemplateParams, ISquadTemplateRepository, SQUAD_NAME_CONFLICT_PREFIX, SQUAD_STALE_CONFLICT_PREFIX,
-    UpdateSquadTemplateParams,
+    UpdateSquadTemplateParams, WorkItemAssignment,
 };
 pub use repository::task_board::{
     AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams,

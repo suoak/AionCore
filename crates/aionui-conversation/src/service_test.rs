@@ -11832,3 +11832,77 @@ async fn board_patch_honours_expected_updated_at() {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// M8 E7-6: Squad cards carry `squad_run` from the composition-layer port.
+// ---------------------------------------------------------------------------
+
+struct FixedSquadRun {
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::board::BoardSquadRunPort for FixedSquadRun {
+    async fn squad_run_for_work_item(
+        &self,
+        _user_id: &str,
+        work_item_id: &str,
+    ) -> Option<aionui_api_types::SquadRunPayload> {
+        self.calls.lock().unwrap().push(work_item_id.to_owned());
+        Some(aionui_api_types::SquadRunPayload {
+            team_id: format!("team-{work_item_id}"),
+            state: aionui_api_types::SquadRunState::Running,
+            leader_conversation_id: None,
+            leader_mode: Some("route_only".into()),
+            updated_at: 7,
+        })
+    }
+}
+
+#[tokio::test]
+async fn board_squad_cards_carry_squad_run_and_others_do_not() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskAssignee, TaskAssigneeKind, UpdateTaskBoardRequest};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let squad_item = board_task(&service, TaskSessionMode::Agent).await;
+    let plain_item = board_task(&service, TaskSessionMode::Agent).await;
+
+    // Port not wired: Squad cards just omit squad_run.
+    let assign = UpdateTaskBoardRequest {
+        assignee: Some(Some(TaskAssignee {
+            kind: TaskAssigneeKind::Squad,
+            id: "sq1".into(),
+        })),
+        ..Default::default()
+    };
+    let item = service
+        .update_task_board("user_1", &squad_item, BoardActor::User, assign.clone())
+        .await
+        .unwrap();
+    assert_eq!(item.squad_run, None);
+
+    let port = Arc::new(FixedSquadRun {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    service.with_board_squad_run_port(port.clone());
+    let item = service
+        .update_task_board("user_1", &squad_item, BoardActor::User, assign)
+        .await
+        .unwrap();
+    let run = item.squad_run.expect("squad card carries squad_run");
+    assert_eq!(run.team_id, format!("team-{squad_item}"));
+
+    let board = service.task_board("user_1", Default::default()).await.unwrap();
+    let items: Vec<_> = board.columns.iter().flat_map(|c| c.items.iter()).collect();
+    let squad = items.iter().find(|i| i.id == squad_item).unwrap();
+    let plain = items.iter().find(|i| i.id == plain_item).unwrap();
+    assert!(squad.squad_run.is_some());
+    assert_eq!(plain.squad_run, None);
+    let json = serde_json::to_value(plain).unwrap();
+    assert!(json.get("squad_run").is_none(), "omitted, not null");
+    // Only Squad cards hit the port.
+    assert!(port.calls.lock().unwrap().iter().all(|id| *id == squad_item));
+}

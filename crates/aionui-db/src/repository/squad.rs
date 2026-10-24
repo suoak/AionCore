@@ -58,4 +58,24 @@ pub trait ISquadTemplateRepository: Send + Sync {
     /// M8 E7-2: stamp `teams.squad_template_id` on a freshly created Team owned
     /// by `user_id`. Returns `DbError::NotFound` when no such team.
     async fn bind_team_instance(&self, user_id: &str, team_id: &str, template_id: &str) -> Result<(), DbError>;
+
+    /// M8 E7-6: board assignment of a work item (`task_sessions` row owned by
+    /// `user_id`), `None` when no such item.
+    async fn work_item_assignment(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+    ) -> Result<Option<WorkItemAssignment>, DbError>;
+
+    /// M8 E7-6: stamp `teams.work_item_id` on a Team owned by `user_id`.
+    /// Returns `DbError::NotFound` when no such team.
+    async fn bind_team_work_item(&self, user_id: &str, team_id: &str, work_item_id: &str) -> Result<(), DbError>;
+}
+
+/// Board fields of a work item that decide whether a Squad may start for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkItemAssignment {
+    pub assignee_kind: Option<String>,
+    pub assignee_id: Option<String>,
+    pub board_status: String,
 }

@@ -77,6 +77,18 @@ pub trait ITeamRepository: Send + Sync {
         Ok(None)
     }
 
+    /// M8 E7-6: newest Squad instance owned by `user_id` that was started for
+    /// `work_item_id` (`teams.work_item_id`), `None` when there is none.
+    async fn latest_team_for_work_item(&self, _user_id: &str, _work_item_id: &str) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
+    /// M8 E7-6: work item a Team was started for (`None` for plain Teams and
+    /// Squads instantiated without one).
+    async fn team_work_item_id(&self, _team_id: &str) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
     /// M8 E7-6: raw `members` JSON of the Squad template a Team was
     /// instantiated from (`None` for plain Teams). Used to label each Team
     /// agent with its Squad role title.

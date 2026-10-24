@@ -869,6 +869,9 @@ pub struct ConversationService {
     task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
     /// Work-item board (M8 E6-3). `None` until the composition layer wires it.
     task_board_repo: Arc<RwLock<Option<Arc<dyn aionui_db::ITaskBoardRepository>>>>,
+    /// Squad run lookup for board cards (M8 E7-6). `None` until the
+    /// composition layer wires the team service; cards then omit `squad_run`.
+    board_squad_run: Arc<RwLock<Option<Arc<dyn crate::board::BoardSquadRunPort>>>>,
     /// Managed worktree port (M7 E3-2). `None` until the composition layer
     /// wires it; `worktree_id` creates are then refused.
     worktree_binding: Arc<RwLock<Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>>>>,
@@ -1027,6 +1030,7 @@ impl ConversationService {
             inbox_repo: Arc::new(RwLock::new(None)),
             task_session_repo: Arc::new(RwLock::new(None)),
             task_board_repo: Arc::new(RwLock::new(None)),
+            board_squad_run: Arc::new(RwLock::new(None)),
             worktree_binding: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
             session_mention_grants: Arc::new(session_mentions::SessionMentionGrants::new()),
@@ -1114,6 +1118,16 @@ impl ConversationService {
         if let Ok(mut guard) = self.task_board_repo.write() {
             *guard = Some(repo);
         }
+    }
+
+    pub fn with_board_squad_run_port(&self, port: Arc<dyn crate::board::BoardSquadRunPort>) {
+        if let Ok(mut guard) = self.board_squad_run.write() {
+            *guard = Some(port);
+        }
+    }
+
+    pub(crate) fn board_squad_run_port(&self) -> Option<Arc<dyn crate::board::BoardSquadRunPort>> {
+        self.board_squad_run.read().ok().and_then(|guard| guard.clone())
     }
 
     pub(crate) fn task_board_repo(&self) -> Result<Arc<dyn aionui_db::ITaskBoardRepository>, ConversationError> {

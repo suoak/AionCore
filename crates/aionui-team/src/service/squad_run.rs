@@ -51,6 +51,39 @@ impl TeamSessionService {
         self.squad_run_for_team(user_id, &team, leader_mode).await
     }
 
+    /// M8 E7-6: `squad_run` of the newest Squad instance started for an E6
+    /// work item (board cards). `None` when no instance is linked, it was
+    /// removed, or it has nothing to show yet.
+    pub async fn squad_run_for_work_item(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+    ) -> Result<Option<SquadRunPayload>, TeamError> {
+        let Some(team_id) = self.repo.latest_team_for_work_item(user_id, work_item_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.repo.get_team(user_id, &team_id).await? else {
+            return Ok(None);
+        };
+        let team = Team::from_row(&row)?;
+        let leader_mode = self.repo.team_squad_leader_mode(&team_id).await?;
+        self.squad_run_for_team(user_id, &team, leader_mode).await
+    }
+
+    /// M8 E7-6: work item a Team was started for, with its current
+    /// `squad_run` (used to push `task.board.updated` on state changes).
+    pub async fn linked_work_item_squad_run(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Option<(String, Option<SquadRunPayload>)>, TeamError> {
+        let Some(work_item_id) = self.repo.team_work_item_id(team_id).await? else {
+            return Ok(None);
+        };
+        let run = self.squad_run_for_work_item(user_id, &work_item_id).await?;
+        Ok(Some((work_item_id, run)))
+    }
+
     /// Shared by `GET /squad-run` and the embedded `TeamResponse.squad_run`.
     /// Caller has already checked that `team` is a Squad instance owned by
     /// `user_id`.

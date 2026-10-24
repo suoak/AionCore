@@ -292,12 +292,19 @@ pub struct SquadInstantiateInput {
     /// Shared workspace; defaults to the Team provisioning default.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// M8 E7-6: E6 work item (`task_sessions.id`) this instance works on. It
+    /// must be assigned to this Squad and not be in `backlog`; the board card
+    /// then carries this instance's `squad_run`.
+    #[serde(default)]
+    pub work_item_id: Option<String>,
 }
 
 /// `POST /api/squads/{id}/instantiate` response.
 #[derive(Debug, Clone, Serialize)]
 pub struct SquadInstantiateResponse {
     pub squad_template_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
     pub team: crate::TeamResponse,
 }
 

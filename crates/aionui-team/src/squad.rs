@@ -602,6 +602,15 @@ async fn instantiate_squad(
             Some(json!({ "assistant_id": first.assistant_id, "blocking": preview.blocking })),
         ));
     }
+    let work_item_id = input
+        .work_item_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    if let Some(work_item_id) = &work_item_id {
+        check_work_item(&state, &user.id, &row.id, work_item_id).await?;
+    }
     let Some(teams) = state.teams.clone() else {
         return Err(coded(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -666,6 +675,17 @@ async fn instantiate_squad(
             Some(json!({ "team_id": team.id })),
         ));
     }
+    if let Some(work_item_id) = &work_item_id
+        && let Err(err) = state.repo.bind_team_work_item(&user.id, &team.id, work_item_id).await
+    {
+        tracing::error!(team_id = %team.id, work_item_id = %work_item_id, error = %err, "failed to link squad instance to work item");
+        return Err(coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "squad_store_failed",
+            "team created but work item link failed",
+            Some(json!({ "team_id": team.id })),
+        ));
+    }
     // M8 E7-4: persist each participant's native tool profile before any
     // session launches (sessions start lazily on first message).
     teams
@@ -675,9 +695,54 @@ async fn instantiate_squad(
         StatusCode::CREATED,
         Json(ApiResponse::ok(SquadInstantiateResponse {
             squad_template_id: row.id,
+            work_item_id,
             team,
         })),
     ))
+}
+
+/// M8 E7-6: a Squad starts for a work item only when the item is assigned to
+/// this template and has left `backlog` (E7 §2.4 "Backlog 不触发").
+async fn check_work_item(
+    state: &SquadRouterState,
+    user_id: &str,
+    template_id: &str,
+    work_item_id: &str,
+) -> Result<(), ApiError> {
+    let item = state
+        .repo
+        .work_item_assignment(user_id, work_item_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            coded(
+                StatusCode::NOT_FOUND,
+                "squad_work_item_not_found",
+                "work item not found",
+                Some(json!({ "work_item_id": work_item_id })),
+            )
+        })?;
+    if item.assignee_kind.as_deref() != Some("squad") || item.assignee_id.as_deref() != Some(template_id) {
+        return Err(coded(
+            StatusCode::CONFLICT,
+            "squad_work_item_not_assigned",
+            "work item is not assigned to this squad",
+            Some(json!({
+                "work_item_id": work_item_id,
+                "assignee_kind": item.assignee_kind,
+                "assignee_id": item.assignee_id,
+            })),
+        ));
+    }
+    if item.board_status == "backlog" {
+        return Err(coded(
+            StatusCode::CONFLICT,
+            "squad_backlog_not_started",
+            "work item is still in backlog; the squad does not start",
+            Some(json!({ "work_item_id": work_item_id, "board_status": item.board_status })),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -953,6 +1018,73 @@ mod tests {
             assert_eq!(v["data"]["can_instantiate"], true, "{leader}: {v}");
             assert_eq!(v["data"]["participants"][0]["native_tool_enforcement"], "enforced");
         }
+    }
+
+    /// M8 E7-6: work-item checks run before any Team is created.
+    #[tokio::test]
+    async fn instantiate_checks_work_item_assignment_and_backlog() {
+        let (app, db) = app(vec!["lead", "a"]).await;
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/squads",
+            Some(json!({ "name": "w", "leader_assistant_id": "lead", "members": [member("a")] })),
+        )
+        .await;
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        let user = CurrentUser::local_default().id;
+        sqlx::query(
+            "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) VALUES (?, ?, 'x', 0, 0)",
+        )
+        .bind(&user)
+        .bind(&user)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (item, status, kind, assignee) in [
+            ("w-backlog", "backlog", "squad", id.as_str()),
+            ("w-other", "todo", "squad", "other-squad"),
+            ("w-agent", "todo", "agent", id.as_str()),
+            ("w-ok", "todo", "squad", id.as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO task_sessions (id, user_id, title, mode, status, agent_type, created_at, updated_at, \
+                 board_status, assignee_kind, assignee_id) VALUES (?, ?, 't', 'agent', 'draft', 'claude', 1, 1, ?, ?, ?)",
+            )
+            .bind(item)
+            .bind(&user)
+            .bind(status)
+            .bind(kind)
+            .bind(assignee)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let uri = format!("/api/squads/{id}/instantiate");
+        let (status, v) = call(&app, "POST", &uri, Some(json!({ "work_item_id": "nope" }))).await;
+        assert_eq!(
+            (status, code(&v)),
+            (StatusCode::NOT_FOUND, "squad_work_item_not_found".into())
+        );
+        for item in ["w-other", "w-agent"] {
+            let (status, v) = call(&app, "POST", &uri, Some(json!({ "work_item_id": item }))).await;
+            assert_eq!(
+                (status, code(&v)),
+                (StatusCode::CONFLICT, "squad_work_item_not_assigned".into()),
+                "{item}: {v}"
+            );
+        }
+        let (status, v) = call(&app, "POST", &uri, Some(json!({ "work_item_id": "w-backlog" }))).await;
+        assert_eq!(
+            (status, code(&v)),
+            (StatusCode::CONFLICT, "squad_backlog_not_started".into())
+        );
+        // A valid item passes the checks; unit state then has no Team service.
+        let (status, v) = call(&app, "POST", &uri, Some(json!({ "work_item_id": "w-ok" }))).await;
+        assert_eq!(
+            (status, code(&v)),
+            (StatusCode::SERVICE_UNAVAILABLE, "squad_instantiate_unavailable".into())
+        );
     }
 
     #[tokio::test]
