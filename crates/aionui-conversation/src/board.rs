@@ -4,13 +4,19 @@
 //! module owns the column state machine and the review gate; the DB layer only
 //! validates values.
 //!
-//! Rules (E6-tasks-board.md §2.2):
+//! Rules (E6-tasks-board.md §2.2, E6-5 auto-start / auto-review):
 //! - `done` is reachable only through the review endpoint (`in_review → done`)
 //!   and only for a user credential. Agent runtime tokens are denied on
 //!   `/api/task-sessions/*` by the agent scope; [`BoardActor::Agent`] is the
 //!   service-side second check and may only move `in_progress → in_review`.
 //! - `backlog` never starts work: `backlog → in_progress` is rejected; items go
-//!   through `todo`.
+//!   through `todo`. Assigning an Agent on backlog only records the assignee.
+//! - Assigning an Agent on `todo` (plan/goal approved when required) auto-moves
+//!   to `in_progress` and writes an agent `assignment` comment 「已开工：…」.
+//! - When a run finishes `completed` with at least one artifact while the card
+//!   is `in_progress`, the board auto-moves to `in_review` (Agent actor).
+//! - Failed / blocked runs keep `in_progress` and rely on the Inbox sink
+//!   (`source_kind=task_run`) — they do not change the column.
 //! - `plan` / `goal` items need an approved plan/goal approval before
 //!   `in_progress`.
 //! - Review reject sends the item back to `todo` (D6-5) with a mandatory
@@ -282,6 +288,15 @@ fn assigned_to_squad(item: &TaskBoardItemResponse) -> bool {
         .is_some_and(|assignee| assignee.kind == TaskAssigneeKind::Squad)
 }
 
+fn truncate_summary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    if trimmed.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
 impl ConversationService {
     /// Fills `squad_run` on cards assigned to a Squad.
     async fn decorate_squad_run(&self, user_id: &str, item: &mut TaskBoardItemResponse) {
@@ -530,6 +545,7 @@ impl ConversationService {
             )
             .await?;
         }
+        let mut assignee_changed_to_agent: Option<String> = None;
         if let Some(assignee) = &request.assignee {
             let previous = current.assignee_kind.as_deref().zip(current.assignee_id.as_deref());
             let next = assignee.as_ref().map(|value| (value.kind.as_str(), value.id.trim()));
@@ -542,9 +558,25 @@ impl ConversationService {
                     now,
                 )
                 .await?;
+                if let Some(value) = assignee.as_ref()
+                    && value.kind == TaskAssigneeKind::Agent
+                    && actor == BoardActor::User
+                {
+                    assignee_changed_to_agent = Some(value.id.trim().to_owned());
+                }
             }
         }
         let mut item = item_response(row)?;
+        // E6-5: assigning an Agent on `todo` auto-starts (backlog stays put).
+        // Also covers backlog→todo+assign in one PATCH; skip when the card is
+        // already past todo (e.g. same PATCH set in_progress).
+        if let Some(agent_id) = assignee_changed_to_agent
+            && item.board_status == TaskBoardStatus::Todo
+        {
+            item = self
+                .auto_start_after_agent_assign(user_id, id, &agent_id, &current.mode, item)
+                .await?;
+        }
         self.decorate_squad_run(user_id, &mut item).await;
         self.publish_board_updated(user_id, TaskBoardChange::Board, from, &item);
         Ok(item)
@@ -607,6 +639,118 @@ impl ConversationService {
             item,
             decision: comment_response(decision),
         })
+    }
+
+    /// M8 E6-5: `todo` + Agent assignee → `in_progress` and an agent
+    /// 「已开工」assignment comment. Plan/goal still need an approved plan;
+    /// without one the card stays on `todo` (assignment already recorded).
+    async fn auto_start_after_agent_assign(
+        &self,
+        user_id: &str,
+        id: &str,
+        agent_id: &str,
+        mode: &str,
+        current: TaskBoardItemResponse,
+    ) -> Result<TaskBoardItemResponse, ConversationError> {
+        let plan_approved = self.plan_approved(user_id, id, mode).await?;
+        if let Err(rejection) = check_transition(
+            TaskBoardStatus::Todo,
+            TaskBoardStatus::InProgress,
+            BoardActor::User,
+            TransitionContext { mode, plan_approved },
+        ) {
+            tracing::info!(
+                task_session_id = %id,
+                code = rejection.code,
+                "E6-5 auto-start skipped"
+            );
+            return Ok(current);
+        }
+        let summary = match self.task_session_repo()?.get(user_id, id).await? {
+            Some(session) if !session.objective.trim().is_empty() => truncate_summary(&session.objective, 80),
+            _ => truncate_summary(&current.title, 80),
+        };
+        let now = now_ms().max(current.updated_at + 1);
+        let row = self
+            .task_board_repo()?
+            .update_board(
+                user_id,
+                id,
+                &UpdateTaskBoardParams {
+                    board_status: Some(TaskBoardStatus::InProgress.as_str()),
+                    updated_at: now,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| map_db(id, error))?;
+        self.append_event(
+            user_id,
+            id,
+            "status_change",
+            serde_json::json!({
+                "from": TaskBoardStatus::Todo.as_str(),
+                "to": TaskBoardStatus::InProgress.as_str(),
+            }),
+            now,
+        )
+        .await?;
+        // Design: kind=assignment, author_kind=agent, plain-text body 「已开工：…」
+        let body = format!("已开工：{summary}");
+        self.task_board_repo()?
+            .append_comment(&AppendTaskCommentParams {
+                user_id,
+                task_session_id: id,
+                author_kind: "agent",
+                author_id: agent_id,
+                kind: "assignment",
+                body: &body,
+                created_at: now + 1,
+            })
+            .await
+            .map_err(|error| map_db(id, error))
+            .inspect(|row| self.publish_comment(EVENT_TASK_COMMENT_CREATED, user_id, comment_response(row.clone())))?;
+        item_response(row)
+    }
+
+    /// M8 E6-5: when a run finishes `completed` with ≥1 artifact and the card
+    /// is still `in_progress`, move it to `in_review` as the Agent actor.
+    /// Returns `Ok(None)` when the card is missing, not in progress, or has no
+    /// artifacts (board column unchanged). Failures/blocks stay on
+    /// `in_progress` and rely on the existing Inbox sink.
+    pub async fn maybe_submit_board_for_review_on_completion(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+    ) -> Result<Option<TaskBoardItemResponse>, ConversationError> {
+        let Some(row) = self.task_board_repo()?.get_board_item(user_id, task_session_id).await? else {
+            return Ok(None);
+        };
+        let from = TaskBoardStatus::parse(&row.board_status)
+            .ok_or_else(|| ConversationError::internal("Unknown board_status"))?;
+        if from != TaskBoardStatus::InProgress {
+            return Ok(None);
+        }
+        let artifacts = self
+            .task_session_repo()?
+            .list_artifacts(user_id, task_session_id)
+            .await?;
+        if artifacts.is_empty() {
+            tracing::info!(task_session_id, "E6-5 auto in_review skipped: no artifacts yet");
+            return Ok(None);
+        }
+        let item = self
+            .update_task_board(
+                user_id,
+                task_session_id,
+                BoardActor::Agent,
+                UpdateTaskBoardRequest {
+                    board_status: Some(TaskBoardStatus::InReview),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(Some(item))
     }
 
     pub async fn list_task_comments(

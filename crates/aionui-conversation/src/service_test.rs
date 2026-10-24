@@ -11977,3 +11977,214 @@ async fn squad_run_change_pushes_board_updated_for_squad_cards_only() {
     assert_eq!(data["item"]["squad_run"]["state"], "finished");
     assert_eq!(data["item"]["squad_run"]["team_id"], "team-1");
 }
+
+// ---------------------------------------------------------------------------
+// M8 E6-5: assign Agent → auto-start; completed+artifacts → in_review.
+// ---------------------------------------------------------------------------
+
+fn assign_agent(agent_id: &str) -> aionui_api_types::UpdateTaskBoardRequest {
+    aionui_api_types::UpdateTaskBoardRequest {
+        assignee: Some(Some(aionui_api_types::TaskAssignee {
+            kind: aionui_api_types::TaskAssigneeKind::Agent,
+            id: agent_id.into(),
+        })),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn e6_5_assigning_agent_on_todo_auto_starts_with_agent_comment() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskBoardStatus as S, TaskCommentKind};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+    service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Todo))
+        .await
+        .unwrap();
+
+    let item = service
+        .update_task_board("user_1", &id, BoardActor::User, assign_agent("agent_boot"))
+        .await
+        .unwrap();
+    assert_eq!(item.board_status, S::InProgress);
+    assert_eq!(item.assignee.as_ref().unwrap().id, "agent_boot");
+
+    let timeline = service.list_task_comments("user_1", &id).await.unwrap();
+    let started = timeline
+        .iter()
+        .find(|c| c.author_kind == "agent" && c.body.starts_with("已开工："))
+        .expect("agent 已开工 comment");
+    assert_eq!(started.kind, TaskCommentKind::Assignment);
+    assert_eq!(started.author_id, "agent_boot");
+    assert!(started.body.contains("Do it"), "{}", started.body);
+}
+
+#[tokio::test]
+async fn e6_5_assigning_agent_on_backlog_does_not_start() {
+    use crate::board::BoardActor;
+    use aionui_api_types::TaskBoardStatus as S;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+
+    let item = service
+        .update_task_board("user_1", &id, BoardActor::User, assign_agent("agent_idle"))
+        .await
+        .unwrap();
+    assert_eq!(item.board_status, S::Backlog);
+    let timeline = service.list_task_comments("user_1", &id).await.unwrap();
+    assert!(
+        timeline.iter().all(|c| !c.body.starts_with("已开工：")),
+        "no auto-start on backlog: {timeline:?}"
+    );
+}
+
+#[tokio::test]
+async fn e6_5_backlog_to_todo_plus_assign_auto_starts_in_one_patch() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskAssignee, TaskAssigneeKind, TaskBoardStatus as S, UpdateTaskBoardRequest};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+
+    let item = service
+        .update_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                board_status: Some(S::Todo),
+                assignee: Some(Some(TaskAssignee {
+                    kind: TaskAssigneeKind::Agent,
+                    id: "agent_combo".into(),
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(item.board_status, S::InProgress);
+    let timeline = service.list_task_comments("user_1", &id).await.unwrap();
+    assert!(
+        timeline
+            .iter()
+            .any(|c| c.author_kind == "agent" && c.body.starts_with("已开工：")),
+        "{timeline:?}"
+    );
+}
+
+#[tokio::test]
+async fn e6_5_plan_without_approval_stays_on_todo_when_agent_assigned() {
+    use crate::board::BoardActor;
+    use aionui_api_types::TaskBoardStatus as S;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Plan).await;
+    service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Todo))
+        .await
+        .unwrap();
+
+    let item = service
+        .update_task_board("user_1", &id, BoardActor::User, assign_agent("agent_plan"))
+        .await
+        .unwrap();
+    assert_eq!(item.board_status, S::Todo, "plan gate blocks auto-start");
+    assert!(
+        service
+            .list_task_comments("user_1", &id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| !c.body.starts_with("已开工："))
+    );
+}
+
+#[tokio::test]
+async fn e6_5_completed_with_artifacts_moves_to_in_review() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{
+        DecideTaskApprovalRequest, SubmitTaskArtifactRequest, TaskApprovalDecision, TaskArtifactKind,
+        TaskBoardStatus as S,
+    };
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Plan).await;
+
+    let plan = service
+        .submit_task_artifact(
+            "user_1",
+            &id,
+            SubmitTaskArtifactRequest {
+                kind: TaskArtifactKind::Plan,
+                content: "Ship the board auto-review path".into(),
+                acceptance_criteria: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    service
+        .decide_task_approval(
+            "user_1",
+            &id,
+            &plan.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: plan.artifact.id.clone(),
+                artifact_hash: plan.artifact.content_hash.clone(),
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Todo))
+        .await
+        .unwrap();
+    let started = service
+        .update_task_board("user_1", &id, BoardActor::User, assign_agent("agent_review"))
+        .await
+        .unwrap();
+    assert_eq!(started.board_status, S::InProgress);
+
+    let moved = service
+        .maybe_submit_board_for_review_on_completion("user_1", &id)
+        .await
+        .unwrap()
+        .expect("should move to in_review");
+    assert_eq!(moved.board_status, S::InReview);
+
+    // No artifacts → stay put (fresh agent item).
+    let bare = board_task(&service, TaskSessionMode::Agent).await;
+    service
+        .update_task_board("user_1", &bare, BoardActor::User, move_to(S::Todo))
+        .await
+        .unwrap();
+    service
+        .update_task_board("user_1", &bare, BoardActor::User, assign_agent("agent_bare"))
+        .await
+        .unwrap();
+    assert!(
+        service
+            .maybe_submit_board_for_review_on_completion("user_1", &bare)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let still = service.task_board("user_1", Default::default()).await.unwrap();
+    let bare_col = still.columns.iter().find(|c| c.board_status == S::InProgress).unwrap();
+    assert!(bare_col.items.iter().any(|i| i.id == bare));
+}
