@@ -663,6 +663,12 @@ mod tests {
                 "/api/task-sessions/t1/execute",
                 "/api/task-sessions/t1/runs",
                 "/api/task-sessions/t1",
+                // M8 E6-3 board: review gate, user credential only.
+                "/api/task-sessions/board",
+                "/api/task-sessions/t1/board",
+                "/api/task-sessions/t1/review",
+                "/api/task-sessions/t1/comments",
+                "/api/task-sessions/t1/comments/c1",
             ] {
                 assert_eq!(
                     classify(method.clone(), path),

@@ -867,6 +867,8 @@ pub struct ConversationService {
     usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
     inbox_repo: Arc<RwLock<Option<Arc<dyn aionui_db::IInboxRepository>>>>,
     task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
+    /// Work-item board (M8 E6-3). `None` until the composition layer wires it.
+    task_board_repo: Arc<RwLock<Option<Arc<dyn aionui_db::ITaskBoardRepository>>>>,
     /// Managed worktree port (M7 E3-2). `None` until the composition layer
     /// wires it; `worktree_id` creates are then refused.
     worktree_binding: Arc<RwLock<Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>>>>,
@@ -1024,6 +1026,7 @@ impl ConversationService {
             usage_event_repo: Arc::new(RwLock::new(None)),
             inbox_repo: Arc::new(RwLock::new(None)),
             task_session_repo: Arc::new(RwLock::new(None)),
+            task_board_repo: Arc::new(RwLock::new(None)),
             worktree_binding: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
             session_mention_grants: Arc::new(session_mentions::SessionMentionGrants::new()),
@@ -1107,7 +1110,21 @@ impl ConversationService {
         }
     }
 
-    fn task_session_repo(&self) -> Result<Arc<dyn ITaskSessionRepository>, ConversationError> {
+    pub fn with_task_board_repo(&self, repo: Arc<dyn aionui_db::ITaskBoardRepository>) {
+        if let Ok(mut guard) = self.task_board_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub(crate) fn task_board_repo(&self) -> Result<Arc<dyn aionui_db::ITaskBoardRepository>, ConversationError> {
+        self.task_board_repo
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| ConversationError::internal("Task board repository is not configured"))
+    }
+
+    pub(crate) fn task_session_repo(&self) -> Result<Arc<dyn ITaskSessionRepository>, ConversationError> {
         self.task_session_repo_optional()
             .ok_or_else(|| ConversationError::internal("Task session repository is not configured"))
     }

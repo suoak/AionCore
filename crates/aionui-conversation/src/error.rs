@@ -71,6 +71,14 @@ pub enum ConversationError {
     #[error("Team runtime is required for conversation: {conversation_id}")]
     TeamRuntimeRequired { conversation_id: String, team_id: String },
 
+    #[error("Board transition rejected ({from} -> {to}): {reason}")]
+    BoardTransitionRejected {
+        from: String,
+        to: String,
+        code: &'static str,
+        reason: String,
+    },
+
     #[error("Unprocessable entity: {reason}")]
     Unprocessable { reason: String },
 
@@ -133,6 +141,7 @@ impl ConversationError {
                 AgentError::conflict("This conversation belongs to a team; use the team runtime session")
             }
             Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
+            Self::BoardTransitionRejected { reason, .. } => AgentError::conflict(reason.clone()),
             Self::CapabilityUnsupported { capability } => {
                 AgentError::bad_request(format!("Capability '{capability}' is not supported"))
             }
@@ -168,6 +177,7 @@ impl ConversationError {
             Self::RuntimeRestarting { .. } => "runtime_restarting",
             Self::TeamRuntimeRequired { .. } => "TEAM_RUNTIME_REQUIRED",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
+            Self::BoardTransitionRejected { .. } => "board_transition_rejected",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",
             Self::RuntimeRetired { .. } => "runtime_retired",

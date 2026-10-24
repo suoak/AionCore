@@ -11441,3 +11441,250 @@ async fn user_cancel_missing_the_turn_still_stops_execution_and_blocks_retry() {
     let runs = service.list_task_runs("user_1", &task_id).await.unwrap();
     assert_eq!(runs.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// M8 E6-3: board state machine and review gate against a real sqlite schema.
+// ---------------------------------------------------------------------------
+
+fn board_service(db: &aionui_db::Database) -> ConversationService {
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        Arc::new(MockTaskManager::new()),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    service.with_task_session_repo(Arc::new(SqliteTaskSessionRepository::new(db.pool().clone())));
+    service.with_task_board_repo(Arc::new(aionui_db::SqliteTaskBoardRepository::new(db.pool().clone())));
+    service
+}
+
+async fn board_task(service: &ConversationService, mode: TaskSessionMode) -> String {
+    service
+        .create_task_session(
+            "user_1",
+            CreateTaskSessionRequest {
+                title: "Board item".into(),
+                project_id: None,
+                conversation_id: None,
+                mode,
+                objective: "Do it".into(),
+                acceptance_criteria: Vec::new(),
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+}
+
+fn move_to(status: aionui_api_types::TaskBoardStatus) -> aionui_api_types::UpdateTaskBoardRequest {
+    aionui_api_types::UpdateTaskBoardRequest {
+        board_status: Some(status),
+        ..Default::default()
+    }
+}
+
+fn rejection_code(error: ConversationError) -> &'static str {
+    match error {
+        ConversationError::BoardTransitionRejected { code, .. } => code,
+        other => panic!("expected a board rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn board_moves_through_review_and_records_the_timeline() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskBoardReviewDecision, TaskBoardReviewRequest, TaskBoardStatus as S};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+
+    let board = service.task_board("user_1", Default::default()).await.unwrap();
+    assert_eq!(board.columns.len(), 6);
+    assert_eq!(board.columns[0].board_status, S::Backlog);
+    assert_eq!(board.columns[0].items.len(), 1);
+
+    // backlog cannot jump straight into in_progress
+    let err = service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::InProgress))
+        .await
+        .unwrap_err();
+    assert_eq!(rejection_code(err), "backlog_not_started");
+
+    for step in [S::Todo, S::InProgress] {
+        service
+            .update_task_board("user_1", &id, BoardActor::User, move_to(step))
+            .await
+            .unwrap();
+    }
+    // done only through review
+    let err = service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Done))
+        .await
+        .unwrap_err();
+    assert_eq!(rejection_code(err), "review_required");
+    // the agent may only hand the item over to review
+    let err = service
+        .update_task_board("user_1", &id, BoardActor::Agent, move_to(S::Todo))
+        .await
+        .unwrap_err();
+    assert_eq!(rejection_code(err), "agent_review_gate");
+    let item = service
+        .update_task_board("user_1", &id, BoardActor::Agent, move_to(S::InReview))
+        .await
+        .unwrap();
+    assert_eq!(item.board_status, S::InReview);
+    // the agent cannot approve its own work
+    let err = service
+        .review_task_board(
+            "user_1",
+            &id,
+            BoardActor::Agent,
+            TaskBoardReviewRequest {
+                decision: TaskBoardReviewDecision::Approve,
+                comment: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejection_code(err), "agent_review_gate");
+    // reject needs a comment and sends the item back to todo
+    assert!(matches!(
+        service
+            .review_task_board(
+                "user_1",
+                &id,
+                BoardActor::User,
+                TaskBoardReviewRequest {
+                    decision: TaskBoardReviewDecision::Reject,
+                    comment: None,
+                },
+            )
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    let rejected = service
+        .review_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            TaskBoardReviewRequest {
+                decision: TaskBoardReviewDecision::Reject,
+                comment: Some("missing tests".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.item.board_status, S::Todo);
+
+    for step in [S::InProgress, S::InReview] {
+        service
+            .update_task_board("user_1", &id, BoardActor::User, move_to(step))
+            .await
+            .unwrap();
+    }
+    let approved = service
+        .review_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            TaskBoardReviewRequest {
+                decision: TaskBoardReviewDecision::Approve,
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.item.board_status, S::Done);
+    let err = service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Cancelled))
+        .await
+        .unwrap_err();
+    assert_eq!(rejection_code(err), "not_allowed");
+
+    service
+        .create_task_comment("user_1", &id, "  looks good ")
+        .await
+        .unwrap();
+    let timeline = service.list_task_comments("user_1", &id).await.unwrap();
+    let kinds: Vec<_> = timeline.iter().map(|c| format!("{:?}", c.kind)).collect();
+    // 2 + 1 (agent) status changes, reject, 2 status changes, approve, comment
+    assert_eq!(timeline.len(), 8, "{kinds:?}");
+    assert_eq!(timeline.last().unwrap().body, "looks good");
+}
+
+#[tokio::test]
+async fn plan_items_need_an_approved_plan_before_work_starts() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskAssignee, TaskAssigneeKind, TaskBoardStatus as S, UpdateTaskBoardRequest};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let id = board_task(&service, TaskSessionMode::Plan).await;
+    service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Todo))
+        .await
+        .unwrap();
+    let err = service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::InProgress))
+        .await
+        .unwrap_err();
+    assert_eq!(rejection_code(err), "plan_not_approved");
+
+    // rank, assignee, priority and labels are user-only fields
+    let item = service
+        .update_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                board_rank: Some(Some("a0".into())),
+                assignee: Some(Some(TaskAssignee {
+                    kind: TaskAssigneeKind::Agent,
+                    id: "agent_1".into(),
+                })),
+                priority: Some(2),
+                labels: Some(vec!["ui".into(), " ui ".into(), "api".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(item.board_rank.as_deref(), Some("a0"));
+    assert_eq!(item.priority, 2);
+    assert_eq!(item.labels, vec!["ui".to_string(), "api".to_string()]);
+    let err = service
+        .update_task_board(
+            "user_1",
+            &id,
+            BoardActor::Agent,
+            UpdateTaskBoardRequest {
+                priority: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejection_code(err), "agent_review_gate");
+    let unassigned = service
+        .update_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                assignee: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(unassigned.assignee.is_none());
+}
