@@ -152,6 +152,10 @@ impl ISkillSourceRepository for SqliteSkillSourceRepository {
         } else {
             current_status
         };
+        if let Some(hook) = p.before_commit {
+            // Dropping `tx` without commit rolls back the insert and status change.
+            hook(version.version_no).map_err(|e| DbError::Init(format!("skill version files: {e}")))?;
+        }
         tx.commit().await?;
         Ok(AppendSkillVersionOutcome {
             version,
@@ -188,10 +192,21 @@ impl ISkillSourceRepository for SqliteSkillSourceRepository {
 
     async fn governance(&self, skill_id: &str) -> Result<Option<SkillGovernanceRow>, DbError> {
         Ok(sqlx::query_as::<_, SkillGovernanceRow>(
-            "SELECT id, visibility, team_id, review_status FROM skills WHERE id = ?",
+            "SELECT id, user_id, name, visibility, team_id, review_status FROM skills WHERE id = ?",
         )
         .bind(skill_id)
         .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn list_pending_reviews_for_user(&self, user_id: &str) -> Result<Vec<SkillGovernanceRow>, DbError> {
+        Ok(sqlx::query_as::<_, SkillGovernanceRow>(
+            "SELECT id, user_id, name, visibility, team_id, review_status FROM skills \
+             WHERE review_status = 'pending' AND deleted_at IS NULL AND user_id = ? \
+             ORDER BY updated_at DESC, id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
         .await?)
     }
 
@@ -274,6 +289,7 @@ mod tests {
             source_ref: None,
             created_by: "import",
             now: 10,
+            before_commit: None,
         }
     }
 
@@ -284,6 +300,26 @@ mod tests {
         assert_eq!(gov.visibility, "private");
         assert_eq!(gov.team_id, None);
         assert_eq!(gov.review_status, "none");
+        assert_eq!(gov.name, "imported");
+    }
+
+    #[tokio::test]
+    async fn pending_queue_lists_only_owner_pending_skills() {
+        let (_db, _skills, repo, skill_id) = setup().await;
+        let owner = repo.governance(&skill_id).await.unwrap().unwrap().user_id.unwrap();
+        assert!(repo.list_pending_reviews_for_user(&owner).await.unwrap().is_empty());
+        repo.append_version(version("v1", &skill_id, "h1", true)).await.unwrap();
+        let queue = repo.list_pending_reviews_for_user(&owner).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id, skill_id);
+        assert!(
+            repo.list_pending_reviews_for_user("someone-else")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        repo.set_review_status(&skill_id, "approved", 20).await.unwrap();
+        assert!(repo.list_pending_reviews_for_user(&owner).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -447,5 +483,28 @@ mod tests {
             .unwrap();
         assert_eq!(repo.governance(&skill_id).await.unwrap().unwrap().team_id, None);
         assert!(repo.set_visibility("nope", "private", None, 4).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn before_commit_failure_rolls_back_row_and_status() {
+        let (_db, _skills, repo, skill_id) = setup().await;
+        let fail = |_: i64| -> Result<(), String> { Err("disk full".into()) };
+        let mut p = version("v1", &skill_id, "h1", true);
+        p.before_commit = Some(&fail);
+        assert!(repo.append_version(p).await.is_err());
+        assert!(repo.list_versions(&skill_id).await.unwrap().is_empty());
+        let gov = repo.governance(&skill_id).await.unwrap().unwrap();
+        assert_ne!(gov.review_status, "pending");
+
+        let seen = std::sync::Mutex::new(None);
+        let ok = |n: i64| -> Result<(), String> {
+            *seen.lock().unwrap() = Some(n);
+            Ok(())
+        };
+        let mut p = version("v1b", &skill_id, "h1", true);
+        p.before_commit = Some(&ok);
+        let out = repo.append_version(p).await.unwrap();
+        assert_eq!(out.version.version_no, 1);
+        assert_eq!(*seen.lock().unwrap(), Some(1));
     }
 }

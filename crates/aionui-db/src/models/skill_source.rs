@@ -47,6 +47,8 @@ pub struct SkillVersionRow {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SkillGovernanceRow {
     pub id: String,
+    pub user_id: Option<String>,
+    pub name: String,
     pub visibility: String,
     pub team_id: Option<String>,
     pub review_status: String,

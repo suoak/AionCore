@@ -22,7 +22,7 @@ pub struct UpsertSkillSourceParams<'a> {
 }
 
 /// A new snapshot of a skill. `version_no` is assigned by the repository.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppendSkillVersionParams<'a> {
     pub id: &'a str,
     pub skill_id: &'a str,
@@ -33,6 +33,11 @@ pub struct AppendSkillVersionParams<'a> {
     pub source_ref: Option<&'a str>,
     pub created_by: &'a str,
     pub now: TimestampMs,
+    /// Runs inside the insert transaction once `version_no` is known, before
+    /// commit. An `Err` aborts and rolls the row back, so callers can put the
+    /// version files in place first and never leave a row without files.
+    /// Not called when the content equals the latest version.
+    pub before_commit: Option<&'a (dyn Fn(i64) -> Result<(), String> + Send + Sync)>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +71,8 @@ pub trait ISkillSourceRepository: Send + Sync {
     async fn latest_version(&self, skill_id: &str) -> Result<Option<SkillVersionRow>, DbError>;
 
     async fn governance(&self, skill_id: &str) -> Result<Option<SkillGovernanceRow>, DbError>;
+    /// Skills owned by `user_id` waiting for review (`review_status = 'pending'`), newest first.
+    async fn list_pending_reviews_for_user(&self, user_id: &str) -> Result<Vec<SkillGovernanceRow>, DbError>;
     /// Set the review state. Who may approve (owner vs team admin, D10-3) is
     /// decided by the service; this layer only validates the value.
     async fn set_review_status(&self, skill_id: &str, status: &str, now: TimestampMs) -> Result<(), DbError>;

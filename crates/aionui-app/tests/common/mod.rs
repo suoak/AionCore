@@ -74,6 +74,7 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: states.skill.assistant_dispatcher.clone(),
         registry_service: None,
+        governance: None,
     };
 
     let router = create_router_with_states(&services, states);

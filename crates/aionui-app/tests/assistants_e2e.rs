@@ -317,6 +317,7 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
         external_paths_manager: ext_paths_mgr,
         assistant_dispatcher: None, // wired below once service is constructed
         registry_service: None,
+        governance: None,
     };
 
     // Rebuild AssistantService pointing at our temp built-in manifest + temp

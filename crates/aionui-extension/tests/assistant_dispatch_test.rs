@@ -174,6 +174,7 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
         external_paths_manager: ext_mgr,
         assistant_dispatcher: Some(dispatcher),
         registry_service: None,
+        governance: None,
     };
     skill_routes(state).layer(Extension(CurrentUser {
         id: "user-current".into(),
