@@ -26,7 +26,6 @@ futures-util.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true
-tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }
 futures-util.workspace = true
 reqwest.workspace = true

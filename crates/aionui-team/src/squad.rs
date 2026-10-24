@@ -439,9 +439,6 @@ async fn delete_squad(
 mod tests {
     use super::*;
     use crate::error::TeamError;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
 
     struct Catalog(Vec<&'static str>);
 
@@ -480,21 +477,24 @@ mod tests {
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> (StatusCode, serde_json::Value) {
-        let mut req = Request::builder().method(method).uri(uri);
-        let body = match body {
-            Some(b) => {
-                req = req.header("content-type", "application/json");
-                Body::from(b.to_string())
-            }
-            None => Body::empty(),
+        // Real loopback server + reqwest: avoids a tower dev-dependency (and a
+        // Cargo.lock change) just for `oneshot`.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = {
+            let app = app.clone();
+            tokio::spawn(async move { axum::serve(listener, app).await })
         };
-        let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
-        )
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut req = reqwest::Client::new().request(method, format!("http://{addr}{uri}"));
+        if let Some(b) = body {
+            req = req.header("content-type", "application/json").body(b.to_string());
+        }
+        let resp = req.send().await.unwrap();
+        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+        let text = resp.text().await.unwrap();
+        server.abort();
+        (status, serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
     }
 
     fn member(id: &str) -> serde_json::Value {
