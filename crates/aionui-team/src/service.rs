@@ -1,5 +1,7 @@
 mod describe_support;
 mod response_builder;
+mod squad_run;
+pub use squad_run::derive_squad_run_state;
 pub(crate) mod spawn_support;
 
 use std::collections::HashSet;

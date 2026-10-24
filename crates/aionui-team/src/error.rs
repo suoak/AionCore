@@ -24,6 +24,10 @@ pub enum TeamError {
     #[error("squad_spawn_forbidden: Squad teams have a fixed roster; {action} is not allowed")]
     SquadSpawnForbidden { team_id: String, action: String },
 
+    /// M8 E7-5: Squad-only endpoint called on a regular team.
+    #[error("team_not_squad: {0}")]
+    TeamNotSquad(String),
+
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
