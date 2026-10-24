@@ -263,10 +263,11 @@ pub use system::{
     FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use task_board::{
-    CreateTaskCommentRequest, EditTaskCommentRequest, TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind,
+    CreateTaskCommentRequest, EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED,
+    EditTaskCommentRequest, TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind, TaskBoardChange,
     TaskBoardColumnResponse, TaskBoardItemResponse, TaskBoardQuery, TaskBoardResponse, TaskBoardReviewDecision,
-    TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus, TaskCommentKind, TaskCommentResponse,
-    UpdateTaskBoardRequest,
+    TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus, TaskBoardUpdatedEvent, TaskCommentEvent,
+    TaskCommentKind, TaskCommentResponse, UpdateTaskBoardRequest,
 };
 pub use task_session::{
     AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,

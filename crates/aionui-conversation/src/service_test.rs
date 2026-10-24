@@ -11447,9 +11447,13 @@ async fn user_cancel_missing_the_turn_still_stops_execution_and_blocks_retry() {
 // ---------------------------------------------------------------------------
 
 fn board_service(db: &aionui_db::Database) -> ConversationService {
+    board_service_with(db, Arc::new(MockBroadcaster::new()))
+}
+
+fn board_service_with(db: &aionui_db::Database, broadcaster: Arc<MockBroadcaster>) -> ConversationService {
     let service = ConversationService::new(
         std::env::temp_dir(),
-        Arc::new(MockBroadcaster::new()),
+        broadcaster,
         Arc::new(FixedSkillResolver { names: vec![] }),
         Arc::new(MockTaskManager::new()),
         Arc::new(MockRepo::new()),
@@ -11687,4 +11691,144 @@ async fn plan_items_need_an_approved_plan_before_work_starts() {
         .await
         .unwrap();
     assert!(unassigned.assignee.is_none());
+}
+
+#[tokio::test]
+async fn board_changes_push_realtime_events_after_the_write() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskBoardReviewDecision, TaskBoardReviewRequest, TaskBoardStatus as S};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = board_service_with(&db, broadcaster.clone());
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+    broadcaster.take_events();
+
+    service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Todo))
+        .await
+        .unwrap();
+    let events = broadcaster.take_events();
+    let names: Vec<_> = events.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["task.comment.created", "task.board.updated"]);
+    assert_eq!(events[0].data["user_id"], "user_1");
+    assert_eq!(events[0].data["comment"]["kind"], "status_change");
+    let board = &events[1].data;
+    assert_eq!(board["user_id"], "user_1");
+    assert_eq!(board["task_session_id"], id.as_str());
+    assert_eq!(board["change"], "board");
+    assert_eq!(board["from_board_status"], "backlog");
+    assert_eq!(board["item"]["board_status"], "todo");
+
+    // A rejected move publishes nothing.
+    service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Done))
+        .await
+        .unwrap_err();
+    assert!(broadcaster.take_events().is_empty());
+
+    let comment = service.create_task_comment("user_1", &id, "hi").await.unwrap();
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "task.comment.created");
+    assert_eq!(events[0].data["comment"]["id"], comment.id.as_str());
+    service
+        .edit_task_comment("user_1", &id, &comment.id, "hello")
+        .await
+        .unwrap();
+    let events = broadcaster.take_events();
+    assert_eq!(events[0].name, "task.comment.updated");
+    assert_eq!(events[0].data["comment"]["body"], "hello");
+
+    for step in [S::InProgress, S::InReview] {
+        service
+            .update_task_board("user_1", &id, BoardActor::User, move_to(step))
+            .await
+            .unwrap();
+    }
+    broadcaster.take_events();
+    service
+        .review_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            TaskBoardReviewRequest {
+                decision: TaskBoardReviewDecision::Approve,
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    let events = broadcaster.take_events();
+    let names: Vec<_> = events.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["task.comment.created", "task.board.updated"]);
+    assert_eq!(events[1].data["change"], "review");
+    assert_eq!(events[1].data["from_board_status"], "in_review");
+    assert_eq!(events[1].data["item"]["board_status"], "done");
+}
+
+#[tokio::test]
+async fn board_patch_honours_expected_updated_at() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskBoardStatus as S, UpdateTaskBoardRequest};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = board_service_with(&db, broadcaster.clone());
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+    let seen = service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::Todo))
+        .await
+        .unwrap();
+
+    // A matching version applies and always moves the version forward.
+    let next = service
+        .update_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                priority: Some(3),
+                expected_updated_at: Some(seen.updated_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(next.updated_at > seen.updated_at);
+    broadcaster.take_events();
+
+    // The old version is now stale: 409, nothing written, nothing pushed.
+    let err = service
+        .update_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                board_status: Some(S::InProgress),
+                expected_updated_at: Some(seen.updated_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ConversationError::BoardItemStale { expected, current, .. } => {
+            assert_eq!(expected, seen.updated_at);
+            assert_eq!(current, Some(next.updated_at));
+        }
+        other => panic!("expected stale, got {other:?}"),
+    }
+    assert!(broadcaster.take_events().is_empty());
+    let item = service.task_board("user_1", Default::default()).await.unwrap().columns[1].items[0].clone();
+    assert_eq!(item.board_status, S::Todo);
+    assert_eq!(item.priority, 3);
+
+    // Without the field the update stays last-write-wins.
+    service
+        .update_task_board("user_1", &id, BoardActor::User, move_to(S::InProgress))
+        .await
+        .unwrap();
 }

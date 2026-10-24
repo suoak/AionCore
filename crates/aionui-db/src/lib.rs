@@ -59,7 +59,9 @@ pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams, Up
 pub use repository::skill_source::{
     AppendSkillVersionOutcome, AppendSkillVersionParams, ISkillSourceRepository, UpsertSkillSourceParams,
 };
-pub use repository::task_board::{AppendTaskCommentParams, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams};
+pub use repository::task_board::{
+    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams,
+};
 pub use repository::task_session::{
     AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateRetryTaskRunParams,
     CreateTaskArtifactParams, CreateTaskCheckpointParams, CreateTaskEvidenceParams, CreateTaskRunParams,
