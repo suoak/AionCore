@@ -147,6 +147,7 @@ async fn list_skills(
             is_custom: s.is_custom,
             source: to_source_response(s.source),
             registry_origin: s.registry_origin,
+            skill_id: s.skill_id,
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))
@@ -745,5 +746,60 @@ mod tests {
         assert!(versions[0].has_scripts);
         let gov = source_repo.governance(&row.id).await.unwrap().unwrap();
         assert_eq!(gov.review_status, "pending");
+
+        // Pending skills are hidden from GET /api/skills; a plain (script-free)
+        // import is approved-by-default and must carry its DB id in the list.
+        let plain = state.skill_paths.data_dir.join("ext").join("legacy-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(
+            plain.join("SKILL.md"),
+            "---\nname: legacy-plain\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+        let resp = skill_routes(state.clone())
+            .layer(Extension(user.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"skill_path": plain.to_string_lossy()}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let plain_row = skill_repo
+            .find_by_name_any_for_user(&user.id, "legacy-plain")
+            .await
+            .unwrap()
+            .expect("imported");
+
+        // GET /api/skills exposes the DB id so the UI can open source/versions.
+        let resp = skill_routes(state.clone())
+            .layer(Extension(user.clone()))
+            .oneshot(Request::builder().uri("/api/skills").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let item = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "legacy-plain")
+            .unwrap_or_else(|| panic!("not listed: {v}"));
+        assert_eq!(item["skill_id"], serde_json::Value::String(plain_row.id.clone()));
+        assert!(
+            !v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["name"] == "legacy-scripted"),
+            "pending skill must stay hidden"
+        );
     }
 }
