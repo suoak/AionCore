@@ -20,6 +20,7 @@ pub mod runtime_tools;
 pub mod scheduler;
 pub mod service;
 pub mod session;
+pub mod squad;
 pub mod task_board;
 pub mod team_run;
 #[cfg(test)]

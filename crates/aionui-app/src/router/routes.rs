@@ -363,6 +363,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let team_authenticated =
         team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // M8 E7 Squad template routes protected by auth middleware
+    let squad_authenticated = aionui_team::squad::squad_routes(states.squad.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Cron routes protected by auth middleware
     let cron_authenticated =
         cron_routes(states.cron).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -465,6 +469,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(skill_runtime)
         .merge(channel_authenticated)
         .merge(team_authenticated)
+        .merge(squad_authenticated)
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)

@@ -38,12 +38,14 @@ mod sqlite_sidebar;
 mod sqlite_skill;
 mod sqlite_skill_evolution;
 mod sqlite_skill_source;
+mod sqlite_squad;
 mod sqlite_task_board;
 mod sqlite_task_session;
 mod sqlite_team;
 mod sqlite_usage_event;
 mod sqlite_user;
 mod sqlite_user_order;
+pub mod squad;
 pub mod task_board;
 pub mod task_session;
 pub mod team;
@@ -105,6 +107,7 @@ pub use sqlite_skill_evolution::{
     SqliteExperienceArticleRepository, SqliteSkillEvolutionProposalRepository, SqliteSkillEvolutionSettingsRepository,
 };
 pub use sqlite_skill_source::SqliteSkillSourceRepository;
+pub use sqlite_squad::SqliteSquadTemplateRepository;
 pub use sqlite_task_board::SqliteTaskBoardRepository;
 pub use sqlite_task_session::SqliteTaskSessionRepository;
 pub use sqlite_team::SqliteTeamRepository;

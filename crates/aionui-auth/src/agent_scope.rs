@@ -46,6 +46,8 @@ pub enum AgentActionKind {
     Assistant,
     Skill,
     Cron,
+    /// M8 E7: Squad template writes.
+    Squad,
 }
 
 /// Per-conversation read sub-resources an agent token may NOT read even for
@@ -70,6 +72,7 @@ const READ_PREFIXES: &[&str] = &[
     "/api/internal/conversation-cron/list",
     "/api/teams",
     "/api/agent-approvals",
+    "/api/squads",
 ];
 
 /// Non-GET routes that only read or probe and never persist state.
@@ -92,6 +95,7 @@ const APPROVAL_PREFIXES: &[(&str, AgentActionKind)] = &[
     ("/api/skills", AgentActionKind::Skill),
     ("/api/internal/conversation-cron", AgentActionKind::Cron),
     ("/api/cron", AgentActionKind::Cron),
+    ("/api/squads", AgentActionKind::Squad),
 ];
 
 /// `path` matches `prefix` exactly or as a `/`-delimited parent.
@@ -484,6 +488,9 @@ mod tests {
             (Method::POST, "/api/agents/custom", AgentActionKind::Agent),
             (Method::PUT, "/api/assistants/a1", AgentActionKind::Assistant),
             (Method::POST, "/api/skills/import", AgentActionKind::Skill),
+            (Method::POST, "/api/squads", AgentActionKind::Squad),
+            (Method::PATCH, "/api/squads/s1", AgentActionKind::Squad),
+            (Method::DELETE, "/api/squads/s1", AgentActionKind::Squad),
             (
                 Method::POST,
                 "/api/internal/conversation-cron/create",
