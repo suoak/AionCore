@@ -208,6 +208,7 @@ mod tests {
         let teams = crate::SqliteTeamRepository::new(db.pool().clone());
         assert_eq!(teams.team_squad_template_id("t1").await.unwrap(), None);
         assert_eq!(teams.team_squad_leader_mode("t1").await.unwrap(), None);
+        assert_eq!(teams.team_squad_members("t1").await.unwrap(), None);
         assert!(matches!(
             repo.bind_team_instance("u2", "t1", "s1").await,
             Err(DbError::NotFound(_))
@@ -218,6 +219,8 @@ mod tests {
             teams.team_squad_leader_mode("t1").await.unwrap().as_deref(),
             Some("route_only")
         );
+        let members = teams.team_squad_members("t1").await.unwrap().expect("members json");
+        assert!(members.contains(r#""role_title":"fe""#));
         assert_eq!(repo.instance_team_ids("s1").await.unwrap(), vec!["t1".to_string()]);
     }
 

@@ -91,6 +91,17 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(row.map(|(mode,)| mode))
     }
 
+    async fn team_squad_members(&self, team_id: &str) -> Result<Option<String>, DbError> {
+        // Same JOIN as leader_mode: soft-deleted templates still label instances.
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT s.members FROM teams t JOIN squad_templates s ON s.id = t.squad_template_id WHERE t.id = ?",
+        )
+        .bind(team_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(members,)| members))
+    }
+
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
         let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE id = ?")
             .bind(team_id)

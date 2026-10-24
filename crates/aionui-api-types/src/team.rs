@@ -597,6 +597,10 @@ pub struct TeamAgentResponse {
     #[serde(default)]
     pub pending_confirmations: usize,
     pub context_reset: TeamContextResetCapability,
+    /// M8 E7-6: Squad role title (`"Leader"` for the lead, the template
+    /// member's `role_title` otherwise). Omitted for plain Teams / unmatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad_role_title: Option<String>,
 }
 
 /// Full team response returned by create, get, and list endpoints.
@@ -615,6 +619,14 @@ pub struct TeamResponse {
     /// M8 E7-4: set when the Team was instantiated from a Squad template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub squad_template_id: Option<String>,
+    /// M8 E7-6: template `leader_mode` (`route_only` | `route_and_work`);
+    /// omitted for plain Teams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad_leader_mode: Option<String>,
+    /// M8 E7-6: same payload as `GET /api/teams/{id}/squad-run`; omitted for
+    /// plain Teams and for Squads with neither tasks nor a run yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squad_run: Option<crate::SquadRunPayload>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -1249,6 +1261,7 @@ mod tests {
                 supported: true,
                 availability: TeamContextResetAvailability::Ready,
             },
+            squad_role_title: None,
         };
         let json = serde_json::to_value(&agent).unwrap();
         assert_eq!(json["slot_id"], "slot-1");
@@ -1285,6 +1298,7 @@ mod tests {
                 supported: true,
                 availability: TeamContextResetAvailability::Dormant,
             },
+            squad_role_title: None,
         };
         let json = serde_json::to_value(&agent).unwrap();
         assert!(json.get("icon").is_none());
@@ -1315,9 +1329,12 @@ mod tests {
                     supported: false,
                     availability: TeamContextResetAvailability::LeaderNotTargetable,
                 },
+                squad_role_title: None,
             }],
             leader_assistant_id: Some("slot-1".into()),
             squad_template_id: None,
+            squad_leader_mode: None,
+            squad_run: None,
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
@@ -1341,6 +1358,8 @@ mod tests {
             assistants: vec![],
             leader_assistant_id: None,
             squad_template_id: None,
+            squad_leader_mode: None,
+            squad_run: None,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
@@ -1385,6 +1404,7 @@ mod tests {
                     supported: true,
                     availability: TeamContextResetAvailability::Ready,
                 },
+                squad_role_title: None,
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -1440,6 +1460,7 @@ mod tests {
                 supported: false,
                 availability: TeamContextResetAvailability::LeaderNotTargetable,
             },
+            squad_role_title: None,
         };
         let json = serde_json::to_string(&agent).unwrap();
         let parsed: TeamAgentResponse = serde_json::from_str(&json).unwrap();
@@ -1470,6 +1491,7 @@ mod tests {
                         supported: false,
                         availability: TeamContextResetAvailability::LeaderNotTargetable,
                     },
+                    squad_role_title: None,
                 },
                 TeamAgentResponse {
                     slot_id: "s2".into(),
@@ -1488,10 +1510,13 @@ mod tests {
                         supported: true,
                         availability: TeamContextResetAvailability::Ready,
                     },
+                    squad_role_title: None,
                 },
             ],
             leader_assistant_id: Some("s1".into()),
             squad_template_id: None,
+            squad_leader_mode: None,
+            squad_run: None,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -1533,6 +1558,7 @@ mod tests {
                     supported: true,
                     availability: TeamContextResetAvailability::Dormant,
                 },
+                squad_role_title: None,
             },
         };
         let json = serde_json::to_string(&payload).unwrap();
