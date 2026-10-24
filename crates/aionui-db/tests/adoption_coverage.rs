@@ -41,6 +41,8 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("messages", "conversation_id", "conversations"),
     // M7 E4 diff-annotation replies inherit ownership from review_threads.user_id.
     ("review_comments", "thread_id", "review_threads"),
+    // E10-1 skill version history inherits ownership from skills.user_id.
+    ("skill_versions", "skill_id", "skills"),
     // Plan/Goal execution records inherit ownership from task_sessions.user_id.
     ("task_acceptance_criteria", "task_session_id", "task_sessions"),
     ("task_approvals", "task_session_id", "task_sessions"),
