@@ -38,6 +38,7 @@ mod sidebar;
 mod skill;
 mod skill_delivery;
 mod skill_evolution;
+mod skill_governance;
 mod skill_runtime;
 mod system;
 mod task_board;
@@ -251,6 +252,11 @@ pub use skill_evolution::{
     SkillEvolutionGateMode, SkillEvolutionGateRecommendation, SkillEvolutionGateSignal, SkillEvolutionListQuery,
     SkillEvolutionProposalResponse, SkillEvolutionSettingsResponse, SkillEvolutionSkillRefPayload,
     SkillEvolutionStatus, SkillEvolutionTrajectoryOverview, UpdateSkillEvolutionSettingsRequest,
+};
+pub use skill_governance::{
+    ImportFromSourceRequest, ImportFromSourceResponse, ImportSourceKind, ReviewDecision, ReviewSkillRequest,
+    SetVisibilityRequest, SkillGovernanceInfo, SkillSourceDetailResponse, SkillSourceInfo, SkillSourceSyncResult,
+    SkillVersionInfo,
 };
 pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,

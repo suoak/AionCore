@@ -220,6 +220,13 @@ async fn import_skill(
         );
     }
     let names = outcome.imported;
+    if let Some(gov) = state.governance.as_ref() {
+        // E10-2b: the legacy import also records a version (files-first; a
+        // scripted skill goes to `pending` and is hidden until reviewed, D10-7).
+        for name in &names {
+            crate::skill_governance::record_version_for_named_skill(gov, &current_user.id, name, "import").await?;
+        }
+    }
     let first_name = names.first().cloned().unwrap_or_default();
     let failed = outcome
         .failed
@@ -686,5 +693,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn legacy_import_records_version_and_holds_scripted_skill_for_review() {
+        let mut state = make_state().await;
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let skill_repo: Arc<dyn ISkillRepository> = Arc::new(aionui_db::SqliteSkillRepository::new(db.pool().clone()));
+        let source_repo: Arc<dyn aionui_db::ISkillSourceRepository> =
+            Arc::new(aionui_db::SqliteSkillSourceRepository::new(db.pool().clone()));
+        std::mem::forget(db);
+        state.skill_repo = skill_repo.clone();
+        state.governance = Some(crate::skill_governance::SkillGovernanceState {
+            skill_paths: state.skill_paths.clone(),
+            skill_repo: skill_repo.clone(),
+            source_repo: source_repo.clone(),
+            team_roles: Arc::new(crate::skill_governance::NoTeamRoles),
+        });
+        let src = state.skill_paths.data_dir.join("ext").join("legacy-scripted");
+        std::fs::create_dir_all(src.join("scripts")).unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: legacy-scripted\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("scripts").join("x.sh"), "echo\n").unwrap();
+        let user = CurrentUser::local_default();
+        let resp = skill_routes(state.clone())
+            .layer(Extension(user.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/skills/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"skill_path": src.to_string_lossy()}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = skill_repo
+            .find_by_name_any_for_user(&user.id, "legacy-scripted")
+            .await
+            .unwrap()
+            .expect("imported");
+        let versions = source_repo.list_versions(&row.id).await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].created_by, "import");
+        assert!(versions[0].has_scripts);
+        let gov = source_repo.governance(&row.id).await.unwrap().unwrap();
+        assert_eq!(gov.review_status, "pending");
     }
 }
