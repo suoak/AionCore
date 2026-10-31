@@ -144,6 +144,9 @@ pub(crate) fn data() -> Value {
                 stdin(&["cron", "current", "create"], "Create the scheduled task for the current conversation.", &["name", "schedule", "schedule_description", "message"], &["conversation_id"], true, false),
                 stdin(&["cron", "current", "update"], "Update the scheduled task for the current conversation.", &["job_id"], &["conversation_id"], true, false),
             ]),
+            domain("work-items", &[
+                stdin(&["work-items", "create"], "Propose an unassigned backlog work item; the user must approve it before it appears on the board.", &["title", "objective", "acceptance_criteria", "mode", "agent_type", "project_id", "status"], &[], false, false),
+            ]),
         ]
     })
 }

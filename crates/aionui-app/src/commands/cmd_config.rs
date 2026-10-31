@@ -14,7 +14,8 @@ use crate::cli::{
     ConfigCronJobSkillCommand, ConfigCronJobsArgs, ConfigCronJobsCommand, ConfigMcpArgs, ConfigMcpCommand,
     ConfigMcpOauthCommand, ConfigMcpServersCommand, ConfigProviderModelsCommand, ConfigProvidersArgs,
     ConfigProvidersCommand, ConfigSettingsArgs, ConfigSettingsClientCommand, ConfigSettingsCommand, ConfigSkillsArgs,
-    ConfigSkillsCommand, ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand,
+    ConfigSkillsCommand, ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand, ConfigWorkItemsArgs,
+    ConfigWorkItemsCommand,
 };
 use crate::commands::config_capabilities;
 
@@ -47,6 +48,7 @@ async fn run(args: ConfigArgs) -> Result<(), ConfigError> {
         ConfigCommand::Settings(args) => run_settings(&client, args).await,
         ConfigCommand::Agents(args) => run_agents(&client, args).await,
         ConfigCommand::Cron(args) => run_cron(&client, args).await,
+        ConfigCommand::WorkItems(args) => run_work_items(&client, args).await,
     }
 }
 
@@ -809,6 +811,64 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
                 .await
             }
         },
+    }
+}
+
+/// M8 Q9: payload keys the server accepts from an agent. Checked locally so
+/// the user is never asked to approve a request the server would refuse.
+const WORK_ITEM_CREATE_FIELDS: &[&str] = &[
+    "title",
+    "objective",
+    "acceptance_criteria",
+    "mode",
+    "project_id",
+    "agent_type",
+    "status",
+];
+
+fn check_work_item_payload(command: &str, payload: &Value) -> Result<(), ConfigError> {
+    let Some(object) = payload.as_object() else {
+        return Err(ConfigError::new(
+            ConfigErrorCode::PayloadInvalid,
+            command,
+            "payload must be a JSON object",
+        )
+        .field("field", "stdin"));
+    };
+    if let Some(key) = object
+        .keys()
+        .find(|key| !WORK_ITEM_CREATE_FIELDS.contains(&key.as_str()))
+    {
+        return Err(ConfigError::new(
+            ConfigErrorCode::PayloadInvalid,
+            command,
+            "agents can only create unassigned backlog work items; field is not allowed",
+        )
+        .field("field", key.clone()));
+    }
+    if let Some(status) = object.get("status")
+        && status.as_str() != Some("draft")
+    {
+        return Err(ConfigError::new(
+            ConfigErrorCode::PayloadInvalid,
+            command,
+            "agent-created work items must use status draft",
+        )
+        .field("field", "status"));
+    }
+    Ok(())
+}
+
+async fn run_work_items(client: &reqwest::Client, args: ConfigWorkItemsArgs) -> Result<(), ConfigError> {
+    match args.command {
+        ConfigWorkItemsCommand::Create => {
+            let command = "config work-items create";
+            let env = ConfigEnv::from_env(command)?;
+            let payload = read_stdin_payload(command)?;
+            check_work_item_payload(command, &payload)?;
+            let data = request_json(client, &env, Method::POST, "/api/task-sessions", Some(payload), command).await?;
+            print_envelope(data, meta(None), command)
+        }
     }
 }
 

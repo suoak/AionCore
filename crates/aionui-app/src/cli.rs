@@ -418,6 +418,20 @@ pub(crate) enum ConfigCommand {
     Agents(ConfigAgentsArgs),
     /// Manage scheduled tasks.
     Cron(ConfigCronArgs),
+    /// Propose board work items (backlog only, needs user approval).
+    WorkItems(ConfigWorkItemsArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigWorkItemsArgs {
+    #[command(subcommand)]
+    pub command: ConfigWorkItemsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub(crate) enum ConfigWorkItemsCommand {
+    /// Create an unassigned backlog work item from a JSON payload on stdin.
+    Create,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1060,6 +1074,7 @@ mod tests {
             &["aioncore", "config", "skills", "external-paths", "remove"],
             &["aioncore", "config", "skills", "market", "enable"],
             &["aioncore", "config", "skills", "market", "disable"],
+            &["aioncore", "config", "work-items", "create"],
         ];
 
         for command in commands {

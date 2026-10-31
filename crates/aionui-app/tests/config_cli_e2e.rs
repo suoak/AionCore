@@ -1104,6 +1104,7 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
         "\"$AIONUI_HELPER_BIN\" config agents",
         "\"$AIONUI_HELPER_BIN\" config cron jobs",
         "\"$AIONUI_HELPER_BIN\" config skills external-paths",
+        "\"$AIONUI_HELPER_BIN\" config work-items create",
     ] {
         assert!(
             aionui_config.contains(command),

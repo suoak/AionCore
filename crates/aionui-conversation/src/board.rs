@@ -859,6 +859,62 @@ impl ConversationService {
         Ok(comment)
     }
 
+    /// M8 Q9 (D6-7): create a work item on behalf of an agent, after the user
+    /// approved the request (the auth layer holds the request until then, so
+    /// nothing is persisted before approval). The item always lands in
+    /// `backlog`, unassigned and unbound, so no E7-4 trigger can fire from it
+    /// (backlog never starts, no assignee). The board timeline records which
+    /// conversation asked for it and that the user approved.
+    pub async fn create_agent_backlog_work_item(
+        &self,
+        user_id: &str,
+        agent_conversation_id: &str,
+        request: aionui_api_types::CreateTaskSessionRequest,
+    ) -> Result<aionui_api_types::TaskSessionResponse, ConversationError> {
+        if request.conversation_id.is_some() || request.agent_session_id.is_some() {
+            return Err(ConversationError::bad_request(
+                "An agent-created work item cannot bind a conversation or agent session",
+            ));
+        }
+        if request.status != aionui_api_types::TaskSessionStatus::Draft {
+            return Err(ConversationError::bad_request(
+                "An agent-created work item must start as draft",
+            ));
+        }
+        let session = self.create_task_session(user_id, request).await?;
+        let row = self.board_item(user_id, &session.id).await?;
+        // Defensive: creation never writes these, but the Q9 guarantee is
+        // "backlog + unassigned" regardless of future column defaults.
+        if row.board_status != TaskBoardStatus::Backlog.as_str() || row.assignee_kind.is_some() {
+            return Err(ConversationError::internal(
+                "agent-created work item did not land in an unassigned backlog",
+            ));
+        }
+        let body =
+            format!("由 Agent（会话 {agent_conversation_id}）提议创建，已经用户审批，进入 Backlog；需人工排期与指派。");
+        match self
+            .task_board_repo()?
+            .append_comment(&AppendTaskCommentParams {
+                user_id,
+                task_session_id: &session.id,
+                author_kind: "system",
+                author_id: "agent-approval",
+                kind: "comment",
+                body: &body,
+                created_at: now_ms(),
+            })
+            .await
+        {
+            Ok(comment) => self.publish_comment(EVENT_TASK_COMMENT_CREATED, user_id, comment_response(comment)),
+            Err(error) => {
+                tracing::warn!(task_session_id = %session.id, %error, "failed to record agent work item origin")
+            }
+        }
+        let item = item_response(row)?;
+        self.publish_board_updated(user_id, TaskBoardChange::Board, TaskBoardStatus::Backlog, &item);
+        Ok(session)
+    }
+
     /// M8 E7-5: Leader (or other agent) round evaluation as a timeline comment.
     /// `kind=comment`, `author_kind=agent`. Verifies the work item belongs to the user.
     pub async fn append_agent_board_comment(
