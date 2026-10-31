@@ -48,6 +48,10 @@ pub enum AgentActionKind {
     Cron,
     /// M8 E7: Squad template writes.
     Squad,
+    /// M8 Q9 (D6-7): an agent asking to create a work item. Only
+    /// `POST /api/task-sessions` qualifies, and the handler additionally
+    /// limits the body to an unassigned `backlog` item.
+    WorkItem,
 }
 
 /// Per-conversation read sub-resources an agent token may NOT read even for
@@ -97,6 +101,11 @@ const APPROVAL_PREFIXES: &[(&str, AgentActionKind)] = &[
     ("/api/cron", AgentActionKind::Cron),
     ("/api/squads", AgentActionKind::Squad),
 ];
+
+/// M8 Q9: the only work-item write an agent token may request (with user
+/// approval). Every other `/api/task-sessions` write — board moves,
+/// assignment, review, comments, edits — stays outside agent scope.
+pub const AGENT_WORK_ITEM_CREATE_PATH: &str = "/api/task-sessions";
 
 /// `path` matches `prefix` exactly or as a `/`-delimited parent.
 fn has_prefix(path: &str, prefix: &str) -> bool {
@@ -158,6 +167,10 @@ pub fn classify_agent_request(method: &Method, path: &str, own_conversation_id: 
         } else {
             AgentRouteDecision::Deny
         };
+    }
+
+    if method == Method::POST && path == AGENT_WORK_ITEM_CREATE_PATH {
+        return AgentRouteDecision::RequireApproval(AgentActionKind::WorkItem);
     }
 
     if matches!(method, &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE)
@@ -263,7 +276,10 @@ pub fn required_helper_skills(method: &Method, path: &str) -> Option<&'static [H
     if CRON_PREFIXES.iter().any(|prefix| has_prefix(path, prefix)) {
         return Some(&[HelperSkill::Config, HelperSkill::Cron]);
     }
-    if READ_LIKE_POSTS.contains(&path) || APPROVAL_PREFIXES.iter().any(|(prefix, _)| has_prefix(path, prefix)) {
+    if (method == Method::POST && path == AGENT_WORK_ITEM_CREATE_PATH)
+        || READ_LIKE_POSTS.contains(&path)
+        || APPROVAL_PREFIXES.iter().any(|(prefix, _)| has_prefix(path, prefix))
+    {
         return Some(&[HelperSkill::Config]);
     }
     None
@@ -491,6 +507,8 @@ mod tests {
             (Method::POST, "/api/squads", AgentActionKind::Squad),
             (Method::PATCH, "/api/squads/s1", AgentActionKind::Squad),
             (Method::DELETE, "/api/squads/s1", AgentActionKind::Squad),
+            (Method::POST, "/api/task-sessions", AgentActionKind::WorkItem),
+            (Method::POST, "/api/task-sessions/", AgentActionKind::WorkItem),
             (
                 Method::POST,
                 "/api/internal/conversation-cron/create",
@@ -505,6 +523,41 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn q9_agents_may_only_request_work_item_creation() {
+        // Creation is the single approvable work-item write.
+        assert_eq!(
+            classify(Method::POST, "/api/task-sessions?x=1"),
+            AgentRouteDecision::RequireApproval(AgentActionKind::WorkItem)
+        );
+        // Board moves, assignment, review, comments, edits, execution and
+        // reads stay outside agent scope (no approval card either).
+        for (method, path) in [
+            (Method::PATCH, "/api/task-sessions/t1/board"),
+            (Method::POST, "/api/task-sessions/t1/review"),
+            (Method::PATCH, "/api/task-sessions/t1"),
+            (Method::POST, "/api/task-sessions/t1/comments"),
+            (Method::POST, "/api/task-sessions/t1/execute"),
+            (Method::POST, "/api/task-sessions/t1/automatic-plan"),
+            (Method::PUT, "/api/task-sessions/t1/retry-policy"),
+            (Method::POST, "/api/task-sessions/t1/approvals/a1/decision"),
+            (Method::PUT, "/api/task-sessions"),
+            (Method::DELETE, "/api/task-sessions"),
+            (Method::GET, "/api/task-sessions"),
+            (Method::GET, "/api/task-sessions/board"),
+        ] {
+            assert_eq!(
+                classify(method.clone(), path),
+                AgentRouteDecision::Deny,
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            required_helper_skills(&Method::POST, "/api/task-sessions"),
+            Some(&[HelperSkill::Config][..])
+        );
     }
 
     #[test]

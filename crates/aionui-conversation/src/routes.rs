@@ -21,7 +21,7 @@ use aionui_api_types::{
     UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskRetryPolicyRequest,
     UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{AgentPrincipal, CurrentUser};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -248,12 +248,74 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
 
 // ── Handlers ───────────────────────────────────────────────────────
 
+/// M8 Q9: body fields an agent may set on a work item it proposes. Anything
+/// else (board column, assignee, priority, labels, rank, conversation or
+/// agent-session binding, unknown keys) is refused, so an agent can only ever
+/// propose an unassigned backlog item.
+const AGENT_WORK_ITEM_FIELDS: &[&str] = &[
+    "title",
+    "objective",
+    "acceptance_criteria",
+    "mode",
+    "project_id",
+    "agent_type",
+    "status",
+];
+
+fn agent_backlog_only(message: impl Into<String>, field: Option<&str>) -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "agent_work_item_backlog_only",
+        message,
+        field.map(|field| serde_json::json!({ "field": field })),
+    )
+}
+
+/// Validate an agent-proposed work item body before it is deserialized.
+fn check_agent_work_item_body(body: &serde_json::Value) -> Result<(), ApiError> {
+    let Some(object) = body.as_object() else {
+        return Err(ApiError::BadRequest("Invalid JSON request body.".to_owned()));
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|key| !AGENT_WORK_ITEM_FIELDS.contains(&key.as_str()))
+    {
+        return Err(agent_backlog_only(
+            format!("Agents can only create unassigned backlog work items; `{field}` is not allowed"),
+            Some(field),
+        ));
+    }
+    if let Some(status) = object.get("status")
+        && status.as_str() != Some("draft")
+    {
+        return Err(agent_backlog_only(
+            "Agents can only create draft work items in backlog",
+            Some("status"),
+        ));
+    }
+    Ok(())
+}
+
 async fn create_task_session(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    body: Result<Json<CreateTaskSessionRequest>, JsonRejection>,
+    agent: Option<Extension<AgentPrincipal>>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<TaskSessionResponse>>), ApiError> {
-    let Json(request) = body.map_err(ApiError::from)?;
+    let Json(body) = body.map_err(ApiError::from)?;
+    if let Some(Extension(agent)) = &agent {
+        check_agent_work_item_body(&body)?;
+        let request: CreateTaskSessionRequest =
+            serde_json::from_value(body).map_err(|_| ApiError::BadRequest("Invalid JSON request body.".to_owned()))?;
+        let session = state
+            .service
+            .create_agent_backlog_work_item(&user.id, &agent.conversation_id, request)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok((StatusCode::CREATED, Json(ApiResponse::ok(session))));
+    }
+    let request: CreateTaskSessionRequest =
+        serde_json::from_value(body).map_err(|_| ApiError::BadRequest("Invalid JSON request body.".to_owned()))?;
     let session = state
         .service
         .create_task_session(&user.id, request)
