@@ -211,6 +211,23 @@ mod tests {
     }
 
     #[test]
+    fn governance_routes_are_denied() {
+        // M8 E12-3: governance is desktop / WebUI user only.
+        for method in [Method::GET, Method::POST, Method::PUT] {
+            for path in [
+                "/api/governance/me",
+                "/api/governance/policies",
+                "/api/governance/policies/no_yolo",
+                "/api/governance/roles",
+                "/api/governance/roles/u1",
+                "/api/governance/agent-permissions",
+            ] {
+                assert_eq!(classify_device_request(&method, path), Deny, "{method} {path}");
+            }
+        }
+    }
+
+    #[test]
     fn other_methods_are_denied() {
         for method in [Method::PUT, Method::PATCH, Method::DELETE] {
             assert_eq!(classify_device_request(&method, "/api/conversations/c1"), Deny);

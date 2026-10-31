@@ -3,13 +3,14 @@
 //!
 //! Signed-in user only: agent and device tokens get 403 here (they are also
 //! absent from the agent / device route whitelists, so they are refused
-//! before reaching a handler). Until roles land (E12-3) a user only sees
-//! events recorded with their own `user_id`.
+//! before reaching a handler). A member only sees events recorded with their
+//! own `user_id`; an owner / admin (E12-3) sees every row and may narrow it
+//! with `user_id`. On the desktop the single user is owner.
 //!
-//! - `GET /api/audit/events?from&to&action&action_prefix&actor&actor_kind&before_seq&limit`
+//! - `GET /api/audit/events?from&to&action&action_prefix&actor&actor_kind&user_id&before_seq&limit`
 //!   newest first; `next_before_seq` pages backwards.
 //! - `GET /api/audit/verify` — re-hash the whole chain.
-//! - `GET /api/audit/export.csv?from&to&action&action_prefix&actor&actor_kind`
+//! - `GET /api/audit/export.csv?from&to&action&action_prefix&actor&actor_kind&user_id`
 //!   chain order, with the chain verification in `X-Audit-Chain-*` headers.
 use std::sync::Arc;
 
@@ -37,6 +38,8 @@ pub const AUDIT_EXPORT_MAX_ROWS: usize = 100_000;
 #[derive(Clone)]
 pub struct AuditRouterState {
     pub repo: Arc<dyn IAuditEventRepository>,
+    /// Role source (E12-3). `None` keeps every caller scoped to their own rows.
+    pub governance: Option<Arc<aionui_db::GovernanceService>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,6 +53,8 @@ pub struct AuditQuery {
     /// Actor id (user id, conversation id, device id).
     pub actor: Option<String>,
     pub actor_kind: Option<String>,
+    /// Owner / admin only: narrow to one user's rows.
+    pub user_id: Option<String>,
     pub before_seq: Option<i64>,
     pub limit: Option<i64>,
 }
@@ -139,7 +144,28 @@ fn non_empty(value: &Option<String>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn build_filter(user: &CurrentUser, query: &AuditQuery) -> Result<AuditEventFilter, ApiError> {
+/// Whether the caller may read every user's rows (owner / admin).
+async fn can_view_all(state: &AuditRouterState, user: &CurrentUser) -> Result<bool, ApiError> {
+    let Some(governance) = state.governance.as_ref() else {
+        return Ok(false);
+    };
+    let role = governance.role_of(&user.id).await.map_err(db_unavailable)?;
+    Ok(role.can_view_all_audit())
+}
+
+fn build_filter(user: &CurrentUser, query: &AuditQuery, view_all: bool) -> Result<AuditEventFilter, ApiError> {
+    let requested_user = non_empty(&query.user_id);
+    if !view_all
+        && let Some(requested) = &requested_user
+        && requested != &user.id
+    {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "AUDIT_SCOPE_FORBIDDEN",
+            "Only an owner or admin can read other users' audit events.",
+            None,
+        ));
+    }
     let actor_kind = non_empty(&query.actor_kind);
     if let Some(kind) = &actor_kind
         && AuditActorKind::parse(kind).is_none()
@@ -161,7 +187,11 @@ fn build_filter(user: &CurrentUser, query: &AuditQuery) -> Result<AuditEventFilt
         )));
     }
     Ok(AuditEventFilter {
-        user_id: Some(user.id.clone()),
+        user_id: if view_all {
+            requested_user
+        } else {
+            Some(user.id.clone())
+        },
         from_ts: query.from,
         to_ts: query.to,
         action: non_empty(&query.action),
@@ -183,7 +213,8 @@ async fn list_events_handler(
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<ApiResponse<AuditEventPage>>, ApiError> {
     ensure_user_session(&device, &agent)?;
-    let filter = build_filter(&user, &query)?;
+    let view_all = can_view_all(&state, &user).await?;
+    let filter = build_filter(&user, &query, view_all)?;
     let limit = filter.limit.unwrap_or(aionui_db::AUDIT_LIST_DEFAULT_LIMIT);
     let rows = state.repo.list(&filter).await.map_err(db_unavailable)?;
     let next_before_seq = if rows.len() as i64 == limit {
@@ -274,7 +305,8 @@ async fn export_csv_handler(
     Query(query): Query<AuditQuery>,
 ) -> Result<Response, ApiError> {
     ensure_user_session(&device, &agent)?;
-    let mut filter = build_filter(&user, &query)?;
+    let view_all = can_view_all(&state, &user).await?;
+    let mut filter = build_filter(&user, &query, view_all)?;
     filter.before_seq = None;
     filter.order = AuditOrder::OldestFirst;
     filter.limit = Some(AUDIT_LIST_MAX_LIMIT);
@@ -387,28 +419,48 @@ mod tests {
     #[test]
     fn filter_is_scoped_to_the_user_and_validated() {
         let user = CurrentUser::local_default();
-        let filter = build_filter(&user, &AuditQuery::default()).unwrap();
+        let filter = build_filter(&user, &AuditQuery::default(), false).unwrap();
         assert_eq!(filter.user_id.as_deref(), Some(user.id.as_str()));
         let bad_kind = AuditQuery {
             actor_kind: Some("robot".into()),
             ..Default::default()
         };
-        assert!(build_filter(&user, &bad_kind).is_err());
+        assert!(build_filter(&user, &bad_kind, false).is_err());
         let reversed = AuditQuery {
             from: Some(2),
             to: Some(1),
             ..Default::default()
         };
-        assert!(build_filter(&user, &reversed).is_err());
+        assert!(build_filter(&user, &reversed, false).is_err());
         let too_many = AuditQuery {
             limit: Some(AUDIT_LIST_MAX_LIMIT + 1),
             ..Default::default()
         };
-        assert!(build_filter(&user, &too_many).is_err());
+        assert!(build_filter(&user, &too_many, false).is_err());
         let blank = AuditQuery {
             action: Some("  ".into()),
             ..Default::default()
         };
-        assert!(build_filter(&user, &blank).unwrap().action.is_none());
+        assert!(build_filter(&user, &blank, false).unwrap().action.is_none());
+    }
+
+    #[test]
+    fn only_privileged_callers_widen_the_user_scope() {
+        let user = CurrentUser::local_default();
+        let other = AuditQuery {
+            user_id: Some("someone-else".into()),
+            ..Default::default()
+        };
+        assert!(build_filter(&user, &other, false).is_err());
+        assert_eq!(
+            build_filter(&user, &other, true).unwrap().user_id.as_deref(),
+            Some("someone-else")
+        );
+        assert!(
+            build_filter(&user, &AuditQuery::default(), true)
+                .unwrap()
+                .user_id
+                .is_none()
+        );
     }
 }

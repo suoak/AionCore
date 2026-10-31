@@ -312,6 +312,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let audit_authenticated = aionui_auth::audit_routes(aionui_auth::AuditRouterState {
         repo: services.audit_events.clone(),
+        governance: Some(services.governance.clone()),
+    })
+    .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let governance_authenticated = aionui_auth::governance_routes(aionui_auth::GovernanceRouterState {
+        governance: services.governance.clone(),
+        users: services.user_repo.clone(),
     })
     .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
@@ -479,6 +485,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(system_authenticated)
         .merge(agent_approvals_authenticated)
         .merge(audit_authenticated)
+        .merge(governance_authenticated)
         .merge(device_pairing_public)
         .merge(device_pairing_authenticated)
         .merge(conversation_authenticated)

@@ -897,6 +897,9 @@ pub struct ConversationService {
     /// Managed worktree port (M7 E3-2). `None` until the composition layer
     /// wires it; `worktree_id` creates are then refused.
     worktree_binding: Arc<RwLock<Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>>>>,
+    /// Roles and policy switches (M8 E12-3). `None` (tests, early boot)
+    /// means no policy is enforced.
+    governance: Arc<RwLock<Option<Arc<aionui_db::GovernanceService>>>>,
     input_queue_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Cross-session delivery grants created by the user's `@@` picks.
     session_mention_grants: Arc<session_mentions::SessionMentionGrants>,
@@ -1055,6 +1058,7 @@ impl ConversationService {
             task_board_repo: Arc::new(RwLock::new(None)),
             board_squad_run: Arc::new(RwLock::new(None)),
             worktree_binding: Arc::new(RwLock::new(None)),
+            governance: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),
             session_mention_grants: Arc::new(session_mentions::SessionMentionGrants::new()),
             task_execution_stop_grace_ms: Arc::new(std::sync::atomic::AtomicU64::new(
@@ -2851,6 +2855,34 @@ impl ConversationService {
         self.worktree_binding.read().ok().and_then(|guard| guard.clone())
     }
 
+    /// Wire roles/policies (M8 E12-3). Conversation create, session-mode
+    /// changes and runtime-forced modes are checked against it.
+    pub fn with_governance(&self, governance: Arc<aionui_db::GovernanceService>) {
+        if let Ok(mut guard) = self.governance.write() {
+            *guard = Some(governance);
+        }
+    }
+
+    pub fn governance_optional(&self) -> Option<Arc<aionui_db::GovernanceService>> {
+        self.governance.read().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Run a governance check; a denial becomes `Forbidden` (already audited
+    /// by the service).
+    pub(crate) async fn enforce_launch_policy(
+        &self,
+        user_id: &str,
+        facts: &aionui_db::LaunchFacts<'_>,
+    ) -> Result<(), ConversationError> {
+        let Some(governance) = self.governance_optional() else {
+            return Ok(());
+        };
+        governance
+            .check_launch(user_id, facts)
+            .await
+            .map_err(|denial| ConversationError::Forbidden { reason: denial.message })
+    }
+
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order before
@@ -3920,6 +3952,25 @@ impl ConversationService {
             }
         }
 
+        // M8 E12-3: roles/policies gate every new conversation (UI, batch,
+        // channel, runtime create) on its final runtime identity.
+        {
+            let backend = extra.get("backend").and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+            let modes = governed_session_modes(&extra);
+            let mut facts = aionui_db::LaunchFacts::new(aionui_db::LaunchSurface::ConversationCreate);
+            facts.target = Some(("conversation", id.as_str()));
+            facts.agent_type = Some(effective_type);
+            facts.backend = backend;
+            facts.assistant_id = assistant_id.as_deref();
+            facts.mcp_strict = Some(mcp_strict);
+            facts.mode = modes.first().map(String::as_str);
+            self.enforce_launch_policy(user_id, &facts).await?;
+            for mode in modes.iter().skip(1) {
+                facts.mode = Some(mode.as_str());
+                self.enforce_launch_policy(user_id, &facts).await?;
+            }
+        }
+
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
@@ -4857,6 +4908,30 @@ impl ConversationService {
                 return Err(ConversationError::BadRequest {
                     reason: crate::worktree_binding::WORKSPACE_LOCKED_REASON.into(),
                 });
+            }
+            // M8 E12-3: a PATCHed mode is checked like a created one.
+            let changed_modes: Vec<String> = governed_session_modes(incoming)
+                .into_iter()
+                .filter(|mode| {
+                    ["session_mode", "current_mode_id"].iter().any(|key| {
+                        incoming.get(*key).and_then(|v| v.as_str()).map(str::trim) == Some(mode.as_str())
+                            && protected_extra_value_changes(&existing_extra, incoming, key)
+                    })
+                })
+                .collect();
+            if !changed_modes.is_empty() {
+                let backend = existing_extra
+                    .get("backend")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty());
+                let mut facts = aionui_db::LaunchFacts::new(aionui_db::LaunchSurface::ModeChange);
+                facts.target = Some(("conversation", id));
+                facts.agent_type = Some(existing_type);
+                facts.backend = backend;
+                for mode in &changed_modes {
+                    facts.mode = Some(mode.as_str());
+                    self.enforce_launch_policy(user_id, &facts).await?;
+                }
             }
         }
 
@@ -6781,6 +6856,28 @@ impl ConversationService {
         validate_planning_turn_content(runtime_tool_policy, &request.content)?;
 
         reject_deprecated_runtime_row(&row)?;
+        // M8 E12-3: a runtime-forced mode (cron full-auto) is checked before
+        // the turn starts; a denial fails the run and is audited.
+        if let Some(mode) = request
+            .required_runtime_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+        {
+            let row_extra: serde_json::Value =
+                serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+            let backend = row_extra
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty());
+            let mut facts = aionui_db::LaunchFacts::new(aionui_db::LaunchSurface::Cron);
+            facts.target = Some(("conversation", request.conversation_id.as_str()));
+            facts.agent_type = string_to_enum::<AgentType>(&row.r#type).ok();
+            facts.backend = backend;
+            facts.mode = Some(mode);
+            facts.via = Some(aionui_db::AuditVia::Cron);
+            self.enforce_launch_policy(&request.user_id, &facts).await?;
+        }
         self.validate_turn_start(&request.user_id, &request.conversation_id, &row.extra)
             .await?;
 
@@ -8788,6 +8885,21 @@ fn resolve_effective_assistant_mcp_ids(
 /// `conversation.extra` keys that bind a conversation to a team. Only the
 /// team service writes them (via internal `create` / `update_extra`).
 pub(crate) const TEAM_BINDING_EXTRA_KEYS: [&str; 4] = ["teamId", "slot_id", "role", "team_mcp_stdio_config"];
+
+/// Distinct, non-empty session-mode values in `extra` (`session_mode`, then
+/// `current_mode_id`) — what governance checks for yolo / no-sandbox modes.
+pub(crate) fn governed_session_modes(extra: &serde_json::Value) -> Vec<String> {
+    let mut modes: Vec<String> = Vec::new();
+    for key in ["session_mode", "current_mode_id"] {
+        if let Some(mode) = extra.get(key).and_then(|v| v.as_str()).map(str::trim)
+            && !mode.is_empty()
+            && !modes.iter().any(|m| m == mode)
+        {
+            modes.push(mode.to_owned());
+        }
+    }
+    modes
+}
 
 /// Whether `incoming` sets `key` to a value different from the stored one.
 /// Re-sending the stored value unchanged (clients that echo the full extra

@@ -520,6 +520,17 @@ impl ConversationService {
                 backend: RETIRED_DEEPSEEK_HARNESS_BACKEND.to_owned(),
             });
         }
+        // M8 E12-3: a mode / permission switch is checked against policy
+        // before it reaches the agent. Model and reasoning options are not
+        // modes and skip the check.
+        if !matches!(option_id, "model" | "thought_level" | "reasoning_effort") {
+            let mut facts = aionui_db::LaunchFacts::new(aionui_db::LaunchSurface::ModeChange);
+            facts.target = Some(("conversation", conversation_id));
+            facts.agent_type = Some(agent.agent_type());
+            facts.backend = agent.backend();
+            facts.mode = Some(req.value.as_str());
+            self.enforce_launch_policy(user_id, &facts).await?;
+        }
         let response = {
             match agent.set_config_option(option_id, &req.value).await {
                 Ok(response) => response,
