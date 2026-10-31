@@ -50,6 +50,8 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
 const RUN_LEASE_MS: i64 = 60_000;
 const RUN_LEASE_HEARTBEAT_MS: u64 = 20_000;
 const RUN_HISTORY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// Newest run records always kept per job, even past the time window (D8-5).
+const RUN_HISTORY_KEEP_PER_JOB: i64 = 100;
 #[derive(Clone)]
 pub struct CronService {
     repo: Arc<dyn ICronRepository>,
@@ -97,7 +99,18 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn add_job(&self, user_id: &str, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
-        self.add_job_internal(user_id, req, None, None).await
+        self.add_job_internal(user_id, req, None, None, CronActor::User).await
+    }
+
+    /// `add_job` with the caller's credential kind, so Autopilot full-auto can
+    /// be refused for agent (conversation-runtime) tokens.
+    pub async fn add_job_as(
+        &self,
+        user_id: &str,
+        req: CreateCronJobRequest,
+        actor: CronActor,
+    ) -> Result<CronJob, CronError> {
+        self.add_job_internal(user_id, req, None, None, actor).await
     }
 
     pub async fn create_for_conversation_helper(
@@ -127,18 +140,23 @@ impl CronService {
             execution_mode: Some("existing".to_owned()),
             queue_enabled: false,
             agent_config,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         };
 
         let job = self
-            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override)
+            .add_job_internal(
+                user_id,
+                create_req,
+                Some(agent_type),
+                assistant_backend_override,
+                CronActor::Agent,
+            )
             .await?;
         if let Err(err) = self
             .executor
-            .bind_cron_job_to_conversation(
-                conversation_id,
-                &job.id,
-                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
-            )
+            .bind_cron_job_to_conversation(conversation_id, &job.id, job.seeded_session_mode())
             .await
         {
             if let Err(cleanup_err) = self.remove_job(user_id, &job.id).await {
@@ -214,16 +232,15 @@ impl CronService {
                     conversation_title: None,
                     max_retries: None,
                     queue_enabled: None,
+                    autopilot: None,
+                    autopilot_yolo: None,
+                    notify_channel_id: None,
                 },
             )
             .await?;
 
         self.executor
-            .bind_cron_job_to_conversation(
-                conversation_id,
-                &job.id,
-                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
-            )
+            .bind_cron_job_to_conversation(conversation_id, &job.id, job.seeded_session_mode())
             .await?;
 
         Ok(job)
@@ -256,6 +273,7 @@ impl CronService {
         req: CreateCronJobRequest,
         runtime_agent_type: Option<String>,
         assistant_backend_override: Option<String>,
+        actor: CronActor,
     ) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
@@ -270,6 +288,15 @@ impl CronService {
 
         let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
         let created_by = CreatedBy::from_str(&req.created_by)?;
+        validate_autopilot_request(&AutopilotCheck {
+            autopilot: req.autopilot,
+            yolo: req.autopilot && req.autopilot_yolo,
+            yolo_requested: req.autopilot_yolo,
+            disabling_autopilot: false,
+            created_by,
+            actor,
+            requested_mode: req.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
+        })?;
         let message = req.message.or(req.prompt).unwrap_or_default();
         let conversation_id = req.conversation_id.trim();
         if matches!(execution_mode, ExecutionMode::Existing) {
@@ -318,6 +345,9 @@ impl CronService {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: req.queue_enabled,
+            autopilot: req.autopilot,
+            autopilot_yolo: req.autopilot && req.autopilot_yolo,
+            notify_channel_id: normalize_notify_channel_id(req.notify_channel_id.as_deref()),
         };
 
         self.validate_job_workspace(&job).await?;
@@ -337,6 +367,17 @@ impl CronService {
         user_id: &str,
         job_id: &str,
         req: UpdateCronJobRequest,
+    ) -> Result<CronJob, CronError> {
+        self.update_job_as(user_id, job_id, req, CronActor::User).await
+    }
+
+    /// `update_job` with the caller's credential kind (see `add_job_as`).
+    pub async fn update_job_as(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        req: UpdateCronJobRequest,
+        actor: CronActor,
     ) -> Result<CronJob, CronError> {
         let existing_row = self
             .repo
@@ -407,6 +448,28 @@ impl CronService {
         if let Some(queue_enabled) = req.queue_enabled {
             job.queue_enabled = queue_enabled;
         }
+        let original_autopilot = job.autopilot;
+        if let Some(autopilot) = req.autopilot {
+            job.autopilot = autopilot;
+        }
+        if let Some(yolo) = req.autopilot_yolo {
+            job.autopilot_yolo = yolo;
+        }
+        if !job.autopilot {
+            job.autopilot_yolo = false;
+        }
+        if let Some(channel) = &req.notify_channel_id {
+            job.notify_channel_id = normalize_notify_channel_id(Some(channel));
+        }
+        validate_autopilot_request(&AutopilotCheck {
+            autopilot: job.autopilot,
+            yolo: job.autopilot_yolo,
+            yolo_requested: req.autopilot_yolo == Some(true),
+            disabling_autopilot: original_autopilot && !job.autopilot,
+            created_by: job.created_by,
+            actor,
+            requested_mode: req.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
+        })?;
 
         if req.schedule.is_some() || req.enabled.is_some() {
             job.next_run_at = compute_next_run(&job.schedule, now_ms());
@@ -498,7 +561,11 @@ impl CronService {
 
     pub async fn init(&self) {
         let now = now_ms();
-        if let Err(error) = self.repo.cleanup_runs_before(now - RUN_HISTORY_RETENTION_MS).await {
+        if let Err(error) = self
+            .repo
+            .cleanup_runs_before(now - RUN_HISTORY_RETENTION_MS, RUN_HISTORY_KEEP_PER_JOB)
+            .await
+        {
             warn!(error = %error, "Failed to clean up old cron run records");
         }
 
@@ -658,7 +725,7 @@ impl CronService {
                 owner_id: &self.instance_id,
                 now: claim_now,
                 lease_until: claim_now + RUN_LEASE_MS,
-                queue_enabled: job.queue_enabled,
+                queue_enabled: job.skips_overlap(),
             })
             .await
         {
@@ -1082,11 +1149,7 @@ impl CronService {
 
         if let Err(err) = self
             .executor
-            .bind_cron_job_to_conversation(
-                &job.conversation_id,
-                &job.id,
-                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
-            )
+            .bind_cron_job_to_conversation(&job.conversation_id, &job.id, job.seeded_session_mode())
             .await
         {
             warn!(
@@ -1117,11 +1180,7 @@ impl CronService {
         };
         self.repo.update_for_user(&job.user_id, &job.id, &params).await?;
         self.executor
-            .bind_cron_job_to_conversation(
-                conversation_id,
-                &job.id,
-                job.agent_config.as_ref().and_then(|config| config.mode.as_deref()),
-            )
+            .bind_cron_job_to_conversation(conversation_id, &job.id, job.seeded_session_mode())
             .await?;
         job.conversation_id = conversation_id.to_owned();
 
@@ -2298,7 +2357,79 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         run_count: None,
         retry_count: None,
         queue_enabled: req.queue_enabled,
+        autopilot: (req.autopilot.is_some() || req.autopilot_yolo.is_some()).then_some(job.autopilot),
+        autopilot_yolo: (req.autopilot.is_some() || req.autopilot_yolo.is_some()).then_some(job.autopilot_yolo),
+        notify_channel_id: req.notify_channel_id.as_ref().map(|_| job.notify_channel_id.clone()),
     }
+}
+
+/// Who is calling a cron write API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronActor {
+    /// The signed-in user (session/JWT or local default user).
+    User,
+    /// A conversation-runtime agent token or the in-conversation cron helper.
+    Agent,
+}
+
+struct AutopilotCheck<'a> {
+    /// Resulting `autopilot` flag.
+    autopilot: bool,
+    /// Resulting full-auto flag (already forced off when `autopilot` is off).
+    yolo: bool,
+    /// The request itself asks for full-auto.
+    yolo_requested: bool,
+    /// The request turns Autopilot off on a job that had it on.
+    disabling_autopilot: bool,
+    created_by: CreatedBy,
+    actor: CronActor,
+    /// `agent_config.mode` sent with the request, if any.
+    requested_mode: Option<&'a str>,
+}
+
+/// Autopilot guardrails 1–2 (E8-batch-autopilot.md §2.3):
+/// - full-auto needs an explicit user confirmation; agent credentials and
+///   agent-created jobs can never get it (403);
+/// - plan/goal modes cannot run unattended (400).
+fn validate_autopilot_request(check: &AutopilotCheck<'_>) -> Result<(), CronError> {
+    if check.actor == CronActor::Agent && (check.yolo_requested || check.disabling_autopilot) {
+        return Err(CronError::Forbidden(
+            "agent credentials cannot enable Autopilot full-auto or turn Autopilot off".into(),
+        ));
+    }
+    if !check.autopilot {
+        if check.yolo_requested {
+            return Err(CronError::InvalidAgentConfig(
+                "autopilot_yolo requires autopilot to be enabled".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if check.yolo && check.created_by == CreatedBy::Agent {
+        return Err(CronError::Forbidden(
+            "agent-created cron jobs cannot run Autopilot in full-auto".into(),
+        ));
+    }
+    if let Some(mode) = check.requested_mode.map(str::trim)
+        && is_interactive_only_mode(mode)
+    {
+        return Err(CronError::InvalidAgentConfig(format!(
+            "mode `{mode}` cannot be used with Autopilot"
+        )));
+    }
+    Ok(())
+}
+
+/// Modes that need a human in the loop and are rejected for Autopilot.
+fn is_interactive_only_mode(mode: &str) -> bool {
+    mode.eq_ignore_ascii_case("plan") || mode.eq_ignore_ascii_case("goal")
+}
+
+fn normalize_notify_channel_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn sanitize_agent_config_dto(
@@ -2621,6 +2752,9 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: false,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         }
     }
 
@@ -2638,6 +2772,9 @@ mod tests {
             conversation_title: None,
             max_retries: None,
             queue_enabled: None,
+            autopilot: None,
+            autopilot_yolo: None,
+            notify_channel_id: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.name.as_deref(), Some("New Name"));
@@ -2672,6 +2809,9 @@ mod tests {
             conversation_title: None,
             max_retries: None,
             queue_enabled: None,
+            autopilot: None,
+            autopilot_yolo: None,
+            notify_channel_id: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.schedule_kind.as_deref(), Some("cron"));
@@ -2714,6 +2854,9 @@ mod tests {
             conversation_title: None,
             max_retries: None,
             queue_enabled: None,
+            autopilot: None,
+            autopilot_yolo: None,
+            notify_channel_id: None,
         };
 
         let params = build_update_params(&job, &req);
@@ -2777,6 +2920,9 @@ mod tests {
             conversation_title: None,
             max_retries: None,
             queue_enabled: None,
+            autopilot: None,
+            autopilot_yolo: None,
+            notify_channel_id: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.enabled, Some(false));
@@ -2797,6 +2943,9 @@ mod tests {
             conversation_title: None,
             max_retries: None,
             queue_enabled: None,
+            autopilot: None,
+            autopilot_yolo: None,
+            notify_channel_id: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(

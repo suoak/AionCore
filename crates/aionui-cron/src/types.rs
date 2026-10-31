@@ -176,6 +176,51 @@ pub struct CronJob {
     pub retry_count: i64,
     pub max_retries: i64,
     pub queue_enabled: bool,
+    /// Autopilot guardrails enabled (E8-6, migration 077).
+    pub autopilot: bool,
+    /// User-confirmed full-auto for an Autopilot job; `false` = Ask.
+    pub autopilot_yolo: bool,
+    /// Channel session (`assistant_sessions.id`) receiving run summaries.
+    pub notify_channel_id: Option<String>,
+}
+
+/// Session mode requested for Autopilot jobs running in Ask mode. Backends
+/// treat `default` as their approval-asking mode (Claude/Gemini/aionrs
+/// natively; Codex normalizes it to its ask-on-escalation mode).
+pub const AUTOPILOT_ASK_SESSION_MODE: &str = "default";
+
+impl CronJob {
+    /// Autopilot job that must NOT be escalated to full-auto (guardrail 1).
+    pub fn is_autopilot_ask(&self) -> bool {
+        self.autopilot && !self.autopilot_yolo
+    }
+
+    /// Overlapping occurrences are skipped (not queued, not retried). Always
+    /// true for Autopilot jobs (guardrail 4); legacy jobs keep `queue_enabled`.
+    pub fn skips_overlap(&self) -> bool {
+        self.queue_enabled || self.autopilot
+    }
+
+    /// Mode the runtime must force for this job's turns. Autopilot Ask jobs
+    /// force nothing so the agent keeps asking for approval.
+    pub fn required_runtime_mode(&self) -> Option<&str> {
+        if self.is_autopilot_ask() {
+            return None;
+        }
+        self.agent_config
+            .as_ref()
+            .and_then(|config| config.mode.as_deref())
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+    }
+
+    /// Mode seeded into conversations the job creates.
+    pub fn seeded_session_mode(&self) -> Option<&str> {
+        if self.is_autopilot_ask() {
+            return Some(AUTOPILOT_ASK_SESSION_MODE);
+        }
+        self.agent_config.as_ref().and_then(|config| config.mode.as_deref())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +271,9 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
         retry_count: row.retry_count,
         max_retries: row.max_retries,
         queue_enabled: row.queue_enabled,
+        autopilot: row.autopilot,
+        autopilot_yolo: row.autopilot_yolo,
+        notify_channel_id: row.notify_channel_id,
     })
 }
 
@@ -299,6 +347,9 @@ pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
         retry_count: job.retry_count,
         max_retries: job.max_retries,
         queue_enabled: job.queue_enabled,
+        autopilot: job.autopilot,
+        autopilot_yolo: job.autopilot_yolo,
+        notify_channel_id: job.notify_channel_id.clone(),
     })
 }
 
@@ -386,6 +437,9 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
             retry_count: job.retry_count,
             max_retries: job.max_retries,
             queue_enabled: job.queue_enabled,
+            autopilot: job.autopilot,
+            autopilot_yolo: job.autopilot && job.autopilot_yolo,
+            notify_channel_id: job.notify_channel_id.clone(),
         },
     }
 }
@@ -584,6 +638,9 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: false,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         }
     }
 
@@ -627,6 +684,9 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: false,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         }
     }
 
@@ -985,5 +1045,56 @@ mod tests {
                 description: Some("every 5m".into()),
             }
         );
+    }
+
+    #[test]
+    fn autopilot_mode_helpers() {
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().mode = Some(" bypassPermissions ".into());
+        // Legacy job: unchanged behaviour.
+        assert!(!job.is_autopilot_ask());
+        assert!(!job.skips_overlap());
+        assert_eq!(job.required_runtime_mode(), Some("bypassPermissions"));
+        assert_eq!(job.seeded_session_mode(), Some(" bypassPermissions "));
+
+        // Autopilot Ask: never forced into full-auto, seeded with "default".
+        job.autopilot = true;
+        assert!(job.is_autopilot_ask());
+        assert!(job.skips_overlap());
+        assert_eq!(job.required_runtime_mode(), None);
+        assert_eq!(job.seeded_session_mode(), Some(AUTOPILOT_ASK_SESSION_MODE));
+
+        // Autopilot full-auto (explicit user confirmation): stored mode applies.
+        job.autopilot_yolo = true;
+        assert!(!job.is_autopilot_ask());
+        assert_eq!(job.required_runtime_mode(), Some("bypassPermissions"));
+
+        // yolo without autopilot is inert.
+        job.autopilot = false;
+        assert!(!job.is_autopilot_ask());
+        assert!(!job.skips_overlap());
+    }
+
+    #[test]
+    fn autopilot_fields_map_row_and_response() {
+        let mut row = sample_row();
+        row.autopilot = true;
+        row.autopilot_yolo = true;
+        row.notify_channel_id = Some("session_1".into());
+        let job = cron_job_from_row(row).unwrap();
+        assert!(job.autopilot && job.autopilot_yolo);
+        assert_eq!(job.notify_channel_id.as_deref(), Some("session_1"));
+        let back = cron_job_to_row(&job).unwrap();
+        assert!(back.autopilot && back.autopilot_yolo);
+        assert_eq!(back.notify_channel_id.as_deref(), Some("session_1"));
+
+        let response = cron_job_to_response(&job);
+        assert!(response.state.autopilot);
+        assert!(response.state.autopilot_yolo);
+        assert_eq!(response.state.notify_channel_id.as_deref(), Some("session_1"));
+
+        let mut job = job;
+        job.autopilot = false;
+        assert!(!cron_job_to_response(&job).state.autopilot_yolo);
     }
 }

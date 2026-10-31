@@ -11,12 +11,12 @@ use aionui_api_types::{
     CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{AgentPrincipal, CurrentUser};
 use aionui_common::ApiError;
 use aionui_db::DbError;
 
 use crate::error::CronError;
-use crate::service::CronService;
+use crate::service::{CronActor, CronService};
 use crate::state::CronRouterState;
 
 fn db_error_to_api_error(err: DbError) -> ApiError {
@@ -41,6 +41,7 @@ impl From<CronError> for ApiError {
             CronError::InvalidTimezone(msg) => ApiError::BadRequest(msg),
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
+            CronError::Forbidden(msg) => ApiError::Forbidden(msg),
             CronError::CrossAccountReference(msg) => {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", msg, None)
             }
@@ -77,10 +78,14 @@ pub fn cron_routes(state: CronRouterState) -> Router {
 async fn create_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    agent: Option<Extension<AgentPrincipal>>,
     body: Result<Json<CreateCronJobRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<CronJobResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let job = state.cron_service.add_job(&user.id, req).await?;
+    let job = state
+        .cron_service
+        .add_job_as(&user.id, req, cron_actor(agent.as_ref()))
+        .await?;
     let resp = CronService::to_response(&job);
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(resp))))
 }
@@ -107,11 +112,15 @@ async fn get_job(
 async fn update_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    agent: Option<Extension<AgentPrincipal>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateCronJobRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let job = state.cron_service.update_job(&user.id, &id, req).await?;
+    let job = state
+        .cron_service
+        .update_job_as(&user.id, &id, req, cron_actor(agent.as_ref()))
+        .await?;
     Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
 }
 
@@ -192,6 +201,16 @@ async fn update_conversation_cron(
         .update_for_conversation_helper(&user_id, &conversation_id, &id, req)
         .await?;
     Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
+}
+
+/// Agent (conversation-runtime) tokens are tagged with `AgentPrincipal` by
+/// the auth middleware; everything else is the signed-in user.
+fn cron_actor(agent: Option<&Extension<AgentPrincipal>>) -> CronActor {
+    if agent.is_some() {
+        CronActor::Agent
+    } else {
+        CronActor::User
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {

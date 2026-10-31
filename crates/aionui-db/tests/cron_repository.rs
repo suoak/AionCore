@@ -69,6 +69,9 @@ fn make_job(id: &str) -> CronJobRow {
         retry_count: 0,
         max_retries: 3,
         queue_enabled: false,
+        autopilot: false,
+        autopilot_yolo: false,
+        notify_channel_id: None,
     }
 }
 

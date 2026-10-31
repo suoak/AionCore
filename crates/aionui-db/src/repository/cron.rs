@@ -62,6 +62,9 @@ pub struct UpdateCronJobParams {
     pub run_count: Option<i64>,
     pub retry_count: Option<i64>,
     pub queue_enabled: Option<bool>,
+    pub autopilot: Option<bool>,
+    pub autopilot_yolo: Option<bool>,
+    pub notify_channel_id: Option<Option<String>>,
 }
 
 /// Data access abstraction for the `cron_jobs` table.
@@ -129,8 +132,10 @@ pub trait ICronRepository: Send + Sync {
     /// Completes a claimed occurrence and releases its lease.
     async fn finish_run(&self, params: &FinishCronRunParams<'_>) -> Result<bool, DbError>;
 
-    /// Deletes terminal run records older than the retention cutoff.
-    async fn cleanup_runs_before(&self, cutoff: TimestampMs) -> Result<u64, DbError>;
+    /// Deletes terminal run records that are older than `cutoff` and are not
+    /// among the newest `keep_latest_per_job` records of their job (the
+    /// retention keeps whichever of the two rules retains more).
+    async fn cleanup_runs_before(&self, cutoff: TimestampMs, keep_latest_per_job: i64) -> Result<u64, DbError>;
 
     /// Returns the oldest unfinished occurrence that should be resumed for a job.
     async fn get_recoverable_run(&self, job_id: &str, now: TimestampMs) -> Result<Option<RecoverableCronRun>, DbError>;

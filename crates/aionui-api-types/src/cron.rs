@@ -124,6 +124,16 @@ pub struct CronJobStateDto {
     pub retry_count: i64,
     pub max_retries: i64,
     pub queue_enabled: bool,
+    /// Autopilot guardrails enabled (E8-6). Off for legacy jobs (D8-8).
+    #[serde(default)]
+    pub autopilot: bool,
+    /// The user explicitly confirmed full-auto for this Autopilot job.
+    /// `false` means Autopilot runs in Ask mode (default).
+    #[serde(default)]
+    pub autopilot_yolo: bool,
+    /// Channel session (`assistant_sessions.id`) receiving run summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -164,6 +174,16 @@ pub struct CreateCronJobRequest {
     pub queue_enabled: bool,
     #[serde(default)]
     pub agent_config: Option<CronAgentConfigWriteDto>,
+    /// Enable Autopilot guardrails for this job (E8-6). Defaults to off.
+    #[serde(default)]
+    pub autopilot: bool,
+    /// Explicit user confirmation to run this Autopilot job in full-auto.
+    /// Rejected for agent credentials and `created_by = "agent"`.
+    #[serde(default)]
+    pub autopilot_yolo: bool,
+    /// Channel session (`assistant_sessions.id`) receiving run summaries.
+    #[serde(default)]
+    pub notify_channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +234,16 @@ pub struct UpdateCronJobRequest {
     pub max_retries: Option<i64>,
     #[serde(default)]
     pub queue_enabled: Option<bool>,
+    /// Toggle Autopilot guardrails (E8-6).
+    #[serde(default)]
+    pub autopilot: Option<bool>,
+    /// Explicit user confirmation for full-auto (`true`) or back to Ask
+    /// (`false`). Rejected for agent credentials when `true`.
+    #[serde(default)]
+    pub autopilot_yolo: Option<bool>,
+    /// Channel session receiving run summaries; empty string clears it.
+    #[serde(default)]
+    pub notify_channel_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +645,9 @@ mod tests {
                 retry_count: 0,
                 max_retries: 3,
                 queue_enabled: false,
+                autopilot: false,
+                autopilot_yolo: false,
+                notify_channel_id: None,
             },
         }
     }
@@ -684,6 +717,9 @@ mod tests {
                 retry_count: 0,
                 max_retries: 3,
                 queue_enabled: true,
+                autopilot: false,
+                autopilot_yolo: false,
+                notify_channel_id: None,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -821,6 +857,61 @@ mod tests {
         let req: UpdateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert!(req.schedule.is_some());
         assert!(req.name.is_none());
+    }
+
+    #[test]
+    fn autopilot_request_fields_default_off() {
+        let create: CreateCronJobRequest = serde_json::from_value(json!({
+            "name": "n",
+            "schedule": {"kind": "every", "every_ms": 60000},
+            "conversation_id": "c",
+            "created_by": "user"
+        }))
+        .unwrap();
+        assert!(!create.autopilot && !create.autopilot_yolo);
+        assert!(create.notify_channel_id.is_none());
+
+        let create: CreateCronJobRequest = serde_json::from_value(json!({
+            "name": "n",
+            "schedule": {"kind": "every", "every_ms": 60000},
+            "conversation_id": "c",
+            "created_by": "user",
+            "autopilot": true,
+            "autopilot_yolo": true,
+            "notify_channel_id": "session_1"
+        }))
+        .unwrap();
+        assert!(create.autopilot && create.autopilot_yolo);
+        assert_eq!(create.notify_channel_id.as_deref(), Some("session_1"));
+
+        let update: UpdateCronJobRequest =
+            serde_json::from_value(json!({"autopilot": false, "notify_channel_id": ""})).unwrap();
+        assert_eq!(update.autopilot, Some(false));
+        assert!(update.autopilot_yolo.is_none());
+        assert_eq!(update.notify_channel_id.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn autopilot_state_serializes_and_defaults() {
+        let mut resp = sample_cron_job_response();
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["state"]["autopilot"], false);
+        assert_eq!(json["state"]["autopilot_yolo"], false);
+        assert!(json["state"].get("notify_channel_id").is_none());
+
+        resp.state.autopilot = true;
+        resp.state.notify_channel_id = Some("session_1".into());
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["state"]["autopilot"], true);
+        assert_eq!(json["state"]["notify_channel_id"], "session_1");
+
+        // Older payloads without the new fields still deserialize.
+        let mut legacy = serde_json::to_value(sample_cron_job_response()).unwrap();
+        let state = legacy["state"].as_object_mut().unwrap();
+        state.remove("autopilot");
+        state.remove("autopilot_yolo");
+        let parsed: CronJobResponse = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.state.autopilot);
     }
 
     #[test]
