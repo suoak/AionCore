@@ -26,6 +26,25 @@ pub enum TaskApprovalDecider<'a> {
     Device(&'a str),
 }
 
+/// Why a pending Plan/Goal approval stopped being answerable without a
+/// decision (M8 E9-7); sent as `reason` on `task.approval.changed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskApprovalInvalidation {
+    /// A newer Plan/Goal version replaced it.
+    Superseded,
+    /// The work item completed, failed or was cancelled.
+    TaskEnded,
+}
+
+impl TaskApprovalInvalidation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Superseded => "superseded",
+            Self::TaskEnded => "task_ended",
+        }
+    }
+}
+
 /// Inbox dedupe key of one Plan/Goal approval.
 pub(crate) fn task_approval_inbox_key(approval_id: &str) -> String {
     format!("{}{approval_id}", aionui_api_types::TASK_APPROVAL_INBOX_KEY_PREFIX)
@@ -335,7 +354,6 @@ impl ConversationService {
     /// A work item's Plan/Goal approval changed (M8 E9): tell clients, and
     /// keep its Inbox `approval` item in step — open while pending (which
     /// also reaches IM push for paired devices), resolved otherwise.
-    /// `superseded` are earlier approvals the new one cancelled or expired.
     /// `decision` says who decided it (only for a decision, not a new
     /// pending approval), so the desktop can say "approved on your phone".
     pub(crate) async fn task_approval_changed(
@@ -343,7 +361,6 @@ impl ConversationService {
         user_id: &str,
         task_title: Option<&str>,
         approval: &aionui_db::models::TaskApprovalRow,
-        superseded: &[String],
         decision: Option<TaskApprovalDecider<'_>>,
     ) {
         let (decided_via, device_id) = match decision {
@@ -351,21 +368,7 @@ impl ConversationService {
             Some(TaskApprovalDecider::User) => (Some("user"), None),
             None => (None, None),
         };
-        self.broadcaster().broadcast(WebSocketMessage::new(
-            EVENT_TASK_APPROVAL_CHANGED,
-            serde_json::json!({
-                "user_id": user_id,
-                "task_session_id": approval.task_session_id,
-                "approval_id": approval.id,
-                "approval_type": approval.approval_type,
-                "status": approval.status,
-                "decided_via": decided_via,
-                "device_id": device_id,
-            }),
-        ));
-        for id in superseded {
-            self.resolve_inbox_item(user_id, &task_approval_inbox_key(id)).await;
-        }
+        self.broadcast_task_approval(user_id, approval, decided_via, device_id, None);
         let key = task_approval_inbox_key(&approval.id);
         if approval.status != "pending" {
             self.resolve_inbox_item(user_id, &key).await;
@@ -398,6 +401,145 @@ impl ConversationService {
         .await;
     }
 
+    fn broadcast_task_approval(
+        &self,
+        user_id: &str,
+        approval: &aionui_db::models::TaskApprovalRow,
+        decided_via: Option<&str>,
+        device_id: Option<&str>,
+        reason: Option<TaskApprovalInvalidation>,
+    ) {
+        self.broadcaster().broadcast(WebSocketMessage::new(
+            EVENT_TASK_APPROVAL_CHANGED,
+            serde_json::json!({
+                "user_id": user_id,
+                "task_session_id": approval.task_session_id,
+                "approval_id": approval.id,
+                "approval_type": approval.approval_type,
+                "status": approval.status,
+                "decided_via": decided_via,
+                "device_id": device_id,
+                "reason": reason.map(TaskApprovalInvalidation::as_str),
+            }),
+        ));
+    }
+
+    /// Approvals that stopped being answerable without a decision (M8 E9-7):
+    /// one `task.approval.changed` per approval (with `reason`) and their
+    /// Inbox items resolved, so desktop and phone drop the stale card.
+    pub(crate) async fn task_approvals_invalidated(
+        &self,
+        user_id: &str,
+        approvals: &[aionui_db::models::TaskApprovalRow],
+        reason: TaskApprovalInvalidation,
+    ) {
+        for approval in approvals {
+            self.broadcast_task_approval(user_id, approval, None, None, Some(reason));
+            self.resolve_inbox_item(user_id, &task_approval_inbox_key(&approval.id))
+                .await;
+        }
+    }
+
+    /// The work item ended (completed / failed / cancelled): cancel its
+    /// still-pending approvals and close their Inbox items. Best effort —
+    /// errors are logged, never returned. No-op while the item is active.
+    pub(crate) async fn invalidate_approvals_of_ended_task(&self, user_id: &str, task_session_id: &str) {
+        let Some(repo) = self.task_session_repo_optional() else {
+            return;
+        };
+        match repo
+            .cancel_pending_approvals_of_ended_task(user_id, task_session_id, now_ms())
+            .await
+        {
+            Ok(cancelled) if !cancelled.is_empty() => {
+                self.task_approvals_invalidated(user_id, &cancelled, TaskApprovalInvalidation::TaskEnded)
+                    .await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(user_id, task_session_id, error = %error, "cancelling approvals of ended task failed");
+            }
+        }
+    }
+
+    /// Whether an open Plan/Goal approval item no longer has a pending
+    /// approval behind it (decided, superseded, work item ended or deleted).
+    /// Ended work items get their approvals cancelled on the way. Lookup
+    /// errors count as "still valid" so a flaky read never hides a card.
+    async fn task_approval_item_is_stale(&self, item: &InboxItemRow) -> bool {
+        let (Some(approval_id), Some(task_session_id)) = (
+            aionui_api_types::inbox_task_approval_id(&item.dedupe_key),
+            item.task_session_id.as_deref(),
+        ) else {
+            return false;
+        };
+        if item.resolved_at.is_some() {
+            return false;
+        }
+        let Some(repo) = self.task_session_repo_optional() else {
+            return false;
+        };
+        let task = match repo.get(&item.user_id, task_session_id).await {
+            Ok(Some(task)) => task,
+            Ok(None) => return true,
+            Err(error) => {
+                tracing::warn!(task_session_id, error = %error, "inbox approval reconcile: task lookup failed");
+                return false;
+            }
+        };
+        if matches!(task.status.as_str(), "completed" | "failed" | "cancelled") {
+            self.invalidate_approvals_of_ended_task(&item.user_id, task_session_id)
+                .await;
+            return true;
+        }
+        match repo.get_approval(&item.user_id, task_session_id, approval_id).await {
+            Ok(Some(approval)) => approval.status != "pending",
+            Ok(None) => true,
+            Err(error) => {
+                tracing::warn!(approval_id, error = %error, "inbox approval reconcile: approval lookup failed");
+                false
+            }
+        }
+    }
+
+    /// Close an open approval item whose approval is no longer pending
+    /// (see [`Self::task_approval_item_is_stale`]). Returns the refreshed
+    /// row when it was closed here.
+    async fn reconcile_task_approval_item(
+        &self,
+        repo: &dyn IInboxRepository,
+        item: &InboxItemRow,
+    ) -> Option<InboxItemRow> {
+        if !self.task_approval_item_is_stale(item).await {
+            return None;
+        }
+        // `invalidate_approvals_of_ended_task` may already have closed it.
+        self.resolve_inbox_item(&item.user_id, &item.dedupe_key).await;
+        match repo.get(&item.user_id, &item.id).await {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(id = %item.id, error = %error, "inbox reconcile reload failed");
+                None
+            }
+        }
+    }
+
+    /// One inbox item (M8 E9-7), for the phone's detail page. A Plan/Goal
+    /// approval item whose approval is no longer pending is closed first, so
+    /// a stale deep link shows it as handled instead of offering a decision.
+    pub async fn get_inbox_item(&self, user_id: &str, id: &str) -> Result<InboxItemDto, ConversationError> {
+        let not_found = || ConversationError::not_found_reason(format!("Inbox item '{id}' not found"));
+        let Some(repo) = self.inbox_repo() else {
+            return Err(not_found());
+        };
+        let item = repo.get(user_id, id).await?.ok_or_else(not_found)?;
+        let item = self
+            .reconcile_task_approval_item(repo.as_ref(), &item)
+            .await
+            .unwrap_or(item);
+        Ok(to_dto(item))
+    }
+
     /// Dedupe key of the inbox item a plain (non-task) conversation turn
     /// raises when it settles; external producers reuse it to refresh that
     /// item instead of stacking a second one for the same failure.
@@ -416,7 +558,26 @@ impl ConversationService {
                 unread_count: 0,
             });
         };
-        list_inbox(repo.as_ref(), user_id, query, now_ms()).await
+        let mut response = list_inbox(repo.as_ref(), user_id, query, now_ms()).await?;
+        // M8 E9-7: close approval items left open by a path that bypassed
+        // the normal hooks (older data, a deleted work item).
+        let mut reconciled = false;
+        for item in &mut response.items {
+            if item.approval_id.is_none() || item.resolved_at.is_some() {
+                continue;
+            }
+            let Ok(Some(row)) = repo.get(user_id, &item.id).await else {
+                continue;
+            };
+            if let Some(row) = self.reconcile_task_approval_item(repo.as_ref(), &row).await {
+                *item = to_dto(row);
+                reconciled = true;
+            }
+        }
+        if reconciled {
+            response.unread_count = repo.unread_count(user_id).await?;
+        }
+        Ok(response)
     }
 
     /// Mark one item read. Unknown or foreign ids are a no-op (`updated: 0`).

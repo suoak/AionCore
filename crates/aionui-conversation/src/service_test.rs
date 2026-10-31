@@ -12483,7 +12483,20 @@ async fn task_approvals_raise_and_resolve_inbox_items_with_events() {
     let open: Vec<_> = items.iter().filter(|i| i.resolved_at.is_none()).collect();
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].dedupe_key, format!("task_approval:{}", second.approval.id));
-    broadcaster.take_events();
+    // The superseded approval tells desktop and phone why it went away.
+    let events = broadcaster.take_events();
+    let superseded = events
+        .iter()
+        .find(|e| e.name == "task.approval.changed" && e.data["approval_id"] == first.approval.id.as_str())
+        .expect("superseded event");
+    assert_eq!(superseded.data["status"], "cancelled");
+    assert_eq!(superseded.data["reason"], "superseded");
+    let fresh = events
+        .iter()
+        .find(|e| e.name == "task.approval.changed" && e.data["approval_id"] == second.approval.id.as_str())
+        .expect("new approval event");
+    assert_eq!(fresh.data["status"], "pending");
+    assert!(fresh.data["reason"].is_null());
 
     // Deciding (e.g. from the phone) resolves the item and tells the desktop.
     service
@@ -12520,4 +12533,171 @@ async fn task_approvals_raise_and_resolve_inbox_items_with_events() {
     assert_eq!(changed.data["task_session_id"], task_id.as_str());
     assert_eq!(changed.data["decided_via"], "user");
     assert!(changed.data["device_id"].is_null());
+}
+
+fn plan_submit(content: &str) -> SubmitTaskArtifactRequest {
+    SubmitTaskArtifactRequest {
+        kind: TaskArtifactKind::Plan,
+        content: content.into(),
+        acceptance_criteria: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn ending_a_work_item_invalidates_its_pending_approval_and_inbox_item() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = board_service_with(&db, broadcaster.clone());
+    let inbox = Arc::new(aionui_db::SqliteInboxRepository::new(db.pool().clone()));
+    service.with_inbox_repo(inbox.clone());
+    let task_id = board_task(&service, TaskSessionMode::Plan).await;
+    let submitted = service
+        .submit_task_artifact("user_1", &task_id, plan_submit("Plan v1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        aionui_db::IInboxRepository::unread_count(inbox.as_ref(), "user_1")
+            .await
+            .unwrap(),
+        1
+    );
+    broadcaster.take_events();
+
+    service
+        .update_task_session(
+            "user_1",
+            &task_id,
+            aionui_api_types::UpdateTaskSessionRequest {
+                status: Some(TaskSessionStatus::Cancelled),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let approvals = service.list_task_approvals("user_1", &task_id).await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].status, aionui_api_types::TaskApprovalStatus::Cancelled);
+    assert!(approvals[0].resolved_at.is_some());
+    assert_eq!(
+        aionui_db::IInboxRepository::unread_count(inbox.as_ref(), "user_1")
+            .await
+            .unwrap(),
+        0,
+        "the approval card closes on desktop and phone"
+    );
+    let events = broadcaster.take_events();
+    let changed = events
+        .iter()
+        .find(|e| e.name == "task.approval.changed")
+        .expect("invalidation event");
+    assert_eq!(changed.data["approval_id"], submitted.approval.id.as_str());
+    assert_eq!(changed.data["status"], "cancelled");
+    assert_eq!(changed.data["reason"], "task_ended");
+    assert!(changed.data["decided_via"].is_null());
+    assert!(events.iter().any(|e| e.name == "inbox.changed"));
+
+    // A late decision (stale phone screen) is refused and does not revive the task.
+    let late = service
+        .decide_task_approval(
+            "user_1",
+            &task_id,
+            &submitted.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: submitted.artifact.id.clone(),
+                artifact_hash: submitted.artifact.content_hash.clone(),
+                comment: None,
+            },
+        )
+        .await;
+    assert!(late.is_err(), "{late:?}");
+    let task = service.get_task_session("user_1", &task_id).await.unwrap();
+    assert_eq!(task.status, TaskSessionStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn get_inbox_item_returns_own_items_and_closes_stale_approvals() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    seed_test_user(db.pool(), "user_2").await;
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = board_service_with(&db, broadcaster.clone());
+    let inbox = Arc::new(aionui_db::SqliteInboxRepository::new(db.pool().clone()));
+    service.with_inbox_repo(inbox.clone());
+    let task_id = board_task(&service, TaskSessionMode::Plan).await;
+    let submitted = service
+        .submit_task_artifact("user_1", &task_id, plan_submit("Plan v1"))
+        .await
+        .unwrap();
+    let listed = service
+        .list_inbox("user_1", aionui_api_types::InboxListQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(listed.items.len(), 1);
+    let item_id = listed.items[0].id.clone();
+
+    let item = service.get_inbox_item("user_1", &item_id).await.unwrap();
+    assert_eq!(item.approval_id.as_deref(), Some(submitted.approval.id.as_str()));
+    assert_eq!(item.resolved_at, None, "a pending approval stays open");
+    assert!(service.get_inbox_item("user_1", "missing").await.is_err());
+    assert!(
+        service.get_inbox_item("user_2", &item_id).await.is_err(),
+        "another user's item is not found"
+    );
+
+    // An older path ended the task without the hook: the read closes the card
+    // and cancels the approval.
+    sqlx::query("UPDATE task_sessions SET status = 'failed' WHERE id = ?")
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    broadcaster.take_events();
+    let item = service.get_inbox_item("user_1", &item_id).await.unwrap();
+    assert!(item.resolved_at.is_some(), "{item:?}");
+    let approvals = service.list_task_approvals("user_1", &task_id).await.unwrap();
+    assert_eq!(approvals[0].status, aionui_api_types::TaskApprovalStatus::Cancelled);
+    let events = broadcaster.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.name == "task.approval.changed" && e.data["reason"] == "task_ended")
+    );
+}
+
+#[tokio::test]
+async fn list_inbox_closes_approval_items_of_deleted_work_items() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = board_service_with(&db, broadcaster.clone());
+    let inbox = Arc::new(aionui_db::SqliteInboxRepository::new(db.pool().clone()));
+    service.with_inbox_repo(inbox.clone());
+    let task_id = board_task(&service, TaskSessionMode::Plan).await;
+    service
+        .submit_task_artifact("user_1", &task_id, plan_submit("Plan v1"))
+        .await
+        .unwrap();
+    // Deleting the work item cascades its approvals, but not the inbox row.
+    sqlx::query("DELETE FROM task_sessions WHERE id = ?")
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        aionui_db::IInboxRepository::unread_count(inbox.as_ref(), "user_1")
+            .await
+            .unwrap(),
+        1
+    );
+
+    let listed = service
+        .list_inbox("user_1", aionui_api_types::InboxListQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(listed.items.len(), 1);
+    assert!(listed.items[0].resolved_at.is_some(), "{:?}", listed.items[0]);
+    assert_eq!(listed.unread_count, 0);
 }

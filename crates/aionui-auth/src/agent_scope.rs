@@ -693,6 +693,7 @@ mod tests {
             for path in [
                 "/api/inbox",
                 "/api/inbox?unread_only=true",
+                "/api/inbox/i1",
                 "/api/inbox/read-all",
                 "/api/inbox/i1/read",
             ] {

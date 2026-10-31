@@ -40,6 +40,15 @@ pub trait ITaskSessionRepository: Send + Sync {
         approval_id: &str,
     ) -> Result<Option<TaskApprovalRow>, DbError>;
     async fn resolve_approval(&self, params: &ResolveTaskApprovalParams<'_>) -> Result<TaskApprovalRow, DbError>;
+    /// Cancel every still-pending Plan/Goal approval of a work item that
+    /// ended (completed / failed / cancelled), so it can no longer be
+    /// decided (M8 E9-7). Returns the cancelled rows; a no-op otherwise.
+    async fn cancel_pending_approvals_of_ended_task(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        at: TimestampMs,
+    ) -> Result<Vec<TaskApprovalRow>, DbError>;
     async fn create_run(&self, params: &CreateTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
     async fn finish_run(&self, params: &FinishTaskRunParams<'_>) -> Result<TaskRunRow, DbError>;
     /// Create the next attempt for a failed execution run, transferring the

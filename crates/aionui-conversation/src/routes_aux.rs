@@ -26,6 +26,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/usage/summary", get(summarize_usage))
         .route("/api/inbox", get(list_inbox))
         .route("/api/inbox/read-all", post(mark_all_inbox_read))
+        .route("/api/inbox/{id}", get(get_inbox_item))
         .route("/api/inbox/{id}/read", post(mark_inbox_read))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
         .route("/api/conversations/{id}/transcript", get(get_event_transcript))
@@ -200,6 +201,22 @@ async fn list_inbox(
         state
             .service
             .list_inbox(&user.id, query)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+/// M8 E9-7: one inbox item. Open to the signed-in user and to paired
+/// devices (`mobile_default` reads `GET /api/inbox/**`).
+async fn get_inbox_item(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::InboxItemDto>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_inbox_item(&user.id, &id)
             .await
             .map_err(ApiError::from)?,
     )))

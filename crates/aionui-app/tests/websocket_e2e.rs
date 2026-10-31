@@ -783,6 +783,23 @@ async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
         plan.approval.id.as_str(),
         "{inbox}"
     );
+    let item_id = inbox["data"]["items"][0]["id"].as_str().unwrap().to_owned();
+    let get_item = |token: &str, id: &str| {
+        reqwest::Client::new()
+            .get(format!("http://{}/api/inbox/{id}", app.addr))
+            .bearer_auth(token)
+            .send()
+    };
+
+    // The phone opens the card by id with its device token (M8 E9-7).
+    let resp = get_item(&device_token, &item_id).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let one: Value = resp.json().await.unwrap();
+    assert_eq!(one["data"]["id"], item_id.as_str(), "{one}");
+    assert_eq!(one["data"]["approval_id"], plan.approval.id.as_str(), "{one}");
+    assert!(one["data"]["resolved_at"].is_null(), "{one}");
+    let missing = get_item(&device_token, "no-such-item").await.unwrap();
+    assert_eq!(missing.status(), 404);
 
     // The phone answers with its device token (no cookie → CSRF-exempt).
     let resp = reqwest::Client::new()
@@ -811,4 +828,6 @@ async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
         .await
         .unwrap();
     assert_eq!(open, 0, "the approval's inbox item is closed");
+    let one: Value = get_item(&jwt, &item_id).await.unwrap().json().await.unwrap();
+    assert!(one["data"]["resolved_at"].is_i64(), "{one}");
 }
