@@ -32,6 +32,9 @@ pub enum CronError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Invalid notify channel: {0}")]
+    InvalidNotifyChannel(String),
+
     #[error("Cross-account reference: {0}")]
     CrossAccountReference(String),
 

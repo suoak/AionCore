@@ -264,6 +264,34 @@ impl ConversationService {
             .map(|repo| InboxSink::new(repo, self.broadcaster().clone()))
     }
 
+    /// Raise (or refresh, by `dedupe_key`) an inbox item for a producer that
+    /// lives outside the turn runtime, e.g. cron Autopilot failures. Errors
+    /// are logged and swallowed like every other inbox producer.
+    pub async fn raise_inbox_item(&self, params: &UpsertInboxItemParams<'_>) {
+        if let Some(sink) = self.inbox_sink() {
+            sink.upsert(params).await;
+        }
+    }
+
+    /// Resolve the open item with `dedupe_key`, if any (see `raise_inbox_item`).
+    pub async fn resolve_inbox_item(&self, user_id: &str, dedupe_key: &str) {
+        let Some(sink) = self.inbox_sink() else {
+            return;
+        };
+        match sink.repo.resolve_by_dedupe_key(user_id, dedupe_key, now_ms()).await {
+            Ok(true) => sink.announce(user_id, None, None).await,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(user_id, dedupe_key, error = %error, "inbox resolve failed"),
+        }
+    }
+
+    /// Dedupe key of the inbox item a plain (non-task) conversation turn
+    /// raises when it settles; external producers reuse it to refresh that
+    /// item instead of stacking a second one for the same failure.
+    pub fn conversation_turn_inbox_key(conversation_id: &str) -> String {
+        turn_dedupe_key(conversation_id, None)
+    }
+
     pub async fn list_inbox(
         &self,
         user_id: &str,

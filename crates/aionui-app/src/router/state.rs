@@ -298,6 +298,16 @@ pub async fn build_module_states(
     .await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
+    // E8-6: Autopilot results go out through the channel sender built above.
+    cron.cron_service
+        .set_autopilot_notifier(Arc::new(super::autopilot_notifier::ChannelAutopilotNotifier::new(
+            Arc::new(aionui_db::SqliteChannelRepository::new(
+                services.database.pool().clone(),
+            )),
+            channel_components.manager.clone(),
+            services.conversation_service.clone(),
+        )));
+
     let backend_binary_path = services.backend_binary_path();
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),

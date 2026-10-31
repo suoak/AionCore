@@ -41,6 +41,7 @@ impl From<CronError> for ApiError {
             CronError::InvalidTimezone(msg) => ApiError::BadRequest(msg),
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
+            CronError::InvalidNotifyChannel(msg) => ApiError::BadRequest(msg),
             CronError::Forbidden(msg) => ApiError::Forbidden(msg),
             CronError::CrossAccountReference(msg) => {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", msg, None)
