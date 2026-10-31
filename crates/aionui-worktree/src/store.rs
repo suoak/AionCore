@@ -132,9 +132,25 @@ impl WorktreeStore {
         status: Option<&str>,
         include_removed: bool,
     ) -> Result<Vec<WorktreeRow>, WorktreeError> {
+        self.list_filtered(user_id, repo_path, None, status, include_removed)
+            .await
+    }
+
+    /// [`Self::list`] plus an optional `task_session_id` (work item) filter.
+    pub async fn list_filtered(
+        &self,
+        user_id: &str,
+        repo_path: Option<&str>,
+        task_session_id: Option<&str>,
+        status: Option<&str>,
+        include_removed: bool,
+    ) -> Result<Vec<WorktreeRow>, WorktreeError> {
         let mut sql = format!("SELECT {COLUMNS} FROM task_worktrees WHERE user_id = ?");
         if repo_path.is_some() {
             sql.push_str(" AND source_repo_path = ?");
+        }
+        if task_session_id.is_some() {
+            sql.push_str(" AND task_session_id = ?");
         }
         if status.is_some() {
             sql.push_str(" AND status = ?");
@@ -146,10 +162,32 @@ impl WorktreeStore {
         if let Some(repo) = repo_path {
             query = query.bind(repo);
         }
+        if let Some(task_session_id) = task_session_id {
+            query = query.bind(task_session_id);
+        }
         if let Some(status) = status {
             query = query.bind(status);
         }
         query.fetch_all(&self.pool).await.map_err(map_err)
+    }
+
+    /// M8 Q12: the work item's shared (non fan-out) worktrees that are still
+    /// usable or in progress, newest first.
+    pub async fn list_live_for_work_item(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+    ) -> Result<Vec<WorktreeRow>, WorktreeError> {
+        sqlx::query_as::<_, WorktreeRow>(&format!(
+            "SELECT {COLUMNS} FROM task_worktrees WHERE user_id = ? AND task_session_id = ? \
+             AND fanout_group_id IS NULL AND removed_at IS NULL \
+             AND status IN ('creating', 'ready', 'unbound') ORDER BY created_at DESC, id DESC"
+        ))
+        .bind(user_id)
+        .bind(task_session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_err)
     }
 
     /// Rows in the given statuses across all users (boot recovery).

@@ -35,6 +35,9 @@ pub struct ListWorktreesQuery {
     pub status: Option<String>,
     #[serde(default)]
     pub include_removed: Option<bool>,
+    /// M8 Q12: only worktrees linked to this TaskSession / work item.
+    #[serde(default)]
+    pub task_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]

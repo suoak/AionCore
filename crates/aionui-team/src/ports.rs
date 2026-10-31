@@ -286,3 +286,36 @@ impl BoardWorkItemTimelinePort for NoopBoardWorkItemTimelinePort {
         Ok(())
     }
 }
+
+/// M8 Q12: why the work item's shared worktree could not be provided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SquadWorktreeError {
+    /// The caller-named source (`repo_path`) is unusable (not a git
+    /// repository, missing, ...). Maps to 400.
+    InvalidSource(String),
+    /// Creating / reconciling the worktree failed. Maps to 500.
+    Failed(String),
+}
+
+impl fmt::Display for SquadWorktreeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSource(m) => write!(f, "invalid worktree source: {m}"),
+            Self::Failed(m) => write!(f, "worktree failed: {m}"),
+        }
+    }
+}
+
+/// M8 Q12: one shared managed worktree per work item, implemented by the
+/// composition layer over `aionui-worktree` (this crate must not depend on
+/// it). `Ok(None)` = no git source, keep the plain shared workspace.
+#[async_trait]
+pub trait SquadWorkItemWorktreePort: Send + Sync {
+    async fn ensure(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+        repo_path: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<Option<aionui_api_types::SquadWorkItemWorktree>, SquadWorktreeError>;
+}

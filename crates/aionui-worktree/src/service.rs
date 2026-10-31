@@ -61,6 +61,9 @@ struct Inner {
     /// Optional: when set, `task_session_id` is ownership-checked and
     /// lifecycle events are mirrored into `task_trace_events`.
     task_sessions: OnceLock<Arc<dyn ITaskSessionRepository>>,
+    /// M8 Q12: serialises "find or create" of a work item's shared worktree
+    /// (key `user_id\u{0}work_item_id`).
+    work_item_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 #[derive(Clone)]
@@ -79,6 +82,7 @@ impl WorktreeService {
                 inflight: DashMap::new(),
                 git_version: Mutex::new(None),
                 task_sessions: OnceLock::new(),
+                work_item_locks: DashMap::new(),
             }),
         }
     }
@@ -342,6 +346,15 @@ impl WorktreeService {
 
     pub(crate) fn task_sessions(&self) -> Option<&Arc<dyn ITaskSessionRepository>> {
         self.inner.task_sessions.get()
+    }
+
+    /// M8 Q12: per-work-item lock for find-or-create.
+    pub(crate) fn work_item_lock(&self, user_id: &str, work_item_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .work_item_locks
+            .entry(format!("{user_id}\u{0}{work_item_id}"))
+            .or_default()
+            .clone()
     }
 
     pub async fn cancel(&self, user_id: &str, id: &str) -> Result<WorktreeResponse, WorktreeError> {
@@ -885,10 +898,21 @@ impl WorktreeService {
                     .unwrap_or_else(|_| p.to_owned())
             });
         let status = query.status.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let task_session_id = query
+            .task_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let rows = self
             .inner
             .store
-            .list(user_id, repo.as_deref(), status, query.include_removed.unwrap_or(false))
+            .list_filtered(
+                user_id,
+                repo.as_deref(),
+                task_session_id,
+                status,
+                query.include_removed.unwrap_or(false),
+            )
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -937,7 +961,7 @@ impl WorktreeService {
     ///   is a rolled-back conversation delete (the unbind hook runs before the
     ///   row delete; a successful delete nulls `conversation_id` through the
     ///   FK), so it goes back to `ready`.
-    async fn refresh_orphan(&self, row: WorktreeRow) -> Result<WorktreeRow, WorktreeError> {
+    pub(crate) async fn refresh_orphan(&self, row: WorktreeRow) -> Result<WorktreeRow, WorktreeError> {
         let row = self.reconcile_unbound(row).await?;
         if [STATUS_READY, STATUS_UNBOUND].contains(&row.status.as_str()) && !Path::new(&row.path).exists() {
             let changed = self

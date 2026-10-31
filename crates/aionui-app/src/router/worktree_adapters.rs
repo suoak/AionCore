@@ -63,6 +63,24 @@ impl IWorktreeBinding for WorktreeConversationBinding {
             Err(WorktreeBindingError::AlreadyBound)
         }
     }
+
+    async fn on_work_item_closed(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+        board_status: &str,
+    ) -> Vec<aionui_conversation::KeptWorkItemWorktree> {
+        self.service
+            .mark_work_item_closed(user_id, work_item_id, board_status)
+            .await
+            .into_iter()
+            .map(|row| aionui_conversation::KeptWorkItemWorktree {
+                worktree_id: row.id,
+                path: row.path,
+                branch: row.branch,
+            })
+            .collect()
+    }
 }
 
 /// Conversation delete → bound worktrees become `unbound`; directories stay.
@@ -249,4 +267,229 @@ pub(crate) fn build_fanout_state(
         assistants,
     }));
     aionui_worktree::FanoutRouterState { service }
+}
+
+/// M8 Q12 / D7-3: one shared managed worktree per work item for Squad
+/// instances. Source repository, used only for the first instance:
+/// explicit `repo_path` (must be git) → instantiate `workspace` (if git) →
+/// the work item's project workspace folder (if git); otherwise `None` and
+/// the Team keeps its plain shared workspace.
+pub(crate) struct SquadWorkItemWorktreeAdapter {
+    pub(crate) service: WorktreeService,
+    pub(crate) task_sessions: Arc<dyn aionui_db::ITaskSessionRepository>,
+    pub(crate) projects: aionui_project::ProjectService,
+}
+
+impl SquadWorkItemWorktreeAdapter {
+    async fn project_workspace(&self, user_id: &str, project_id: &str) -> Option<String> {
+        let detail = self.projects.get_project(user_id, project_id).await.ok()?;
+        let entry = detail
+            .explorer
+            .entries
+            .iter()
+            .find(|e| e.pe_id == detail.explorer.workspace_pe_id)
+            .or_else(|| detail.explorer.entries.iter().find(|e| e.role == "workspace"))?;
+        let path = aionui_project::canonical::uri_to_path(&entry.folder.resource_uri).ok()?;
+        Some(path.to_string_lossy().into_owned())
+    }
+}
+
+fn squad_worktree_error(error: WorktreeError) -> aionui_team::SquadWorktreeError {
+    match error {
+        WorktreeError::NotARepository(_) | WorktreeError::BadRequest(_) | WorktreeError::InvalidRef(_) => {
+            aionui_team::SquadWorktreeError::InvalidSource(error.to_string())
+        }
+        other => aionui_team::SquadWorktreeError::Failed(other.to_string()),
+    }
+}
+
+#[async_trait]
+impl aionui_team::SquadWorkItemWorktreePort for SquadWorkItemWorktreeAdapter {
+    async fn ensure(
+        &self,
+        user_id: &str,
+        work_item_id: &str,
+        repo_path: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<Option<aionui_api_types::SquadWorkItemWorktree>, aionui_team::SquadWorktreeError> {
+        let item = self
+            .task_sessions
+            .get(user_id, work_item_id)
+            .await
+            .map_err(|e| aionui_team::SquadWorktreeError::Failed(e.to_string()))?;
+        let mut sources = Vec::new();
+        if let Some(repo) = repo_path {
+            sources.push(aionui_worktree::WorkItemWorktreeSource {
+                repo_path: repo.to_owned(),
+                explicit: true,
+            });
+        } else if let Some(workspace) = workspace {
+            // A caller-chosen non-git workspace keeps the plain shared
+            // workspace rather than silently switching to the project.
+            sources.push(aionui_worktree::WorkItemWorktreeSource {
+                repo_path: workspace.to_owned(),
+                explicit: false,
+            });
+        } else if let Some(project_id) = item.as_ref().and_then(|i| i.project_id.as_deref())
+            && let Some(path) = self.project_workspace(user_id, project_id).await
+        {
+            sources.push(aionui_worktree::WorkItemWorktreeSource {
+                repo_path: path,
+                explicit: false,
+            });
+        }
+        let title = item.as_ref().map(|i| i.title.as_str());
+        let found = self
+            .service
+            .ensure_for_work_item(user_id, work_item_id, title, &sources)
+            .await
+            .map_err(squad_worktree_error)?;
+        Ok(found.map(|wt| aionui_api_types::SquadWorkItemWorktree {
+            id: wt.row.id,
+            path: wt.row.path,
+            branch: wt.row.branch,
+            source_repo_path: wt.row.source_repo_path,
+            reused: wt.reused,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod q12_tests {
+    use super::*;
+    use aionui_db::{CreateTaskSessionParams, ITaskSessionRepository, SqliteTaskSessionRepository};
+    use aionui_team::{SquadWorkItemWorktreePort, SquadWorktreeError};
+
+    const USER: &str = "system_default_user";
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        assert!(git(dir, &["init", "-q", "-b", "main"]));
+        std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+        assert!(git(dir, &["add", "."]));
+        assert!(git(dir, &["commit", "-q", "-m", "init"]));
+    }
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        repo: std::path::PathBuf,
+        plain: std::path::PathBuf,
+        project_id: String,
+        tasks: Arc<SqliteTaskSessionRepository>,
+        adapter: SquadWorkItemWorktreeAdapter,
+    }
+
+    async fn fixture() -> Option<Fixture> {
+        if !git(Path::new("."), &["--version"]) {
+            eprintln!("git not available; skipping");
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        init_repo(&repo);
+        let plain = repo.parent().unwrap().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let service = WorktreeService::new(
+            aionui_worktree::WorktreeStore::new(db.pool().clone()),
+            aionui_worktree::WorktreeServiceConfig {
+                root_dir: repo.parent().unwrap().join("worktrees"),
+                git: aionui_worktree::GitCli::default(),
+                events: aionui_worktree::WorktreeEvents::disabled(),
+            },
+        );
+        let tasks = Arc::new(SqliteTaskSessionRepository::new(db.pool().clone()));
+        service.set_task_sessions(tasks.clone());
+        let projects = aionui_project::ProjectService::new(
+            Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone())),
+            repo.parent().unwrap().join("tmp-projects"),
+        );
+        let uri = aionui_project::canonical::to_file_uri(&repo).unwrap();
+        let project_id = projects.create_standard(USER, uri).await.unwrap().project.project_id;
+        Some(Fixture {
+            _tmp: tmp,
+            repo,
+            plain,
+            project_id,
+            tasks: tasks.clone(),
+            adapter: SquadWorkItemWorktreeAdapter {
+                service,
+                task_sessions: tasks,
+                projects,
+            },
+        })
+    }
+
+    async fn item(f: &Fixture, project_id: Option<&str>) -> String {
+        f.tasks
+            .create(&CreateTaskSessionParams {
+                user_id: USER,
+                title: "Squad item",
+                project_id,
+                conversation_id: None,
+                mode: "agent",
+                objective: "g",
+                acceptance_criteria: "[]",
+                status: "ready",
+                agent_type: "codex",
+                agent_session_id: None,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn project_workspace_is_the_default_source_and_is_reused() {
+        let Some(f) = fixture().await else { return };
+        let id = item(&f, Some(&f.project_id)).await;
+        let first = f.adapter.ensure(USER, &id, None, None).await.unwrap().expect("created");
+        assert!(!first.reused);
+        assert_eq!(Path::new(&first.source_repo_path), f.repo.as_path());
+        assert!(first.branch.ends_with("-squad-item"), "{}", first.branch);
+        assert!(Path::new(&first.path).join("README.md").is_file());
+        // A later instance reuses it, whatever it passes.
+        let plain = f.plain.to_string_lossy().into_owned();
+        let again = f.adapter.ensure(USER, &id, None, Some(&plain)).await.unwrap().unwrap();
+        assert!(again.reused);
+        assert_eq!(
+            (again.id.as_str(), again.path.as_str()),
+            (first.id.as_str(), first.path.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_and_workspace_sources() {
+        let Some(f) = fixture().await else { return };
+        let plain = f.plain.to_string_lossy().into_owned();
+        let repo = f.repo.to_string_lossy().into_owned();
+
+        // A non-git workspace keeps the plain shared workspace (no silent
+        // switch to the project repository).
+        let id = item(&f, Some(&f.project_id)).await;
+        assert!(f.adapter.ensure(USER, &id, None, Some(&plain)).await.unwrap().is_none());
+        // An explicit non-git repo_path is a caller error.
+        let err = f.adapter.ensure(USER, &id, Some(&plain), None).await.unwrap_err();
+        assert!(matches!(err, SquadWorktreeError::InvalidSource(_)), "{err:?}");
+        // A git workspace is used directly.
+        let wt = f.adapter.ensure(USER, &id, None, Some(&repo)).await.unwrap().unwrap();
+        assert_eq!(Path::new(&wt.source_repo_path), f.repo.as_path());
+
+        // No project, no source: nothing to do.
+        let bare = item(&f, None).await;
+        assert!(f.adapter.ensure(USER, &bare, None, None).await.unwrap().is_none());
+    }
 }
