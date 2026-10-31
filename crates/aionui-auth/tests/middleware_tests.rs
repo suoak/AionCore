@@ -186,6 +186,7 @@ fn protected_auth_app_with_mode_and_verifier(
         local_secret: None,
         agent_approvals: None,
         agent_conversation_access: None,
+        devices: None,
     };
 
     Router::new()
@@ -209,6 +210,7 @@ fn identity_echo_app(
         local_secret: None,
         agent_approvals: None,
         agent_conversation_access: None,
+        devices: None,
     };
 
     Router::new()
@@ -886,6 +888,7 @@ fn local_secret_echo_app(
         local_secret,
         agent_approvals: None,
         agent_conversation_access: None,
+        devices: None,
     };
     Router::new()
         .route(
@@ -1065,6 +1068,7 @@ fn scoped_agent_app_with_verifier(
         local_secret: Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
         agent_approvals: approvals,
         agent_conversation_access: Some(Arc::new(MentionGrant)),
+        devices: None,
     };
     let ok_json = || async { axum::Json(serde_json::json!({"success": true, "data": "written"})) };
     Router::new()

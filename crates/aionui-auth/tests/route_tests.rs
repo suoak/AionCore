@@ -79,6 +79,7 @@ async fn test_app_full(
         local,
         aionpro_mode,
         local_api_secret: local_api_secret.map(|secret| LocalApiSecret::parse(secret).unwrap()),
+        devices: None,
     };
 
     let app = auth_routes(state);

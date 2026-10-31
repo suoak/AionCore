@@ -8,7 +8,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
-use aionui_db::{IUserRepository, UserStatus, UserType};
+use aionui_db::{IUserDeviceRepository, IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
 use crate::agent_approval::{
@@ -18,7 +18,12 @@ use crate::agent_scope::{
     AgentRouteDecision, HelperSkill, HelperSkillSet, classify_agent_request, filter_conversation_list,
     is_rename_only_patch, redact_secrets, required_helper_skills,
 };
-use crate::extract::extract_token_from_headers;
+use crate::device::scope::{DeviceRouteDecision, classify_device_request};
+use crate::device::token::{
+    DEVICE_INACTIVITY_TTL_MS, DevicePrincipal, LAST_SEEN_THROTTLE_MS, MOBILE_DEFAULT_SCOPE, hash_device_token,
+    is_device_token,
+};
+use crate::extract::{extract_bearer_token, extract_token_from_headers};
 use crate::local_secret::LocalApiSecret;
 
 /// Largest request body an agent token may send to a gated route (the body is
@@ -125,6 +130,9 @@ pub struct AuthState {
     pub agent_approvals: Option<Arc<AgentActionApprovals>>,
     /// `@@` read grants for agent tokens. `None`: own conversation only.
     pub agent_conversation_access: Option<Arc<dyn IAgentConversationAccess>>,
+    /// Paired-device store for the device-token channel (M8 E9-1). `None`
+    /// rejects device tokens with 401.
+    pub devices: Option<Arc<dyn IUserDeviceRepository>>,
 }
 
 impl AuthState {
@@ -154,6 +162,14 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // A paired-device token is checked first, so its scope applies even where
+    // the local-mode shortcut below would otherwise trust the caller.
+    if let Some(token) = extract_bearer_token(request.headers())
+        && is_device_token(&token)
+    {
+        return device_token_channel(&state, &token, request, next).await;
+    }
+
     // In local mode the desktop app is the default user. With a per-launch
     // secret configured, only callers presenting it get that identity; others
     // (WebUI browsers via the desktop proxy, agent helper CLIs) must
@@ -213,6 +229,144 @@ pub async fn auth_middleware(
     });
 
     Ok(next.run(request).await)
+}
+
+fn device_scope_denied() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "DEVICE_SCOPE_DENIED",
+        "This action is not available from a paired device.",
+        None,
+    )
+}
+
+/// Audit label for a state-changing request made from a device.
+fn device_write_action(path: &str) -> Option<&'static str> {
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    if path.starts_with("/api/inbox") {
+        None
+    } else if path.starts_with("/api/conversations/") && path.ends_with("/messages") {
+        Some("conversation.follow_up")
+    } else {
+        Some("approval.decide")
+    }
+}
+
+/// Authenticate a request carrying a paired-device bearer token (M8 E9-1).
+///
+/// The token is looked up by its SHA-256 on every request (indexed, no cache),
+/// so a revocation takes effect on the very next request. A device unused for
+/// [`DEVICE_INACTIVITY_TTL_MS`] is revoked as `inactivity` and refused. On
+/// success the owner is injected as [`CurrentUser`] together with a
+/// [`DevicePrincipal`]; the `mobile_default` route whitelist applies.
+async fn device_token_channel(
+    state: &AuthState,
+    token: &str,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let invalid = || ApiError::Unauthorized("Invalid or revoked device token".into());
+    let Some(devices) = state.devices.as_ref() else {
+        return Err(invalid());
+    };
+    let device = devices
+        .find_active_by_token_hash(&hash_device_token(token))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "device token lookup failed");
+            ApiError::Internal("Authentication service unavailable".into())
+        })?
+        .ok_or_else(invalid)?;
+
+    let now = aionui_common::now_ms();
+    if now - device.last_active_at() >= DEVICE_INACTIVITY_TTL_MS {
+        if let Err(e) = devices.revoke(&device.user_id, &device.id, now, "inactivity").await {
+            tracing::warn!(error = %e, device_id = %device.id, "failed to revoke inactive device");
+        }
+        tracing::info!(
+            target: "audit",
+            action = "device.revoke",
+            user_id = %device.user_id,
+            device_id = %device.id,
+            revoked_by = "inactivity",
+            "device revoked after 90 days of inactivity"
+        );
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_TOKEN_INACTIVE",
+            "This device was unused for 90 days. Pair it again.",
+            None,
+        ));
+    }
+
+    let user = state
+        .user_repo
+        .find_active_by_id(&device.user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "device token channel user lookup failed");
+            ApiError::Internal("Authentication service unavailable".into())
+        })?
+        .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
+
+    if state.identity_mode == AuthIdentityMode::AionPro && user.user_type != UserType::Aionpro {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "USER_CONTEXT_REQUIRED",
+            "User context required.",
+            None,
+        ));
+    }
+
+    let scopes: Vec<String> = serde_json::from_str(&device.scopes).unwrap_or_default();
+    // Only `mobile_default` exists; an unknown scope set grants nothing.
+    if !scopes.iter().any(|scope| scope == MOBILE_DEFAULT_SCOPE)
+        || classify_device_request(request.method(), request.uri().path()) == DeviceRouteDecision::Deny
+    {
+        tracing::info!(
+            method = %request.method(),
+            path = request.uri().path(),
+            device_id = %device.id,
+            "device token request outside its scope"
+        );
+        return Err(device_scope_denied());
+    }
+
+    if now - device.last_active_at() >= LAST_SEEN_THROTTLE_MS
+        && let Err(e) = devices.touch_last_seen(&device.id, now).await
+    {
+        tracing::warn!(error = %e, device_id = %device.id, "failed to record device activity");
+    }
+
+    let audit_action = (request.method() == axum::http::Method::POST)
+        .then(|| device_write_action(request.uri().path()))
+        .flatten();
+    let path = request.uri().path().to_owned();
+    request.extensions_mut().insert(DevicePrincipal {
+        device_id: device.id.clone(),
+        scopes,
+    });
+    request.extensions_mut().insert(CurrentUser {
+        id: user.id.clone(),
+        username: user.username.unwrap_or_else(|| "external_user".to_string()),
+        user_type: user.user_type,
+        status: user.status,
+    });
+
+    let response = next.run(request).await;
+    if let Some(action) = audit_action {
+        // Interim audit trail until E12 `audit_events` lands.
+        tracing::info!(
+            target: "audit",
+            action,
+            user_id = %user.id,
+            via = %format!("device:{}", device.id),
+            path = %path,
+            status = response.status().as_u16(),
+            "device action"
+        );
+    }
+    Ok(response)
 }
 
 /// Authenticate a JWT-less request via the conversation-helper runtime token.
