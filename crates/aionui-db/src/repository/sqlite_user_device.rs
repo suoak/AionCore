@@ -114,4 +114,24 @@ impl IUserDeviceRepository for SqliteUserDeviceRepository {
                 .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn set_push(
+        &self,
+        user_id: &str,
+        id: &str,
+        push_kind: &str,
+        push_target: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE user_devices SET push_kind = ?, push_target = ? \
+             WHERE user_id = ? AND id = ? AND revoked_at IS NULL",
+        )
+        .bind(push_kind)
+        .bind(push_target)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }

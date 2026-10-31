@@ -19,7 +19,8 @@ pub use pairing::{
     PairingOfferView, PairingStartError, StartedPairing,
 };
 pub use routes::{
-    DeviceRevokedHook, DeviceRouterState, DeviceView, device_pairing_public_routes, device_pairing_user_routes,
+    DevicePushTargetValidator, DeviceRevokedHook, DeviceRouterState, DeviceView, device_pairing_public_routes,
+    device_pairing_user_routes,
 };
 pub use scope::{DeviceRouteDecision, classify_device_request};
 pub use token::{
