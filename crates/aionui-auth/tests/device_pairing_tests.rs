@@ -15,8 +15,9 @@ use aionui_auth::{
     JwtService, auth_middleware, csrf_middleware, device_pairing_public_routes, device_pairing_user_routes,
 };
 use aionui_db::{
-    CreateUserDeviceParams, IUserDeviceRepository, IUserRepository, SqliteUserDeviceRepository, SqliteUserRepository,
-    init_database_memory,
+    AuditEventFilter, AuditOrder, AuditSink, AuditVia, CreateUserDeviceParams, IAuditEventRepository,
+    IUserDeviceRepository, IUserRepository, SqliteAuditEventRepository, SqliteUserDeviceRepository,
+    SqliteUserRepository, init_database_memory,
 };
 
 /// Accepts `sess-<user_id>` only, like the app's channel-backed validator
@@ -38,6 +39,7 @@ struct Ctx {
     user_id: String,
     jwt: String,
     revoked: Arc<Mutex<Vec<String>>>,
+    audit: Arc<dyn IAuditEventRepository>,
     _db: aionui_db::Database,
 }
 
@@ -60,12 +62,15 @@ async fn setup() -> Ctx {
         devices: Some(devices.clone()),
     };
     let revoked = Arc::new(Mutex::new(Vec::new()));
+    let audit = Arc::new(SqliteAuditEventRepository::new(db.pool().clone())) as Arc<dyn IAuditEventRepository>;
     let revoked_log = revoked.clone();
     let router_state = DeviceRouterState {
         devices: devices.clone(),
         pairings: Arc::new(DevicePairingStore::new()),
         on_revoked: Some(Arc::new(move |row| revoked_log.lock().unwrap().push(row.id.clone()))),
         push_targets: Some(Arc::new(OnlyOwnSession)),
+        audit: Some(AuditSink::new(audit.clone())),
+        audit_via: AuditVia::WebUi,
     };
     let echo = |user: Extension<CurrentUser>, device: Option<Extension<DevicePrincipal>>| async move {
         axum::Json(json!({
@@ -98,6 +103,7 @@ async fn setup() -> Ctx {
         user_id: user.id,
         jwt,
         revoked,
+        audit,
         _db: db,
     }
 }
@@ -479,4 +485,49 @@ async fn desktop_sets_im_push_target_only_to_its_own_channel() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// M8 E12-4: pairing and device management land in the audit ledger.
+#[tokio::test]
+async fn device_lifecycle_is_recorded_in_the_audit_ledger() {
+    let ctx = setup().await;
+    let phone = pair(&ctx).await;
+    let phone_id = phone["device_id"].as_str().unwrap();
+    let uri = format!("/api/auth/devices/{phone_id}");
+    let (status, _) = desktop(&ctx, "PATCH", &uri, Some(json!({"name": "Work phone"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = desktop(&ctx, "DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let rows = ctx
+        .audit
+        .list(&AuditEventFilter {
+            order: AuditOrder::OldestFirst,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let actions: Vec<&str> = rows.iter().map(|r| r.action.as_str()).collect();
+    assert_eq!(
+        actions,
+        [
+            "device.pair_offer",
+            "device.pair_start",
+            "device.paired",
+            "device.rename",
+            "device.revoke"
+        ]
+    );
+    let paired = &rows[2];
+    assert_eq!(paired.actor_kind, "device");
+    assert_eq!(paired.via, "mobile");
+    assert_eq!(paired.user_id.as_deref(), Some(ctx.user_id.as_str()));
+    assert_eq!(paired.actor_id.as_deref(), Some(phone_id));
+    let revoke = &rows[4];
+    assert_eq!(revoke.actor_kind, "user");
+    assert_eq!(revoke.via, "webui");
+    assert_eq!(revoke.target_id.as_deref(), Some(phone_id));
+    // The pairing token never reaches the ledger.
+    let token = phone["device_token"].as_str().unwrap();
+    assert!(rows.iter().all(|r| !r.diff.as_deref().unwrap_or("").contains(token)));
 }

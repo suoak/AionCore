@@ -23,6 +23,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aionui_db::{AuditActorKind, AuditSink, AuditVia, NewAuditEvent};
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
@@ -70,6 +72,38 @@ pub struct DeviceRouterState {
     pub pairings: Arc<DevicePairingStore>,
     pub on_revoked: Option<DeviceRevokedHook>,
     pub push_targets: Option<Arc<dyn DevicePushTargetValidator>>,
+    /// Audit ledger for pairing / rename / revoke / push changes (M8 E12-4).
+    /// `None` keeps only the `target: "audit"` log lines.
+    pub audit: Option<AuditSink>,
+    /// `via` for desktop-side actions: `Desktop` in local mode, else `WebUi`.
+    pub audit_via: AuditVia,
+}
+
+impl DeviceRouterState {
+    async fn audit(&self, event: NewAuditEvent) {
+        if let Some(sink) = &self.audit {
+            sink.record(event).await;
+        }
+    }
+
+    /// A desktop-side action by the signed-in user on `device` / `offer`.
+    async fn audit_user(
+        &self,
+        action: &str,
+        user_id: &str,
+        target_kind: &str,
+        target_id: &str,
+        diff: serde_json::Value,
+    ) {
+        self.audit(
+            NewAuditEvent::new(action, AuditActorKind::User, self.audit_via)
+                .with_user(user_id)
+                .with_actor(user_id)
+                .with_target(target_kind, target_id)
+                .with_diff(diff),
+        )
+        .await;
+    }
 }
 
 /// A paired device as shown on the desktop. Never carries the token hash.
@@ -209,6 +243,15 @@ async fn create_offer_handler(
         offer_id = %offer.offer_id,
         "device pairing offer created"
     );
+    state
+        .audit_user(
+            "device.pair_offer",
+            &user.id,
+            "device_pairing",
+            &offer.offer_id,
+            serde_json::json!({}),
+        )
+        .await;
     Ok(Json(ApiResponse::ok(offer)))
 }
 
@@ -250,6 +293,15 @@ async fn reject_offer_handler(
         offer_id = %offer_id,
         "device pairing rejected on the desktop"
     );
+    state
+        .audit_user(
+            "device.pair_reject",
+            &user.id,
+            "device_pairing",
+            &offer_id,
+            serde_json::json!({}),
+        )
+        .await;
     Ok(Json(ApiResponse::ok(view)))
 }
 
@@ -305,6 +357,15 @@ async fn rename_device_handler(
         device_id = %device_id,
         "device renamed"
     );
+    state
+        .audit_user(
+            "device.rename",
+            &user.id,
+            "device",
+            &device_id,
+            serde_json::json!({ "name": row.name }),
+        )
+        .await;
     Ok(Json(ApiResponse::ok(row.into())))
 }
 
@@ -333,6 +394,15 @@ async fn revoke_device_handler(
         revoked_by = "user",
         "device revoked"
     );
+    state
+        .audit_user(
+            "device.revoke",
+            &user.id,
+            "device",
+            &device_id,
+            serde_json::json!({ "revoked_by": "user" }),
+        )
+        .await;
     if let Some(hook) = state.on_revoked.as_ref() {
         match state.devices.find_for_user(&user.id, &device_id).await {
             Ok(Some(row)) => hook(&row),
@@ -405,6 +475,15 @@ async fn set_device_push_handler(
         push_kind = %req.push_kind,
         "device push settings changed"
     );
+    state
+        .audit_user(
+            "device.push",
+            &user.id,
+            "device",
+            &device_id,
+            serde_json::json!({ "push_kind": req.push_kind }),
+        )
+        .await;
     Ok(Json(ApiResponse::ok(row.into())))
 }
 
@@ -434,6 +513,13 @@ async fn pair_start_handler(
         platform,
         "device pairing started"
     );
+    state
+        .audit(
+            NewAuditEvent::new("device.pair_start", AuditActorKind::Device, AuditVia::Mobile)
+                .with_target("device_pairing", &started.pairing_id)
+                .with_diff(serde_json::json!({ "device_name": name, "platform": platform })),
+        )
+        .await;
     Ok(Json(ApiResponse::ok(PairStartResponse {
         pairing_id: started.pairing_id,
         expires_at: started.expires_at,
@@ -501,6 +587,15 @@ async fn pair_confirm_handler(
         platform = %row.platform,
         "device paired"
     );
+    state
+        .audit(
+            NewAuditEvent::new("device.paired", AuditActorKind::Device, AuditVia::Mobile)
+                .with_user(&row.user_id)
+                .with_actor(&row.id)
+                .with_target("device", &row.id)
+                .with_diff(serde_json::json!({ "name": row.name, "platform": row.platform })),
+        )
+        .await;
     Ok(Json(ApiResponse::ok(PairConfirmResponse {
         device_id: row.id,
         device_token: token,
