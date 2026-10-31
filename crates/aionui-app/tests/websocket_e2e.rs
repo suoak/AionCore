@@ -708,3 +708,88 @@ async fn t8_2_unknown_device_token_is_rejected() {
     let msg = read_text(&mut rx).await;
     assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
 }
+
+/// Read frames until one named `name` arrives (other events may interleave).
+async fn read_event<S>(stream: &mut S, name: &str) -> Value
+where
+    S: StreamExt<Item = Result<tungstenite::Message, tungstenite::Error>> + Unpin,
+{
+    for _ in 0..20 {
+        let msg = read_text(stream).await;
+        if msg["name"] == name {
+            return msg;
+        }
+    }
+    panic!("no {name} event");
+}
+
+#[tokio::test]
+async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
+    use aionui_api_types::{
+        CreateTaskSessionRequest, SubmitTaskArtifactRequest, TaskArtifactKind, TaskSessionMode, TaskSessionStatus,
+    };
+    let app = start_app().await;
+    let jwt = sign_token(&app, "user1").await;
+    let (_device_id, device_token) = seed_device(&app, "user1").await;
+    let service = &app.services.conversation_service;
+    let task = service
+        .create_task_session(
+            "user1",
+            CreateTaskSessionRequest {
+                title: "Ship export".into(),
+                project_id: None,
+                conversation_id: None,
+                mode: TaskSessionMode::Plan,
+                objective: "Ship it".into(),
+                acceptance_criteria: Vec::new(),
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (_desk_tx, mut desk_rx) = connect_bearer(app.addr, &jwt).await;
+    wait_for_clients(&app, 1).await;
+    let plan = service
+        .submit_task_artifact(
+            "user1",
+            &task.id,
+            SubmitTaskArtifactRequest {
+                kind: TaskArtifactKind::Plan,
+                content: "Step 1".into(),
+                acceptance_criteria: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let asked = read_event(&mut desk_rx, "task.approval.changed").await;
+    assert_eq!(asked["data"]["status"], "pending");
+
+    // The phone answers with its device token (no cookie → CSRF-exempt).
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/task-sessions/{}/approvals/{}/decision",
+            app.addr, task.id, plan.approval.id
+        ))
+        .bearer_auth(&device_token)
+        .json(&json!({
+            "decision": "approve",
+            "artifact_id": plan.artifact.id,
+            "artifact_hash": plan.artifact.content_hash,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap_or_default());
+
+    let decided = read_event(&mut desk_rx, "task.approval.changed").await;
+    assert_eq!(decided["data"]["approval_id"], plan.approval.id.as_str());
+    assert_eq!(decided["data"]["status"], "approved");
+    let open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_items WHERE resolved_at IS NULL")
+        .fetch_one(app.services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(open, 0, "the approval's inbox item is closed");
+}

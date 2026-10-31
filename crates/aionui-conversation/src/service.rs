@@ -344,6 +344,26 @@ fn task_artifact_response(row: TaskArtifactRow) -> Result<TaskArtifactResponse, 
     })
 }
 
+/// Ids of a work item's pending Plan/Goal approvals; empty on lookup errors
+/// (Inbox bookkeeping is best effort and never fails the request).
+async fn pending_task_approval_ids(
+    repo: &Arc<dyn ITaskSessionRepository>,
+    user_id: &str,
+    task_session_id: &str,
+) -> Vec<String> {
+    match repo.list_approvals(user_id, task_session_id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|row| row.status == "pending")
+            .map(|row| row.id)
+            .collect(),
+        Err(error) => {
+            warn!(task_session_id, %error, "listing task approvals for inbox bookkeeping failed");
+            Vec::new()
+        }
+    }
+}
+
 fn task_approval_response(row: TaskApprovalRow) -> Result<TaskApprovalResponse, ConversationError> {
     Ok(TaskApprovalResponse {
         id: row.id,
@@ -1385,6 +1405,7 @@ impl ConversationService {
         let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
         let planning_result_summary = crate::trace_redaction::redact_and_bound(&content);
         let kind = TaskArtifactKind::Plan.to_string();
+        let pending_before = pending_task_approval_ids(&repo, user_id, task_session_id).await;
         let persisted = repo
             .create_artifact_with_approval(&CreateTaskArtifactParams {
                 user_id,
@@ -1407,6 +1428,8 @@ impl ConversationService {
                 return Err(error.into());
             }
         };
+        self.notify_task_approval_requested(&repo, user_id, &task, &approval, &pending_before)
+            .await;
         Ok(SubmitTaskArtifactResponse {
             artifact: task_artifact_response(artifact)?,
             approval: task_approval_response(approval)?,
@@ -1415,6 +1438,26 @@ impl ConversationService {
                 .map(acceptance_criterion_response)
                 .collect::<Result<_, _>>()?,
         })
+    }
+
+    /// A new Plan/Goal approval is pending (M8 E9): event + Inbox item, and
+    /// close the Inbox items of approvals it superseded.
+    async fn notify_task_approval_requested(
+        &self,
+        repo: &Arc<dyn ITaskSessionRepository>,
+        user_id: &str,
+        task: &TaskSessionRow,
+        approval: &TaskApprovalRow,
+        pending_before: &[String],
+    ) {
+        let still_pending = pending_task_approval_ids(repo, user_id, &task.id).await;
+        let superseded: Vec<String> = pending_before
+            .iter()
+            .filter(|id| !still_pending.contains(id))
+            .cloned()
+            .collect();
+        self.task_approval_changed(user_id, Some(&task.title), approval, &superseded)
+            .await;
     }
 
     async fn fail_automatic_planning(
@@ -1653,6 +1696,7 @@ impl ConversationService {
 
         let content = request.content.trim();
         let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let pending_before = pending_task_approval_ids(&repo, user_id, task_session_id).await;
         let (artifact, approval, criteria) = repo
             .create_artifact_with_approval(&CreateTaskArtifactParams {
                 user_id,
@@ -1666,6 +1710,8 @@ impl ConversationService {
                 planning_usage: None,
             })
             .await?;
+        self.notify_task_approval_requested(&repo, user_id, &task, &approval, &pending_before)
+            .await;
         Ok(SubmitTaskArtifactResponse {
             artifact: task_artifact_response(artifact)?,
             approval: task_approval_response(approval)?,
@@ -1736,6 +1782,7 @@ impl ConversationService {
                 resolved_at: now_ms(),
             })
             .await?;
+        self.task_approval_changed(user_id, None, &row, &[]).await;
         task_approval_response(row)
     }
 
