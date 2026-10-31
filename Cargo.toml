@@ -29,6 +29,7 @@ members = [
     "crates/aionui-assistant",
     "crates/aionui-review",
     "crates/aionui-worktree",
+    "crates/aionui-batch",
     "crates/aionui-app",
 ]
 
@@ -67,6 +68,7 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-review = { path = "crates/aionui-review" }
 aionui-worktree = { path = "crates/aionui-worktree" }
+aionui-batch = { path = "crates/aionui-batch" }
 aionui-app = { path = "crates/aionui-app" }
 
 aion-agent = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.25" }
@@ -160,6 +162,11 @@ rust-embed = "8"
 # Runtime embedding
 fs2 = "0.4"
 zstd = "0.13"
+
+# Batch artifact checks (M8 E8). jsonschema is MIT; default features off
+# so remote `$ref` resolution (resolve-http) is never compiled in (D8-6).
+jsonschema = { version = "0.60", default-features = false }
+globset = "0.4"
 
 # Cron
 cron = "0.15"

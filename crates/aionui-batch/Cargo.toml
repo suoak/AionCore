@@ -1,0 +1,24 @@
+[package]
+name = "aionui-batch"
+version.workspace = true
+edition.workspace = true
+
+# M8 E8: batch jobs — one prompt template run once per target with bounded
+# concurrency, a mandatory trial gate, and artifact-only checks.
+# Design: m8 E8 (batch / autopilot), D8-1..D8-6.
+
+[dependencies]
+aionui-common.workspace = true
+aionui-db.workspace = true
+aionui-api-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dunce.workspace = true
+jsonschema.workspace = true
+globset.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

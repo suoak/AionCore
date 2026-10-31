@@ -11,6 +11,7 @@ mod antigravity_hook;
 mod ask;
 mod assistant;
 mod auth;
+mod batch;
 mod channel;
 mod chat_file;
 mod codex_account;
@@ -108,6 +109,13 @@ pub use auth::{
     LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
     RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
     WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+};
+pub use batch::{
+    BATCH_DEFAULT_CONCURRENCY, BATCH_DEFAULT_ITEM_TIMEOUT_SEC, BATCH_DEFAULT_TRIAL_SIZE, BATCH_MAX_CHECKS,
+    BATCH_MAX_CONCURRENCY, BATCH_MAX_ITEM_TIMEOUT_SEC, BATCH_MAX_TARGETS, BATCH_MAX_TRIAL_SIZE,
+    BATCH_MIN_ITEM_TIMEOUT_SEC, BATCH_MODE_AGENT, BatchCheckResult, BatchCheckSpec, BatchCounts, BatchItemResponse,
+    BatchJobResponse, BatchListQuery, BatchRetryRequest, BatchTemplate, CreateBatchJobRequest,
+    EVENT_BATCH_ITEM_UPDATED, EVENT_BATCH_JOB_UPDATED, batch_item_status, batch_job_status,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,
