@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use crate::error::BatchError;
+use crate::summary::BatchSummary;
 use crate::validate::TargetLocation;
 
 /// One item attempt about to run.
@@ -80,4 +81,8 @@ pub trait IBatchExecutor: Send + Sync {
     async fn finish_session(&self, user_id: &str, task_session_id: &str, outcome: AttemptOutcome, summary: &str);
 
     fn notify(&self, user_id: &str, event: BatchEvent);
+
+    /// The job reached `completed` / `failed` / `cancelled`: raise (or
+    /// refresh) its single Inbox summary (best-effort).
+    async fn job_finished(&self, user_id: &str, summary: &BatchSummary);
 }

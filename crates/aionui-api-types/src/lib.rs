@@ -188,7 +188,10 @@ pub use file::{
     SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery,
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
-pub use inbox::{InboxItemDto, InboxListQuery, InboxListResponse, InboxMarkReadResponse};
+pub use inbox::{
+    AUTOPILOT_INBOX_TITLE_PREFIX, INBOX_ORIGIN_AUTOPILOT, INBOX_ORIGIN_BATCH, InboxItemDto, InboxListQuery,
+    InboxListResponse, InboxMarkReadResponse, inbox_origin,
+};
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
     BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerEntry, DetectedMcpServerResponse,

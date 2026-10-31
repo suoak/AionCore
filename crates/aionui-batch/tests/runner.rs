@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use aionui_api_types::{BatchRetryRequest, CreateBatchJobRequest};
 use aionui_batch::{
-    AttemptOutcome, BatchError, BatchEvent, BatchRunnerConfig, BatchService, IBatchExecutor, ItemSpec, PreparedItem,
-    TargetLocation,
+    AttemptOutcome, BatchError, BatchEvent, BatchRunnerConfig, BatchService, BatchSummary, IBatchExecutor, ItemSpec,
+    PreparedItem, TargetLocation,
 };
 use aionui_db::{IBatchRepository, SqliteBatchRepository, init_database_memory};
 use serde_json::{Value, json};
@@ -36,6 +36,7 @@ struct FakeState {
     cancels: usize,
     ended: std::collections::HashSet<String>,
     disk_checks: Vec<(usize, u32)>,
+    summaries: Vec<BatchSummary>,
 }
 
 struct Fake {
@@ -147,6 +148,9 @@ impl IBatchExecutor for Fake {
     }
     fn notify(&self, _user: &str, event: BatchEvent) {
         self.state.lock().unwrap().events.push(event);
+    }
+    async fn job_finished(&self, _user: &str, summary: &BatchSummary) {
+        self.state.lock().unwrap().summaries.push(summary.clone());
     }
 }
 
@@ -260,6 +264,16 @@ async fn trial_gate_then_scale_with_bounded_concurrency() {
         status: "completed".into()
     }));
 
+    // One Inbox summary, only once the job is terminal (not after the trial).
+    let summaries = h.fake.state.lock().unwrap().summaries.clone();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].dedupe_key, format!("batch:{}", job.id));
+    assert_eq!(
+        (summaries[0].kind, summaries[0].status.as_str()),
+        ("completed", "completed")
+    );
+    assert_eq!((summaries[0].counts.total, summaries[0].counts.passed), (6, 6));
+
     let csv = h.svc.export_csv("u1", &job.id).await.unwrap();
     assert_eq!(csv.lines().count(), 7);
     assert!(csv.lines().nth(1).unwrap().starts_with("1,passed,1,true,"));
@@ -317,6 +331,14 @@ async fn failing_items_fail_the_job_and_retry_completes_it() {
         (failed.status.as_str(), failed.counts.failed, failed.counts.passed),
         ("failed", 1, 2)
     );
+    {
+        let st = h.fake.state.lock().unwrap();
+        assert_eq!(st.summaries.len(), 1);
+        let s = &st.summaries[0];
+        assert_eq!((s.kind, s.status.as_str()), ("failed", "failed"));
+        assert_eq!((s.counts.passed, s.counts.failed, s.counts.timeout), (2, 1, 0));
+        assert_eq!(s.title, "Batch failed: Release check");
+    }
 
     h.fake.set(3, Behave::Pass);
     let rerun = h.svc.retry("u1", &job.id, &BatchRetryRequest::default()).await.unwrap();
@@ -324,6 +346,13 @@ async fn failing_items_fail_the_job_and_retry_completes_it() {
     wait_idle(&h, &job.id).await;
     let done = h.svc.get("u1", &job.id).await.unwrap();
     assert_eq!((done.status.as_str(), done.counts.passed), ("completed", 3));
+    {
+        // The re-run refreshes the same `batch:{id}` summary.
+        let st = h.fake.state.lock().unwrap();
+        assert_eq!(st.summaries.len(), 2);
+        assert_eq!(st.summaries[0].dedupe_key, st.summaries[1].dedupe_key);
+        assert_eq!((st.summaries[1].kind, st.summaries[1].counts.passed), ("completed", 3));
+    }
     assert!(matches!(
         h.svc.retry("u1", &job.id, &BatchRetryRequest::default()).await,
         Err(BatchError::InvalidState(_))
@@ -378,10 +407,47 @@ async fn cancel_stops_in_flight_and_pending_items() {
         ("cancelled", 1, 3)
     );
     assert_eq!(h.fake.state.lock().unwrap().cancels, 2);
+    {
+        // Exactly one summary, with the final counts after in-flight attempts ended.
+        let st = h.fake.state.lock().unwrap();
+        assert_eq!(st.summaries.len(), 1, "{:?}", st.summaries);
+        let s = &st.summaries[0];
+        assert_eq!(s.status, "cancelled");
+        assert_eq!((s.counts.passed, s.counts.cancelled, s.counts.total), (1, 3, 4));
+        assert_eq!(s.kind, "completed");
+        assert_eq!(s.title, "Batch cancelled: Release check");
+    }
     assert!(matches!(
         h.svc.cancel("u1", &job.id).await,
         Err(BatchError::InvalidState(_))
     ));
+}
+
+#[tokio::test]
+async fn cancelling_an_idle_job_raises_its_summary_once() {
+    let h = harness().await;
+    let job = h.svc.create("u1", request(&h, 2, json!({}))).await.unwrap();
+    h.svc.cancel("u1", &job.id).await.unwrap();
+    let st = h.fake.state.lock().unwrap();
+    assert_eq!(st.summaries.len(), 1);
+    let s = &st.summaries[0];
+    assert_eq!((s.status.as_str(), s.kind), ("cancelled", "completed"));
+    assert_eq!((s.counts.total, s.counts.cancelled), (2, 2));
+}
+
+#[tokio::test]
+async fn trial_and_timeout_do_not_summarise_until_terminal() {
+    let h = harness().await;
+    h.fake.set(1, Behave::Hang);
+    let job = h.svc.create("u1", request(&h, 2, json!({}))).await.unwrap();
+    h.svc.start_trial("u1", &job.id).await.unwrap();
+    wait_idle(&h, &job.id).await;
+    assert!(h.fake.state.lock().unwrap().summaries.is_empty(), "trial stays open");
+    h.svc.cancel("u1", &job.id).await.unwrap();
+    let st = h.fake.state.lock().unwrap();
+    assert_eq!(st.summaries.len(), 1);
+    let s = &st.summaries[0];
+    assert_eq!((s.kind, s.counts.timeout, s.counts.cancelled), ("failed", 1, 1));
 }
 
 #[tokio::test]

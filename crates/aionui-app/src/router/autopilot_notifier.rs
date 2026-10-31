@@ -109,7 +109,7 @@ impl ChannelAutopilotNotifier {
                     Some(conversation_id) => ConversationService::conversation_turn_inbox_key(conversation_id),
                     None => cron_job_inbox_key(&report.job_id),
                 };
-                let title = format!("Autopilot: {}", report.job_name);
+                let title = format!("{}{}", aionui_api_types::AUTOPILOT_INBOX_TITLE_PREFIX, report.job_name);
                 let summary = report
                     .error
                     .as_deref()

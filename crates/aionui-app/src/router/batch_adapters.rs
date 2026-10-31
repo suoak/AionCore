@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_api_types::{EVENT_BATCH_ITEM_UPDATED, EVENT_BATCH_JOB_UPDATED, WebSocketMessage};
-use aionui_batch::{AttemptOutcome, BatchError, BatchEvent, IBatchExecutor, ItemSpec, PreparedItem, TargetLocation};
+use aionui_batch::{
+    AttemptOutcome, BatchError, BatchEvent, BatchSummary, IBatchExecutor, ItemSpec, PreparedItem, TargetLocation,
+};
 use aionui_db::{
     CreateTaskSessionParams, ITaskBoardRepository, ITaskSessionRepository, UpdateTaskBoardParams,
-    UpdateTaskSessionParams,
+    UpdateTaskSessionParams, UpsertInboxItemParams,
 };
 use aionui_realtime::EventBroadcaster;
 use aionui_worktree::{WorkItemWorktreeSource, WorktreeService};
@@ -58,6 +60,30 @@ pub(crate) fn required_bytes(tracked: &[u64], concurrency: u32) -> u64 {
         .take(concurrency.max(1) as usize)
         .fold(0u64, |acc, s| acc.saturating_add(*s))
         .saturating_add(DISK_HEADROOM_BYTES)
+}
+
+/// Inbox row for a job's end-of-job summary. `inbox_items.source_kind` is
+/// CHECK-constrained (069) and not rebuilt (D6-4), so the job is filed under
+/// `fanout_group` (one template fanned out over N targets) with the job id as
+/// `source_id`; clients tell it apart by the derived `origin = batch`.
+pub(crate) fn summary_inbox_params<'a>(
+    user_id: &'a str,
+    summary: &'a BatchSummary,
+    created_at: i64,
+) -> UpsertInboxItemParams<'a> {
+    UpsertInboxItemParams {
+        user_id,
+        kind: summary.kind,
+        source_kind: "fanout_group",
+        source_id: &summary.job_id,
+        conversation_id: None,
+        task_session_id: None,
+        run_id: None,
+        title: &summary.title,
+        summary: Some(&summary.text),
+        dedupe_key: &summary.dedupe_key,
+        created_at,
+    }
 }
 
 fn free_bytes(dir: &Path) -> Option<u64> {
@@ -351,6 +377,12 @@ impl IBatchExecutor for BatchExecutorAdapter {
         };
         b.broadcast(WebSocketMessage::new(name, payload));
     }
+
+    async fn job_finished(&self, user_id: &str, summary: &BatchSummary) {
+        self.conversations
+            .raise_inbox_item(&summary_inbox_params(user_id, summary, aionui_common::now_ms()))
+            .await;
+    }
 }
 
 /// Build the batch state and its executor. Called once from
@@ -399,6 +431,29 @@ mod tests {
         assert_eq!(required_bytes(&[10 * mib], 4), 10 * mib + DISK_HEADROOM_BYTES);
         assert_eq!(required_bytes(&[5 * mib, 5 * mib], 0), 5 * mib + DISK_HEADROOM_BYTES);
         assert_eq!(required_bytes(&[u64::MAX, u64::MAX], 2), u64::MAX);
+    }
+
+    #[test]
+    fn summary_maps_to_one_deduped_inbox_row() {
+        let summary = BatchSummary {
+            job_id: "bj_1".into(),
+            job_title: "Release check".into(),
+            status: "failed".into(),
+            counts: Default::default(),
+            dedupe_key: aionui_batch::batch_inbox_key("bj_1"),
+            kind: "failed",
+            title: "Batch failed: Release check".into(),
+            text: "1 passed · 1 failed · 0 timed out (of 2)".into(),
+        };
+        let p = summary_inbox_params("u1", &summary, 7);
+        assert_eq!((p.kind, p.source_kind, p.source_id), ("failed", "fanout_group", "bj_1"));
+        assert_eq!(p.dedupe_key, "batch:bj_1");
+        assert_eq!(p.summary, Some("1 passed · 1 failed · 0 timed out (of 2)"));
+        assert!(p.conversation_id.is_none() && p.task_session_id.is_none());
+        assert_eq!(
+            aionui_api_types::inbox_origin(p.dedupe_key, p.kind, p.title),
+            Some(aionui_api_types::INBOX_ORIGIN_BATCH)
+        );
     }
 
     #[test]

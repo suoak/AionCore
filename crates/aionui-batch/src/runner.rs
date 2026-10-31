@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 use crate::checks::{CompiledChecks, all_passed};
 use crate::error::BatchError;
 use crate::port::{AttemptOutcome, BatchEvent, IBatchExecutor, ItemSpec};
+use crate::summary::summarize;
 use crate::template::PromptTemplate;
 use crate::validate::target_location;
 
@@ -288,6 +289,7 @@ impl BatchRunner {
             let to = if ok { job_status::COMPLETED } else { job_status::FAILED };
             self.set_job(user_id, job_id, &[job_status::RUNNING], to).await;
         } else {
+            let cancelled = job.status == job_status::CANCELLED;
             self.exec.notify(
                 user_id,
                 BatchEvent::JobUpdated {
@@ -295,6 +297,27 @@ impl BatchRunner {
                     status: job.status,
                 },
             );
+            if cancelled {
+                // In-flight attempts have now ended: summarise the final counts.
+                self.report_summary(user_id, job_id).await;
+            }
+        }
+    }
+
+    /// Raises the job's Inbox summary if it is in a terminal status.
+    pub(crate) async fn report_summary(&self, user_id: &str, job_id: &str) {
+        let Ok(Some(job)) = self.repo.get_job(user_id, job_id).await else {
+            return;
+        };
+        let items = match self.repo.list_items(user_id, job_id).await {
+            Ok(items) => items,
+            Err(e) => {
+                warn!(job_id = %job_id, error = %e, "batch summary: list items failed");
+                return;
+            }
+        };
+        if let Some(summary) = summarize(&job, &items) {
+            self.exec.job_finished(user_id, &summary).await;
         }
     }
 
@@ -304,13 +327,18 @@ impl BatchRunner {
             .transition_job_status(user_id, job_id, from, to, now_ms())
             .await
         {
-            Ok(true) => self.exec.notify(
-                user_id,
-                BatchEvent::JobUpdated {
-                    job_id: job_id.to_string(),
-                    status: to.to_string(),
-                },
-            ),
+            Ok(true) => {
+                self.exec.notify(
+                    user_id,
+                    BatchEvent::JobUpdated {
+                        job_id: job_id.to_string(),
+                        status: to.to_string(),
+                    },
+                );
+                if to == job_status::COMPLETED || to == job_status::FAILED {
+                    self.report_summary(user_id, job_id).await;
+                }
+            }
             Ok(false) => {}
             Err(e) => warn!(job_id = %job_id, error = %e, "batch job transition failed"),
         }
