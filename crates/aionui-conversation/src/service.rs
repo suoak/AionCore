@@ -1177,7 +1177,7 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::internal("Task session repository is not configured"))
     }
 
-    fn task_session_repo_optional(&self) -> Option<Arc<dyn ITaskSessionRepository>> {
+    pub(crate) fn task_session_repo_optional(&self) -> Option<Arc<dyn ITaskSessionRepository>> {
         self.task_session_repo.read().ok().and_then(|guard| guard.clone())
     }
 
@@ -1464,13 +1464,19 @@ impl ConversationService {
         approval: &TaskApprovalRow,
         pending_before: &[String],
     ) {
-        let still_pending = pending_task_approval_ids(repo, user_id, &task.id).await;
-        let superseded: Vec<String> = pending_before
-            .iter()
-            .filter(|id| !still_pending.contains(id))
-            .cloned()
-            .collect();
-        self.task_approval_changed(user_id, Some(&task.title), approval, &superseded, None)
+        let superseded: Vec<TaskApprovalRow> = match repo.list_approvals(user_id, &task.id).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|row| row.status != "pending" && pending_before.contains(&row.id))
+                .collect(),
+            Err(error) => {
+                warn!(task_session_id = %task.id, %error, "listing task approvals for inbox bookkeeping failed");
+                Vec::new()
+            }
+        };
+        self.task_approvals_invalidated(user_id, &superseded, crate::inbox::TaskApprovalInvalidation::Superseded)
+            .await;
+        self.task_approval_changed(user_id, Some(&task.title), approval, None)
             .await;
     }
 
@@ -1626,6 +1632,13 @@ impl ConversationService {
             )
             .await?;
         info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, "task session updated");
+        if matches!(
+            request.status,
+            Some(TaskSessionStatus::Completed | TaskSessionStatus::Failed | TaskSessionStatus::Cancelled)
+        ) {
+            // M8 E9-7: an ended work item's pending approvals are void.
+            self.invalidate_approvals_of_ended_task(user_id, id).await;
+        }
         if request.status == Some(TaskSessionStatus::Completed)
             && let Err(error) = self.maybe_submit_board_for_review_on_completion(user_id, id).await
         {
@@ -1816,8 +1829,7 @@ impl ConversationService {
                 resolved_at: now_ms(),
             })
             .await?;
-        self.task_approval_changed(user_id, None, &row, &[], Some(decider))
-            .await;
+        self.task_approval_changed(user_id, None, &row, Some(decider)).await;
         task_approval_response(row)
     }
 
@@ -2409,6 +2421,9 @@ impl ConversationService {
                     Err(error) => return Err(error.into()),
                 }
             }
+            // M8 E9-7: if the run ended the work item (no retry follows),
+            // any approval still pending on it can no longer be decided.
+            self.invalidate_approvals_of_ended_task(user_id, task_session_id).await;
             // M8 E6-5: completed run with artifacts → board in_review.
             // Failures leave the card on in_progress; Inbox is written by the
             // turn orchestrator when task_trace is present (D6-4).

@@ -71,6 +71,16 @@ impl IInboxRepository for SqliteInboxRepository {
         Ok(query.bind(filter.limit.clamp(1, 500)).fetch_all(&self.pool).await?)
     }
 
+    async fn get(&self, user_id: &str, id: &str) -> Result<Option<InboxItemRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, InboxItemRow>(&format!("{SELECT_COLUMNS} WHERE user_id = ? AND id = ?"))
+                .bind(user_id)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     async fn unread_count(&self, user_id: &str) -> Result<i64, DbError> {
         Ok(sqlx::query_scalar(
             "SELECT COUNT(*) FROM inbox_items WHERE user_id = ? AND read_at IS NULL AND resolved_at IS NULL",

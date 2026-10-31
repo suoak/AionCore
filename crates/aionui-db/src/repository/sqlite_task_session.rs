@@ -543,7 +543,8 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
             "UPDATE task_approvals SET status = ?, resolved_at = ?, resolved_by = ?, comment = ? \
              WHERE id = ? AND task_session_id = ? AND artifact_id = ? AND artifact_hash = ? \
              AND status = 'pending' AND task_session_id IN \
-             (SELECT id FROM task_sessions WHERE user_id = ?)",
+             (SELECT id FROM task_sessions WHERE user_id = ? \
+              AND status NOT IN ('completed', 'failed', 'cancelled'))",
         )
         .bind(params.status)
         .bind(params.resolved_at)
@@ -558,7 +559,7 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         .await?;
         if result.rows_affected() != 1 {
             return Err(DbError::Conflict(
-                "Approval is not pending or does not match the task artifact".into(),
+                "Approval is not pending, does not match the task artifact, or its work item has ended".into(),
             ));
         }
         let artifact_status = if params.status == "approved" {
@@ -620,6 +621,27 @@ impl ITaskSessionRepository for SqliteTaskSessionRepository {
         self.get_approval(params.user_id, params.task_session_id, params.approval_id)
             .await?
             .ok_or_else(|| DbError::NotFound("Resolved task approval is missing".into()))
+    }
+
+    async fn cancel_pending_approvals_of_ended_task(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        at: TimestampMs,
+    ) -> Result<Vec<TaskApprovalRow>, DbError> {
+        Ok(sqlx::query_as::<_, TaskApprovalRow>(
+            "UPDATE task_approvals SET status = 'cancelled', resolved_at = ? \
+             WHERE task_session_id = ? AND status = 'pending' AND task_session_id IN \
+             (SELECT id FROM task_sessions WHERE id = ? AND user_id = ? \
+              AND status IN ('completed', 'failed', 'cancelled')) \
+             RETURNING *",
+        )
+        .bind(at)
+        .bind(task_session_id)
+        .bind(task_session_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn create_run(&self, params: &CreateTaskRunParams<'_>) -> Result<TaskRunRow, DbError> {
@@ -1880,6 +1902,86 @@ mod tests {
             })
             .await;
         assert!(matches!(duplicate, Err(DbError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn ended_task_cancels_pending_approvals_and_refuses_decisions() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteTaskSessionRepository::new(db.pool().clone());
+        let task = repo.create(&create_params("ready")).await.unwrap();
+        let (artifact, approval, _) = repo
+            .create_artifact_with_approval(&CreateTaskArtifactParams {
+                user_id: USER,
+                task_session_id: &task.id,
+                kind: "plan",
+                content: "Inspect, then release.",
+                content_hash: "hash-ended",
+                acceptance_criteria: &[],
+                planning_run_id: None,
+                planning_result_summary: None,
+                planning_usage: None,
+            })
+            .await
+            .unwrap();
+
+        // Still running: nothing is cancelled.
+        assert!(
+            repo.cancel_pending_approvals_of_ended_task(USER, &task.id, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        repo.update(
+            USER,
+            &task.id,
+            &UpdateTaskSessionParams {
+                status: Some("cancelled"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // A stale approval of an ended work item cannot revive it.
+        let decided = repo
+            .resolve_approval(&ResolveTaskApprovalParams {
+                user_id: USER,
+                task_session_id: &task.id,
+                approval_id: &approval.id,
+                artifact_id: &artifact.id,
+                artifact_hash: &artifact.content_hash,
+                status: "approved",
+                resolved_by: USER,
+                comment: None,
+                resolved_at: 21,
+            })
+            .await;
+        assert!(matches!(decided, Err(DbError::Conflict(_))));
+        assert_eq!(repo.get(USER, &task.id).await.unwrap().unwrap().status, "cancelled");
+
+        // Another user cannot cancel it.
+        assert!(
+            repo.cancel_pending_approvals_of_ended_task("someone_else", &task.id, 22)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let cancelled = repo
+            .cancel_pending_approvals_of_ended_task(USER, &task.id, 23)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, approval.id);
+        assert_eq!(cancelled[0].status, "cancelled");
+        assert_eq!(cancelled[0].resolved_at, Some(23));
+        // Idempotent.
+        assert!(
+            repo.cancel_pending_approvals_of_ended_task(USER, &task.id, 24)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

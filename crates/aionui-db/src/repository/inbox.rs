@@ -40,6 +40,9 @@ pub trait IInboxRepository: Send + Sync {
     /// Newest first.
     async fn list(&self, user_id: &str, filter: &InboxFilter) -> Result<Vec<InboxItemRow>, DbError>;
 
+    /// One item of this user, if it exists (M8 E9-7).
+    async fn get(&self, user_id: &str, id: &str) -> Result<Option<InboxItemRow>, DbError>;
+
     /// Unread and unresolved items.
     async fn unread_count(&self, user_id: &str) -> Result<i64, DbError>;
 

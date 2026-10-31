@@ -10,7 +10,7 @@
 //!   work items is denied (D9-4)
 //! - answer approval cards: ACP tool confirmations, ask-user answers,
 //!   Plan/Goal task approvals, agent config-write approvals (D9-5)
-//! - read / mark Inbox items
+//! - read / mark Inbox items (list and `GET /api/inbox/{id}`)
 //! - read work items and their approvals (`GET /api/task-sessions/**`)
 //! - `GET /api/auth/user`
 //!
@@ -129,6 +129,7 @@ mod tests {
             "/api/messages/search?q=x",
             "/api/inbox",
             "/api/inbox?unread_only=true",
+            "/api/inbox/i1",
             "/api/task-sessions/t1/approvals",
             "/api/agent-approvals",
             "/api/agent-approvals/a1",
