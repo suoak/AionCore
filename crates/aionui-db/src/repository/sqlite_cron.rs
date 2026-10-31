@@ -38,9 +38,10 @@ impl ICronRepository for SqliteCronRepository {
                 schedule_description, payload_message, execution_mode, agent_config, \
                 conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
-                last_status, last_error, run_count, retry_count, max_retries, queue_enabled\
+                last_status, last_error, run_count, retry_count, max_retries, queue_enabled, \
+                autopilot, autopilot_yolo, notify_channel_id\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
@@ -69,6 +70,9 @@ impl ICronRepository for SqliteCronRepository {
         .bind(row.retry_count)
         .bind(row.max_retries)
         .bind(row.queue_enabled)
+        .bind(row.autopilot)
+        .bind(row.autopilot_yolo)
+        .bind(&row.notify_channel_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -346,12 +350,24 @@ impl ICronRepository for SqliteCronRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    async fn cleanup_runs_before(&self, cutoff: TimestampMs) -> Result<u64, DbError> {
-        let result =
-            sqlx::query("DELETE FROM cron_job_runs WHERE status IN ('ok', 'error', 'skipped') AND finished_at < ?")
-                .bind(cutoff)
-                .execute(&self.pool)
-                .await?;
+    async fn cleanup_runs_before(&self, cutoff: TimestampMs, keep_latest_per_job: i64) -> Result<u64, DbError> {
+        // A terminal record is removed only when it is BOTH older than the
+        // time-window cutoff AND outside the newest `keep_latest_per_job`
+        // records of its job, i.e. whichever rule keeps more wins (D8-5).
+        let result = sqlx::query(
+            "DELETE FROM cron_job_runs WHERE id IN (\
+                 SELECT id FROM (\
+                     SELECT id, status, finished_at, ROW_NUMBER() OVER (\
+                         PARTITION BY job_id \
+                         ORDER BY COALESCE(finished_at, created_at) DESC, created_at DESC, id DESC\
+                     ) AS rn FROM cron_job_runs\
+                 ) WHERE status IN ('ok', 'error', 'skipped') AND finished_at < ? AND rn > ?\
+             )",
+        )
+        .bind(cutoff)
+        .bind(keep_latest_per_job.max(0))
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -438,6 +454,14 @@ impl SqliteCronRepository {
             set_parts.push("queue_enabled = ?".to_string());
             binds.push(BindValue::Bool(v));
         }
+        if let Some(v) = params.autopilot {
+            set_parts.push("autopilot = ?".to_string());
+            binds.push(BindValue::Bool(v));
+        }
+        if let Some(v) = params.autopilot_yolo {
+            set_parts.push("autopilot_yolo = ?".to_string());
+            binds.push(BindValue::Bool(v));
+        }
 
         push_str!(name);
         push_str!(schedule_kind);
@@ -451,6 +475,7 @@ impl SqliteCronRepository {
         push_opt_str!(conversation_title);
         push_opt_str!(skill_content);
         push_opt_str!(description);
+        push_opt_str!(notify_channel_id);
         push_opt_i64!(next_run_at);
         push_opt_i64!(last_run_at);
         push_opt_str!(last_status);
@@ -578,6 +603,9 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: false,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         }
     }
 
@@ -669,6 +697,127 @@ mod tests {
         assert!(!updated.enabled);
         assert_eq!(updated.run_count, 42);
         assert!(updated.updated_at >= updated.created_at);
+    }
+
+    async fn insert_run(db: &crate::Database, job_id: &str, idx: i64, status: &str, finished_at: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO cron_job_runs (id, job_id, scheduled_at, status, finished_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(format!("{job_id}_run_{idx}"))
+        .bind(job_id)
+        .bind(idx)
+        .bind(status)
+        .bind(finished_at)
+        .bind(idx)
+        .bind(idx)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn run_ids(db: &crate::Database, job_id: &str) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT id FROM cron_job_runs WHERE job_id = ? ORDER BY scheduled_at")
+            .bind(job_id)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_runs_keeps_latest_per_job_and_window() {
+        let (repo, db) = setup().await;
+        repo.insert(&make_row("cron_old")).await.unwrap();
+        repo.insert(&make_row("cron_busy")).await.unwrap();
+        // cron_old: 5 terminal runs, all older than the cutoff (1000).
+        for idx in 1..=5 {
+            insert_run(&db, "cron_old", idx, "ok", Some(idx * 10)).await;
+        }
+        // An old run that is still active is never removed.
+        insert_run(&db, "cron_old", 6, "running", None).await;
+        // cron_busy: 4 old runs + 3 runs inside the window.
+        for idx in 1..=4 {
+            insert_run(&db, "cron_busy", idx, "error", Some(idx * 10)).await;
+        }
+        for idx in 5..=7 {
+            insert_run(&db, "cron_busy", idx, "ok", Some(2_000 + idx)).await;
+        }
+
+        let deleted = repo.cleanup_runs_before(1_000, 2).await.unwrap();
+
+        // cron_old keeps its newest 2 terminal records (count rule wins).
+        assert_eq!(
+            run_ids(&db, "cron_old").await,
+            vec!["cron_old_run_4", "cron_old_run_5", "cron_old_run_6"]
+        );
+        // cron_busy keeps everything in the window (time rule wins), old ones go.
+        assert_eq!(
+            run_ids(&db, "cron_busy").await,
+            vec!["cron_busy_run_5", "cron_busy_run_6", "cron_busy_run_7"]
+        );
+        assert_eq!(deleted, 3 + 4);
+    }
+
+    #[tokio::test]
+    async fn cleanup_runs_keep_zero_is_pure_time_window() {
+        let (repo, db) = setup().await;
+        repo.insert(&make_row("cron_w")).await.unwrap();
+        insert_run(&db, "cron_w", 1, "skipped", Some(10)).await;
+        insert_run(&db, "cron_w", 2, "ok", Some(5_000)).await;
+
+        assert_eq!(repo.cleanup_runs_before(1_000, 0).await.unwrap(), 1);
+        assert_eq!(run_ids(&db, "cron_w").await, vec!["cron_w_run_2"]);
+    }
+
+    #[tokio::test]
+    async fn autopilot_columns_round_trip_and_update() {
+        let (repo, _db) = setup().await;
+        let mut row = make_row("cron_ap");
+        row.autopilot = true;
+        row.notify_channel_id = Some("session_1".into());
+        repo.insert(&row).await.unwrap();
+
+        let found = repo.get_by_id_system("cron_ap").await.unwrap().unwrap();
+        assert!(found.autopilot);
+        assert!(!found.autopilot_yolo);
+        assert_eq!(found.notify_channel_id.as_deref(), Some("session_1"));
+
+        repo.update_for_user(
+            "user_1",
+            "cron_ap",
+            &UpdateCronJobParams {
+                autopilot_yolo: Some(true),
+                notify_channel_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let found = repo.get_by_id_system("cron_ap").await.unwrap().unwrap();
+        assert!(found.autopilot);
+        assert!(found.autopilot_yolo);
+        assert_eq!(found.notify_channel_id, None);
+    }
+
+    #[tokio::test]
+    async fn autopilot_columns_default_off_for_existing_jobs() {
+        // D8-8: jobs that existed before migration 077 must not gain Autopilot.
+        let (_repo, db) = setup().await;
+        let defaults = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT name, dflt_value, \"notnull\" FROM pragma_table_info('cron_jobs') \
+             WHERE name IN ('autopilot', 'autopilot_yolo', 'notify_channel_id') ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            defaults,
+            vec![
+                ("autopilot".to_owned(), Some("0".to_owned()), 1),
+                ("autopilot_yolo".to_owned(), Some("0".to_owned()), 1),
+                ("notify_channel_id".to_owned(), None, 0),
+            ]
+        );
     }
 
     #[tokio::test]

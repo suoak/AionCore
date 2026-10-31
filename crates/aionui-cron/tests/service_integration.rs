@@ -1119,6 +1119,9 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
             config_options: None,
             workspace: None,
         }),
+        autopilot: false,
+        autopilot_yolo: false,
+        notify_channel_id: None,
     }
 }
 
@@ -1165,6 +1168,9 @@ fn make_cron_row_with_workspace(id: &str, user_id: &str, conversation_id: &str, 
         retry_count: 0,
         max_retries: 3,
         queue_enabled: false,
+        autopilot: false,
+        autopilot_yolo: false,
+        notify_channel_id: None,
     }
 }
 
@@ -1587,6 +1593,9 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: false,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         })
         .await
         .unwrap();
@@ -1666,6 +1675,9 @@ async fn cj8_update_job() {
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
 
     let updated = svc.update_job("u1", &created.id, req).await.unwrap();
@@ -1710,6 +1722,9 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
 
     let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
@@ -1749,6 +1764,9 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
 
     let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
@@ -1785,6 +1803,9 @@ async fn update_existing_job_to_new_conversation_keeps_owner_anchor() {
                 conversation_title: None,
                 max_retries: None,
                 queue_enabled: None,
+                autopilot: None,
+                autopilot_yolo: None,
+                notify_channel_id: None,
             },
         )
         .await
@@ -1846,6 +1867,9 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
             conversation_title: None,
             max_retries: None,
             queue_enabled: None,
+            autopilot: None,
+            autopilot_yolo: None,
+            notify_channel_id: None,
         },
     )
     .await
@@ -1891,6 +1915,9 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
             conversation_title: None,
             max_retries: None,
             queue_enabled: None,
+            autopilot: None,
+            autopilot_yolo: None,
+            notify_channel_id: None,
         },
     )
     .await
@@ -1926,6 +1953,9 @@ async fn update_team_conversation_job_rejects_execution_mode_change() {
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
 
     let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
@@ -1960,6 +1990,9 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
 
     let updated = svc.update_job("u1", &created.id, req).await.unwrap();
@@ -1997,6 +2030,9 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
 
     let err = svc
@@ -2032,6 +2068,9 @@ async fn cj9_update_schedule_type() {
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
 
     let updated = svc.update_job("u1", &created.id, req).await.unwrap();
@@ -2058,6 +2097,9 @@ async fn cj10_update_nonexistent() {
         conversation_title: None,
         max_retries: None,
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
     let err = svc.update_job("u1", "cron_nonexistent", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
@@ -3224,6 +3266,9 @@ async fn update_max_retries() {
         conversation_title: None,
         max_retries: Some(5),
         queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
     };
     let updated = svc.update_job("u1", &job.id, req).await.unwrap();
     assert_eq!(updated.max_retries, 5);
@@ -3255,6 +3300,9 @@ async fn create_and_update_queue_enabled() {
                     conversation_title: None,
                     max_retries: None,
                     queue_enabled: None,
+                    autopilot: None,
+                    autopilot_yolo: None,
+                    notify_channel_id: None,
                 }
             },
         )
@@ -3608,4 +3656,213 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
     let events = bc.take_events();
     let removed_events: Vec<_> = events.iter().filter(|e| e.name == "cron.job-removed").collect();
     assert!(removed_events.is_empty());
+}
+
+// ── E8: Autopilot guardrails (migration 077) ─────────────────────
+
+fn empty_update_req() -> UpdateCronJobRequest {
+    UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: None,
+        agent_config: None,
+        conversation_title: None,
+        max_retries: None,
+        queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
+    }
+}
+
+#[tokio::test]
+async fn autopilot_create_persists_flags_and_defaults_off() {
+    let (svc, cron_repo, _) = setup().await;
+
+    let plain = svc.add_job("u1", make_create_req("Plain", every_60s())).await.unwrap();
+    assert!(!plain.autopilot && !plain.autopilot_yolo);
+    assert_eq!(plain.notify_channel_id, None);
+
+    let mut req = make_create_req("Autopilot", every_60s());
+    req.autopilot = true;
+    req.notify_channel_id = Some("  session_1  ".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+    assert!(job.autopilot);
+    assert!(!job.autopilot_yolo);
+    assert!(job.is_autopilot_ask());
+    assert!(job.skips_overlap());
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert!(row.autopilot);
+    assert!(!row.autopilot_yolo);
+    assert_eq!(row.notify_channel_id.as_deref(), Some("session_1"));
+
+    let mut req = make_create_req("Autopilot yolo", every_60s());
+    req.autopilot = true;
+    req.autopilot_yolo = true;
+    let job = svc.add_job("u1", req).await.unwrap();
+    assert!(job.autopilot_yolo);
+    assert!(!job.is_autopilot_ask());
+}
+
+#[tokio::test]
+async fn autopilot_rejects_plan_and_goal_modes() {
+    let (svc, _, _) = setup().await;
+    for mode in ["plan", "Goal"] {
+        let mut req = make_create_req("Autopilot plan", every_60s());
+        req.autopilot = true;
+        req.agent_config.as_mut().unwrap().mode = Some(mode.into());
+        let err = svc.add_job("u1", req).await.unwrap_err();
+        assert!(
+            matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)),
+            "{mode}: {err:?}"
+        );
+    }
+    // The same modes stay allowed for non-autopilot jobs.
+    let mut req = make_create_req("Plan only", every_60s());
+    req.agent_config.as_mut().unwrap().mode = Some("plan".into());
+    svc.add_job("u1", req).await.unwrap();
+}
+
+#[tokio::test]
+async fn autopilot_yolo_requires_autopilot() {
+    let (svc, _, _) = setup().await;
+    let mut req = make_create_req("Yolo only", every_60s());
+    req.autopilot_yolo = true;
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(
+        matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn autopilot_yolo_forbidden_for_agent_created_jobs_and_agent_actor() {
+    let (svc, _, _) = setup().await;
+
+    let mut req = make_create_req("Agent yolo", every_60s());
+    req.created_by = "agent".into();
+    req.autopilot = true;
+    req.autopilot_yolo = true;
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::Forbidden(_)), "{err:?}");
+
+    let mut req = make_create_req("Agent actor yolo", every_60s());
+    req.autopilot = true;
+    req.autopilot_yolo = true;
+    let err = svc
+        .add_job_as("u1", req, aionui_cron::service::CronActor::Agent)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::Forbidden(_)), "{err:?}");
+
+    // Agent credentials may still create an ask-mode autopilot job.
+    let mut req = make_create_req("Agent actor ask", every_60s());
+    req.autopilot = true;
+    let job = svc
+        .add_job_as("u1", req, aionui_cron::service::CronActor::Agent)
+        .await
+        .unwrap();
+    assert!(job.is_autopilot_ask());
+}
+
+#[tokio::test]
+async fn autopilot_update_guardrails() {
+    let (svc, cron_repo, _) = setup().await;
+    let job = svc.add_job("u1", make_create_req("Upd", every_60s())).await.unwrap();
+
+    // User enables autopilot + yolo + notification target.
+    let mut req = empty_update_req();
+    req.autopilot = Some(true);
+    req.autopilot_yolo = Some(true);
+    req.notify_channel_id = Some("session_9".into());
+    let updated = svc.update_job("u1", &job.id, req).await.unwrap();
+    assert!(updated.autopilot && updated.autopilot_yolo);
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert!(row.autopilot && row.autopilot_yolo);
+    assert_eq!(row.notify_channel_id.as_deref(), Some("session_9"));
+
+    // Agent credentials cannot turn autopilot off or (re-)enable yolo.
+    let mut req = empty_update_req();
+    req.autopilot = Some(false);
+    let err = svc
+        .update_job_as("u1", &job.id, req, aionui_cron::service::CronActor::Agent)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::Forbidden(_)), "{err:?}");
+    let mut req = empty_update_req();
+    req.autopilot_yolo = Some(true);
+    let err = svc
+        .update_job_as("u1", &job.id, req, aionui_cron::service::CronActor::Agent)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::Forbidden(_)), "{err:?}");
+
+    // Plan mode is rejected while autopilot stays on.
+    let mut req = empty_update_req();
+    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        name: "Default Assistant".into(),
+        cli_path: None,
+        assistant_id: Some("assistant-default".into()),
+        mode: Some("plan".into()),
+        model_id: Some("claude-sonnet-4".into()),
+        model: None,
+        config_options: None,
+        workspace: None,
+    });
+    let err = svc.update_job("u1", &job.id, req).await.unwrap_err();
+    assert!(
+        matches!(err, aionui_cron::error::CronError::InvalidAgentConfig(_)),
+        "{err:?}"
+    );
+
+    // Turning autopilot off (user) also clears yolo; empty string clears the target.
+    let mut req = empty_update_req();
+    req.autopilot = Some(false);
+    req.notify_channel_id = Some(String::new());
+    let updated = svc.update_job("u1", &job.id, req).await.unwrap();
+    assert!(!updated.autopilot && !updated.autopilot_yolo);
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert!(!row.autopilot && !row.autopilot_yolo);
+    assert_eq!(row.notify_channel_id, None);
+}
+
+#[tokio::test]
+async fn autopilot_routes_map_agent_token_to_403() {
+    let (svc, _, _, _, conv_service) = setup_with_conv_runtime().await;
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+    })
+    .layer(Extension(aionui_auth::AgentPrincipal {
+        conversation_id: "conv_1".into(),
+    }))
+    .layer(Extension(current_user("u1")));
+
+    let req = serde_json::json!({
+        "name": "Route yolo",
+        "schedule": serde_json::to_value(every_60s()).unwrap(),
+        "message": "hi",
+        "conversation_id": "conv_1",
+        "created_by": "user",
+        "autopilot": true,
+        "autopilot_yolo": true,
+        "agent_config": { "name": "Default Assistant", "assistant_id": "assistant-default" },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/cron/jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&body));
 }

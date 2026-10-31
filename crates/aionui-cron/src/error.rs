@@ -29,6 +29,9 @@ pub enum CronError {
     #[error("Invalid agent config: {0}")]
     InvalidAgentConfig(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Cross-account reference: {0}")]
     CrossAccountReference(String),
 

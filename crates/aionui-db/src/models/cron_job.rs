@@ -30,6 +30,12 @@ pub struct CronJobRow {
     pub retry_count: i64,
     pub max_retries: i64,
     pub queue_enabled: bool,
+    /// Autopilot guardrails enabled (migration 077, default off).
+    pub autopilot: bool,
+    /// User-confirmed full-auto for an Autopilot job.
+    pub autopilot_yolo: bool,
+    /// `assistant_sessions.id` that receives Autopilot run summaries.
+    pub notify_channel_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -65,6 +71,9 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: true,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         let restored: CronJobRow = serde_json::from_str(&json).expect("deserialize");
@@ -104,6 +113,9 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: false,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         };
         assert!(row.schedule_tz.is_none());
         assert!(row.agent_config.is_none());

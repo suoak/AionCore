@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
+use aionui_api_types::{
+    AssistantConversationOverridesRequest, AssistantConversationRequest, CreateConversationRequest,
+};
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
@@ -112,7 +114,7 @@ impl JobExecutor {
             return Err(ExecutionResult::Error { message: e.to_string() });
         }
 
-        if job.queue_enabled && job.execution_mode == ExecutionMode::NewConversation {
+        if job.skips_overlap() && job.execution_mode == ExecutionMode::NewConversation {
             match self.find_active_cron_conversation(job).await {
                 Ok(Some(conversation_id)) => {
                     info!(
@@ -497,8 +499,8 @@ impl JobExecutor {
 
 impl JobExecutor {
     fn handle_busy(&self, job: &CronJob) -> ExecutionResult {
-        if job.queue_enabled {
-            info!(job_id = %job.id, "Cron queue is enabled; skipping overlapping execution");
+        if job.skips_overlap() {
+            info!(job_id = %job.id, "Cron queue/Autopilot is enabled; skipping overlapping execution");
             return ExecutionResult::Skipped;
         }
 
@@ -767,7 +769,7 @@ impl JobExecutor {
             content: prompt,
             files: vec![],
             inject_skills: skill_names.clone(),
-            required_runtime_mode: cron_job_runtime_mode(job).map(ToOwned::to_owned),
+            required_runtime_mode: job.required_runtime_mode().map(ToOwned::to_owned),
             persist_user_message: true,
             user_message_hidden: true,
             on_started,
@@ -1130,8 +1132,8 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
                 );
             }
         }
-        if let Some(mode) = &config.mode {
-            extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.clone()));
+        if let Some(mode) = job.seeded_session_mode() {
+            extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.to_owned()));
         }
     }
 
@@ -1153,14 +1155,6 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
     }
 }
 
-fn cron_job_runtime_mode(job: &CronJob) -> Option<&str> {
-    job.agent_config
-        .as_ref()
-        .and_then(|config| config.mode.as_deref())
-        .map(str::trim)
-        .filter(|mode| !mode.is_empty())
-}
-
 fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest> {
     let config = job.agent_config.as_ref()?;
     let assistant_id = config
@@ -1176,10 +1170,18 @@ fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest
                 .map(ToOwned::to_owned)
         })?;
 
+    // Autopilot Ask: request the asking permission explicitly so an
+    // assistant whose permission mode is `auto` does not inherit a last-used
+    // full-auto permission. A `fixed` assistant permission still wins.
+    let conversation_overrides = job.is_autopilot_ask().then(|| AssistantConversationOverridesRequest {
+        permission: Some(crate::types::AUTOPILOT_ASK_SESSION_MODE.to_owned()),
+        ..Default::default()
+    });
+
     Some(AssistantConversationRequest {
         id: assistant_id,
         locale: None,
-        conversation_overrides: None,
+        conversation_overrides,
     })
 }
 
@@ -1230,8 +1232,8 @@ async fn build_conversation_extra(
         if !assistant_backed && !config.name.is_empty() {
             extra.insert("agent_name".to_owned(), serde_json::Value::String(config.name.clone()));
         }
-        if let Some(mode) = &config.mode {
-            extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.clone()));
+        if let Some(mode) = job.seeded_session_mode() {
+            extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.to_owned()));
         }
         if let Some(workspace) = &config.workspace
             && !workspace.trim().is_empty()
@@ -1380,6 +1382,9 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             queue_enabled: false,
+            autopilot: false,
+            autopilot_yolo: false,
+            notify_channel_id: None,
         }
     }
 
@@ -1945,6 +1950,20 @@ mod tests {
 
         assert_eq!(assistant.id, "custom-assistant");
         assert!(assistant.locale.is_none());
+        assert!(assistant.conversation_overrides.is_none());
+    }
+
+    #[test]
+    fn build_assistant_request_requests_ask_permission_for_autopilot_ask() {
+        let mut job = sample_job();
+        job.agent_config.as_mut().unwrap().assistant_id = Some("assistant-1".into());
+        job.autopilot = true;
+        let assistant = build_assistant_request(&job).expect("assistant request");
+        let overrides = assistant.conversation_overrides.expect("ask override");
+        assert_eq!(overrides.permission.as_deref(), Some("default"));
+
+        job.autopilot_yolo = true;
+        let assistant = build_assistant_request(&job).expect("assistant request");
         assert!(assistant.conversation_overrides.is_none());
     }
 
