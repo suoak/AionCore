@@ -19,6 +19,9 @@ dunce.workspace = true
 jsonschema.workspace = true
 globset.workspace = true
 walkdir.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
