@@ -3866,3 +3866,139 @@ async fn autopilot_routes_map_agent_token_to_403() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(status, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&body));
 }
+
+// -- E8-6 Autopilot result delivery ------------------------------------------
+
+#[derive(Default)]
+struct RecordingAutopilotNotifier {
+    valid_channels: Vec<String>,
+    validated: std::sync::Mutex<Vec<(String, String)>>,
+    reports: std::sync::Mutex<Vec<aionui_cron::notify::AutopilotRunReport>>,
+}
+
+#[async_trait::async_trait]
+impl aionui_cron::notify::AutopilotNotifier for RecordingAutopilotNotifier {
+    async fn validate_target(&self, user_id: &str, channel_id: &str) -> Result<(), String> {
+        self.validated
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), channel_id.to_owned()));
+        if self.valid_channels.iter().any(|c| c == channel_id) {
+            Ok(())
+        } else {
+            Err(format!("notify channel '{channel_id}' not found"))
+        }
+    }
+
+    async fn notify(&self, report: aionui_cron::notify::AutopilotRunReport) {
+        self.reports.lock().unwrap().push(report);
+    }
+}
+
+fn recording_notifier(valid: &[&str]) -> Arc<RecordingAutopilotNotifier> {
+    Arc::new(RecordingAutopilotNotifier {
+        valid_channels: valid.iter().map(|c| (*c).to_owned()).collect(),
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn autopilot_notify_channel_is_validated_when_notifier_installed() {
+    let (svc, _, _) = setup().await;
+    let notifier = recording_notifier(&["session_ok"]);
+    svc.set_autopilot_notifier(notifier.clone());
+
+    let mut req = make_create_req("Bad channel", every_60s());
+    req.autopilot = true;
+    req.notify_channel_id = Some("session_missing".into());
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(
+        matches!(err, aionui_cron::error::CronError::InvalidNotifyChannel(_)),
+        "{err:?}"
+    );
+
+    let mut req = make_create_req("Good channel", every_60s());
+    req.autopilot = true;
+    req.notify_channel_id = Some(" session_ok ".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+    assert_eq!(job.notify_channel_id.as_deref(), Some("session_ok"));
+    assert_eq!(
+        notifier.validated.lock().unwrap().last().cloned(),
+        Some(("u1".to_owned(), "session_ok".to_owned()))
+    );
+
+    // Unchanged channel is not re-validated; a new bad one is rejected;
+    // clearing it needs no validation.
+    let before = notifier.validated.lock().unwrap().len();
+    let mut update = empty_update_req();
+    update.name = Some("Renamed".into());
+    svc.update_job("u1", &job.id, update).await.unwrap();
+    assert_eq!(notifier.validated.lock().unwrap().len(), before);
+
+    let mut update = empty_update_req();
+    update.notify_channel_id = Some("session_missing".into());
+    let err = svc.update_job("u1", &job.id, update).await.unwrap_err();
+    assert!(
+        matches!(err, aionui_cron::error::CronError::InvalidNotifyChannel(_)),
+        "{err:?}"
+    );
+
+    let mut update = empty_update_req();
+    update.notify_channel_id = Some("".into());
+    let job = svc.update_job("u1", &job.id, update).await.unwrap();
+    assert_eq!(job.notify_channel_id, None);
+    assert_eq!(notifier.validated.lock().unwrap().len(), before + 1);
+}
+
+#[tokio::test]
+async fn autopilot_notify_channel_stored_unchecked_without_notifier() {
+    let (svc, _, _) = setup().await;
+    let mut req = make_create_req("No notifier", every_60s());
+    req.autopilot = true;
+    req.notify_channel_id = Some("anything".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+    assert_eq!(job.notify_channel_id.as_deref(), Some("anything"));
+}
+
+async fn wait_for_reports(notifier: &RecordingAutopilotNotifier, n: usize) {
+    for _ in 0..100 {
+        if notifier.reports.lock().unwrap().len() >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn autopilot_scheduled_run_reports_result_and_plain_jobs_do_not() {
+    let (svc, _, _) = setup().await;
+    let notifier = recording_notifier(&["session_ok"]);
+    svc.set_autopilot_notifier(notifier.clone());
+
+    let plain = svc.add_job("u1", make_create_req("Plain", every_60s())).await.unwrap();
+    svc.tick(&plain.id, plain.next_run_at.unwrap()).await;
+
+    let mut req = make_create_req("Autopilot", every_60s());
+    req.autopilot = true;
+    req.notify_channel_id = Some("session_ok".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+    svc.tick(&job.id, job.next_run_at.unwrap()).await;
+
+    wait_for_reports(&notifier, 1).await;
+    // Give a stray report from the plain job time to land, if any.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let reports = notifier.reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report.job_id, job.id);
+    assert_eq!(report.user_id, "u1");
+    assert_eq!(report.job_name, "Autopilot");
+    assert_eq!(report.notify_channel_id.as_deref(), Some("session_ok"));
+    match report.outcome {
+        aionui_cron::notify::AutopilotOutcome::Ok => {
+            assert!(report.conversation_id.is_some());
+            assert_eq!(report.error, None);
+        }
+        aionui_cron::notify::AutopilotOutcome::Error => assert!(report.error.is_some()),
+    }
+}

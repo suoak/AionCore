@@ -23,6 +23,7 @@ use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
 use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
+use crate::notify::{AutopilotNotifier, AutopilotOutcome, AutopilotRunReport};
 use crate::scheduler::{
     CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule, validate_timezone,
 };
@@ -64,6 +65,9 @@ pub struct CronService {
     emitter: CronEventEmitter,
     data_dir: PathBuf,
     instance_id: String,
+    /// E8-6 guardrail 6: delivery port for Autopilot run results. Wired
+    /// late by the app because channels are built after cron.
+    autopilot_notifier: Arc<std::sync::RwLock<Option<Arc<dyn AutopilotNotifier>>>>,
 }
 
 pub struct CronServiceDeps {
@@ -91,7 +95,63 @@ impl CronService {
             emitter: deps.emitter,
             data_dir: deps.data_dir,
             instance_id: generate_prefixed_id("cron-owner"),
+            autopilot_notifier: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the Autopilot result notifier (IM + Inbox delivery).
+    pub fn set_autopilot_notifier(&self, notifier: Arc<dyn AutopilotNotifier>) {
+        let mut slot = self
+            .autopilot_notifier
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(notifier);
+    }
+
+    fn autopilot_notifier(&self) -> Option<Arc<dyn AutopilotNotifier>> {
+        self.autopilot_notifier
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Reject a `notify_channel_id` the notifier cannot deliver to. Without
+    /// a notifier (tests, headless tools) the id is stored unchecked.
+    async fn validate_notify_channel(&self, user_id: &str, channel_id: Option<&str>) -> Result<(), CronError> {
+        let (Some(channel_id), Some(notifier)) = (channel_id, self.autopilot_notifier()) else {
+            return Ok(());
+        };
+        notifier
+            .validate_target(user_id, channel_id)
+            .await
+            .map_err(CronError::InvalidNotifyChannel)
+    }
+
+    /// Fire-and-forget delivery of a scheduled Autopilot run result.
+    fn report_autopilot_run(
+        &self,
+        owner_user_id: Option<&str>,
+        job: &CronJob,
+        outcome: AutopilotOutcome,
+        conversation_id: Option<String>,
+        error: Option<String>,
+    ) {
+        if !job.autopilot {
+            return;
+        }
+        let Some(notifier) = self.autopilot_notifier() else {
+            return;
+        };
+        let report = AutopilotRunReport {
+            user_id: owner_user_id.unwrap_or(&job.user_id).to_owned(),
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+            notify_channel_id: job.notify_channel_id.clone(),
+            outcome,
+            conversation_id: conversation_id.filter(|id| !id.is_empty()),
+            error,
+        };
+        tokio::spawn(async move { notifier.notify(report).await });
     }
 
     // -----------------------------------------------------------------------
@@ -351,6 +411,8 @@ impl CronService {
         };
 
         self.validate_job_workspace(&job).await?;
+        self.validate_notify_channel(user_id, job.notify_channel_id.as_deref())
+            .await?;
 
         let row = cron_job_to_row(&job)?;
         self.repo.insert(&row).await?;
@@ -458,6 +520,7 @@ impl CronService {
         if !job.autopilot {
             job.autopilot_yolo = false;
         }
+        let original_notify_channel_id = job.notify_channel_id.clone();
         if let Some(channel) = &req.notify_channel_id {
             job.notify_channel_id = normalize_notify_channel_id(Some(channel));
         }
@@ -484,6 +547,10 @@ impl CronService {
 
         job.updated_at = now_ms();
         self.validate_job_workspace(&job).await?;
+        if job.notify_channel_id != original_notify_channel_id {
+            self.validate_notify_channel(user_id, job.notify_channel_id.as_deref())
+                .await?;
+        }
 
         let mut params = build_update_params(&job, &req);
         if clear_conversation_binding {
@@ -1251,6 +1318,13 @@ impl CronService {
                 if let Some(user_id) = owner_user_id.as_deref() {
                     self.emitter.emit_job_executed(user_id, job_id, "ok", None);
                 }
+                self.report_autopilot_run(
+                    owner_user_id.as_deref(),
+                    &job,
+                    AutopilotOutcome::Ok,
+                    Some(conversation_id),
+                    None,
+                );
             }
             ExecutionResult::Retrying { attempt } => {
                 if !self.schedule_retry(job_id, scheduled_at, attempt).await {
@@ -1296,6 +1370,17 @@ impl CronService {
                 if let Some(user_id) = owner_user_id.as_deref() {
                     self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
                 }
+                // The executor error carries no conversation id; an
+                // existing-mode job always runs in its bound conversation.
+                let conversation_id =
+                    matches!(job.execution_mode, ExecutionMode::Existing).then(|| job.conversation_id.clone());
+                self.report_autopilot_run(
+                    owner_user_id.as_deref(),
+                    &job,
+                    AutopilotOutcome::Error,
+                    conversation_id,
+                    Some(message),
+                );
             }
         }
     }
