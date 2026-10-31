@@ -173,6 +173,8 @@ pub struct ModuleStates {
     pub worktree: aionui_worktree::WorktreeRouterState,
     /// M7 E3-4 fan-out groups (`/api/fanout-groups*`).
     pub fanout: aionui_worktree::FanoutRouterState,
+    /// M8 E8 batch jobs (`/api/batch*`).
+    pub batch: aionui_batch::BatchRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -376,6 +378,13 @@ pub async fn build_module_states(
     if let Err(error) = fanout.service.recover_on_boot().await {
         tracing::warn!(error = %error, "fanout: startup recovery failed");
     }
+    // M8 E8: interrupted batch attempts are marked failed and running jobs
+    // paused; nothing restarts on its own (scale / retry resumes).
+    let batch =
+        crate::router::batch_adapters::build_batch_state(services, &worktree.service, assistant.service.clone());
+    if let Err(error) = batch.service.recover_on_boot().await {
+        tracing::warn!(error = %error, "batch: startup recovery failed");
+    }
     let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
         build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
     });
@@ -433,6 +442,7 @@ pub async fn build_module_states(
         scm_delivery: build_module_state_phase(&boot, "scm_delivery", || build_delivery_state(services)),
         worktree,
         fanout,
+        batch,
     };
     // M8 E7-2: Squad instantiation provisions through the shared Team service.
     states.squad.teams = Some(states.team.service.clone());

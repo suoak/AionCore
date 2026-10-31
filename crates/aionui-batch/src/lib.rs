@@ -19,6 +19,7 @@
 pub mod checks;
 pub mod error;
 pub mod port;
+pub mod routes;
 pub mod runner;
 pub mod service;
 pub mod template;
@@ -27,6 +28,7 @@ pub mod validate;
 pub use checks::{CompiledChecks, all_passed};
 pub use error::BatchError;
 pub use port::{AttemptOutcome, BatchEvent, IBatchExecutor, ItemSpec, PreparedItem};
+pub use routes::{BatchRouterState, batch_routes};
 pub use runner::{BatchRunner, BatchRunnerConfig};
 pub use service::{BatchService, INTERRUPTED_ERROR, item_response, job_response};
 pub use template::PromptTemplate;

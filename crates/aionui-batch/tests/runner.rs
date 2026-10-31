@@ -153,7 +153,7 @@ impl IBatchExecutor for Fake {
 struct Harness {
     _dir: tempfile::TempDir,
     fake: Arc<Fake>,
-    svc: BatchService,
+    svc: Arc<BatchService>,
     repo: Arc<dyn IBatchRepository>,
 }
 
@@ -168,7 +168,7 @@ async fn harness() -> Harness {
         start_grace: Duration::from_millis(500),
         timeout_unit: Duration::from_millis(5),
     };
-    let svc = BatchService::new(repo.clone(), fake.clone(), cfg);
+    let svc = Arc::new(BatchService::new(repo.clone(), fake.clone(), cfg));
     Harness {
         _dir: dir,
         fake,
@@ -178,6 +178,10 @@ async fn harness() -> Harness {
 }
 
 fn request(h: &Harness, n: i64, extra: Value) -> CreateBatchJobRequest {
+    serde_json::from_value(request_json(h, n, extra)).unwrap()
+}
+
+fn request_json(h: &Harness, n: i64, extra: Value) -> Value {
     let targets: Vec<Value> = (1..=n)
         .map(|i| {
             let ws = h.fake.workspace(i);
@@ -200,7 +204,7 @@ fn request(h: &Harness, n: i64, extra: Value) -> CreateBatchJobRequest {
     for (k, v) in extra.as_object().unwrap() {
         req[k] = v.clone();
     }
-    serde_json::from_value(req).unwrap()
+    req
 }
 
 async fn wait_idle(h: &Harness, job_id: &str) {
@@ -444,4 +448,115 @@ async fn boot_recovery_pauses_running_jobs_and_scale_resumes() {
     h.svc.retry("u1", &job.id, &BatchRetryRequest::default()).await.unwrap();
     wait_idle(&h, &job.id).await;
     assert_eq!(h.svc.get("u1", &job.id).await.unwrap().status, "completed");
+}
+
+// ---- HTTP routes -------------------------------------------------------
+
+fn app(h: &Harness, user: &str) -> axum::Router {
+    aionui_batch::batch_routes(aionui_batch::BatchRouterState { service: h.svc.clone() }).layer(axum::Extension(
+        aionui_auth::CurrentUser {
+            id: user.to_owned(),
+            username: user.to_owned(),
+            user_type: aionui_db::UserType::Local,
+            status: aionui_db::UserStatus::Active,
+        },
+    ))
+}
+
+async fn call(router: axum::Router, method: &str, uri: &str, body: Option<Value>) -> (u16, String, Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let mut req = axum::http::Request::builder().method(method).uri(uri);
+    let body = match body {
+        Some(v) => {
+            req = req.header("content-type", "application/json");
+            axum::body::Body::from(v.to_string())
+        }
+        None => axum::body::Body::empty(),
+    };
+    let resp = router.oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status().as_u16();
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let json = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    (status, ctype, json)
+}
+
+#[tokio::test]
+async fn http_routes_drive_the_full_lifecycle() {
+    let h = harness().await;
+    let req = request_json(&h, 3, json!({"concurrency": 2}));
+    let (st, _, body) = call(app(&h, "u1"), "POST", "/api/batch", Some(req)).await;
+    assert_eq!(st, 201, "{body}");
+    let id = body["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(body["data"]["status"], "draft");
+
+    let (st, _, body) = call(app(&h, "u1"), "POST", &format!("/api/batch/{id}/scale"), None).await;
+    assert_eq!(st, 409, "scale before the trial: {body}");
+
+    let (st, _, body) = call(app(&h, "u1"), "POST", &format!("/api/batch/{id}/trial"), None).await;
+    assert_eq!((st, body["data"]["status"].as_str()), (200, Some("trial")));
+    wait_idle(&h, &id).await;
+    let (st, _, body) = call(app(&h, "u1"), "POST", &format!("/api/batch/{id}/scale"), None).await;
+    assert_eq!((st, body["data"]["status"].as_str()), (200, Some("running")));
+    wait_idle(&h, &id).await;
+
+    let (st, _, body) = call(app(&h, "u1"), "GET", &format!("/api/batch/{id}"), None).await;
+    assert_eq!((st, body["data"]["status"].as_str()), (200, Some("completed")));
+    let (st, _, body) = call(app(&h, "u1"), "GET", &format!("/api/batch/{id}/items"), None).await;
+    assert_eq!((st, body["data"].as_array().unwrap().len()), (200, 3));
+    let (st, _, body) = call(app(&h, "u1"), "GET", "/api/batch?limit=10", None).await;
+    assert_eq!((st, body["data"].as_array().unwrap().len()), (200, 1));
+
+    let (st, ctype, body) = call(app(&h, "u1"), "GET", &format!("/api/batch/{id}/export.csv"), None).await;
+    assert_eq!(st, 200);
+    assert!(ctype.starts_with("text/csv"), "{ctype}");
+    assert_eq!(body.as_str().unwrap().lines().count(), 4);
+
+    // Nothing failed: retry with the default filter has nothing to do.
+    let (st, _, _) = call(app(&h, "u1"), "POST", &format!("/api/batch/{id}/retry"), None).await;
+    assert_eq!(st, 409);
+    // Terminal: cancel is refused.
+    let (st, _, _) = call(app(&h, "u1"), "POST", &format!("/api/batch/{id}/cancel"), None).await;
+    assert_eq!(st, 409);
+
+    // Other users see nothing.
+    let (st, _, _) = call(app(&h, "u2"), "GET", &format!("/api/batch/{id}"), None).await;
+    assert_eq!(st, 404);
+    let (st, _, body) = call(app(&h, "u2"), "GET", "/api/batch", None).await;
+    assert_eq!((st, body["data"].as_array().unwrap().len()), (200, 0));
+}
+
+#[tokio::test]
+async fn http_routes_map_validation_and_disk_errors() {
+    let h = harness().await;
+    let (st, _, _) = call(app(&h, "u1"), "POST", "/api/batch", Some(json!({"title": "x"}))).await;
+    assert_eq!(st, 400, "malformed body");
+    let mut req = request_json(&h, 1, json!({}));
+    req["targets"] = json!([]);
+    let (st, _, body) = call(app(&h, "u1"), "POST", "/api/batch", Some(req)).await;
+    assert_eq!(st, 400, "{body}");
+
+    // The disk precheck covers repo targets (each gets a worktree).
+    let repo = h.fake.root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let mut req = request_json(&h, 0, json!({}));
+    req["targets"] = json!([{"repo": repo.to_str().unwrap(), "name": "a"}]);
+    let (st, _, body) = call(app(&h, "u1"), "POST", "/api/batch", Some(req)).await;
+    assert_eq!(st, 201, "{body}");
+    let id = body["data"]["id"].as_str().unwrap().to_owned();
+    h.fake.disk_ok.store(false, Ordering::SeqCst);
+    let (st, _, body) = call(app(&h, "u1"), "POST", &format!("/api/batch/{id}/trial"), None).await;
+    assert_eq!(st, 507, "{body}");
+    h.fake.disk_ok.store(true, Ordering::SeqCst);
+
+    let (st, _, body) = call(app(&h, "u1"), "POST", &format!("/api/batch/{id}/cancel"), None).await;
+    assert_eq!((st, body["data"]["status"].as_str()), (200, Some("cancelled")));
+    let (st, _, _) = call(app(&h, "u1"), "GET", "/api/batch/bj_missing/items", None).await;
+    assert_eq!(st, 404);
 }
