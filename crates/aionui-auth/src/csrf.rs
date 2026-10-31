@@ -59,11 +59,17 @@ pub async fn csrf_middleware(
     let is_antigravity_hook = path.starts_with("/internal/antigravity-hook/");
     // Paired devices (M8 E9-1) send their token as an explicit
     // `Authorization: Bearer wmd_...` header — never an ambient cookie — so a
-    // cross-site page cannot forge one. The phone-side pairing endpoints are
+    // cross-site page cannot forge one. The exemption only holds while the
+    // request carries no session / refresh cookie: a real device never sends
+    // them, and cookie-reading routes outside `auth_middleware` (e.g.
+    // `/api/auth/refresh`) must not be reachable cookie-ambient + CSRF-free by
+    // tacking on a junk `wmd_` header. The phone-side pairing endpoints are
     // credentialed by the QR token / pairing id + code in the body, like
     // `/api/auth/qr-login`.
     let is_device_token_request = crate::extract::extract_bearer_token(request.headers())
-        .is_some_and(|token| crate::device::token::is_device_token(&token));
+        .is_some_and(|token| crate::device::token::is_device_token(&token))
+        && extract_cookie_value(request.headers(), aionui_common::constants::COOKIE_NAME).is_none()
+        && extract_cookie_value(request.headers(), aionui_common::constants::REFRESH_COOKIE_NAME).is_none();
     let is_device_pairing = path == "/api/auth/devices/pair/start" || path == "/api/auth/devices/pair/confirm";
     let is_exempt = path == "/login"
         || path == "/api/auth/qr-login"

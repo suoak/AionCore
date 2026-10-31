@@ -387,3 +387,26 @@ async fn devices_of_another_user_cannot_be_touched() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(ctx.revoked.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn device_csrf_exemption_does_not_cover_cookie_bearing_requests() {
+    let ctx = setup().await;
+    let device = pair(&ctx).await;
+    let token = device["device_token"].as_str().unwrap();
+    let uri = "/api/agent-approvals/a1/approve";
+
+    // A real device: bearer only, no CSRF pair needed.
+    let (status, body) = call(&ctx.app, "POST", uri, Some(token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Same `wmd_` header plus an ambient session or refresh cookie: CSRF applies.
+    for cookie in ["aionui-session=x", "aionui-refresh=x"] {
+        let req = Request::post(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{cookie}");
+    }
+}
