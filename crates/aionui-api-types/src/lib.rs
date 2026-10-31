@@ -190,7 +190,7 @@ pub use file::{
 };
 pub use inbox::{
     AUTOPILOT_INBOX_TITLE_PREFIX, INBOX_ORIGIN_AUTOPILOT, INBOX_ORIGIN_BATCH, InboxItemDto, InboxListQuery,
-    InboxListResponse, InboxMarkReadResponse, inbox_origin,
+    InboxListResponse, InboxMarkReadResponse, TASK_APPROVAL_INBOX_KEY_PREFIX, inbox_origin, inbox_task_approval_id,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

@@ -12466,6 +12466,10 @@ async fn task_approvals_raise_and_resolve_inbox_items_with_events() {
     assert_eq!(changed[0].data["user_id"], "user_1");
     assert_eq!(changed[0].data["approval_id"], first.approval.id.as_str());
     assert_eq!(changed[0].data["status"], "pending");
+    assert!(
+        changed[0].data["decided_via"].is_null(),
+        "a new approval has no decider"
+    );
     assert!(events.iter().any(|e| e.name == "inbox.changed"));
 
     // A newer plan supersedes the pending one: its inbox item closes.
@@ -12514,4 +12518,6 @@ async fn task_approvals_raise_and_resolve_inbox_items_with_events() {
     assert_eq!(changed.data["approval_id"], second.approval.id.as_str());
     assert_eq!(changed.data["status"], "approved");
     assert_eq!(changed.data["task_session_id"], task_id.as_str());
+    assert_eq!(changed.data["decided_via"], "user");
+    assert!(changed.data["device_id"].is_null());
 }
