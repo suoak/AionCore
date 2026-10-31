@@ -14,6 +14,15 @@ use std::sync::Arc;
 /// WebSocket event telling clients to refetch the inbox / unread badge.
 pub(crate) const EVENT_INBOX_CHANGED: &str = "inbox.changed";
 
+/// WebSocket event: a work item's Plan/Goal approval was requested or
+/// decided (M8 E9). Lets the desktop react when the phone answers.
+pub(crate) const EVENT_TASK_APPROVAL_CHANGED: &str = "task.approval.changed";
+
+/// Inbox dedupe key of one Plan/Goal approval.
+pub(crate) fn task_approval_inbox_key(approval_id: &str) -> String {
+    format!("task_approval:{approval_id}")
+}
+
 /// Items older than this are pruned lazily on list.
 pub(crate) const INBOX_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 /// Per-user cap on stored items.
@@ -311,6 +320,62 @@ impl ConversationService {
             Ok(false) => {}
             Err(error) => tracing::warn!(user_id, dedupe_key, error = %error, "inbox resolve failed"),
         }
+    }
+
+    /// A work item's Plan/Goal approval changed (M8 E9): tell clients, and
+    /// keep its Inbox `approval` item in step — open while pending (which
+    /// also reaches IM push for paired devices), resolved otherwise.
+    /// `superseded` are earlier approvals the new one cancelled or expired.
+    pub(crate) async fn task_approval_changed(
+        &self,
+        user_id: &str,
+        task_title: Option<&str>,
+        approval: &aionui_db::models::TaskApprovalRow,
+        superseded: &[String],
+    ) {
+        self.broadcaster().broadcast(WebSocketMessage::new(
+            EVENT_TASK_APPROVAL_CHANGED,
+            serde_json::json!({
+                "user_id": user_id,
+                "task_session_id": approval.task_session_id,
+                "approval_id": approval.id,
+                "approval_type": approval.approval_type,
+                "status": approval.status,
+            }),
+        ));
+        for id in superseded {
+            self.resolve_inbox_item(user_id, &task_approval_inbox_key(id)).await;
+        }
+        let key = task_approval_inbox_key(&approval.id);
+        if approval.status != "pending" {
+            self.resolve_inbox_item(user_id, &key).await;
+            return;
+        }
+        let label = if approval.approval_type == "goal" {
+            "Goal"
+        } else {
+            "Plan"
+        };
+        let title = match task_title.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(task_title) => format!("{label} approval: {}", truncate(task_title, 100)),
+            None => format!("{label} approval needed"),
+        };
+        self.raise_inbox_item(&UpsertInboxItemParams {
+            user_id,
+            kind: "approval",
+            // 069 has no approval source kind; the item points at the work
+            // item through `task_session_id` (and the planning run, if any).
+            source_kind: "task_run",
+            source_id: approval.run_id.as_deref().unwrap_or(&approval.task_session_id),
+            conversation_id: None,
+            task_session_id: Some(&approval.task_session_id),
+            run_id: approval.run_id.as_deref(),
+            title: &title,
+            summary: None,
+            dedupe_key: &key,
+            created_at: now_ms(),
+        })
+        .await;
     }
 
     /// Dedupe key of the inbox item a plain (non-task) conversation turn

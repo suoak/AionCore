@@ -12423,3 +12423,95 @@ async fn closing_a_work_item_notes_the_kept_shared_worktree() {
         ]
     );
 }
+
+// ── M8 E9: Plan/Goal approvals reach the Inbox and the event bus ────
+
+#[tokio::test]
+async fn task_approvals_raise_and_resolve_inbox_items_with_events() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = board_service_with(&db, broadcaster.clone());
+    let inbox = Arc::new(aionui_db::SqliteInboxRepository::new(db.pool().clone()));
+    service.with_inbox_repo(inbox.clone());
+    let task_id = board_task(&service, TaskSessionMode::Plan).await;
+    let all = aionui_db::InboxFilter {
+        unread_only: false,
+        before: None,
+        limit: 50,
+    };
+    let submit = |content: &'static str| SubmitTaskArtifactRequest {
+        kind: TaskArtifactKind::Plan,
+        content: content.into(),
+        acceptance_criteria: Vec::new(),
+    };
+
+    let first = service
+        .submit_task_artifact("user_1", &task_id, submit("Plan v1"))
+        .await
+        .unwrap();
+    let items = aionui_db::IInboxRepository::list(inbox.as_ref(), "user_1", &all)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, "approval");
+    assert_eq!(items[0].title, "Plan approval: Board item");
+    assert_eq!(items[0].summary, None, "no artifact body in the inbox/push");
+    assert_eq!(items[0].task_session_id.as_deref(), Some(task_id.as_str()));
+    assert_eq!(items[0].conversation_id, None);
+    assert_eq!(items[0].dedupe_key, format!("task_approval:{}", first.approval.id));
+    let events = broadcaster.take_events();
+    let changed: Vec<_> = events.iter().filter(|e| e.name == "task.approval.changed").collect();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].data["user_id"], "user_1");
+    assert_eq!(changed[0].data["approval_id"], first.approval.id.as_str());
+    assert_eq!(changed[0].data["status"], "pending");
+    assert!(events.iter().any(|e| e.name == "inbox.changed"));
+
+    // A newer plan supersedes the pending one: its inbox item closes.
+    let second = service
+        .submit_task_artifact("user_1", &task_id, submit("Plan v2"))
+        .await
+        .unwrap();
+    let items = aionui_db::IInboxRepository::list(inbox.as_ref(), "user_1", &all)
+        .await
+        .unwrap();
+    let open: Vec<_> = items.iter().filter(|i| i.resolved_at.is_none()).collect();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].dedupe_key, format!("task_approval:{}", second.approval.id));
+    broadcaster.take_events();
+
+    // Deciding (e.g. from the phone) resolves the item and tells the desktop.
+    service
+        .decide_task_approval(
+            "user_1",
+            &task_id,
+            &second.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: second.artifact.id.clone(),
+                artifact_hash: second.artifact.content_hash.clone(),
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        aionui_db::IInboxRepository::unread_count(inbox.as_ref(), "user_1")
+            .await
+            .unwrap(),
+        0
+    );
+    let items = aionui_db::IInboxRepository::list(inbox.as_ref(), "user_1", &all)
+        .await
+        .unwrap();
+    assert!(items.iter().all(|i| i.resolved_at.is_some()));
+    let events = broadcaster.take_events();
+    let changed = events
+        .iter()
+        .find(|e| e.name == "task.approval.changed")
+        .expect("decision event");
+    assert_eq!(changed.data["approval_id"], second.approval.id.as_str());
+    assert_eq!(changed.data["status"], "approved");
+    assert_eq!(changed.data["task_session_id"], task_id.as_str());
+}
