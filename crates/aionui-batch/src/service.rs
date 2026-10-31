@@ -273,7 +273,9 @@ impl BatchService {
         self.runner.cancel(job_id).await;
         // A live driver settles after its in-flight attempts end and raises
         // the summary then (its settle runs under the same driver-map lock
-        // `is_driving` takes); with no driver nothing else will.
+        // `is_driving` takes); with no driver nothing else will. A driver that
+        // settles in the gap may report too: the upsert on `batch:{id}` makes
+        // that a refresh of the same row, not a second item.
         if !self.runner.is_driving(job_id).await {
             self.runner.report_summary(user_id, job_id).await;
         }
