@@ -122,3 +122,28 @@ async fn token_hash_is_unique_and_platform_is_checked() {
     bad.platform = "symbian";
     assert!(repo.create_within_limit(&bad, 5).await.is_err());
 }
+
+#[tokio::test]
+async fn set_push_is_owner_scoped_and_checked() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteUserDeviceRepository::new(db.pool().clone());
+    let row = repo
+        .create_within_limit(&device("u1", "hp", 1), 5)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.push_kind, "none");
+
+    assert!(!repo.set_push("u2", &row.id, "im", Some("sess-1")).await.unwrap());
+    assert!(repo.set_push("u1", &row.id, "im", Some("sess-1")).await.unwrap());
+    let got = repo.find_for_user("u1", &row.id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.push_kind.as_str(), got.push_target.as_deref()),
+        ("im", Some("sess-1"))
+    );
+
+    assert!(repo.set_push("u1", &row.id, "bogus", None).await.is_err());
+
+    assert!(repo.revoke("u1", &row.id, 2, "user").await.unwrap());
+    assert!(!repo.set_push("u1", &row.id, "none", None).await.unwrap());
+}

@@ -147,11 +147,32 @@ fn truncate(text: &str, max_chars: usize) -> String {
 pub(crate) struct InboxSink {
     repo: Arc<dyn IInboxRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
+    push: Option<Arc<dyn InboxPushHook>>,
+}
+
+/// Inbox kinds that ask for the user's attention away from the desktop and
+/// are handed to the [`InboxPushHook`] (M8 E9-6).
+pub const INBOX_PUSH_KINDS: &[&str] = &["approval", "blocked"];
+
+/// Notified after an attention-worthy inbox item (see [`INBOX_PUSH_KINDS`])
+/// is raised or re-opened. Must not block: implementations spawn their own
+/// delivery work.
+pub trait InboxPushHook: Send + Sync {
+    fn item_raised(&self, item: &InboxItemRow);
 }
 
 impl InboxSink {
     pub(crate) fn new(repo: Arc<dyn IInboxRepository>, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
-        Self { repo, broadcaster }
+        Self {
+            repo,
+            broadcaster,
+            push: None,
+        }
+    }
+
+    pub(crate) fn with_push(mut self, push: Option<Arc<dyn InboxPushHook>>) -> Self {
+        self.push = push;
+        self
     }
 
     pub(crate) async fn announce(&self, user_id: &str, kind: Option<&str>, conversation_id: Option<&str>) {
@@ -175,9 +196,14 @@ impl InboxSink {
 
     async fn upsert(&self, params: &UpsertInboxItemParams<'_>) {
         match self.repo.upsert(params).await {
-            Ok(_) => {
+            Ok(item) => {
                 self.announce(params.user_id, Some(params.kind), params.conversation_id)
-                    .await
+                    .await;
+                if let Some(push) = self.push.as_ref()
+                    && INBOX_PUSH_KINDS.contains(&item.kind.as_str())
+                {
+                    push.item_raised(&item);
+                }
             }
             Err(error) => tracing::warn!(
                 user_id = params.user_id,
@@ -272,7 +298,7 @@ impl InboxSink {
 impl ConversationService {
     pub(crate) fn inbox_sink(&self) -> Option<InboxSink> {
         self.inbox_repo()
-            .map(|repo| InboxSink::new(repo, self.broadcaster().clone()))
+            .map(|repo| InboxSink::new(repo, self.broadcaster().clone()).with_push(self.inbox_push_hook()))
     }
 
     /// Raise (or refresh, by `dedupe_key`) an inbox item for a producer that
@@ -482,6 +508,34 @@ mod tests {
         let repo = Arc::new(repo().await);
         let rec = Arc::new(Recorder::default());
         (InboxSink::new(repo.clone(), rec.clone()), repo, rec)
+    }
+
+    #[derive(Default)]
+    struct PushRecorder(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl InboxPushHook for PushRecorder {
+        fn item_raised(&self, item: &InboxItemRow) {
+            self.0.lock().expect("lock").push((item.kind.clone(), item.id.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_approval_and_blocked_items_are_pushed() {
+        let (sink, repo, _rec) = sink().await;
+        let push = Arc::new(PushRecorder::default());
+        let sink = sink.with_push(Some(push.clone()));
+        sink.approval_asked("u1", "c1", None, "call-1", Some("Bash")).await;
+        sink.turn_settled("u1", "c1", "Chat", None, TurnInboxKind::Completed, None)
+            .await;
+        sink.turn_settled("u1", "c2", "Chat", None, TurnInboxKind::Failed, Some("boom"))
+            .await;
+        sink.turn_settled("u1", "c3", "Chat", None, TurnInboxKind::Blocked, Some("needs input"))
+            .await;
+        let pushed = push.0.lock().expect("lock").clone();
+        let kinds: Vec<&str> = pushed.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(kinds, ["approval", "blocked"]);
+        let stored = repo.list("u1", &all()).await.expect("list");
+        assert!(pushed.iter().all(|(_, id)| stored.iter().any(|row| &row.id == id)));
     }
 
     fn all() -> InboxFilter {

@@ -4,6 +4,7 @@ mod antigravity_hook;
 mod autopilot_notifier;
 mod batch_adapters;
 mod clipboard_writer;
+mod device_push;
 mod device_ws;
 mod fs_monitor;
 mod health;

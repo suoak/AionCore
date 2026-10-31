@@ -49,4 +49,15 @@ pub trait IUserDeviceRepository: Send + Sync {
     /// Rename an unrevoked device of `user_id`. `false` when it does not
     /// exist, belongs to someone else, or is revoked.
     async fn rename(&self, user_id: &str, id: &str, name: &str) -> Result<bool, DbError>;
+
+    /// Set how an unrevoked device of `user_id` is notified (`push_kind`
+    /// `none` | `im`; `push_target` is the IM destination for `im`). `false`
+    /// when it does not exist, belongs to someone else, or is revoked.
+    async fn set_push(
+        &self,
+        user_id: &str,
+        id: &str,
+        push_kind: &str,
+        push_target: Option<&str>,
+    ) -> Result<bool, DbError>;
 }

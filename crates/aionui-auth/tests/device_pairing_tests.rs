@@ -19,6 +19,19 @@ use aionui_db::{
     init_database_memory,
 };
 
+/// Accepts `sess-<user_id>` only, like the app's channel-backed validator
+/// accepts only the user's own IM sessions.
+struct OnlyOwnSession;
+
+#[async_trait::async_trait]
+impl aionui_auth::DevicePushTargetValidator for OnlyOwnSession {
+    async fn validate_im_target(&self, user_id: &str, target: &str) -> Result<(), String> {
+        (target == format!("sess-{user_id}"))
+            .then_some(())
+            .ok_or_else(|| "not your channel".to_owned())
+    }
+}
+
 struct Ctx {
     app: Router,
     devices: Arc<dyn IUserDeviceRepository>,
@@ -52,6 +65,7 @@ async fn setup() -> Ctx {
         devices: devices.clone(),
         pairings: Arc::new(DevicePairingStore::new()),
         on_revoked: Some(Arc::new(move |row| revoked_log.lock().unwrap().push(row.id.clone()))),
+        push_targets: Some(Arc::new(OnlyOwnSession)),
     };
     let echo = |user: Extension<CurrentUser>, device: Option<Extension<DevicePrincipal>>| async move {
         axum::Json(json!({
@@ -409,4 +423,60 @@ async fn device_csrf_exemption_does_not_cover_cookie_bearing_requests() {
         let resp = ctx.app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{cookie}");
     }
+}
+
+#[tokio::test]
+async fn desktop_sets_im_push_target_only_to_its_own_channel() {
+    let ctx = setup().await;
+    let phone = pair(&ctx).await;
+    let phone_token = phone["device_token"].as_str().unwrap();
+    let uri = format!("/api/auth/devices/{}/push", phone["device_id"].as_str().unwrap());
+    let own = format!("sess-{}", ctx.user_id);
+
+    let (status, body) = desktop(&ctx, "PUT", &uri, Some(json!({"push_kind": "im", "push_target": own}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["push_kind"], "im");
+    assert_eq!(body["data"]["push_target"], json!(own));
+
+    for bad in [
+        json!({"push_kind": "im", "push_target": "sess-someone-else"}),
+        json!({"push_kind": "im"}),
+        json!({"push_kind": "im", "push_target": "  "}),
+        json!({"push_kind": "apns", "push_target": "tok"}),
+        json!({"push_kind": "carrier-pigeon"}),
+    ] {
+        let (status, body) = desktop(&ctx, "PUT", &uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+
+    // The device cannot point its own notifications somewhere.
+    let (status, _) = call(
+        &ctx.app,
+        "PUT",
+        &uri,
+        Some(phone_token),
+        Some(json!({"push_kind": "none"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = desktop(
+        &ctx,
+        "PUT",
+        &uri,
+        Some(json!({"push_kind": "none", "push_target": own})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["push_kind"], "none");
+    assert!(body["data"]["push_target"].is_null());
+
+    let (status, _) = desktop(
+        &ctx,
+        "PUT",
+        "/api/auth/devices/nope/push",
+        Some(json!({"push_kind": "none"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

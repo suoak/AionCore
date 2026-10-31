@@ -300,6 +300,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         devices: services.user_devices.clone(),
         pairings: services.device_pairings.clone(),
         on_revoked: Some(crate::router::device_ws::ws_kick_on_revoke(services.ws_manager.clone())),
+        push_targets: Some(Arc::new(crate::router::device_push::ChannelPushTargetValidator::new(
+            Arc::new(aionui_db::SqliteChannelRepository::new(
+                services.database.pool().clone(),
+            )),
+        ))),
     };
     let device_pairing_public = aionui_auth::device_pairing_public_routes(device_router_state.clone());
     let device_pairing_authenticated = aionui_auth::device_pairing_user_routes(device_router_state)

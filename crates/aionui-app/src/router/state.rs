@@ -308,6 +308,17 @@ pub async fn build_module_states(
             services.conversation_service.clone(),
         )));
 
+    // E9-6: approval / blocked Inbox items go to IM-push devices.
+    services
+        .conversation_service
+        .set_inbox_push_hook(Arc::new(super::device_push::ChannelDevicePush::new(
+            services.user_devices.clone(),
+            Arc::new(aionui_db::SqliteChannelRepository::new(
+                services.database.pool().clone(),
+            )),
+            channel_components.manager.clone(),
+        )));
+
     let backend_binary_path = services.backend_binary_path();
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
