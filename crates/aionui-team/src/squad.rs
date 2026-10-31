@@ -50,6 +50,9 @@ pub struct SquadRouterState {
     /// Team service used by `POST /api/squads/{id}/instantiate`. `None` (unit
     /// tests) answers 503 `squad_instantiate_unavailable`.
     pub teams: Option<Arc<crate::service::TeamSessionService>>,
+    /// M8 Q12: shared worktree per work item. `None` keeps the plain shared
+    /// workspace (pre-Q12 behaviour).
+    pub work_item_worktrees: Option<Arc<dyn crate::ports::SquadWorkItemWorktreePort>>,
 }
 
 /// D7-1 `route_only`: the Team MCP tools a Squad Leader keeps (E7-3 enforces
@@ -655,10 +658,23 @@ async fn instantiate_squad(
             conversation_id: None,
         });
     }
+    // M8 Q12: every instance of one work item shares one managed worktree
+    // (created on the first start, reused afterwards, never removed here).
+    // It is resolved after all validation so a refused start creates nothing.
+    let worktree = match (&work_item_id, &state.work_item_worktrees) {
+        (Some(work_item_id), Some(port)) => {
+            ensure_work_item_worktree(port.as_ref(), &user.id, work_item_id, &input).await?
+        }
+        _ => None,
+    };
+    let workspace = match &worktree {
+        Some(wt) => Some(wt.path.clone()),
+        None => input.workspace,
+    };
     let req = aionui_api_types::CreateTeamRequest {
         name,
         agents,
-        workspace: input.workspace,
+        workspace,
     };
     let team = teams.create_team(&user.id, req).await.map_err(|e| {
         let api: ApiError = e.into();
@@ -697,8 +713,41 @@ async fn instantiate_squad(
             squad_template_id: row.id,
             work_item_id,
             team,
+            worktree,
         })),
     ))
+}
+
+async fn ensure_work_item_worktree(
+    port: &dyn crate::ports::SquadWorkItemWorktreePort,
+    user_id: &str,
+    work_item_id: &str,
+    input: &SquadInstantiateInput,
+) -> Result<Option<aionui_api_types::SquadWorkItemWorktree>, ApiError> {
+    let trimmed = |v: &Option<String>| v.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    let repo_path = trimmed(&input.repo_path);
+    let workspace = trimmed(&input.workspace);
+    match port
+        .ensure(user_id, work_item_id, repo_path.as_deref(), workspace.as_deref())
+        .await
+    {
+        Ok(found) => Ok(found),
+        Err(crate::ports::SquadWorktreeError::InvalidSource(message)) => Err(coded(
+            StatusCode::BAD_REQUEST,
+            "squad_worktree_source_invalid",
+            "work item worktree source is not usable",
+            Some(json!({ "work_item_id": work_item_id, "reason": message })),
+        )),
+        Err(crate::ports::SquadWorktreeError::Failed(message)) => {
+            tracing::error!(work_item_id, error = %message, "work item shared worktree failed");
+            Err(coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "squad_worktree_failed",
+                "work item shared worktree could not be prepared",
+                Some(json!({ "work_item_id": work_item_id, "reason": message })),
+            ))
+        }
+    }
 }
 
 /// M8 E7-6: a Squad starts for a work item only when the item is assigned to
@@ -786,6 +835,7 @@ mod tests {
             repo: Arc::new(aionui_db::SqliteSquadTemplateRepository::new(db.pool().clone())),
             catalog: Arc::new(Catalog(ids)),
             teams: None,
+            work_item_worktrees: None,
         };
         (squad_routes(state).layer(Extension(CurrentUser::local_default())), db)
     }
@@ -1087,6 +1137,154 @@ mod tests {
         );
     }
 
+    /// `(work_item_id, repo_path, workspace)` of one `ensure` call.
+    type EnsureCall = (String, Option<String>, Option<String>);
+
+    /// M8 Q12: records `ensure` calls and answers a canned result.
+    struct FakeWorktrees {
+        calls: std::sync::Mutex<Vec<EnsureCall>>,
+        answer: Result<Option<aionui_api_types::SquadWorkItemWorktree>, crate::ports::SquadWorktreeError>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::SquadWorkItemWorktreePort for FakeWorktrees {
+        async fn ensure(
+            &self,
+            _user_id: &str,
+            work_item_id: &str,
+            repo_path: Option<&str>,
+            workspace: Option<&str>,
+        ) -> Result<Option<aionui_api_types::SquadWorkItemWorktree>, crate::ports::SquadWorktreeError> {
+            self.calls.lock().unwrap().push((
+                work_item_id.to_owned(),
+                repo_path.map(str::to_owned),
+                workspace.map(str::to_owned),
+            ));
+            self.answer.clone()
+        }
+    }
+
+    fn fake_worktrees(
+        answer: Result<Option<aionui_api_types::SquadWorkItemWorktree>, crate::ports::SquadWorktreeError>,
+    ) -> Arc<FakeWorktrees> {
+        Arc::new(FakeWorktrees {
+            calls: std::sync::Mutex::new(Vec::new()),
+            answer,
+        })
+    }
+
+    async fn error_parts(err: ApiError) -> (StatusCode, serde_json::Value) {
+        let resp = axum::response::IntoResponse::into_response(err);
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn work_item_worktree_port_is_called_with_trimmed_inputs_and_errors_are_coded() {
+        let shared = aionui_api_types::SquadWorkItemWorktree {
+            id: "wt1".into(),
+            path: "/wt/one".into(),
+            branch: "wm/one".into(),
+            source_repo_path: "/repo".into(),
+            reused: true,
+        };
+        let port = fake_worktrees(Ok(Some(shared.clone())));
+        let input = SquadInstantiateInput {
+            workspace: Some("  /ws  ".into()),
+            repo_path: Some("   ".into()),
+            ..Default::default()
+        };
+        let got = ensure_work_item_worktree(port.as_ref(), "u", "w1", &input)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(shared));
+        assert_eq!(
+            port.calls.lock().unwrap().as_slice(),
+            [("w1".to_owned(), None, Some("/ws".to_owned()))]
+        );
+
+        for (answer, want_status, want_code) in [
+            (
+                crate::ports::SquadWorktreeError::InvalidSource("not a git repository".into()),
+                StatusCode::BAD_REQUEST,
+                "squad_worktree_source_invalid",
+            ),
+            (
+                crate::ports::SquadWorktreeError::Failed("git exploded".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "squad_worktree_failed",
+            ),
+        ] {
+            let port = fake_worktrees(Err(answer));
+            let err = ensure_work_item_worktree(port.as_ref(), "u", "w1", &SquadInstantiateInput::default())
+                .await
+                .unwrap_err();
+            let (status, body) = error_parts(err).await;
+            assert_eq!((status, code(&body)), (want_status, want_code.to_owned()), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_instantiate_never_touches_the_work_item_worktree() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let port = fake_worktrees(Ok(None));
+        let state = SquadRouterState {
+            repo: Arc::new(aionui_db::SqliteSquadTemplateRepository::new(db.pool().clone())),
+            catalog: Arc::new(Catalog(vec!["lead", "a"])),
+            teams: None,
+            work_item_worktrees: Some(port.clone()),
+        };
+        let app = squad_routes(state).layer(Extension(CurrentUser::local_default()));
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/squads",
+            Some(json!({ "name": "w", "leader_assistant_id": "lead", "members": [member("a")] })),
+        )
+        .await;
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        let user = CurrentUser::local_default().id;
+        sqlx::query(
+            "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) VALUES (?, ?, 'x', 0, 0)",
+        )
+        .bind(&user)
+        .bind(&user)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (item, status) in [("q-backlog", "backlog"), ("q-ok", "todo")] {
+            sqlx::query(
+                "INSERT INTO task_sessions (id, user_id, title, mode, status, agent_type, created_at, updated_at, \
+                 board_status, assignee_kind, assignee_id) VALUES (?, ?, 't', 'agent', 'draft', 'claude', 1, 1, ?, 'squad', ?)",
+            )
+            .bind(item)
+            .bind(&user)
+            .bind(status)
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let uri = format!("/api/squads/{id}/instantiate");
+        for (item, want) in [
+            ("nope", "squad_work_item_not_found"),
+            ("q-backlog", "squad_backlog_not_started"),
+            // Valid item, but no Team service: refused before any worktree.
+            ("q-ok", "squad_instantiate_unavailable"),
+        ] {
+            let (_, v) = call(
+                &app,
+                "POST",
+                &uri,
+                Some(json!({ "work_item_id": item, "repo_path": "/repo" })),
+            )
+            .await;
+            assert_eq!(code(&v), want, "{item}: {v}");
+        }
+        assert!(port.calls.lock().unwrap().is_empty(), "no worktree for a refused start");
+    }
+
     #[tokio::test]
     async fn preview_and_instantiate_block_on_ineligible_assistant() {
         let (app, db) = app(vec!["lead", "a"]).await;
@@ -1103,6 +1301,7 @@ mod tests {
             repo: Arc::new(aionui_db::SqliteSquadTemplateRepository::new(db.pool().clone())),
             catalog: Arc::new(Catalog(vec!["lead"])),
             teams: None,
+            work_item_worktrees: None,
         };
         let app2 = squad_routes(state).layer(Extension(CurrentUser::local_default()));
         let (_, v) = call(&app2, "GET", &format!("/api/squads/{id}/preview"), None).await;

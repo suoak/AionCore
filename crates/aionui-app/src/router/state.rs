@@ -419,6 +419,7 @@ pub async fn build_module_states(
                 assistant_service: assistant.service.clone(),
             }),
             teams: None,
+            work_item_worktrees: None,
         },
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
@@ -435,6 +436,16 @@ pub async fn build_module_states(
     };
     // M8 E7-2: Squad instantiation provisions through the shared Team service.
     states.squad.teams = Some(states.team.service.clone());
+    // M8 Q12: Squad instances of one work item share one managed worktree.
+    states.squad.work_item_worktrees = Some(Arc::new(
+        crate::router::worktree_adapters::SquadWorkItemWorktreeAdapter {
+            service: states.worktree.service.clone(),
+            task_sessions: Arc::new(aionui_db::SqliteTaskSessionRepository::new(
+                services.database.pool().clone(),
+            )),
+            projects: services.project_service.clone(),
+        },
+    ));
     // M8 E7-6: board cards show the run state of the linked Squad instance.
     // Weak: the team service already holds the conversation service.
     services

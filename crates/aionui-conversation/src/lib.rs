@@ -62,7 +62,7 @@ pub use service::{
 };
 pub use state::ConversationRouterState;
 pub use worktree_binding::{
-    IWorktreeBinding, WORKTREE_BINDING_EXTRA_KEYS, WorktreeBindingError, WorktreeBindingTarget,
+    IWorktreeBinding, KeptWorkItemWorktree, WORKTREE_BINDING_EXTRA_KEYS, WorktreeBindingError, WorktreeBindingTarget,
 };
 
 #[cfg(test)]

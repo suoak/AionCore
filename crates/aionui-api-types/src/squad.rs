@@ -297,6 +297,23 @@ pub struct SquadInstantiateInput {
     /// then carries this instance's `squad_run`.
     #[serde(default)]
     pub work_item_id: Option<String>,
+    /// M8 Q12: git repository for the work item's shared worktree, used only
+    /// when the work item has none yet. Must be a git repository. Without it
+    /// Core tries `workspace`, then the work item's project workspace folder.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+}
+
+/// M8 Q12: the managed worktree shared by every Squad instance of one work
+/// item. It becomes the instance's Team workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SquadWorkItemWorktree {
+    pub id: String,
+    pub path: String,
+    pub branch: String,
+    pub source_repo_path: String,
+    /// `true` when an earlier instance of the work item created it.
+    pub reused: bool,
 }
 
 /// `POST /api/squads/{id}/instantiate` response.
@@ -306,6 +323,10 @@ pub struct SquadInstantiateResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_item_id: Option<String>,
     pub team: crate::TeamResponse,
+    /// M8 Q12: present when the instance runs in the work item's shared
+    /// worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<SquadWorkItemWorktree>,
 }
 
 /// M8 E7-5: Squad run state shown on board cards / team page

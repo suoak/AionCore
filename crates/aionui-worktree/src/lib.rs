@@ -14,6 +14,10 @@
 //! holds the worktree (`conversation_id`); deleting the conversation marks
 //! it `unbound` and keeps the directory.
 //!
+//! Work item sharing (M8 Q12 / D7-3): [`work_item`] gives every Squad
+//! instance of one E6 work item the same worktree (`task_session_id` =
+//! work item id); closing the item only marks it, never removes it.
+//!
 //! Fan-out (E3-4): [`fanout`] runs one prompt through 2..=5 assistants, each
 //! in its own worktree slot, then compares and adopts one
 //! (`/api/fanout-groups*`, [`fanout_routes`]).
@@ -31,6 +35,7 @@ pub mod routes;
 pub mod service;
 pub mod store;
 pub mod types;
+pub mod work_item;
 
 pub use error::WorktreeError;
 pub use events::WorktreeEvents;
@@ -42,3 +47,4 @@ pub use git_cli::{GitCli, GitCliError, GitVersion, MIN_GIT_VERSION};
 pub use routes::{WorktreeRouterState, worktree_routes};
 pub use service::{WorktreeService, WorktreeServiceConfig};
 pub use store::WorktreeStore;
+pub use work_item::{WorkItemWorktree, WorkItemWorktreeSource};

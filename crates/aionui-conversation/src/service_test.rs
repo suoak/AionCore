@@ -12312,3 +12312,114 @@ async fn e7_5_append_agent_board_comment_rejects_empty_and_missing() {
             .is_err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// M8 Q12: closing a work item keeps (only marks) its shared worktree.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct RecordingWorkItemWorktrees {
+    closed: std::sync::Mutex<Vec<(String, String)>>,
+    keep_for: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::worktree_binding::IWorktreeBinding for RecordingWorkItemWorktrees {
+    async fn resolve(
+        &self,
+        _user_id: &str,
+        _worktree_id: &str,
+    ) -> Result<crate::worktree_binding::WorktreeBindingTarget, crate::worktree_binding::WorktreeBindingError> {
+        Err(crate::worktree_binding::WorktreeBindingError::NotFound)
+    }
+
+    async fn bind(
+        &self,
+        _user_id: &str,
+        _worktree_id: &str,
+        _conversation_id: &str,
+    ) -> Result<(), crate::worktree_binding::WorktreeBindingError> {
+        Ok(())
+    }
+
+    async fn on_work_item_closed(
+        &self,
+        _user_id: &str,
+        work_item_id: &str,
+        board_status: &str,
+    ) -> Vec<crate::worktree_binding::KeptWorkItemWorktree> {
+        self.closed
+            .lock()
+            .unwrap()
+            .push((work_item_id.to_owned(), board_status.to_owned()));
+        if self.keep_for.lock().unwrap().as_deref() == Some(work_item_id) {
+            vec![crate::worktree_binding::KeptWorkItemWorktree {
+                worktree_id: "wt-q12".into(),
+                path: "/data/worktrees/repo/wt-q12".into(),
+                branch: "wm/q12-fix".into(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[tokio::test]
+async fn closing_a_work_item_notes_the_kept_shared_worktree() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskBoardReviewDecision, TaskBoardReviewRequest, TaskBoardStatus as S};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let worktrees = Arc::new(RecordingWorkItemWorktrees::default());
+    service.with_worktree_binding(worktrees.clone());
+
+    // Approve → done: marked and noted on the timeline.
+    let done = board_task(&service, TaskSessionMode::Agent).await;
+    *worktrees.keep_for.lock().unwrap() = Some(done.clone());
+    for step in [S::Todo, S::InProgress, S::InReview] {
+        service
+            .update_task_board("user_1", &done, BoardActor::User, move_to(step))
+            .await
+            .unwrap();
+    }
+    assert!(worktrees.closed.lock().unwrap().is_empty(), "only done/cancelled mark");
+    service
+        .review_task_board(
+            "user_1",
+            &done,
+            BoardActor::User,
+            TaskBoardReviewRequest {
+                decision: TaskBoardReviewDecision::Approve,
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    let timeline = service.list_task_comments("user_1", &done).await.unwrap();
+    let note = timeline.last().unwrap();
+    assert_eq!(note.author_kind, "system");
+    assert_eq!(note.author_id, "worktree");
+    assert_eq!(format!("{:?}", note.kind), "Comment");
+    assert!(note.body.contains("已完成"), "{}", note.body);
+    assert!(note.body.contains("/data/worktrees/repo/wt-q12"), "{}", note.body);
+    assert!(note.body.contains("wm/q12-fix"), "{}", note.body);
+    assert!(note.body.contains("未删除"), "{}", note.body);
+
+    // Cancelled without a shared worktree: hook runs, no note.
+    let cancelled = board_task(&service, TaskSessionMode::Agent).await;
+    service
+        .update_task_board("user_1", &cancelled, BoardActor::User, move_to(S::Cancelled))
+        .await
+        .unwrap();
+    let timeline = service.list_task_comments("user_1", &cancelled).await.unwrap();
+    assert!(timeline.iter().all(|c| c.author_kind != "system"), "{timeline:?}");
+    assert_eq!(
+        worktrees.closed.lock().unwrap().as_slice(),
+        [
+            (done.clone(), "done".to_owned()),
+            (cancelled.clone(), "cancelled".to_owned())
+        ]
+    );
+}

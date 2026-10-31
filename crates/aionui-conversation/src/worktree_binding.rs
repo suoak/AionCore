@@ -65,6 +65,25 @@ pub trait IWorktreeBinding: Send + Sync {
     /// Atomically attach `conversation_id`. Must fail with `AlreadyBound` when
     /// another conversation won the race since [`IWorktreeBinding::resolve`].
     async fn bind(&self, user_id: &str, worktree_id: &str, conversation_id: &str) -> Result<(), WorktreeBindingError>;
+
+    /// M8 Q12: the work item reached `done` / `cancelled`. Mark (never
+    /// remove) its shared worktrees and return what was kept, best effort.
+    async fn on_work_item_closed(
+        &self,
+        _user_id: &str,
+        _work_item_id: &str,
+        _board_status: &str,
+    ) -> Vec<KeptWorkItemWorktree> {
+        Vec::new()
+    }
+}
+
+/// M8 Q12: a work item's shared worktree kept after the item closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptWorkItemWorktree {
+    pub worktree_id: String,
+    pub path: String,
+    pub branch: String,
 }
 
 /// Remove server-owned worktree keys from a client create body. Returns

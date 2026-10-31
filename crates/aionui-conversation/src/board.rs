@@ -594,9 +594,60 @@ impl ConversationService {
         if request.board_status == Some(TaskBoardStatus::Backlog) && from != TaskBoardStatus::Backlog {
             self.pause_squad_after_backlog(user_id, id).await;
         }
+        if let Some(to) = request.board_status
+            && to != from
+        {
+            self.note_work_item_closed(user_id, id, to).await;
+        }
         self.decorate_squad_run(user_id, &mut item).await;
         self.publish_board_updated(user_id, TaskBoardChange::Board, from, &item);
         Ok(item)
+    }
+
+    /// M8 Q12: a work item entering `done` / `cancelled` keeps its shared
+    /// Squad worktree. The worktree is only marked (trace +
+    /// `worktree.changed`) and a system comment tells the user where it is;
+    /// nothing is removed. Best effort: never fails the board write.
+    async fn note_work_item_closed(&self, user_id: &str, id: &str, to: TaskBoardStatus) {
+        if !matches!(to, TaskBoardStatus::Done | TaskBoardStatus::Cancelled) {
+            return;
+        }
+        let Some(binding) = self.worktree_binding_optional() else {
+            return;
+        };
+        let kept = binding.on_work_item_closed(user_id, id, to.as_str()).await;
+        if kept.is_empty() {
+            return;
+        }
+        let label = if to == TaskBoardStatus::Done {
+            "已完成"
+        } else {
+            "已取消"
+        };
+        let list = kept
+            .iter()
+            .map(|wt| format!("{}（分支 {}）", wt.path, wt.branch))
+            .collect::<Vec<_>>()
+            .join("；");
+        let body = format!("工作项{label}；共享 worktree 已保留，未删除：{list}");
+        let Ok(repo) = self.task_board_repo() else {
+            return;
+        };
+        match repo
+            .append_comment(&AppendTaskCommentParams {
+                user_id,
+                task_session_id: id,
+                author_kind: "system",
+                author_id: "worktree",
+                kind: "comment",
+                body: &body,
+                created_at: now_ms(),
+            })
+            .await
+        {
+            Ok(row) => self.publish_comment(EVENT_TASK_COMMENT_CREATED, user_id, comment_response(row)),
+            Err(error) => tracing::warn!(task_session_id = %id, %error, "failed to record kept work item worktree"),
+        }
     }
 
     /// `POST /api/task-sessions/{id}/review` (user credential only).
@@ -649,6 +700,9 @@ impl ConversationService {
                 now,
             )
             .await?;
+        if to != from {
+            self.note_work_item_closed(user_id, id, to).await;
+        }
         let mut item = item_response(row)?;
         self.decorate_squad_run(user_id, &mut item).await;
         self.publish_board_updated(user_id, TaskBoardChange::Review, from, &item);

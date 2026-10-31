@@ -2750,7 +2750,7 @@ impl ConversationService {
         }
     }
 
-    fn worktree_binding_optional(&self) -> Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>> {
+    pub(crate) fn worktree_binding_optional(&self) -> Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>> {
         self.worktree_binding.read().ok().and_then(|guard| guard.clone())
     }
 
