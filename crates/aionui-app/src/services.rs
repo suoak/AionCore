@@ -254,8 +254,17 @@ impl AppServices {
         // masking an existing-but-unreadable row).
         let env_encryption_secret = std::env::var("AIONUI_ENCRYPTION_SECRET").ok();
         let db_encryption_secret = system_user.as_ref().and_then(|u| u.encryption_secret.as_deref());
+        // E12-6: the desktop launcher may hand over its safeStorage (OS
+        // keychain) copy of the root. It is only ever a mirror of the persisted
+        // column, so it is used solely when it matches; any disagreement keeps
+        // the database value, which is what existing ciphertext was sealed with.
+        let keychain_root = keychain_encryption_root(config.encryption_root.as_ref(), db_encryption_secret);
+        let explicit_encryption_secret = env_encryption_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(keychain_root);
         let (encryption_secret, encryption_is_new) =
-            resolve_encryption_secret(env_encryption_secret.as_deref(), db_encryption_secret, &secret);
+            resolve_encryption_secret(explicit_encryption_secret, db_encryption_secret, &secret);
 
         // Persist a seeded/generated encryption secret so it survives restarts
         // and stays stable when the signing secret later rotates. Only persist
@@ -610,9 +619,76 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     service
 }
 
+/// Accept the desktop keychain copy of the storage-encryption root only when
+/// it equals the persisted `users.encryption_secret` (E12-6).
+///
+/// The keychain value is a mirror written by the launcher from the database
+/// column, never a freshly generated key, so on a mismatch (restored or
+/// swapped database) or when the column is still empty (first boot, not yet
+/// seeded) the database / seed path stays authoritative and nothing that is
+/// already encrypted can become unreadable.
+fn keychain_encryption_root<'a>(
+    keychain: Option<&'a crate::config::EncryptionRoot>,
+    db_secret: Option<&str>,
+) -> Option<&'a str> {
+    let keychain = keychain?.expose();
+    match db_secret.filter(|s| !s.is_empty()) {
+        Some(db) if db == keychain => {
+            tracing::info!("storage-encryption root verified against the desktop keychain copy");
+            Some(keychain)
+        }
+        Some(_) => {
+            tracing::warn!("desktop keychain encryption root does not match the database; using the database secret");
+            None
+        }
+        None => {
+            tracing::warn!("desktop keychain encryption root provided before the database secret exists; ignoring it");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keychain_root_is_used_only_when_it_matches_the_database() {
+        let root = crate::config::EncryptionRoot::parse("db-secret").unwrap();
+        assert_eq!(
+            keychain_encryption_root(Some(&root), Some("db-secret")),
+            Some("db-secret")
+        );
+        assert_eq!(keychain_encryption_root(Some(&root), Some("other")), None);
+        assert_eq!(keychain_encryption_root(Some(&root), Some("")), None);
+        assert_eq!(keychain_encryption_root(Some(&root), None), None);
+        assert_eq!(keychain_encryption_root(None, Some("db-secret")), None);
+    }
+
+    #[tokio::test]
+    async fn mismatched_keychain_root_never_replaces_the_persisted_secret() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let users = SqliteUserRepository::new(db.pool().clone());
+        // First boot seeds and persists the encryption secret.
+        AppServices::from_config(db.clone(), &AppConfig::default())
+            .await
+            .unwrap();
+        let seeded = users
+            .get_system_user()
+            .await
+            .unwrap()
+            .unwrap()
+            .encryption_secret
+            .unwrap();
+
+        let config = AppConfig {
+            encryption_root: crate::config::EncryptionRoot::parse("not-the-db-secret"),
+            ..AppConfig::default()
+        };
+        AppServices::from_config(db.clone(), &config).await.unwrap();
+        let after = users.get_system_user().await.unwrap().unwrap().encryption_secret;
+        assert_eq!(after.as_deref(), Some(seeded.as_str()));
+    }
 
     #[tokio::test]
     async fn test_app_services_from_memory_db() {

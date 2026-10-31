@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use aionui_app::{AppConfig, IdentityMode};
+use aionui_app::{AppConfig, ENCRYPTION_STDIN_ENV, EncryptionRoot, IdentityMode};
 use aionui_db::Database;
 use aionui_runtime::ShellProbeStatus;
 
@@ -84,6 +84,17 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         None
     };
 
+    // The keychain root rides on the line after the local API secret, so it is
+    // only read when that handshake is active.
+    let encryption_root = if local_api_secret.is_some() {
+        resolve_encryption_root(std::env::var(ENCRYPTION_STDIN_ENV).ok().as_deref(), || {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).map(|_| line)
+        })
+    } else {
+        None
+    };
+
     let config = AppConfig {
         host: cli.host.clone(),
         port: cli.port,
@@ -100,6 +111,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         identity_mode,
         bootstrap_secret,
         local_api_secret,
+        encryption_root,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
@@ -112,6 +124,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         },
         bootstrap_secret_configured = config.bootstrap_secret.is_some(),
         local_api_secret_configured = config.local_api_secret.is_some(),
+        keychain_encryption_root_provided = config.encryption_root.is_some(),
         "startup: identity mode resolved"
     );
     if cli.command.is_none() && aionui_auth::HostAllowlist::new(&config.host, &config.allowed_hosts).allows_any() {
@@ -164,6 +177,37 @@ fn resolve_local_api_secret(
         )
         .with_source(error)
     })
+}
+
+/// Read the desktop keychain copy of the storage-encryption root (E12-6).
+///
+/// Opt-in via `AIONUI_ENCRYPTION_STDIN=1`; the value is the stdin line after
+/// the local API secret. Unlike the local API secret this fails *open*: a
+/// missing or unreadable value only means Core keeps using the persisted
+/// `users.encryption_secret`, which is always the source of truth, so no
+/// stored ciphertext can become undecryptable.
+fn resolve_encryption_root(
+    stdin_flag: Option<&str>,
+    read_line: impl FnOnce() -> std::io::Result<String>,
+) -> Option<EncryptionRoot> {
+    if stdin_flag.map(str::trim) != Some("1") {
+        return None;
+    }
+    match read_line() {
+        Ok(line) => {
+            let root = EncryptionRoot::parse(&line);
+            if root.is_none() {
+                warn!(
+                    "launcher opted into the keychain encryption root but sent an empty value; using the database secret"
+                );
+            }
+            root
+        }
+        Err(error) => {
+            warn!(%error, "failed to read the keychain encryption root from stdin; using the database secret");
+            None
+        }
+    }
 }
 
 fn validate_identity_environment(
@@ -357,6 +401,20 @@ mod tests {
         .unwrap()
         .expect("secret");
         assert!(secret.matches("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"));
+    }
+
+    #[test]
+    fn encryption_root_is_opt_in_and_fails_open() {
+        let unread = || -> std::io::Result<String> { panic!("stdin must not be read without the flag") };
+        assert!(resolve_encryption_root(None, unread).is_none());
+        assert!(resolve_encryption_root(Some("0"), unread).is_none());
+
+        let root = resolve_encryption_root(Some("1"), || Ok("  root-secret\n".to_owned())).expect("root");
+        assert_eq!(root.expose(), "root-secret");
+        assert_eq!(format!("{root:?}"), "EncryptionRoot(<redacted>)");
+
+        assert!(resolve_encryption_root(Some("1"), || Ok("\n".to_owned())).is_none());
+        assert!(resolve_encryption_root(Some("1"), || Err(std::io::Error::other("closed"))).is_none());
     }
 
     #[test]
