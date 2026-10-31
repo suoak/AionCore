@@ -29,7 +29,9 @@ fn now_ms() -> i64 {
 }
 
 fn to_dto(row: InboxItemRow) -> InboxItemDto {
+    let origin = aionui_api_types::inbox_origin(&row.dedupe_key, &row.kind, &row.title).map(str::to_owned);
     InboxItemDto {
+        origin,
         id: row.id,
         kind: row.kind,
         source_kind: row.source_kind,
@@ -485,6 +487,54 @@ mod tests {
         assert_eq!(items[0].task_session_id.as_deref(), Some("t1"));
         assert_eq!(items[0].title, "Conversation");
         assert_eq!(items[0].kind, "blocked");
+    }
+
+    #[tokio::test]
+    async fn batch_and_autopilot_items_carry_their_origin() {
+        let repo = repo().await;
+        let batch = UpsertInboxItemParams {
+            kind: "failed",
+            source_kind: "fanout_group",
+            source_id: "bj_1",
+            conversation_id: None,
+            title: "Batch failed: Release check",
+            summary: Some("1 passed · 1 failed · 0 timed out (of 2)"),
+            ..item("u1", "batch:bj_1", 10)
+        };
+        repo.upsert(&batch).await.expect("batch upsert");
+        let autopilot = UpsertInboxItemParams {
+            kind: "failed",
+            title: "Autopilot: Nightly",
+            ..item("u1", "turn:c1", 20)
+        };
+        repo.upsert(&autopilot).await.expect("autopilot upsert");
+        repo.upsert(&item("u1", "turn:c2", 30)).await.expect("plain upsert");
+        // A re-run refreshes the same batch row instead of adding one.
+        repo.upsert(&UpsertInboxItemParams {
+            kind: "completed",
+            title: "Batch completed: Release check",
+            created_at: 40,
+            ..batch
+        })
+        .await
+        .expect("batch refresh");
+
+        let res = list_inbox(&repo, "u1", InboxListQuery::default(), 50)
+            .await
+            .expect("list");
+        assert_eq!(res.items.len(), 3);
+        let by_source = |id: &str| res.items.iter().find(|i| i.source_id == id).expect("item");
+        let b = by_source("bj_1");
+        assert_eq!((b.origin.as_deref(), b.kind.as_str()), (Some("batch"), "completed"));
+        assert_eq!(b.source_kind, "fanout_group");
+        let plain: Vec<_> = res.items.iter().filter(|i| i.source_id == "c1").collect();
+        assert_eq!(plain.len(), 2);
+        let a = plain
+            .iter()
+            .find(|i| i.title.starts_with("Autopilot"))
+            .expect("autopilot");
+        assert_eq!(a.origin.as_deref(), Some("autopilot"));
+        assert!(plain.iter().any(|i| i.origin.is_none()));
     }
 
     #[test]

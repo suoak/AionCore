@@ -14,6 +14,7 @@
 //! - [`validate`]: create-request validation, defaults and caps.
 //! - [`runner`]: per-job drivers — scheduling, concurrency, timeouts.
 //! - [`service`]: the API surface (trial gate, scale, retry, cancel, export).
+//! - [`summary`]: the end-of-job Inbox summary (`batch:{id}`).
 //! - [`port`]: what the runner needs from the app, implemented in `aionui-app`.
 
 pub mod checks;
@@ -22,6 +23,7 @@ pub mod port;
 pub mod routes;
 pub mod runner;
 pub mod service;
+pub mod summary;
 pub mod template;
 pub mod validate;
 
@@ -31,5 +33,6 @@ pub use port::{AttemptOutcome, BatchEvent, IBatchExecutor, ItemSpec, PreparedIte
 pub use routes::{BatchRouterState, batch_routes};
 pub use runner::{BatchRunner, BatchRunnerConfig};
 pub use service::{BatchService, INTERRUPTED_ERROR, item_response, job_response};
+pub use summary::{BatchSummary, BatchSummaryCounts, batch_inbox_key, summarize};
 pub use template::PromptTemplate;
 pub use validate::{TargetLocation, ValidatedBatchJob, target_location, validate_create};
