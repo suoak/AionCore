@@ -827,6 +827,43 @@ mod tests {
     }
 
     #[test]
+    fn batch_routes_are_denied() {
+        // M8 E8: an agent must not fan work out across repositories itself.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            for path in [
+                "/api/batch",
+                "/api/batch?limit=5",
+                "/api/batch/bj_1",
+                "/api/batch/bj_1/items",
+                "/api/batch/bj_1/trial",
+                "/api/batch/bj_1/scale",
+                "/api/batch/bj_1/retry",
+                "/api/batch/bj_1/cancel",
+                "/api/batch/bj_1/export.csv",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+        assert!(
+            !READ_PREFIXES
+                .iter()
+                .any(|p| has_prefix("/api/batch", p) || has_prefix(p, "/api/batch"))
+        );
+        assert!(!READ_LIKE_POSTS.iter().any(|p| has_prefix(p, "/api/batch")));
+    }
+
+    #[test]
     fn rename_only_patch_detection() {
         assert!(is_rename_only_patch(br#"{"name":"new title"}"#));
         assert!(!is_rename_only_patch(

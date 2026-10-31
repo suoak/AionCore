@@ -11,6 +11,8 @@ edition.workspace = true
 aionui-common.workspace = true
 aionui-db.workspace = true
 aionui-api-types.workspace = true
+aionui-auth.workspace = true
+axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -23,5 +25,7 @@ async-trait.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 
 [dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }

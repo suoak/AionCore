@@ -406,6 +406,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // no agent allowlist either).
     let fanout_authenticated = aionui_worktree::fanout_routes(states.fanout)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    // M8 E8 batch routes: user identity only (`/api/batch` is on no agent
+    // allowlist).
+    let batch_authenticated = aionui_batch::batch_routes(states.batch)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Office proxy routes serve iframe content but still require auth so
     // preview ports remain scoped to the active Core user.
@@ -480,6 +484,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(delivery_authenticated)
         .merge(worktree_authenticated)
         .merge(fanout_authenticated)
+        .merge(batch_authenticated)
         .merge(session_message_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)

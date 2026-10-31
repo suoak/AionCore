@@ -20,6 +20,7 @@ discord = ["aionui-channel/discord"]
 [dependencies]
 aionui-common.workspace = true
 aionui-assets.workspace = true
+aionui-batch.workspace = true
 aionui-db.workspace = true
 aionui-api-types.workspace = true
 aionui-realtime.workspace = true
@@ -44,6 +45,7 @@ aionui-sidebar.workspace = true
 aionui-assistant.workspace = true
 aionui-review.workspace = true
 aionui-worktree.workspace = true
+fs2.workspace = true
 aionui-runtime.workspace = true
 aionui-process.workspace = true
 aion-config.workspace = true
