@@ -1,5 +1,6 @@
-//! M8 E9-1: desktop↔phone pairing and the device-token channel.
-use std::sync::Arc;
+//! M8 E9-1/E9-2: desktop↔phone pairing, the device-token channel, and
+//! device management.
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -23,6 +24,7 @@ struct Ctx {
     devices: Arc<dyn IUserDeviceRepository>,
     user_id: String,
     jwt: String,
+    revoked: Arc<Mutex<Vec<String>>>,
     _db: aionui_db::Database,
 }
 
@@ -44,9 +46,12 @@ async fn setup() -> Ctx {
         agent_conversation_access: None,
         devices: Some(devices.clone()),
     };
+    let revoked = Arc::new(Mutex::new(Vec::new()));
+    let revoked_log = revoked.clone();
     let router_state = DeviceRouterState {
         devices: devices.clone(),
         pairings: Arc::new(DevicePairingStore::new()),
+        on_revoked: Some(Arc::new(move |row| revoked_log.lock().unwrap().push(row.id.clone()))),
     };
     let echo = |user: Extension<CurrentUser>, device: Option<Extension<DevicePrincipal>>| async move {
         axum::Json(json!({
@@ -78,6 +83,7 @@ async fn setup() -> Ctx {
         devices,
         user_id: user.id,
         jwt,
+        revoked,
         _db: db,
     }
 }
@@ -103,11 +109,18 @@ async fn call(app: &Router, method: &str, uri: &str, bearer: Option<&str>, body:
 /// JWT-authenticated desktop calls are POSTs; the CSRF layer wants the
 /// double-submit pair, which a real WebUI sends.
 async fn desktop_post(ctx: &Ctx, uri: &str) -> (StatusCode, Value) {
-    let req = Request::post(uri)
+    desktop(ctx, "POST", uri, None).await
+}
+
+async fn desktop(ctx: &Ctx, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
         .header(header::AUTHORIZATION, format!("Bearer {}", ctx.jwt))
         .header(header::COOKIE, "aionui-csrf-token=t")
         .header("x-csrf-token", "t")
-        .body(Body::empty())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
         .unwrap();
     let resp = ctx.app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
@@ -298,6 +311,81 @@ async fn desktop_can_reject_and_offers_stop_at_five_devices() {
     let (status, body) = desktop_post(&ctx, "/api/auth/devices/pair/offers").await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["code"], "DEVICE_LIMIT_REACHED");
+}
+
+#[tokio::test]
+async fn desktop_lists_renames_and_revokes_devices() {
+    let ctx = setup().await;
+    let phone = pair(&ctx).await;
+    let tablet = pair(&ctx).await;
+    let phone_token = phone["device_token"].as_str().unwrap();
+    let tablet_token = tablet["device_token"].as_str().unwrap();
+    let phone_id = phone["device_id"].as_str().unwrap();
+
+    let (status, list) = desktop(&ctx, "GET", "/api/auth/devices", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = list["data"].as_array().unwrap().clone();
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().all(|d| d.get("token_hash").is_none()));
+    assert_eq!(list[0]["scopes"], json!(["mobile_default"]));
+
+    let uri = format!("/api/auth/devices/{phone_id}");
+    let (status, renamed) = desktop(&ctx, "PATCH", &uri, Some(json!({"name": " Work phone "}))).await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["data"]["name"], "Work phone");
+    let (status, _) = desktop(&ctx, "PATCH", &uri, Some(json!({"name": ""}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A device cannot manage devices, not even itself.
+    for (method, path) in [("GET", "/api/auth/devices".to_owned()), ("DELETE", uri.clone())] {
+        let (status, body) = call(&ctx.app, method, &path, Some(phone_token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+    }
+
+    let (status, _) = desktop(&ctx, "DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(*ctx.revoked.lock().unwrap(), vec![phone_id.to_owned()]);
+    let (status, _) = desktop(&ctx, "DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = desktop(&ctx, "PATCH", &uri, Some(json!({"name": "x"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The revoked phone is out on its next request; the tablet and the
+    // desktop session are unaffected.
+    let (status, _) = call(&ctx.app, "GET", "/api/conversations", Some(phone_token), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(&ctx.app, "GET", "/api/conversations", Some(tablet_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, list) = desktop(&ctx, "GET", "/api/auth/devices", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn devices_of_another_user_cannot_be_touched() {
+    let ctx = setup().await;
+    let other = ctx
+        .devices
+        .create_within_limit(
+            &CreateUserDeviceParams {
+                user_id: "someone-else",
+                name: "theirs",
+                platform: "ios",
+                token_hash: "h",
+                scopes: r#"["mobile_default"]"#,
+                created_at: aionui_common::now_ms(),
+            },
+            5,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let uri = format!("/api/auth/devices/{}", other.id);
+    let (status, _) = desktop(&ctx, "DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = desktop(&ctx, "PATCH", &uri, Some(json!({"name": "mine"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(ctx.revoked.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -103,4 +103,15 @@ impl IUserDeviceRepository for SqliteUserDeviceRepository {
         .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn rename(&self, user_id: &str, id: &str, name: &str) -> Result<bool, DbError> {
+        let result =
+            sqlx::query("UPDATE user_devices SET name = ? WHERE user_id = ? AND id = ? AND revoked_at IS NULL")
+                .bind(name)
+                .bind(user_id)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }

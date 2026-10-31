@@ -1658,19 +1658,35 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         if validator_marker.as_deref() == Some(token) {
             return true;
         }
+        // Device tokens (E9-2) are checked against the store at connect
+        // time; a revocation closes their sockets directly.
+        if aionui_auth::device::token::is_device_token(token) {
+            return true;
+        }
         jwt_service.verify(token).is_ok()
     });
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
     let identity_mode = services.identity_mode;
     let resolver_marker = local_marker.clone();
+    let user_devices = services.user_devices.clone();
     let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
+        let user_devices = user_devices.clone();
         let is_local_desktop = resolver_marker.as_deref() == Some(token.as_str());
         Box::pin(async move {
             if is_local_desktop {
                 return Some("system_default_user".to_owned());
+            }
+            if aionui_auth::device::token::is_device_token(&token) {
+                return crate::router::device_ws::resolve_device_ws_user(
+                    user_devices.as_ref(),
+                    user_repo.as_ref(),
+                    identity_mode,
+                    &token,
+                )
+                .await;
             }
             let payload = jwt_service.verify(&token).ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
@@ -1693,7 +1709,10 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
-        router,
+        router: Arc::new(crate::router::device_ws::DeviceInboundGuard {
+            inner: router,
+            manager: services.ws_manager.clone(),
+        }),
         token_validator,
         token_user_resolver,
         token_extractor,
