@@ -25,9 +25,56 @@ pub(crate) struct ChannelAutopilotNotifier {
 
 /// Resolved IM destination.
 #[derive(Debug, PartialEq, Eq)]
-struct ImTarget {
-    plugin_id: String,
-    chat_id: String,
+pub(crate) struct ImTarget {
+    pub(crate) plugin_id: String,
+    pub(crate) chat_id: String,
+}
+
+/// Resolve an IM channel session id (`assistant_sessions.id`) owned by
+/// `user_id` to a deliverable destination; the plugin id is the platform type
+/// of the paired channel user. Shared by Autopilot and device push (E9-6).
+pub(crate) async fn resolve_im_target(
+    channel_repo: &dyn IChannelRepository,
+    user_id: &str,
+    channel_id: &str,
+) -> Result<ImTarget, String> {
+    let session = channel_repo
+        .get_session(user_id, channel_id)
+        .await
+        .map_err(|e| format!("failed to load notify channel: {e}"))?
+        .ok_or_else(|| format!("notify channel '{channel_id}' not found"))?;
+    let chat_id = session
+        .chat_id
+        .filter(|chat| !chat.trim().is_empty())
+        .ok_or_else(|| format!("notify channel '{channel_id}' has no chat to deliver to"))?;
+    let channel_user = channel_repo
+        .get_all_users(user_id)
+        .await
+        .map_err(|e| format!("failed to load notify channel user: {e}"))?
+        .into_iter()
+        .find(|user| user.id == session.user_id)
+        .ok_or_else(|| format!("notify channel '{channel_id}' has no paired user"))?;
+    Ok(ImTarget {
+        plugin_id: channel_user.platform_type,
+        chat_id,
+    })
+}
+
+/// Plain-text IM message.
+pub(crate) fn im_text_message(text: String) -> UnifiedOutgoingMessage {
+    UnifiedOutgoingMessage {
+        message_type: OutgoingMessageType::Text,
+        text: Some(text),
+        parse_mode: None,
+        buttons: None,
+        keyboard: None,
+        image_url: None,
+        file_url: None,
+        file_name: None,
+        media_actions: None,
+        reply_to_message_id: None,
+        silent: None,
+    }
 }
 
 impl ChannelAutopilotNotifier {
@@ -43,31 +90,8 @@ impl ChannelAutopilotNotifier {
         }
     }
 
-    /// `notify_channel_id` is an `assistant_sessions.id` owned by the user;
-    /// the plugin id is the platform type of the paired channel user.
     async fn resolve_target(&self, user_id: &str, channel_id: &str) -> Result<ImTarget, String> {
-        let session = self
-            .channel_repo
-            .get_session(user_id, channel_id)
-            .await
-            .map_err(|e| format!("failed to load notify channel: {e}"))?
-            .ok_or_else(|| format!("notify channel '{channel_id}' not found"))?;
-        let chat_id = session
-            .chat_id
-            .filter(|chat| !chat.trim().is_empty())
-            .ok_or_else(|| format!("notify channel '{channel_id}' has no chat to deliver to"))?;
-        let channel_user = self
-            .channel_repo
-            .get_all_users(user_id)
-            .await
-            .map_err(|e| format!("failed to load notify channel user: {e}"))?
-            .into_iter()
-            .find(|user| user.id == session.user_id)
-            .ok_or_else(|| format!("notify channel '{channel_id}' has no paired user"))?;
-        Ok(ImTarget {
-            plugin_id: channel_user.platform_type,
-            chat_id,
-        })
+        resolve_im_target(self.channel_repo.as_ref(), user_id, channel_id).await
     }
 
     async fn deliver_im(&self, report: &AutopilotRunReport, channel_id: &str) {
@@ -78,19 +102,7 @@ impl ChannelAutopilotNotifier {
                 return;
             }
         };
-        let message = UnifiedOutgoingMessage {
-            message_type: OutgoingMessageType::Text,
-            text: Some(report.summary_text()),
-            parse_mode: None,
-            buttons: None,
-            keyboard: None,
-            image_url: None,
-            file_url: None,
-            file_name: None,
-            media_actions: None,
-            reply_to_message_id: None,
-            silent: None,
-        };
+        let message = im_text_message(report.summary_text());
         if let Err(error) = self
             .sender
             .send_message(&report.user_id, &target.plugin_id, &target.chat_id, message)

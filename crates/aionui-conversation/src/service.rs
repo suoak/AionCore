@@ -866,6 +866,7 @@ pub struct ConversationService {
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
     usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
     inbox_repo: Arc<RwLock<Option<Arc<dyn aionui_db::IInboxRepository>>>>,
+    inbox_push: Arc<RwLock<Option<Arc<dyn crate::inbox::InboxPushHook>>>>,
     task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
     /// Work-item board (M8 E6-3). `None` until the composition layer wires it.
     task_board_repo: Arc<RwLock<Option<Arc<dyn aionui_db::ITaskBoardRepository>>>>,
@@ -1028,6 +1029,7 @@ impl ConversationService {
             acp_session_repo,
             usage_event_repo: Arc::new(RwLock::new(None)),
             inbox_repo: Arc::new(RwLock::new(None)),
+            inbox_push: Arc::new(RwLock::new(None)),
             task_session_repo: Arc::new(RwLock::new(None)),
             task_board_repo: Arc::new(RwLock::new(None)),
             board_squad_run: Arc::new(RwLock::new(None)),
@@ -1106,6 +1108,17 @@ impl ConversationService {
 
     pub(crate) fn inbox_repo(&self) -> Option<Arc<dyn aionui_db::IInboxRepository>> {
         self.inbox_repo.read().ok().and_then(|guard| guard.clone())
+    }
+
+    /// M8 E9-6: hand approval / blocked inbox items to paired-device push.
+    pub fn set_inbox_push_hook(&self, hook: Arc<dyn crate::inbox::InboxPushHook>) {
+        if let Ok(mut guard) = self.inbox_push.write() {
+            *guard = Some(hook);
+        }
+    }
+
+    pub(crate) fn inbox_push_hook(&self) -> Option<Arc<dyn crate::inbox::InboxPushHook>> {
+        self.inbox_push.read().ok().and_then(|guard| guard.clone())
     }
 
     pub fn with_task_session_repo(&self, repo: Arc<dyn ITaskSessionRepository>) {
