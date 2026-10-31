@@ -61,6 +61,10 @@ pub struct AgentApprovalRecord {
     pub path: String,
     /// Secret-redacted, truncated request body for the confirmation card.
     pub summary: String,
+    /// `true` when `summary` was cut at `SUMMARY_MAX_CHARS` (4000) chars, i.e. the card
+    /// does not show the whole request (M8 E9-5: the phone then only lets
+    /// the user read it and sends them to the desktop to decide).
+    pub summary_truncated: bool,
     pub status: ApprovalStatus,
     pub created_at: i64,
     pub expires_at: i64,
@@ -117,9 +121,10 @@ pub fn request_fingerprint(method: &str, path_and_query: &str, body: &[u8]) -> [
     hasher.finalize().into()
 }
 
-fn summarize_body(body: &[u8]) -> String {
+/// Secret-redacted, pretty-printed body and whether it had to be truncated.
+fn summarize_body(body: &[u8]) -> (String, bool) {
     if body.is_empty() {
-        return String::new();
+        return (String::new(), false);
     }
     let text = match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(mut value) => {
@@ -131,9 +136,9 @@ fn summarize_body(body: &[u8]) -> String {
     if text.chars().count() > SUMMARY_MAX_CHARS {
         let mut cut: String = text.chars().take(SUMMARY_MAX_CHARS).collect();
         cut.push_str("\n…");
-        cut
+        (cut, true)
     } else {
-        text
+        (text, false)
     }
 }
 
@@ -184,6 +189,7 @@ impl AgentActionApprovals {
                 return None;
             }
             let ttl_ms = i64::try_from(APPROVAL_TTL.as_millis()).unwrap_or(i64::MAX);
+            let (summary, summary_truncated) = summarize_body(body);
             let record = AgentApprovalRecord {
                 id: random_id(),
                 user_id: user_id.to_owned(),
@@ -191,7 +197,8 @@ impl AgentActionApprovals {
                 kind,
                 method: method.to_owned(),
                 path: path_and_query.to_owned(),
-                summary: summarize_body(body),
+                summary,
+                summary_truncated,
                 status: ApprovalStatus::Pending,
                 created_at: now,
                 expires_at: now.saturating_add(ttl_ms),
@@ -475,8 +482,36 @@ mod tests {
             .unwrap();
         assert!(record.summary.contains("https://evil"));
         assert!(!record.summary.contains("sk-secret"));
+        assert!(!record.summary_truncated);
         store.resolve(&record.id, "u1", true);
         assert_eq!(fired.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn long_summary_is_truncated_and_flagged() {
+        let store = store();
+        let long = format!(r#"{{"command":"{}"}}"#, "x".repeat(SUMMARY_MAX_CHARS + 10));
+        let record = store
+            .request(
+                "u1",
+                "c1",
+                AgentActionKind::Mcp,
+                "POST",
+                "/api/mcp/servers",
+                long.as_bytes(),
+            )
+            .unwrap();
+        assert!(record.summary_truncated);
+        assert!(record.summary.ends_with('…'));
+        assert_eq!(record.summary.chars().count(), SUMMARY_MAX_CHARS + 2);
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["summary_truncated"], serde_json::Value::Bool(true));
+
+        let empty = store
+            .request("u1", "c1", AgentActionKind::Mcp, "POST", "/api/mcp/servers", b"")
+            .unwrap();
+        assert!(!empty.summary_truncated);
+        assert_eq!(serde_json::to_value(&empty).unwrap()["summary_truncated"], false);
     }
 
     #[test]
