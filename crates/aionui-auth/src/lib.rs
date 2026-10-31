@@ -6,6 +6,7 @@ pub mod agent_approval;
 pub mod agent_scope;
 mod cookie;
 mod csrf;
+pub mod device;
 mod error;
 mod extract;
 pub mod host_allowlist;
@@ -82,6 +83,12 @@ pub use middleware::{
     AgentPrincipal, AuthIdentityMode, AuthState, CurrentUser, IAgentConversationAccess, IRuntimeTokenVerifier,
     RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware,
     local_auth_middleware,
+};
+
+// Paired mobile devices (M8 E9-1)
+pub use device::{
+    DEVICE_PAIRING_EVENT, DevicePairingStore, DevicePrincipal, DeviceRouterState, PairingOfferView,
+    device_pairing_public_routes, device_pairing_user_routes,
 };
 
 // QR token store

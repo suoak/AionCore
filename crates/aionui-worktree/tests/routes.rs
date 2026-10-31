@@ -34,6 +34,7 @@ fn app(h: &Harness) -> Router {
         local_secret: Some(LocalApiSecret::parse(LOCAL_SECRET).unwrap()),
         agent_approvals: Some(Arc::new(aionui_auth::AgentActionApprovals::new())),
         agent_conversation_access: None,
+        devices: None,
     };
     worktree_routes(WorktreeRouterState {
         service: h.service.clone(),

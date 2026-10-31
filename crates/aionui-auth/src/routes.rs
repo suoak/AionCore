@@ -95,6 +95,8 @@ pub struct AuthRouterState {
     /// Per-launch desktop secret. When set (local mode), the local-only
     /// internal/WebUI-admin endpoints require it in addition to `local`.
     pub local_api_secret: Option<LocalApiSecret>,
+    /// Paired devices (M8 E9-1): lets a device token read `/api/auth/user`.
+    pub devices: Option<Arc<dyn aionui_db::IUserDeviceRepository>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +290,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         local_secret: None,
         agent_approvals: None,
         agent_conversation_access: None,
+        devices: state.devices.clone(),
     };
 
     // Auth rate limited routes (login, qr-login)

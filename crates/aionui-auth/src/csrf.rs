@@ -57,11 +57,21 @@ pub async fn csrf_middleware(
     // hook reads that as "no answer" and denies (measured 2026-08-14: 9/9 then
     // 12/12 calls rejected across two live runs).
     let is_antigravity_hook = path.starts_with("/internal/antigravity-hook/");
+    // Paired devices (M8 E9-1) send their token as an explicit
+    // `Authorization: Bearer wmd_...` header — never an ambient cookie — so a
+    // cross-site page cannot forge one. The phone-side pairing endpoints are
+    // credentialed by the QR token / pairing id + code in the body, like
+    // `/api/auth/qr-login`.
+    let is_device_token_request = crate::extract::extract_bearer_token(request.headers())
+        .is_some_and(|token| crate::device::token::is_device_token(&token));
+    let is_device_pairing = path == "/api/auth/devices/pair/start" || path == "/api/auth/devices/pair/confirm";
     let is_exempt = path == "/login"
         || path == "/api/auth/qr-login"
         || path.starts_with("/api/auth/internal/external-users/")
         || path.starts_with("/api/auth/internal/external-sessions")
         || is_antigravity_hook
+        || is_device_token_request
+        || is_device_pairing
         || is_runtime_token_request;
 
     if needs_validation && !is_exempt {

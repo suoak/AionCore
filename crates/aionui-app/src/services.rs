@@ -80,6 +80,10 @@ pub struct AppServices {
     pub local_api_secret: Option<aionui_auth::LocalApiSecret>,
     /// Pending user approvals for configuration writes requested by agents.
     pub agent_approvals: Arc<aionui_auth::AgentActionApprovals>,
+    /// Paired mobile devices (M8 E9-1).
+    pub user_devices: Arc<dyn aionui_db::IUserDeviceRepository>,
+    /// Pending desktop↔phone pairings (M8 E9-1); in memory, 5-minute TTL.
+    pub device_pairings: Arc<aionui_auth::DevicePairingStore>,
     /// `Host` header allowlist applied to every route (DNS-rebinding defence).
     pub host_allowlist: Arc<aionui_auth::HostAllowlist>,
     pub app_version: String,
@@ -268,6 +272,23 @@ impl AppServices {
                 if let Ok(data) = serde_json::to_value(record) {
                     event_bus.broadcast(aionui_api_types::WebSocketMessage::new(
                         aionui_auth::APPROVAL_EVENT,
+                        data,
+                    ));
+                }
+            }));
+        }
+        let user_devices: Arc<dyn aionui_db::IUserDeviceRepository> =
+            Arc::new(aionui_db::SqliteUserDeviceRepository::new(database.pool().clone()));
+        let device_pairings = Arc::new(aionui_auth::DevicePairingStore::new());
+        {
+            let event_bus = event_bus.clone();
+            // The view carries `user_id`, so the WebSocket layer routes it to
+            // the owner's desktop sessions only.
+            device_pairings.set_notifier(Arc::new(move |view| {
+                use aionui_realtime::EventBroadcaster;
+                if let Ok(data) = serde_json::to_value(view) {
+                    event_bus.broadcast(aionui_api_types::WebSocketMessage::new(
+                        aionui_auth::DEVICE_PAIRING_EVENT,
                         data,
                     ));
                 }
@@ -487,6 +508,8 @@ impl AppServices {
             local_api_secret: if local { config.local_api_secret.clone() } else { None },
             host_allowlist: Arc::new(aionui_auth::HostAllowlist::new(&config.host, &config.allowed_hosts)),
             agent_approvals,
+            user_devices,
+            device_pairings,
             app_version,
             skill_paths,
             skill_repo,

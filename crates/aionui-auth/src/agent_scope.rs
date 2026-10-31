@@ -108,11 +108,11 @@ const APPROVAL_PREFIXES: &[(&str, AgentActionKind)] = &[
 pub const AGENT_WORK_ITEM_CREATE_PATH: &str = "/api/task-sessions";
 
 /// `path` matches `prefix` exactly or as a `/`-delimited parent.
-fn has_prefix(path: &str, prefix: &str) -> bool {
+pub(crate) fn has_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn normalized_path(path: &str) -> Option<&str> {
+pub(crate) fn normalized_path(path: &str) -> Option<&str> {
     let path = path.split(['?', '#']).next().unwrap_or("");
     // Refuse traversal-ish or encoded separators outright; axum routes on the
     // raw path, so a mismatch between our check and the router is a bypass.

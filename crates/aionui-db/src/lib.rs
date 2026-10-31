@@ -24,6 +24,7 @@ pub use error::{
     message_indicates_unique_violation,
 };
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
+pub use models::UserDeviceRow;
 pub use models::{
     AgentMetadataRow, AgentWorkflowRunRow, AssistantAgentCenterRow, AssistantDefinitionRevisionRow,
     AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
@@ -43,6 +44,7 @@ pub use models::{
     UpsertSkillEvolutionSettingsParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
     evolution_auto_apply_allowed, review_status_is_live,
 };
+pub use repository::SqliteUserDeviceRepository;
 pub use repository::batch::{BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams, FinishBatchItemParams};
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -75,6 +77,7 @@ pub use repository::task_session::{
     UpdateAcceptanceCriterionParams, UpdateTaskSessionParams,
 };
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
+pub use repository::user_device::{CreateUserDeviceParams, IUserDeviceRepository};
 pub use repository::{
     ActivityCursor, ArchiveScope, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,

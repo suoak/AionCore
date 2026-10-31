@@ -24,6 +24,7 @@ mod task_session;
 mod team;
 mod usage_event;
 mod user;
+mod user_device;
 mod user_order;
 
 pub use acp_session::AcpSessionRow;
@@ -77,4 +78,5 @@ pub use task_session::{
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use usage_event::UsageEventRow;
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};
+pub use user_device::UserDeviceRow;
 pub use user_order::{OrderItemType, OrderScene, UserOrderRow};

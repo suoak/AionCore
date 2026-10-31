@@ -278,6 +278,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         local: services.local,
         aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
         local_api_secret: services.local_api_secret.clone(),
+        devices: Some(services.user_devices.clone()),
     };
 
     let auth_mw_state = AuthState {
@@ -292,7 +293,16 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         agent_conversation_access: Some(Arc::new(SessionMentionReadAccess {
             grants: services.conversation_service.session_mention_grants().clone(),
         })),
+        devices: Some(services.user_devices.clone()),
     };
+
+    let device_router_state = aionui_auth::DeviceRouterState {
+        devices: services.user_devices.clone(),
+        pairings: services.device_pairings.clone(),
+    };
+    let device_pairing_public = aionui_auth::device_pairing_public_routes(device_router_state.clone());
+    let device_pairing_authenticated = aionui_auth::device_pairing_user_routes(device_router_state)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let agent_approvals_authenticated = aionui_auth::agent_approval_routes(services.agent_approvals.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -457,6 +467,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(auth_routes(auth_state))
         .merge(system_authenticated)
         .merge(agent_approvals_authenticated)
+        .merge(device_pairing_public)
+        .merge(device_pairing_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
         .merge(remote_agent_authenticated)
