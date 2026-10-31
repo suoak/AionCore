@@ -43,7 +43,7 @@ pub use models::{
     UpsertSkillEvolutionSettingsParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
     evolution_auto_apply_allowed, review_status_is_live,
 };
-pub use repository::batch::{BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams};
+pub use repository::batch::{BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams, FinishBatchItemParams};
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationInputInsert, ConversationInputUpdate, ConversationRowUpdate,

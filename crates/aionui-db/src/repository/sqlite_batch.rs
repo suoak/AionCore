@@ -3,7 +3,9 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{BatchItemRow, BatchJobRow};
-use crate::repository::batch::{BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams, IBatchRepository};
+use crate::repository::batch::{
+    BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams, FinishBatchItemParams, IBatchRepository,
+};
 
 const JOB_COLUMNS: &str = "id, user_id, title, project_id, template, agent_type, assistant_id, mode, \
      concurrency, item_timeout_sec, checks, status, trial_size, created_at, updated_at";
@@ -179,6 +181,146 @@ impl IBatchRepository for SqliteBatchRepository {
         .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn transition_job_status(
+        &self,
+        user_id: &str,
+        id: &str,
+        from: &[&str],
+        to: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        if from.is_empty() {
+            return Ok(false);
+        }
+        let sql = format!(
+            "UPDATE batch_jobs SET status = ?, updated_at = ? WHERE id = ? AND user_id = ? AND status IN ({})",
+            placeholders(from.len())
+        );
+        let mut query = sqlx::query(&sql).bind(to).bind(updated_at).bind(id).bind(user_id);
+        for status in from {
+            query = query.bind(*status);
+        }
+        Ok(query.execute(&self.pool).await?.rows_affected() > 0)
+    }
+
+    async fn start_item(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        task_session_id: &str,
+        started_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE batch_items SET status = 'running', task_session_id = ?, attempt = attempt + 1, \
+             check_results = NULL, error = NULL, started_at = ?, finished_at = NULL \
+             WHERE id = ? AND status = 'pending' \
+             AND batch_job_id IN (SELECT id FROM batch_jobs WHERE user_id = ?)",
+        )
+        .bind(task_session_id)
+        .bind(started_at)
+        .bind(item_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn finish_item(&self, user_id: &str, params: &FinishBatchItemParams<'_>) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE batch_items SET status = ?, check_results = ?, error = ?, finished_at = ? \
+             WHERE id = ? AND status = 'running' \
+             AND batch_job_id IN (SELECT id FROM batch_jobs WHERE user_id = ?)",
+        )
+        .bind(params.status)
+        .bind(params.check_results)
+        .bind(params.error)
+        .bind(params.finished_at)
+        .bind(params.item_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn reset_items(
+        &self,
+        user_id: &str,
+        batch_job_id: &str,
+        item_ids: &[String],
+        from: &[&str],
+    ) -> Result<u64, DbError> {
+        if !self.owned_job_exists(user_id, batch_job_id).await? {
+            return Err(DbError::NotFound(format!("batch job '{batch_job_id}'")));
+        }
+        if item_ids.is_empty() || from.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0;
+        let mut tx = self.pool.begin().await?;
+        // Chunked to stay far below SQLite's bound-parameter limit.
+        for chunk in item_ids.chunks(200) {
+            let sql = format!(
+                "UPDATE batch_items SET status = 'pending', check_results = NULL, error = NULL, \
+                 started_at = NULL, finished_at = NULL \
+                 WHERE batch_job_id = ? AND id IN ({}) AND status IN ({})",
+                placeholders(chunk.len()),
+                placeholders(from.len())
+            );
+            let mut query = sqlx::query(&sql).bind(batch_job_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            for status in from {
+                query = query.bind(*status);
+            }
+            total += query.execute(&mut *tx).await?.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(total)
+    }
+
+    async fn cancel_pending_items(
+        &self,
+        user_id: &str,
+        batch_job_id: &str,
+        finished_at: TimestampMs,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE batch_items SET status = 'cancelled', finished_at = ? \
+             WHERE batch_job_id = ? AND status = 'pending' \
+             AND batch_job_id IN (SELECT id FROM batch_jobs WHERE user_id = ?)",
+        )
+        .bind(finished_at)
+        .bind(batch_job_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn recover_interrupted(&self, error: &str, now: TimestampMs) -> Result<(u64, u64), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let items = sqlx::query(
+            "UPDATE batch_items SET status = 'failed', error = ?, finished_at = ? WHERE status = 'running'",
+        )
+        .bind(error)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let jobs = sqlx::query("UPDATE batch_jobs SET status = 'paused', updated_at = ? WHERE status = 'running'")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok((items, jobs))
+    }
+}
+
+fn placeholders(n: usize) -> String {
+    vec!["?"; n].join(", ")
 }
 
 #[cfg(test)]
@@ -292,6 +434,112 @@ mod tests {
         assert_eq!(got.status, "running");
         assert_eq!(got.started_at, Some(5));
         assert!(repo.get_item("u2", &first.id).await.unwrap().is_none());
+    }
+
+    async fn job_with_items(repo: &SqliteBatchRepository, user: &str, n: i64) -> (BatchJobRow, Vec<BatchItemRow>) {
+        let job_row = repo.create_job(&job(user, "J", 1)).await.unwrap();
+        let targets: Vec<String> = (1..=n).map(|i| format!(r#"{{"workspace":"/w{i}"}}"#)).collect();
+        let params: Vec<CreateBatchItemParams<'_>> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| CreateBatchItemParams {
+                seq: i as i64 + 1,
+                target: t,
+                status: "pending",
+            })
+            .collect();
+        let items = repo.insert_items(user, &job_row.id, &params).await.unwrap();
+        (job_row, items)
+    }
+
+    #[tokio::test]
+    async fn item_attempt_lifecycle_and_retry_reset() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteBatchRepository::new(db.pool().clone());
+        let (job_row, items) = job_with_items(&repo, "u1", 3).await;
+        let first = &items[0].id;
+
+        assert!(!repo.start_item("u2", first, "ts_x", 5).await.unwrap());
+        assert!(repo.start_item("u1", first, "ts_1", 5).await.unwrap());
+        assert!(
+            !repo.start_item("u1", first, "ts_dup", 6).await.unwrap(),
+            "only pending can start"
+        );
+        let finish = FinishBatchItemParams {
+            item_id: first,
+            status: "failed",
+            check_results: Some(r#"[{"kind":"file_exists","ok":false}]"#),
+            error: Some("checks failed"),
+            finished_at: 9,
+        };
+        assert!(repo.finish_item("u1", &finish).await.unwrap());
+        assert!(
+            !repo.finish_item("u1", &finish).await.unwrap(),
+            "only running can finish"
+        );
+        let got = repo.get_item("u1", first).await.unwrap().unwrap();
+        assert_eq!((got.status.as_str(), got.attempt), ("failed", 1));
+        assert_eq!(got.task_session_id.as_deref(), Some("ts_1"));
+        assert!(got.check_results.is_some());
+
+        let ids = vec![first.clone(), items[1].id.clone()];
+        assert_eq!(
+            repo.reset_items("u1", &job_row.id, &ids, &["failed", "timeout"])
+                .await
+                .unwrap(),
+            1,
+            "pending item 2 is not reset"
+        );
+        assert!(repo.reset_items("u2", &job_row.id, &ids, &["failed"]).await.is_err());
+        let got = repo.get_item("u1", first).await.unwrap().unwrap();
+        assert_eq!(got.status, "pending");
+        assert!(got.check_results.is_none() && got.error.is_none() && got.finished_at.is_none());
+        assert_eq!(
+            got.task_session_id.as_deref(),
+            Some("ts_1"),
+            "pointer kept until next start"
+        );
+
+        assert!(repo.start_item("u1", first, "ts_2", 10).await.unwrap());
+        let got = repo.get_item("u1", first).await.unwrap().unwrap();
+        assert_eq!((got.attempt, got.task_session_id.as_deref()), (2, Some("ts_2")));
+    }
+
+    #[tokio::test]
+    async fn transitions_cancel_and_boot_recovery() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteBatchRepository::new(db.pool().clone());
+        let (job_row, items) = job_with_items(&repo, "u1", 3).await;
+
+        assert!(
+            !repo
+                .transition_job_status("u1", &job_row.id, &["trial"], "running", 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.transition_job_status("u1", &job_row.id, &["draft"], "running", 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .transition_job_status("u2", &job_row.id, &["running"], "paused", 3)
+                .await
+                .unwrap()
+        );
+
+        assert!(repo.start_item("u1", &items[0].id, "ts_1", 3).await.unwrap());
+        assert_eq!(repo.cancel_pending_items("u2", &job_row.id, 4).await.unwrap(), 0);
+        assert_eq!(repo.cancel_pending_items("u1", &job_row.id, 4).await.unwrap(), 2);
+
+        assert_eq!(repo.recover_interrupted("interrupted", 5).await.unwrap(), (1, 1));
+        let got = repo.get_item("u1", &items[0].id).await.unwrap().unwrap();
+        assert_eq!(
+            (got.status.as_str(), got.error.as_deref()),
+            ("failed", Some("interrupted"))
+        );
+        assert_eq!(repo.get_job("u1", &job_row.id).await.unwrap().unwrap().status, "paused");
     }
 
     #[tokio::test]
