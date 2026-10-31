@@ -25,6 +25,36 @@ impl IdentityMode {
     }
 }
 
+/// Launcher opt-in for handing Core the desktop keychain copy of the
+/// storage-encryption root as the second stdin line (after the local API
+/// secret), so it never appears on argv or in the environment inherited by
+/// agent subprocesses.
+pub const ENCRYPTION_STDIN_ENV: &str = "AIONUI_ENCRYPTION_STDIN";
+
+/// Desktop keychain (Electron `safeStorage`) copy of the storage-encryption
+/// root. `Debug` is redacted so it never reaches logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptionRoot(String);
+
+impl EncryptionRoot {
+    /// Parse one stdin line; surrounding whitespace is ignored and an empty
+    /// value is treated as absent.
+    pub fn parse(line: &str) -> Option<Self> {
+        let value = line.trim();
+        (!value.is_empty()).then(|| Self(value.to_owned()))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for EncryptionRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EncryptionRoot(<redacted>)")
+    }
+}
+
 /// Application configuration parsed from CLI arguments.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -43,6 +73,10 @@ pub struct AppConfig {
     /// Per-launch desktop API secret (local mode), read from stdin when the
     /// launcher sets `AIONUI_LOCAL_AUTH_STDIN=1`. `Debug` is redacted.
     pub local_api_secret: Option<aionui_auth::LocalApiSecret>,
+    /// Desktop keychain copy of the storage-encryption root (E12-6), read from
+    /// stdin when the launcher sets `AIONUI_ENCRYPTION_STDIN=1`. Only honoured
+    /// when it equals the persisted `users.encryption_secret`.
+    pub encryption_root: Option<EncryptionRoot>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
@@ -91,6 +125,7 @@ impl Default for AppConfig {
             identity_mode: IdentityMode::WebUi,
             bootstrap_secret: None,
             local_api_secret: None,
+            encryption_root: None,
             dump_prompts: false,
             recover_corrupted_database: false,
         }

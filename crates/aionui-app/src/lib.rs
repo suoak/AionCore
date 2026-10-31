@@ -11,7 +11,7 @@ mod services;
 mod skill_evolution_adapters;
 mod squad_board_relay;
 
-pub use config::{AppConfig, IdentityMode, derive_encryption_key};
+pub use config::{AppConfig, ENCRYPTION_STDIN_ENV, EncryptionRoot, IdentityMode, derive_encryption_key};
 pub use router::{
     ChannelOrchestratorComponents, ModuleStates, RouterBuildError, RouterRuntime, build_assistant_state,
     build_conversation_state, build_extension_states, build_module_states, build_ws_state, create_router,
