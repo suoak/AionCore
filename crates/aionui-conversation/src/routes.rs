@@ -21,7 +21,7 @@ use aionui_api_types::{
     UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskRetryPolicyRequest,
     UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
-use aionui_auth::{AgentPrincipal, CurrentUser};
+use aionui_auth::{AgentPrincipal, CurrentUser, DevicePrincipal};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -508,14 +508,20 @@ async fn list_task_approvals(
 async fn decide_task_approval(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<DevicePrincipal>>,
     Path((id, approval_id)): Path<(String, String)>,
     body: Result<Json<DecideTaskApprovalRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TaskApprovalResponse>>, ApiError> {
     let Json(request) = body.map_err(ApiError::from)?;
+    // A paired phone answering is reported to the desktop as such (M8 E9-3).
+    let decider = match device.as_ref() {
+        Some(Extension(device)) => crate::TaskApprovalDecider::Device(&device.device_id),
+        None => crate::TaskApprovalDecider::User,
+    };
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .decide_task_approval(&user.id, &id, &approval_id, request)
+            .decide_task_approval_by(&user.id, &id, &approval_id, request, decider)
             .await?,
     )))
 }

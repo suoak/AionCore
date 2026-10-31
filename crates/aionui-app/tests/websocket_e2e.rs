@@ -730,7 +730,7 @@ async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
     };
     let app = start_app().await;
     let jwt = sign_token(&app, "user1").await;
-    let (_device_id, device_token) = seed_device(&app, "user1").await;
+    let (device_id, device_token) = seed_device(&app, "user1").await;
     let service = &app.services.conversation_service;
     let task = service
         .create_task_session(
@@ -766,6 +766,23 @@ async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
         .unwrap();
     let asked = read_event(&mut desk_rx, "task.approval.changed").await;
     assert_eq!(asked["data"]["status"], "pending");
+    assert!(asked["data"]["decided_via"].is_null());
+
+    // The desktop Inbox item names the approval it is about.
+    let inbox: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{}/api/inbox", app.addr))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox["data"]["items"][0]["approval_id"],
+        plan.approval.id.as_str(),
+        "{inbox}"
+    );
 
     // The phone answers with its device token (no cookie → CSRF-exempt).
     let resp = reqwest::Client::new()
@@ -787,6 +804,8 @@ async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
     let decided = read_event(&mut desk_rx, "task.approval.changed").await;
     assert_eq!(decided["data"]["approval_id"], plan.approval.id.as_str());
     assert_eq!(decided["data"]["status"], "approved");
+    assert_eq!(decided["data"]["decided_via"], "device");
+    assert_eq!(decided["data"]["device_id"], device_id.as_str());
     let open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_items WHERE resolved_at IS NULL")
         .fetch_one(app.services.database.pool())
         .await

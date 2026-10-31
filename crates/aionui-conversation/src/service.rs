@@ -11,6 +11,7 @@ use aionui_ai_agent::{
     audited_aion_strict_runtime_capabilities, audited_runtime_capabilities, resolve_planning_isolation,
 };
 
+use crate::inbox::TaskApprovalDecider;
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
@@ -1469,7 +1470,7 @@ impl ConversationService {
             .filter(|id| !still_pending.contains(id))
             .cloned()
             .collect();
-        self.task_approval_changed(user_id, Some(&task.title), approval, &superseded)
+        self.task_approval_changed(user_id, Some(&task.title), approval, &superseded, None)
             .await;
     }
 
@@ -1768,6 +1769,26 @@ impl ConversationService {
         approval_id: &str,
         request: DecideTaskApprovalRequest,
     ) -> Result<TaskApprovalResponse, ConversationError> {
+        self.decide_task_approval_by(
+            user_id,
+            task_session_id,
+            approval_id,
+            request,
+            TaskApprovalDecider::User,
+        )
+        .await
+    }
+
+    /// [`Self::decide_task_approval`], recording who decided it in the
+    /// `task.approval.changed` event (`decided_via` / `device_id`).
+    pub async fn decide_task_approval_by(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        approval_id: &str,
+        request: DecideTaskApprovalRequest,
+        decider: TaskApprovalDecider<'_>,
+    ) -> Result<TaskApprovalResponse, ConversationError> {
         if request
             .comment
             .as_ref()
@@ -1795,7 +1816,8 @@ impl ConversationService {
                 resolved_at: now_ms(),
             })
             .await?;
-        self.task_approval_changed(user_id, None, &row, &[]).await;
+        self.task_approval_changed(user_id, None, &row, &[], Some(decider))
+            .await;
         task_approval_response(row)
     }
 

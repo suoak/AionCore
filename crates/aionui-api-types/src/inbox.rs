@@ -22,6 +22,21 @@ pub struct InboxItemDto {
     /// [`INBOX_ORIGIN_AUTOPILOT`] (Autopilot run failure). Derived, not stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// The Plan/Goal task approval this item asks about (dedupe key
+    /// `task_approval:{id}`), so a client can match it to
+    /// `task.approval.changed` (M8 E9-3). Derived, not stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+}
+
+/// Dedupe-key prefix of a work item's Plan/Goal approval Inbox item.
+pub const TASK_APPROVAL_INBOX_KEY_PREFIX: &str = "task_approval:";
+
+/// The task approval id behind an Inbox item's dedupe key, if any.
+pub fn inbox_task_approval_id(dedupe_key: &str) -> Option<&str> {
+    dedupe_key
+        .strip_prefix(TASK_APPROVAL_INBOX_KEY_PREFIX)
+        .filter(|id| !id.is_empty())
 }
 
 /// `origin` of a batch job's end-of-job summary (dedupe key `batch:{id}`).
@@ -85,6 +100,14 @@ mod origin_tests {
     }
 
     #[test]
+    fn task_approval_id_comes_from_the_dedupe_key() {
+        assert_eq!(inbox_task_approval_id("task_approval:ap_1"), Some("ap_1"));
+        assert_eq!(inbox_task_approval_id("task_approval:"), None);
+        assert_eq!(inbox_task_approval_id("approval:c1:x"), None);
+        assert_eq!(inbox_task_approval_id("batch:bj_1"), None);
+    }
+
+    #[test]
     fn origin_is_omitted_when_absent() {
         let dto = InboxItemDto {
             id: "i".into(),
@@ -100,9 +123,11 @@ mod origin_tests {
             read_at: None,
             resolved_at: None,
             origin: None,
+            approval_id: None,
         };
         let v = serde_json::to_value(&dto).unwrap();
         assert!(v.get("origin").is_none());
+        assert!(v.get("approval_id").is_none());
         let back: InboxItemDto = serde_json::from_value(v).unwrap();
         assert_eq!(back.origin, None);
     }

@@ -18,9 +18,17 @@ pub(crate) const EVENT_INBOX_CHANGED: &str = "inbox.changed";
 /// decided (M8 E9). Lets the desktop react when the phone answers.
 pub(crate) const EVENT_TASK_APPROVAL_CHANGED: &str = "task.approval.changed";
 
+/// Who decided a Plan/Goal approval (M8 E9-3): the signed-in user on a
+/// desktop/WebUI session, or a paired device (its id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskApprovalDecider<'a> {
+    User,
+    Device(&'a str),
+}
+
 /// Inbox dedupe key of one Plan/Goal approval.
 pub(crate) fn task_approval_inbox_key(approval_id: &str) -> String {
-    format!("task_approval:{approval_id}")
+    format!("{}{approval_id}", aionui_api_types::TASK_APPROVAL_INBOX_KEY_PREFIX)
 }
 
 /// Items older than this are pruned lazily on list.
@@ -39,8 +47,10 @@ fn now_ms() -> i64 {
 
 fn to_dto(row: InboxItemRow) -> InboxItemDto {
     let origin = aionui_api_types::inbox_origin(&row.dedupe_key, &row.kind, &row.title).map(str::to_owned);
+    let approval_id = aionui_api_types::inbox_task_approval_id(&row.dedupe_key).map(str::to_owned);
     InboxItemDto {
         origin,
+        approval_id,
         id: row.id,
         kind: row.kind,
         source_kind: row.source_kind,
@@ -326,13 +336,21 @@ impl ConversationService {
     /// keep its Inbox `approval` item in step — open while pending (which
     /// also reaches IM push for paired devices), resolved otherwise.
     /// `superseded` are earlier approvals the new one cancelled or expired.
+    /// `decision` says who decided it (only for a decision, not a new
+    /// pending approval), so the desktop can say "approved on your phone".
     pub(crate) async fn task_approval_changed(
         &self,
         user_id: &str,
         task_title: Option<&str>,
         approval: &aionui_db::models::TaskApprovalRow,
         superseded: &[String],
+        decision: Option<TaskApprovalDecider<'_>>,
     ) {
+        let (decided_via, device_id) = match decision {
+            Some(TaskApprovalDecider::Device(id)) => (Some("device"), Some(id)),
+            Some(TaskApprovalDecider::User) => (Some("user"), None),
+            None => (None, None),
+        };
         self.broadcaster().broadcast(WebSocketMessage::new(
             EVENT_TASK_APPROVAL_CHANGED,
             serde_json::json!({
@@ -341,6 +359,8 @@ impl ConversationService {
                 "approval_id": approval.id,
                 "approval_type": approval.approval_type,
                 "status": approval.status,
+                "decided_via": decided_via,
+                "device_id": device_id,
             }),
         ));
         for id in superseded {
