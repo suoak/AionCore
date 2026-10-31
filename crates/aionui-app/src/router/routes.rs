@@ -45,6 +45,7 @@ use aionui_team::{TeamSessionService, team_routes};
 
 use crate::services::AppServices;
 
+use super::audit_layer::{RouteAuditState, route_audit_middleware};
 use super::fs_monitor::spawn_fs_monitor;
 use super::health::health_check;
 use aionui_session_message::{session_message_routes, session_message_user_routes};
@@ -281,6 +282,16 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         devices: Some(services.user_devices.clone()),
     };
 
+    // M8 E12-4: audit write points, mounted inside `auth_middleware` so the
+    // caller's principal extensions are visible.
+    let route_audit = RouteAuditState {
+        sink: services.audit_sink.clone(),
+        user_via: if services.identity_mode.is_local() {
+            aionui_db::AuditVia::Desktop
+        } else {
+            aionui_db::AuditVia::WebUi
+        },
+    };
     let auth_mw_state = AuthState {
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
@@ -305,143 +316,178 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 services.database.pool().clone(),
             )),
         ))),
+        audit: Some(route_audit.sink.clone()),
+        audit_via: route_audit.user_via,
     };
     let device_pairing_public = aionui_auth::device_pairing_public_routes(device_router_state.clone());
     let device_pairing_authenticated = aionui_auth::device_pairing_user_routes(device_router_state)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let audit_authenticated = aionui_auth::audit_routes(aionui_auth::AuditRouterState {
         repo: services.audit_events.clone(),
         governance: Some(services.governance.clone()),
     })
+    .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
     .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let governance_authenticated = aionui_auth::governance_routes(aionui_auth::GovernanceRouterState {
         governance: services.governance.clone(),
         users: services.user_repo.clone(),
     })
+    .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
     .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let agent_approvals_authenticated = aionui_auth::agent_approval_routes(services.agent_approvals.clone())
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // System routes protected by auth middleware
-    let system_authenticated =
-        system_routes(states.system).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let system_authenticated = system_routes(states.system)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Conversation routes protected by auth middleware
     let conversation_authenticated = conversation_routes(states.conversation.clone())
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Remote agent routes protected by auth middleware
     let remote_agent_authenticated = remote_agent_routes(states.remote_agent)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Unified agent listing/refresh/test routes protected by auth middleware
-    let agent_authenticated =
-        agent_routes(states.agent).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let agent_authenticated = agent_routes(states.agent)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Connection test routes (Bedrock, Gemini) protected by auth middleware
     let connection_test_authenticated = connection_test_routes(states.connection_test)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // File routes protected by auth middleware
-    let file_authenticated =
-        file_routes(states.file).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let file_authenticated = file_routes(states.file)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Project control-plane routes protected by auth middleware
-    let project_authenticated =
-        project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let project_authenticated = project_routes(states.project)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Sidebar read + ordering routes protected by auth middleware
-    let sidebar_authenticated =
-        sidebar_routes(states.sidebar).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let sidebar_authenticated = sidebar_routes(states.sidebar)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // MCP routes protected by auth middleware
-    let mcp_authenticated =
-        mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let mcp_authenticated = mcp_routes(states.mcp)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Extension routes protected by auth middleware
     // Settings-tab asset sessions: the short-lived path token is the
     // credential (one user, one extension, read-only assets), so no auth
     // middleware here.
     let extension_asset_sessions = extension_asset_session_routes(states.extension.clone());
-    let extension_authenticated =
-        extension_routes(states.extension).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let extension_authenticated = extension_routes(states.extension)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Hub routes protected by auth middleware
-    let hub_authenticated =
-        hub_routes(states.hub).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let hub_authenticated = hub_routes(states.hub)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Skill routes protected by auth middleware
-    let skill_authenticated =
-        skill_routes(states.skill).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let skill_authenticated = skill_routes(states.skill)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Channel routes protected by auth middleware
     #[cfg(feature = "weixin")]
     let weixin_login_authenticated = weixin_login_route(states.channel.clone())
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
-    let channel_authenticated =
-        channel_routes(states.channel).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let channel_authenticated = channel_routes(states.channel)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Team routes protected by auth middleware
-    let team_authenticated =
-        team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let team_authenticated = team_routes(states.team.clone())
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // M8 E7 Squad template routes protected by auth middleware
     let squad_authenticated = aionui_team::squad::squad_routes(states.squad.clone())
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Cron routes protected by auth middleware
-    let cron_authenticated =
-        cron_routes(states.cron).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let cron_authenticated = cron_routes(states.cron)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Office routes protected by auth middleware
-    let office_authenticated =
-        office_routes(states.office.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let office_authenticated = office_routes(states.office.clone())
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Shell + STT routes protected by auth middleware
-    let shell_authenticated =
-        shell_routes(states.shell).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let shell_authenticated = shell_routes(states.shell)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Assistant routes protected by auth middleware (T1a skeleton: all
     // handlers return 500 "not implemented"; T1b wires real service)
-    let assistant_authenticated =
-        assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let assistant_authenticated = assistant_routes(states.assistant)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let agent_center_authenticated = agent_center_routes(states.agent_center)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let skill_evolution_authenticated = skill_evolution_routes(states.skill_evolution)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // M7 E4 diff annotations. User identity only; agent tokens are denied by
     // the agent scope (prefix not allow-listed).
-    let review_authenticated =
-        review_routes(states.review).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let review_authenticated = review_routes(states.review)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     // M7 E4-5 PR delivery: user identity only, same agent-scope denial.
-    let delivery_authenticated =
-        delivery_routes(states.scm_delivery).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let delivery_authenticated = delivery_routes(states.scm_delivery)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // M7 E3 worktree routes: user identity only (agent tokens are denied by
     // `agent_scope` because `/api/worktrees` is on no allowlist).
     let worktree_authenticated = aionui_worktree::worktree_routes(states.worktree)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     // M7 E3-4 fan-out routes: user identity only (`/api/fanout-groups` is on
     // no agent allowlist either).
     let fanout_authenticated = aionui_worktree::fanout_routes(states.fanout)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     // M8 E8 batch routes: user identity only (`/api/batch` is on no agent
     // allowlist).
     let batch_authenticated = aionui_batch::batch_routes(states.batch)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Office proxy routes serve iframe content but still require auth so
     // preview ports remain scoped to the active Core user.
-    let office_proxy =
-        office_proxy_routes(states.office).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let office_proxy = office_proxy_routes(states.office)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let public_assets = asset_routes(AssetRouterState::default());
 
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
@@ -453,7 +499,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     });
     // Runtime routes authenticate on their own token header — deliberately NOT
     // behind auth_middleware, same as runtime_team_tools.
-    let session_message_runtime = session_message_routes(states.session_message.clone());
+    let session_message_runtime = session_message_routes(states.session_message.clone())
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware));
     // Agent-facing `conversation create`. Same runtime-token self-authentication
     // as the two groups above, so it is also mounted after the CSRF layer.
     let conversation_runtime = conversation_runtime_routes(ConversationRuntimeRouterState {
@@ -465,6 +512,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let skill_runtime = skill_runtime_routes(states.skill_runtime);
     // The `@@` picker's outlet goes through ordinary user auth.
     let session_message_authenticated = session_message_user_routes(states.session_message)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
