@@ -111,10 +111,11 @@ mod tests {
         let t =
             PromptTemplate::parse("Check {{ target.name }} (#{{seq}}) v={{target.version}} raw={{target}}").unwrap();
         let target = json!({"repo": "/r", "name": "alpha", "version": 3});
-        assert_eq!(
-            t.render(&target, 2).unwrap(),
-            r#"Check alpha (#2) v=3 raw={"name":"alpha","repo":"/r","version":3}"#
-        );
+        let out = t.render(&target, 2).unwrap();
+        let raw = out.strip_prefix("Check alpha (#2) v=3 raw=").expect("fields rendered");
+        // Key order depends on serde_json's `preserve_order` (feature-unified
+        // across the workspace), so compare values, not text.
+        assert_eq!(serde_json::from_str::<serde_json::Value>(raw).unwrap(), target);
         assert_eq!(t.fields().collect::<Vec<_>>(), vec!["name", "version"]);
     }
 
