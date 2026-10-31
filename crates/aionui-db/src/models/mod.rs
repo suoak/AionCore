@@ -1,6 +1,7 @@
 mod acp_session;
 mod agent_metadata;
 mod assistant;
+mod audit_event;
 mod batch;
 mod channel;
 mod client_preference;
@@ -38,6 +39,7 @@ pub use assistant::{
     UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
+pub use audit_event::AuditEventRow;
 pub use batch::{BatchItemRow, BatchJobRow};
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;

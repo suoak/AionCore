@@ -1,6 +1,7 @@
 pub mod acp_session;
 pub mod agent_metadata;
 pub mod assistant;
+pub mod audit_event;
 pub mod batch;
 pub mod channel;
 mod client_preference;
@@ -23,6 +24,7 @@ mod sqlite_acp_session;
 mod sqlite_agent_center;
 mod sqlite_agent_metadata;
 mod sqlite_assistant;
+mod sqlite_audit_event;
 mod sqlite_batch;
 mod sqlite_channel;
 mod sqlite_client_preference;
@@ -94,6 +96,7 @@ pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
 };
+pub use sqlite_audit_event::SqliteAuditEventRepository;
 pub use sqlite_batch::SqliteBatchRepository;
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;

@@ -4,6 +4,7 @@
 mod account;
 pub mod agent_approval;
 pub mod agent_scope;
+pub mod audit_routes;
 mod cookie;
 mod csrf;
 pub mod device;
@@ -84,6 +85,9 @@ pub use middleware::{
     RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware,
     local_auth_middleware,
 };
+
+// Audit ledger API (M8 E12-2)
+pub use audit_routes::{AuditRouterState, audit_routes};
 
 // Paired mobile devices (M8 E9-1)
 pub use device::{

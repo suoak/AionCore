@@ -201,6 +201,16 @@ mod tests {
     }
 
     #[test]
+    fn audit_routes_are_denied() {
+        // M8 E12-2: the audit ledger is desktop-user only.
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for path in ["/api/audit/events", "/api/audit/verify", "/api/audit/export.csv"] {
+                assert_eq!(classify_device_request(&method, path), Deny, "{method} {path}");
+            }
+        }
+    }
+
+    #[test]
     fn other_methods_are_denied() {
         for method in [Method::PUT, Method::PATCH, Method::DELETE] {
             assert_eq!(classify_device_request(&method, "/api/conversations/c1"), Deny);

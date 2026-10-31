@@ -80,6 +80,10 @@ pub struct AppServices {
     pub local_api_secret: Option<aionui_auth::LocalApiSecret>,
     /// Pending user approvals for configuration writes requested by agents.
     pub agent_approvals: Arc<aionui_auth::AgentActionApprovals>,
+    /// Append-only audit ledger (M8 E12-2).
+    pub audit_events: Arc<dyn aionui_db::IAuditEventRepository>,
+    /// Records audit events from write points (M8 E12-2).
+    pub audit_sink: aionui_db::AuditSink,
     /// Paired mobile devices (M8 E9-1).
     pub user_devices: Arc<dyn aionui_db::IUserDeviceRepository>,
     /// Pending desktop↔phone pairings (M8 E9-1); in memory, 5-minute TTL.
@@ -277,6 +281,9 @@ impl AppServices {
                 }
             }));
         }
+        let audit_events: Arc<dyn aionui_db::IAuditEventRepository> =
+            Arc::new(aionui_db::SqliteAuditEventRepository::new(database.pool().clone()));
+        let audit_sink = aionui_db::AuditSink::new(audit_events.clone());
         let user_devices: Arc<dyn aionui_db::IUserDeviceRepository> =
             Arc::new(aionui_db::SqliteUserDeviceRepository::new(database.pool().clone()));
         let device_pairings = Arc::new(aionui_auth::DevicePairingStore::new());
@@ -508,6 +515,8 @@ impl AppServices {
             local_api_secret: if local { config.local_api_secret.clone() } else { None },
             host_allowlist: Arc::new(aionui_auth::HostAllowlist::new(&config.host, &config.allowed_hosts)),
             agent_approvals,
+            audit_events,
+            audit_sink,
             user_devices,
             device_pairings,
             app_version,
