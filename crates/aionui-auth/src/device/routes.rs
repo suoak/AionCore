@@ -467,4 +467,18 @@ mod tests {
         assert!(validate_platform("IOS").is_err());
         assert!(validate_platform("symbian").is_err());
     }
+
+    #[test]
+    fn device_management_requires_a_user_session() {
+        let device = Some(Extension(DevicePrincipal {
+            device_id: "d1".into(),
+            scopes: vec!["mobile_default".into()],
+        }));
+        let agent = Some(Extension(AgentPrincipal {
+            conversation_id: "c1".into(),
+        }));
+        assert!(ensure_user_session(&None, &None).is_ok());
+        assert!(ensure_user_session(&device, &None).is_err());
+        assert!(ensure_user_session(&None, &agent).is_err());
+    }
 }

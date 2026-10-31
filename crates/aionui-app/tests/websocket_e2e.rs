@@ -699,3 +699,12 @@ async fn t8_1_device_connects_receive_only_and_is_kicked_on_revoke() {
     let msg = read_text(&mut again).await;
     assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
 }
+
+#[tokio::test]
+async fn t8_2_unknown_device_token_is_rejected() {
+    let app = start_app().await;
+    let unknown = format!("wmd_{}", "0".repeat(64));
+    let (_, mut rx) = connect_bearer(app.addr, &unknown).await;
+    let msg = read_text(&mut rx).await;
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
+}
