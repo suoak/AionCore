@@ -553,6 +553,7 @@ dependencies = [
  "aionui-api-types",
  "aionui-common",
  "aionui-db",
+ "async-trait",
  "dunce",
  "globset",
  "jsonschema",
@@ -560,6 +561,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "walkdir",
 ]

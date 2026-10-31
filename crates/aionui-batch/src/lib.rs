@@ -12,13 +12,22 @@
 //!   confined to the item workspace.
 //! - [`template`]: `{{target}}` / `{{target.<key>}}` / `{{seq}}` prompts.
 //! - [`validate`]: create-request validation, defaults and caps.
+//! - [`runner`]: per-job drivers — scheduling, concurrency, timeouts.
+//! - [`service`]: the API surface (trial gate, scale, retry, cancel, export).
+//! - [`port`]: what the runner needs from the app, implemented in `aionui-app`.
 
 pub mod checks;
 pub mod error;
+pub mod port;
+pub mod runner;
+pub mod service;
 pub mod template;
 pub mod validate;
 
 pub use checks::{CompiledChecks, all_passed};
 pub use error::BatchError;
+pub use port::{AttemptOutcome, BatchEvent, IBatchExecutor, ItemSpec, PreparedItem};
+pub use runner::{BatchRunner, BatchRunnerConfig};
+pub use service::{BatchService, INTERRUPTED_ERROR, item_response, job_response};
 pub use template::PromptTemplate;
 pub use validate::{TargetLocation, ValidatedBatchJob, target_location, validate_create};
