@@ -90,8 +90,11 @@ async fn setup() -> Ctx {
         agent_conversation_access: None,
         devices: Some(devices),
     };
-    let app = audit_routes(AuditRouterState { repo: audit })
-        .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware));
+    let app = audit_routes(AuditRouterState {
+        repo: audit,
+        governance: None,
+    })
+    .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware));
     Ctx {
         app,
         alice_jwt,

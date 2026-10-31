@@ -84,6 +84,9 @@ pub struct AppServices {
     pub audit_events: Arc<dyn aionui_db::IAuditEventRepository>,
     /// Records audit events from write points (M8 E12-2).
     pub audit_sink: aionui_db::AuditSink,
+    /// Roles, run permissions and launch policies (M8 E12-3). Roles only
+    /// apply in multi-user (WebUI) mode; desktop single-user is owner.
+    pub governance: Arc<aionui_db::GovernanceService>,
     /// Paired mobile devices (M8 E9-1).
     pub user_devices: Arc<dyn aionui_db::IUserDeviceRepository>,
     /// Pending desktop↔phone pairings (M8 E9-1); in memory, 5-minute TTL.
@@ -151,6 +154,7 @@ impl AppServices {
             project_service: self.project_service.clone(),
             user_order_store: self.user_order_store.clone(),
         });
+        self.conversation_service.with_governance(self.governance.clone());
         self
     }
 
@@ -284,6 +288,11 @@ impl AppServices {
         let audit_events: Arc<dyn aionui_db::IAuditEventRepository> =
             Arc::new(aionui_db::SqliteAuditEventRepository::new(database.pool().clone()));
         let audit_sink = aionui_db::AuditSink::new(audit_events.clone());
+        let governance = Arc::new(aionui_db::GovernanceService::new(
+            Arc::new(aionui_db::SqliteGovernanceRepository::new(database.pool().clone())),
+            Some(audit_sink.clone()),
+            !identity_mode.is_local(),
+        ));
         let user_devices: Arc<dyn aionui_db::IUserDeviceRepository> =
             Arc::new(aionui_db::SqliteUserDeviceRepository::new(database.pool().clone()));
         let device_pairings = Arc::new(aionui_auth::DevicePairingStore::new());
@@ -454,6 +463,7 @@ impl AppServices {
             project_service: project_service.clone(),
             user_order_store: user_order_store.clone(),
         });
+        conversation_service.with_governance(governance.clone());
         conversation_service
             .recover_task_sessions()
             .await
@@ -517,6 +527,7 @@ impl AppServices {
             agent_approvals,
             audit_events,
             audit_sink,
+            governance,
             user_devices,
             device_pairings,
             app_version,

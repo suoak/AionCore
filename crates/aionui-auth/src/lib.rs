@@ -10,6 +10,7 @@ mod csrf;
 pub mod device;
 mod error;
 mod extract;
+pub mod governance_routes;
 pub mod host_allowlist;
 mod jwt;
 pub mod local_secret;
@@ -88,6 +89,7 @@ pub use middleware::{
 
 // Audit ledger API (M8 E12-2)
 pub use audit_routes::{AuditRouterState, audit_routes};
+pub use governance_routes::{GovernanceRouterState, governance_routes};
 
 // Paired mobile devices (M8 E9-1)
 pub use device::{

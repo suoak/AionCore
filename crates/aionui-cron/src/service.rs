@@ -68,6 +68,9 @@ pub struct CronService {
     /// E8-6 guardrail 6: delivery port for Autopilot run results. Wired
     /// late by the app because channels are built after cron.
     autopilot_notifier: Arc<std::sync::RwLock<Option<Arc<dyn AutopilotNotifier>>>>,
+    /// M8 E12-3: governance policy gate. Wired late by the app; `None`
+    /// (tests, headless tools) means no policy is enforced.
+    governance: Arc<std::sync::RwLock<Option<Arc<aionui_db::GovernanceService>>>>,
 }
 
 pub struct CronServiceDeps {
@@ -96,7 +99,55 @@ impl CronService {
             data_dir: deps.data_dir,
             instance_id: generate_prefixed_id("cron-owner"),
             autopilot_notifier: Arc::new(std::sync::RwLock::new(None)),
+            governance: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the governance policy gate (M8 E12-3).
+    pub fn set_governance(&self, governance: Arc<aionui_db::GovernanceService>) {
+        let mut slot = self
+            .governance
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(governance);
+    }
+
+    /// Reject an enabled job whose unattended mode violates policy
+    /// (`no_yolo`, `force_sandbox`, `banned_backends`). Autopilot Ask jobs
+    /// carry no forced mode and are only checked for banned backends.
+    async fn enforce_job_launch_policy(&self, user_id: &str, job: &CronJob) -> Result<(), CronError> {
+        if !job.enabled {
+            return Ok(());
+        }
+        let governance = self
+            .governance
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(governance) = governance else {
+            return Ok(());
+        };
+        let agent_type: Option<aionui_common::AgentType> =
+            serde_json::from_value(serde_json::Value::String(job.agent_type.clone())).ok();
+        let backend = job
+            .agent_config
+            .as_ref()
+            .map(|config| config.name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty());
+        let mut facts = aionui_db::LaunchFacts::new(aionui_db::LaunchSurface::Cron);
+        facts.target = Some(("cron_job", job.id.as_str()));
+        facts.agent_type = agent_type;
+        facts.backend = backend.as_deref();
+        facts.assistant_id = job
+            .agent_config
+            .as_ref()
+            .and_then(|config| config.assistant_id.as_deref());
+        facts.mode = job.required_runtime_mode();
+        facts.via = Some(aionui_db::AuditVia::Cron);
+        governance
+            .check_launch(user_id, &facts)
+            .await
+            .map_err(|denial| CronError::Forbidden(denial.to_string()))
     }
 
     /// Install the Autopilot result notifier (IM + Inbox delivery).
@@ -413,6 +464,7 @@ impl CronService {
         self.validate_job_workspace(&job).await?;
         self.validate_notify_channel(user_id, job.notify_channel_id.as_deref())
             .await?;
+        self.enforce_job_launch_policy(user_id, &job).await?;
 
         let row = cron_job_to_row(&job)?;
         self.repo.insert(&row).await?;
@@ -547,6 +599,7 @@ impl CronService {
 
         job.updated_at = now_ms();
         self.validate_job_workspace(&job).await?;
+        self.enforce_job_launch_policy(user_id, &job).await?;
         if job.notify_channel_id != original_notify_channel_id {
             self.validate_notify_channel(user_id, job.notify_channel_id.as_deref())
                 .await?;

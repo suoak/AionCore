@@ -178,6 +178,22 @@ impl IBatchExecutor for BatchExecutorAdapter {
         if !path.is_dir() {
             return Err(BatchError::BadRequest(format!("{} is not a directory", path.display())));
         }
+        // M8 E12-3: `force_sandbox` refuses in-place workspace targets up
+        // front; `prepare` re-checks (audited) per item.
+        if matches!(location, TargetLocation::Workspace(_))
+            && let Some(governance) = self.conversations.governance_optional()
+        {
+            let policies = governance
+                .policies()
+                .await
+                .map_err(|e| BatchError::Unavailable(format!("governance policy store unavailable: {e}")))?;
+            if policies.force_sandbox {
+                return Err(BatchError::BadRequest(format!(
+                    "{}: in-place workspace targets are disabled by the force_sandbox policy; use a git repository (worktree) target",
+                    path.display()
+                )));
+            }
+        }
         if let TargetLocation::Repo(repo) = location {
             self.worktrees
                 .estimate(&repo.to_string_lossy(), None)
@@ -282,6 +298,17 @@ impl IBatchExecutor for BatchExecutorAdapter {
                 (conv, PathBuf::from(wt.row.path))
             }
             TargetLocation::Workspace(dir) => {
+                if let Some(governance) = self.conversations.governance_optional() {
+                    let mut facts = aionui_db::LaunchFacts::new(aionui_db::LaunchSurface::Batch);
+                    facts.target = Some(("task_session", task_session_id));
+                    facts.assistant_id = Some(spec.assistant_id.as_str());
+                    facts.in_place_workspace = true;
+                    facts.via = Some(aionui_db::AuditVia::Batch);
+                    governance
+                        .check_launch(user_id, &facts)
+                        .await
+                        .map_err(|denial| BatchError::BadRequest(denial.to_string()))?;
+                }
                 let conv = self.create_conversation(user_id, spec, None, Some(dir)).await?;
                 (conv, dir.clone())
             }

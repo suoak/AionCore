@@ -62,6 +62,12 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     // Canonical filesystem-path registry shared by all users by design
     // (project-bind: folders are reused globally by resource_canonical).
     ("folders", "global canonical path registry"),
+    // M8 E12-3 governance: launch policies and per-agent run permissions are
+    // instance-wide settings, not owned by any single user. (`user_roles`
+    // carries `user_id` and is adopted with the rest of the local data, so the
+    // adopting user inherits the bootstrap owner role.)
+    ("policies", "instance-wide governance policy switches"),
+    ("agent_run_permissions", "instance-wide agent run permissions"),
 ];
 
 /// Tables whose `user_id` column is NOT a Core-user ownership column — it

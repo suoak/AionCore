@@ -1539,6 +1539,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         emitter,
         data_dir: services.data_dir.clone(),
     }));
+    cron_service.set_governance(services.governance.clone());
 
     tick_service_ref.0.lock().unwrap().replace(cron_service.clone());
 

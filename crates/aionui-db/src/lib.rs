@@ -5,6 +5,7 @@ mod agent_binding;
 pub mod audit;
 mod database;
 mod error;
+pub mod governance;
 mod instance_lock;
 mod legacy_handoff;
 mod migrate_repair;
@@ -24,6 +25,9 @@ pub use database::{
 pub use error::{
     DbError, SQLITE_BUSY_MESSAGE_MARKERS, SQLITE_UNIQUE_VIOLATION_MARKER, message_indicates_busy,
     message_indicates_unique_violation,
+};
+pub use governance::{
+    GovernanceError, GovernanceService, LaunchFacts, LaunchSurface, PolicyDenial, PolicyKey, PolicySet, UserRole,
 };
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::AuditEventRow;
@@ -62,6 +66,9 @@ pub use repository::conversation::{
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
+};
+pub use repository::governance::{
+    AgentRunPermissionRow, IGovernanceRepository, PolicyRow, SqliteGovernanceRepository, UserRoleRow,
 };
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;

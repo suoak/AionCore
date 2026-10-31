@@ -880,6 +880,13 @@ mod tests {
                 "/api/audit/events?limit=5",
                 "/api/audit/verify",
                 "/api/audit/export.csv",
+                // M8 E12-3: nor read or change governance.
+                "/api/governance/me",
+                "/api/governance/policies",
+                "/api/governance/policies/no_yolo",
+                "/api/governance/roles",
+                "/api/governance/roles/u1",
+                "/api/governance/agent-permissions",
             ] {
                 assert_eq!(
                     classify(method.clone(), path),

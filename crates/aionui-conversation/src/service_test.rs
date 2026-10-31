@@ -12701,3 +12701,49 @@ async fn list_inbox_closes_approval_items_of_deleted_work_items() {
     assert!(listed.items[0].resolved_at.is_some(), "{:?}", listed.items[0]);
     assert_eq!(listed.unread_count, 0);
 }
+
+// M8 E12-3: launch policies gate conversation creation.
+#[tokio::test]
+async fn create_is_refused_by_no_yolo_and_audited() {
+    let (svc, _bc, repo, _task_mgr) = make_service();
+    let db = init_database_memory().await.unwrap();
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(db.pool().clone()));
+    let governance = Arc::new(aionui_db::GovernanceService::new(
+        Arc::new(aionui_db::SqliteGovernanceRepository::new(db.pool().clone())),
+        Some(aionui_db::AuditSink::new(audit.clone())),
+        false,
+    ));
+    svc.with_governance(governance.clone());
+
+    let req_with_mode = |mode: &str| {
+        let mut req = make_create_req_with_backend("claude");
+        req.extra["session_mode"] = json!(mode);
+        req
+    };
+    // Policies are off by default.
+    svc.create("user_1", req_with_mode("bypassPermissions")).await.unwrap();
+
+    governance
+        .set_policy("user_1", aionui_db::PolicyKey::NoYolo, &json!(true), None)
+        .await
+        .unwrap();
+    let before = repo.rows.lock().unwrap().len();
+    let err = svc
+        .create("user_1", req_with_mode("bypassPermissions"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    assert_eq!(repo.rows.lock().unwrap().len(), before, "nothing persisted");
+    let denials = audit
+        .list(&aionui_db::AuditEventFilter {
+            action: Some("policy.deny".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].target_kind.as_deref(), Some("conversation"));
+
+    svc.create("user_1", req_with_mode("default")).await.unwrap();
+}
