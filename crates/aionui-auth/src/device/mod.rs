@@ -7,7 +7,8 @@
 //!   pairing with the QR token and confirms it with the code.
 //! - [`scope`]: the `mobile_default` route whitelist enforced on requests
 //!   authenticated with a device token.
-//! - [`routes`]: `/api/auth/devices/pair/*` endpoints.
+//! - [`routes`]: `/api/auth/devices/pair/*` pairing endpoints and the
+//!   `/api/auth/devices[/{id}]` list / rename / revoke endpoints (E9-2).
 pub mod pairing;
 pub mod routes;
 pub mod scope;
@@ -17,7 +18,9 @@ pub use pairing::{
     DEVICE_PAIRING_EVENT, DevicePairingStore, OfferStatus, PairingConfirmError, PairingNotifier, PairingOffer,
     PairingOfferView, PairingStartError, StartedPairing,
 };
-pub use routes::{DeviceRouterState, device_pairing_public_routes, device_pairing_user_routes};
+pub use routes::{
+    DeviceRevokedHook, DeviceRouterState, DeviceView, device_pairing_public_routes, device_pairing_user_routes,
+};
 pub use scope::{DeviceRouteDecision, classify_device_request};
 pub use token::{
     DEVICE_INACTIVITY_TTL_MS, DEVICE_TOKEN_PREFIX, DevicePrincipal, MAX_DEVICES_PER_USER, MOBILE_DEFAULT_SCOPE,

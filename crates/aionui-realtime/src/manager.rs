@@ -85,12 +85,36 @@ impl WebSocketManager {
     /// saturated or already-closed outbound queues are still removed from the
     /// manager so no future events are delivered to revoked sessions.
     pub fn disconnect_user(&self, user_id: &str, reason: &str) -> usize {
+        let removed = self.disconnect_where(|client| client.user_id == user_id, reason);
+        if removed > 0 {
+            info!(user_id = %user_id, removed, "websocket user connections disconnected");
+        }
+        removed
+    }
+
+    /// Close every connection whose authenticating token satisfies
+    /// `matches` (e.g. one revoked device). Same best-effort semantics as
+    /// [`Self::disconnect_user`].
+    pub fn disconnect_by_token(&self, matches: impl Fn(&str) -> bool, reason: &str) -> usize {
+        let removed = self.disconnect_where(|client| matches(&client.token), reason);
+        if removed > 0 {
+            info!(removed, "websocket token connections disconnected");
+        }
+        removed
+    }
+
+    /// The token connection `conn_id` authenticated with.
+    pub fn connection_token(&self, conn_id: ConnectionId) -> Option<String> {
+        self.connections.get(&conn_id).map(|client| client.token.clone())
+    }
+
+    fn disconnect_where(&self, matches: impl Fn(&ClientInfo) -> bool, reason: &str) -> usize {
         let mut to_remove = Vec::new();
 
         for entry in self.connections.iter() {
             let conn_id = *entry.key();
             let client = entry.value();
-            if client.user_id != user_id {
+            if !matches(client) {
                 continue;
             }
 
@@ -102,9 +126,9 @@ impl WebSocketManager {
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         %conn_id,
-                        user_id = %user_id,
+                        user_id = %client.user_id,
                         code = RealtimeError::Backpressure.code(),
-                        "outbound channel full, user disconnect close dropped"
+                        "outbound channel full, disconnect close dropped"
                     );
                     to_remove.push(conn_id);
                 }
@@ -114,12 +138,7 @@ impl WebSocketManager {
         for conn_id in &to_remove {
             self.remove_client(*conn_id);
         }
-
-        let removed = to_remove.len();
-        if removed > 0 {
-            info!(user_id = %user_id, removed, "websocket user connections disconnected");
-        }
-        removed
+        to_remove.len()
     }
 
     /// Send a message to all connected clients.
@@ -559,6 +578,30 @@ mod tests {
                 }
                 other => panic!("expected terminal auth close, got {other:?}"),
             }
+        }
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn disconnect_by_token_closes_only_that_tokens_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx1, mut rx1) = new_client_tx();
+        let (tx2, mut rx2) = new_client_tx();
+        let device = mgr.add_client_for_user("user-a".into(), "wmd_phone".into(), tx1);
+        let desktop = mgr.add_client_for_user("user-a".into(), "jwt".into(), tx2);
+        assert_eq!(mgr.connection_token(device).as_deref(), Some("wmd_phone"));
+
+        let removed = mgr.disconnect_by_token(|token| token == "wmd_phone", "device revoked");
+
+        assert_eq!(removed, 1);
+        assert!(mgr.connection_token(device).is_none());
+        assert_eq!(mgr.connection_token(desktop).as_deref(), Some("jwt"));
+        match rx1.try_recv().unwrap() {
+            WsOutbound::TextThenClose(text, _, reason) => {
+                assert_realtime_auth_expired(&text);
+                assert_eq!(reason, "device revoked");
+            }
+            other => panic!("expected terminal auth close, got {other:?}"),
         }
         assert!(rx2.try_recv().is_err());
     }

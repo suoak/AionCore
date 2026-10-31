@@ -87,8 +87,8 @@ pub use middleware::{
 
 // Paired mobile devices (M8 E9-1)
 pub use device::{
-    DEVICE_PAIRING_EVENT, DevicePairingStore, DevicePrincipal, DeviceRouterState, PairingOfferView,
-    device_pairing_public_routes, device_pairing_user_routes,
+    DEVICE_PAIRING_EVENT, DevicePairingStore, DevicePrincipal, DeviceRevokedHook, DeviceRouterState, DeviceView,
+    PairingOfferView, device_pairing_public_routes, device_pairing_user_routes,
 };
 
 // QR token store

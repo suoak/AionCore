@@ -631,3 +631,71 @@ async fn t7_2_blacklisted_token_rejected() {
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));
 }
+
+// ===========================================================================
+// T8 — Paired devices (M8 E9-2)
+// ===========================================================================
+
+async fn seed_device(app: &TestApp, user_id: &str) -> (String, String) {
+    use aionui_auth::device::token::{generate_device_token, hash_device_token};
+    let token = generate_device_token();
+    let device = app
+        .services
+        .user_devices
+        .create_within_limit(
+            &aionui_db::CreateUserDeviceParams {
+                user_id,
+                name: "phone",
+                platform: "ios",
+                token_hash: &hash_device_token(&token),
+                scopes: r#"["mobile_default"]"#,
+                created_at: aionui_common::now_ms(),
+            },
+            5,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    (device.id, token)
+}
+
+#[tokio::test]
+async fn t8_1_device_connects_receive_only_and_is_kicked_on_revoke() {
+    let app = start_app().await;
+    let jwt = sign_token(&app, "user1").await;
+    let (device_id, device_token) = seed_device(&app, "user1").await;
+
+    let (mut dtx, mut drx) = connect_bearer(app.addr, &device_token).await;
+    let (_desk_tx, mut desk_rx) = connect_bearer(app.addr, &jwt).await;
+    wait_for_clients(&app, 2).await;
+
+    // Inbound frames from a device never reach the business routers.
+    dtx.send(send_json(&json!({"name": "fs", "data": {}}).to_string()))
+        .await
+        .unwrap();
+    let msg = read_text(&mut drx).await;
+    assert_realtime_error(&msg, "REALTIME_UNSUPPORTED_MESSAGE", true);
+
+    // The owner's scoped events still reach the phone.
+    ws_manager(&app).broadcast_to_user("user1", WebSocketMessage::new("inbox.created", json!({"id": "i1"})));
+    assert_eq!(read_text(&mut drx).await["name"], "inbox.created");
+    assert_eq!(read_text(&mut desk_rx).await["name"], "inbox.created");
+
+    // Revoking from the desktop closes the phone's socket only.
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{}/api/auth/devices/{device_id}", app.addr))
+        .bearer_auth(&jwt)
+        .header("Cookie", "aionui-csrf-token=t")
+        .header("x-csrf-token", "t")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let _ = read_close(&mut drx).await;
+    wait_for_clients(&app, 1).await;
+
+    // A revoked token cannot reconnect.
+    let (_, mut again) = connect_bearer(app.addr, &device_token).await;
+    let msg = read_text(&mut again).await;
+    assert_realtime_error(&msg, "REALTIME_AUTH_EXPIRED", false);
+}

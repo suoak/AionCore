@@ -45,4 +45,8 @@ pub trait IUserDeviceRepository: Send + Sync {
     /// Revoke an unrevoked device of `user_id`. `false` when it does not exist,
     /// belongs to someone else, or is already revoked.
     async fn revoke(&self, user_id: &str, id: &str, at: TimestampMs, revoked_by: &str) -> Result<bool, DbError>;
+
+    /// Rename an unrevoked device of `user_id`. `false` when it does not
+    /// exist, belongs to someone else, or is revoked.
+    async fn rename(&self, user_id: &str, id: &str, name: &str) -> Result<bool, DbError>;
 }

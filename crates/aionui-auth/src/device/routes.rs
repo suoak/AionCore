@@ -8,6 +8,12 @@
 //!   the `device.pairing` WebSocket event)
 //! - `POST /api/auth/devices/pair/offers/{offer_id}/reject` — reject / cancel
 //!
+//! Device management (M8 E9-2; signed-in user only):
+//! - `GET    /api/auth/devices` — the user's active devices
+//! - `PATCH  /api/auth/devices/{device_id} {name}` — rename
+//! - `DELETE /api/auth/devices/{device_id}` — revoke; the next request with
+//!   its token is 401 and its WebSocket connections are closed
+//!
 //! Phone side (public, rate limited, CSRF exempt):
 //! - `POST /api/auth/devices/pair/start {qr_token, device_name, platform}`
 //! - `POST /api/auth/devices/pair/confirm {pairing_id, code}` → device token
@@ -18,14 +24,14 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use aionui_api_types::ApiResponse;
 use aionui_common::ApiError;
-use aionui_db::{CreateUserDeviceParams, IUserDeviceRepository};
+use aionui_db::{CreateUserDeviceParams, IUserDeviceRepository, UserDeviceRow};
 
 use super::pairing::{DevicePairingStore, PairingConfirmError, PairingOffer, PairingOfferView, PairingStartError};
 use super::token::{
@@ -42,10 +48,45 @@ const PLATFORMS: &[&str] = &["ios", "android", "web"];
 const PAIR_FAILURES_PER_WINDOW: u32 = 20;
 const PAIR_WINDOW: Duration = Duration::from_secs(15 * 60);
 
+/// Called after a device is revoked by its owner (closes its WebSockets).
+pub type DeviceRevokedHook = Arc<dyn Fn(&UserDeviceRow) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct DeviceRouterState {
     pub devices: Arc<dyn IUserDeviceRepository>,
     pub pairings: Arc<DevicePairingStore>,
+    pub on_revoked: Option<DeviceRevokedHook>,
+}
+
+/// A paired device as shown on the desktop. Never carries the token hash.
+#[derive(Debug, Serialize)]
+pub struct DeviceView {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub scopes: Vec<String>,
+    pub push_kind: String,
+    pub last_seen_at: Option<i64>,
+    pub created_at: i64,
+}
+
+impl From<UserDeviceRow> for DeviceView {
+    fn from(row: UserDeviceRow) -> Self {
+        Self {
+            scopes: serde_json::from_str(&row.scopes).unwrap_or_default(),
+            id: row.id,
+            name: row.name,
+            platform: row.platform,
+            push_kind: row.push_kind,
+            last_seen_at: row.last_seen_at,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameDeviceRequest {
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +230,96 @@ async fn reject_offer_handler(
     Ok(Json(ApiResponse::ok(view)))
 }
 
+fn device_not_found() -> ApiError {
+    ApiError::NotFound("Device not found".into())
+}
+
+async fn list_devices_handler(
+    State(state): State<DeviceRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<DevicePrincipal>>,
+    agent: Option<Extension<AgentPrincipal>>,
+) -> Result<Json<ApiResponse<Vec<DeviceView>>>, ApiError> {
+    ensure_user_session(&device, &agent)?;
+    let rows = state.devices.list_for_user(&user.id).await.map_err(db_unavailable)?;
+    let views = rows
+        .into_iter()
+        .filter(|row| row.revoked_at.is_none())
+        .map(DeviceView::from)
+        .collect();
+    Ok(Json(ApiResponse::ok(views)))
+}
+
+async fn rename_device_handler(
+    State(state): State<DeviceRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<DevicePrincipal>>,
+    agent: Option<Extension<AgentPrincipal>>,
+    Path(device_id): Path<String>,
+    body: Result<Json<RenameDeviceRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<DeviceView>>, ApiError> {
+    ensure_user_session(&device, &agent)?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let name = validate_device_name(&req.name)?;
+    if !state
+        .devices
+        .rename(&user.id, &device_id, &name)
+        .await
+        .map_err(db_unavailable)?
+    {
+        return Err(device_not_found());
+    }
+    let row = state
+        .devices
+        .find_for_user(&user.id, &device_id)
+        .await
+        .map_err(db_unavailable)?
+        .ok_or_else(device_not_found)?;
+    tracing::info!(
+        target: "audit",
+        action = "device.rename",
+        user_id = %user.id,
+        device_id = %device_id,
+        "device renamed"
+    );
+    Ok(Json(ApiResponse::ok(row.into())))
+}
+
+async fn revoke_device_handler(
+    State(state): State<DeviceRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<DevicePrincipal>>,
+    agent: Option<Extension<AgentPrincipal>>,
+    Path(device_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    ensure_user_session(&device, &agent)?;
+    let now = aionui_common::now_ms();
+    if !state
+        .devices
+        .revoke(&user.id, &device_id, now, "user")
+        .await
+        .map_err(db_unavailable)?
+    {
+        return Err(device_not_found());
+    }
+    tracing::info!(
+        target: "audit",
+        action = "device.revoke",
+        user_id = %user.id,
+        device_id = %device_id,
+        revoked_by = "user",
+        "device revoked"
+    );
+    if let Some(hook) = state.on_revoked.as_ref() {
+        match state.devices.find_for_user(&user.id, &device_id).await {
+            Ok(Some(row)) => hook(&row),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, device_id = %device_id, "revoked device reload failed"),
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn pair_start_handler(
     State(state): State<DeviceRouterState>,
     body: Result<Json<PairStartRequest>, JsonRejection>,
@@ -303,9 +434,15 @@ pub fn device_pairing_public_routes(state: DeviceRouterState) -> Router {
         .with_state(state)
 }
 
-/// Desktop-side endpoints. Mount behind `auth_middleware`.
+/// Desktop-side endpoints (pairing + device management). Mount behind
+/// `auth_middleware`.
 pub fn device_pairing_user_routes(state: DeviceRouterState) -> Router {
     Router::new()
+        .route("/api/auth/devices", get(list_devices_handler))
+        .route(
+            "/api/auth/devices/{device_id}",
+            patch(rename_device_handler).delete(revoke_device_handler),
+        )
         .route("/api/auth/devices/pair/offers", post(create_offer_handler))
         .route("/api/auth/devices/pair/offers/{offer_id}", get(offer_status_handler))
         .route(

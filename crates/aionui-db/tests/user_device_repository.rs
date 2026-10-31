@@ -35,6 +35,14 @@ async fn create_find_touch_revoke_round_trip() {
     assert_eq!(touched.last_seen_at, Some(200));
     assert!(repo.find_for_user("u2", &row.id).await.unwrap().is_none());
 
+    // Rename is owner-only.
+    assert!(!repo.rename("u2", &row.id, "Stolen").await.unwrap());
+    assert!(repo.rename("u1", &row.id, "Work phone").await.unwrap());
+    assert_eq!(
+        repo.find_for_user("u1", &row.id).await.unwrap().unwrap().name,
+        "Work phone"
+    );
+
     // Someone else cannot revoke it.
     assert!(!repo.revoke("u2", &row.id, 300, "user").await.unwrap());
     assert!(repo.revoke("u1", &row.id, 300, "user").await.unwrap());
@@ -44,6 +52,9 @@ async fn create_find_touch_revoke_round_trip() {
     let revoked = repo.find_for_user("u1", &row.id).await.unwrap().unwrap();
     assert_eq!(revoked.revoked_at, Some(300));
     assert_eq!(revoked.revoked_by.as_deref(), Some("user"));
+
+    // Revoked devices cannot be renamed.
+    assert!(!repo.rename("u1", &row.id, "Again").await.unwrap());
 
     // Touch is a no-op once revoked.
     repo.touch_last_seen(&row.id, 400).await.unwrap();
