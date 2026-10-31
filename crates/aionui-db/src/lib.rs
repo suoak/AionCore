@@ -2,6 +2,7 @@
 
 //! SQLite database layer: init, migrations, repository traits, and implementations.
 mod agent_binding;
+pub mod audit;
 mod database;
 mod error;
 mod instance_lock;
@@ -14,6 +15,7 @@ pub use agent_binding::{
     AgentBindingResolution, binding_resolution_for_agent, resolve_agent_binding, resolve_agent_binding_for_user,
     resolve_agent_binding_from_rows, runtime_backend_for_agent,
 };
+pub use audit::AuditSink;
 pub use database::{
     DATABASE_NEWER_THAN_APP_STAGE, Database, DatabaseInitError, DatabaseInitOptions, init_database,
     init_database_memory, init_database_staged, init_database_staged_with_options, init_database_with_options,
@@ -24,6 +26,7 @@ pub use error::{
     message_indicates_unique_violation,
 };
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
+pub use models::AuditEventRow;
 pub use models::UserDeviceRow;
 pub use models::{
     AgentMetadataRow, AgentWorkflowRunRow, AssistantAgentCenterRow, AssistantDefinitionRevisionRow,
@@ -44,7 +47,12 @@ pub use models::{
     UpsertSkillEvolutionSettingsParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
     evolution_auto_apply_allowed, review_status_is_live,
 };
+pub use repository::SqliteAuditEventRepository;
 pub use repository::SqliteUserDeviceRepository;
+pub use repository::audit_event::{
+    AUDIT_LIST_DEFAULT_LIMIT, AUDIT_LIST_MAX_LIMIT, AuditActorKind, AuditChainVerification, AuditEventFilter,
+    AuditOrder, AuditVia, IAuditEventRepository, NewAuditEvent,
+};
 pub use repository::batch::{BatchJobListFilter, CreateBatchItemParams, CreateBatchJobParams, FinishBatchItemParams};
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{

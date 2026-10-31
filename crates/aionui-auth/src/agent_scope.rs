@@ -865,6 +865,32 @@ mod tests {
     }
 
     #[test]
+    fn audit_routes_are_denied() {
+        // M8 E12-2: an agent must never read or export the audit ledger.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            for path in [
+                "/api/audit/events",
+                "/api/audit/events?limit=5",
+                "/api/audit/verify",
+                "/api/audit/export.csv",
+            ] {
+                assert_eq!(
+                    classify(method.clone(), path),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rename_only_patch_detection() {
         assert!(is_rename_only_patch(br#"{"name":"new title"}"#));
         assert!(!is_rename_only_patch(
