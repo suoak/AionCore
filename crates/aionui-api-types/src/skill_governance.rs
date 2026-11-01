@@ -1,6 +1,7 @@
 //! E10-2 skill source / version / review wire types
 //! (`/api/skills/sources/import`, `/api/skills/id/{id}/{refresh,source,review,visibility}`,
-//! `/api/skills/reviews/pending`). snake_case like the other skill endpoints.
+//! `/api/skills/reviews/pending`, E10-3 `/versions/{a}/diff/{b}` and
+//! `/versions/{n}/restore`). snake_case like the other skill endpoints.
 
 use serde::{Deserialize, Serialize};
 
@@ -101,4 +102,42 @@ pub struct SetVisibilityRequest {
     pub visibility: String,
     #[serde(default)]
     pub team_id: Option<String>,
+}
+
+/// E10-3: one changed file between two versions. Unchanged files are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillFileDiff {
+    pub path: String,
+    /// `added` | `removed` | `modified`
+    pub status: String,
+    /// Binary (or non-UTF-8) files are only listed, never diffed.
+    pub binary: bool,
+    /// The file counts as a script in either version (D10-7).
+    pub script: bool,
+    /// Unified diff (3 lines of context) for text files; `None` for binary or
+    /// oversized files.
+    pub diff: Option<String>,
+    /// The text was over the diff size cap, so only the change is listed.
+    pub too_large: bool,
+}
+
+/// `GET /api/skills/id/{skill_id}/versions/{a}/diff/{b}`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillVersionDiffResponse {
+    pub skill_id: String,
+    pub from_version: i64,
+    pub to_version: i64,
+    pub files: Vec<SkillFileDiff>,
+}
+
+/// `POST /api/skills/id/{skill_id}/versions/{n}/restore`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRestoreResponse {
+    pub skill: SkillGovernanceInfo,
+    /// The version the live skill now matches (a new one unless the restored
+    /// content equals the latest version).
+    pub version: SkillVersionInfo,
+    pub restored_from: i64,
+    /// `false` when the restored content equals the latest version (no-op).
+    pub changed: bool,
 }

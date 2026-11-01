@@ -14,6 +14,11 @@ pub struct SkillRow {
     pub deleted_at: Option<TimestampMs>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// E10-1 review gate (`none` | `pending` | `approved` | `rejected`).
+    /// Defaulted so rows read without the column still decode.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub review_status: String,
 }
 
 /// Row mapping for the `skill_import_records` table.

@@ -295,6 +295,13 @@ const AUDIT_RULES: &[AuditRule] = &[
         &["skill_id"],
     ),
     rule(
+        "POST",
+        "/api/skills/id/{skill_id}/versions/{version_no}/restore",
+        "skill.restore",
+        "skill",
+        &["skill_id"],
+    ),
+    rule(
         "DELETE",
         "/api/skills/{name}",
         "config.skill.delete",

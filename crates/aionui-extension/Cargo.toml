@@ -16,6 +16,7 @@ dirs.workspace = true
 fs2.workspace = true
 include_dir.workspace = true
 semver.workspace = true
+similar.workspace = true
 notify.workspace = true
 hex.workspace = true
 getrandom.workspace = true
