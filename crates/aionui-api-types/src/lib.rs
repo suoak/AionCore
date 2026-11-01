@@ -267,8 +267,8 @@ pub use skill_evolution::{
 };
 pub use skill_governance::{
     ImportFromSourceRequest, ImportFromSourceResponse, ImportSourceKind, ReviewDecision, ReviewSkillRequest,
-    SetVisibilityRequest, SkillGovernanceInfo, SkillSourceDetailResponse, SkillSourceInfo, SkillSourceSyncResult,
-    SkillVersionInfo,
+    SetVisibilityRequest, SkillFileDiff, SkillGovernanceInfo, SkillRestoreResponse, SkillSourceDetailResponse,
+    SkillSourceInfo, SkillSourceSyncResult, SkillVersionDiffResponse, SkillVersionInfo,
 };
 pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,

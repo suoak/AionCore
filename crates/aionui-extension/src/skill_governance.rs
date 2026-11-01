@@ -1,5 +1,6 @@
 //! E10-2: skill import from sources (url / git / local snapshot), refresh,
 //! review (D10-3), visibility and the pending-review queue.
+//! E10-3: version diff and restore (restore = a new version, history kept).
 //!
 //! Every import / refresh goes through one pipeline:
 //! fetch → find skill dir → copy into the user skills dir → snapshot →
@@ -17,8 +18,8 @@ use axum::routing::{get, post, put};
 
 use aionui_api_types::{
     ApiResponse, ImportFromSourceRequest, ImportFromSourceResponse, ImportSourceKind, ReviewDecision,
-    ReviewSkillRequest, SetVisibilityRequest, SkillGovernanceInfo, SkillSourceDetailResponse, SkillSourceInfo,
-    SkillSourceSyncResult, SkillVersionInfo,
+    ReviewSkillRequest, SetVisibilityRequest, SkillGovernanceInfo, SkillRestoreResponse, SkillSourceDetailResponse,
+    SkillSourceInfo, SkillSourceSyncResult, SkillVersionDiffResponse, SkillVersionInfo,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, generate_prefixed_id, now_ms};
@@ -489,6 +490,14 @@ pub fn skill_governance_routes(state: SkillGovernanceState) -> Router {
         .route("/api/skills/id/{skill_id}/refresh", post(refresh_from_source))
         .route("/api/skills/id/{skill_id}/review", post(review_skill))
         .route("/api/skills/id/{skill_id}/visibility", put(set_visibility))
+        .route(
+            "/api/skills/id/{skill_id}/versions/{from}/diff/{to}",
+            get(diff_versions),
+        )
+        .route(
+            "/api/skills/id/{skill_id}/versions/{version_no}/restore",
+            post(restore_version),
+        )
         .with_state(state)
 }
 
@@ -691,6 +700,141 @@ async fn set_visibility(
         .map_err(db_err)?;
     let gov = owned(&state, &user.id, &skill_id).await?;
     Ok(Json(ApiResponse::ok(gov.to_api())))
+}
+
+/// The stored files of one recorded version, or 404.
+async fn stored_version_dir(
+    state: &SkillGovernanceState,
+    skill_id: &str,
+    version_no: i64,
+) -> Result<PathBuf, ApiError> {
+    let known = state
+        .source_repo
+        .list_versions(skill_id)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .any(|v| v.version_no == version_no);
+    let dir = skill_versions::version_dir(&state.skill_paths.user_skills_dir, skill_id, version_no)
+        .map_err(|_| ApiError::NotFound("skill_version_not_found".into()))?;
+    if !known || !dir.is_dir() {
+        return Err(ApiError::NotFound(format!("skill_version_not_found: {version_no}")));
+    }
+    Ok(dir)
+}
+
+/// `GET /api/skills/id/{skill_id}/versions/{from}/diff/{to}` — owner only.
+async fn diff_versions(
+    State(state): State<SkillGovernanceState>,
+    Extension(user): Extension<CurrentUser>,
+    AxumPath((skill_id, from, to)): AxumPath<(String, i64, i64)>,
+) -> Result<Json<ApiResponse<SkillVersionDiffResponse>>, ApiError> {
+    owned(&state, &user.id, &skill_id).await?;
+    let a = stored_version_dir(&state, &skill_id, from).await?;
+    let b = stored_version_dir(&state, &skill_id, to).await?;
+    let files = tokio::task::spawn_blocking(move || skill_versions::diff_version_dirs(&a, &b))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .map_err(|e| ApiError::Internal(format!("skill_version_diff_failed: {e}")))?;
+    Ok(Json(ApiResponse::ok(SkillVersionDiffResponse {
+        skill_id,
+        from_version: from,
+        to_version: to,
+        files,
+    })))
+}
+
+/// `POST /api/skills/id/{skill_id}/versions/{version_no}/restore` — owner only.
+///
+/// The current live content is recorded first (so unrecorded edits are kept as
+/// a version), then the old version's files replace the live dir and are
+/// recorded as a NEW version (`created_by = user`, `source_ref = restore:v{n}`).
+/// History is never rewritten; restoring script-bearing content re-pends the
+/// skill (D10-7). The restored SKILL.md must keep the local name (D10-6).
+async fn restore_version(
+    State(state): State<SkillGovernanceState>,
+    Extension(user): Extension<CurrentUser>,
+    AxumPath((skill_id, version_no)): AxumPath<(String, i64)>,
+) -> Result<Json<ApiResponse<SkillRestoreResponse>>, ApiError> {
+    let gov = owned(&state, &user.id, &skill_id).await?;
+    let src = stored_version_dir(&state, &skill_id, version_no).await?;
+    let (restored_name, _) = skill_service::read_skill_info(&src).await.map_err(ext_err)?;
+    if restored_name != gov.name {
+        return Err(ApiError::Conflict(format!(
+            "skill_restore_renamed: version {version_no} names the skill '{restored_name}', local name is '{}'",
+            gov.name
+        )));
+    }
+    let row = state
+        .skill_repo
+        .find_by_name_any_for_user(&user.id, &gov.name)
+        .await
+        .map_err(db_err)?
+        .filter(|r| r.id == skill_id && r.deleted_at.is_none())
+        .ok_or_else(|| ApiError::NotFound("skill_not_found".into()))?;
+    let live = PathBuf::from(&row.path);
+
+    // 1) Keep whatever is live now (no-op when it equals the latest version).
+    record_skill_version(
+        &state.skill_paths,
+        state.source_repo.as_ref(),
+        &skill_id,
+        &live,
+        None,
+        "user",
+    )
+    .await?;
+
+    // 2) Swap the old version's files in.
+    let (root, sid, dst) = (
+        state.skill_paths.user_skills_dir.clone(),
+        skill_id.clone(),
+        live.clone(),
+    );
+    tokio::task::spawn_blocking(move || skill_versions::restore_version_into(&root, &sid, version_no, &dst))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .map_err(|e| ApiError::Internal(format!("skill_restore_failed: {e}")))?;
+
+    // 3) Record it as a new version; scripts ⇒ pending.
+    let source_ref = format!("restore:v{version_no}");
+    let (version, changed) = record_skill_version(
+        &state.skill_paths,
+        state.source_repo.as_ref(),
+        &skill_id,
+        &live,
+        Some(&source_ref),
+        "user",
+    )
+    .await?;
+
+    // Keep the skills row (description) in step with the restored SKILL.md.
+    if let Ok((_, description)) = skill_service::read_skill_info(&live).await
+        && row.description.as_deref() != Some(description.as_str())
+        && let Err(e) = state
+            .skill_repo
+            .upsert_for_user(
+                &user.id,
+                aionui_db::UpsertSkillParams {
+                    name: &row.name,
+                    description: Some(&description),
+                    path: &row.path,
+                    source: &row.source,
+                    enabled: row.enabled,
+                },
+            )
+            .await
+    {
+        tracing::warn!(skill_id, error = %e, "restore: description refresh failed");
+    }
+
+    let gov = owned(&state, &user.id, &skill_id).await?;
+    Ok(Json(ApiResponse::ok(SkillRestoreResponse {
+        skill: gov.to_api(),
+        version: version.to_api(),
+        restored_from: version_no,
+        changed,
+    })))
 }
 
 #[cfg(test)]
@@ -1070,5 +1214,172 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_and_restore_append_a_version_and_gate_scripts() {
+        let f = fixture().await;
+        let dir = f.src_root.join("hist");
+        write_skill(&dir, "hist", false);
+        let me = CurrentUser::local_default();
+        let (st, body) = call(
+            &f.state,
+            me.clone(),
+            "POST",
+            "/api/skills/sources/import",
+            serde_json::json!({"kind": "local", "locator": dir.to_string_lossy()}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let skill_id = body["data"]["imported"][0]["skill"]["skill_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resolve = |state: SkillGovernanceState, user: String| async move {
+            skill_service::materialize_skills_for_agent_with_repo_for_user(
+                &state.skill_paths,
+                state.skill_repo.as_ref(),
+                &user,
+                "e10-3-test",
+                &["hist".to_string()],
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(resolve(f.state.clone(), me.id.clone()).await.len(), 1);
+
+        // v2 adds a script → pending → the resolver must not deliver it.
+        write_skill(&dir, "hist", true);
+        let (_, r) = call(
+            &f.state,
+            me.clone(),
+            "POST",
+            &format!("/api/skills/id/{skill_id}/refresh"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(r["data"]["version"]["version_no"], 2);
+        assert_eq!(r["data"]["skill"]["review_status"], "pending");
+        assert!(
+            resolve(f.state.clone(), me.id.clone()).await.is_empty(),
+            "pending skill must not reach an agent"
+        );
+
+        // Diff v1 → v2 lists the added script with a text body.
+        let (st, d) = call(
+            &f.state,
+            me.clone(),
+            "GET",
+            &format!("/api/skills/id/{skill_id}/versions/1/diff/2"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{d}");
+        let files = d["data"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{d}");
+        assert_eq!(files[0]["path"], "scripts/run.sh");
+        assert_eq!(files[0]["status"], "added");
+        assert_eq!(files[0]["script"], true);
+        assert!(files[0]["diff"].as_str().unwrap().contains("+echo hi"));
+
+        // Unknown version / other user → 404.
+        for (user, uri) in [
+            (me.clone(), format!("/api/skills/id/{skill_id}/versions/1/diff/9")),
+            (other_user(), format!("/api/skills/id/{skill_id}/versions/1/diff/2")),
+        ] {
+            let (st, _) = call(&f.state, user, "GET", &uri, serde_json::Value::Null).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{uri}");
+        }
+        let (st, _) = call(
+            &f.state,
+            other_user(),
+            "POST",
+            &format!("/api/skills/id/{skill_id}/versions/1/restore"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Restore v1 → new v3 (history kept), script gone from the live dir.
+        let (st, r) = call(
+            &f.state,
+            me.clone(),
+            "POST",
+            &format!("/api/skills/id/{skill_id}/versions/1/restore"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!(r["data"]["changed"], true);
+        assert_eq!(r["data"]["restored_from"], 1);
+        assert_eq!(r["data"]["version"]["version_no"], 3);
+        assert_eq!(r["data"]["version"]["source_ref"], "restore:v1");
+        assert_eq!(r["data"]["version"]["created_by"], "user");
+        assert_eq!(r["data"]["version"]["has_scripts"], false);
+        let versions = f.state.source_repo.list_versions(&skill_id).await.unwrap();
+        assert_eq!(versions.len(), 3);
+        let v1 = versions.iter().find(|v| v.version_no == 1).unwrap();
+        assert_eq!(versions[0].content_hash, v1.content_hash);
+        let live = f
+            .state
+            .skill_repo
+            .find_by_name_any_for_user(&me.id, "hist")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Path::new(&live.path).join("scripts/run.sh").exists());
+        assert!(
+            skill_versions::version_dir(&f.state.skill_paths.user_skills_dir, &skill_id, 2)
+                .unwrap()
+                .join("scripts/run.sh")
+                .is_file(),
+            "old versions are never touched"
+        );
+        // Review status is not cleared by a restore (the owner still decides).
+        assert_eq!(r["data"]["skill"]["review_status"], "pending");
+
+        // Restoring the latest content is a no-op.
+        let (_, r) = call(
+            &f.state,
+            me.clone(),
+            "POST",
+            &format!("/api/skills/id/{skill_id}/versions/3/restore"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(r["data"]["changed"], false, "{r}");
+        assert_eq!(r["data"]["version"]["version_no"], 3);
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_version_with_another_name() {
+        let f = fixture().await;
+        let dir = f.src_root.join("named");
+        write_skill(&dir, "named", false);
+        let me = CurrentUser::local_default();
+        let (_, body) = call(
+            &f.state,
+            me.clone(),
+            "POST",
+            "/api/skills/sources/import",
+            serde_json::json!({"kind": "local", "locator": dir.to_string_lossy()}),
+        )
+        .await;
+        let skill_id = body["data"]["imported"][0]["skill"]["skill_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Tamper with the stored v1 name (simulates an upstream rename kept in history).
+        let v1 = skill_versions::version_dir(&f.state.skill_paths.user_skills_dir, &skill_id, 1).unwrap();
+        std::fs::write(v1.join("SKILL.md"), "---\nname: other\ndescription: d\n---\n").unwrap();
+        let (st, _) = call(
+            &f.state,
+            me,
+            "POST",
+            &format!("/api/skills/id/{skill_id}/versions/1/restore"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
     }
 }

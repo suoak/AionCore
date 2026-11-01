@@ -137,6 +137,7 @@ prost = "0.13"
 
 # Semver
 semver = "1"
+similar = "2"
 
 # Directories
 dirs = "6"

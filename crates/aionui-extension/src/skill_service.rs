@@ -1445,6 +1445,12 @@ async fn resolve_skill_source_path(paths: &SkillPaths, name: &str) -> Result<Opt
     Ok(None)
 }
 
+/// Review states that let a skill be used. Rows read without the column
+/// (empty string) predate the gate and count as `none`.
+pub fn skill_review_allows_use(review_status: &str) -> bool {
+    matches!(review_status, "" | "none" | "approved")
+}
+
 async fn resolve_skill_source_path_with_repo_for_user(
     paths: &SkillPaths,
     repo: &dyn ISkillRepository,
@@ -1452,6 +1458,16 @@ async fn resolve_skill_source_path_with_repo_for_user(
     name: &str,
 ) -> Result<Option<PathBuf>, ExtensionError> {
     if let Some(row) = repo.find_by_name_any_for_user(user_id, name).await? {
+        // D10-7 / E10-3: a user skill waiting for review (or rejected) is never
+        // handed to an agent, and never falls back to a same-named builtin.
+        if row.user_id.is_some() && !skill_review_allows_use(&row.review_status) {
+            warn!(
+                skill = %name,
+                review_status = %row.review_status,
+                "skill held by the review gate; not delivered"
+            );
+            return Ok(None);
+        }
         let path = PathBuf::from(&row.path);
         if path.is_dir() {
             return Ok(Some(path));

@@ -235,6 +235,128 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<(
     Ok(())
 }
 
+/// Text files larger than this are listed as changed but not diffed.
+pub const DIFF_MAX_BYTES: usize = 512 * 1024;
+
+struct DiffSide {
+    bytes: Vec<u8>,
+    script: bool,
+}
+
+fn read_side(root: &Path, rel: &str) -> io::Result<Option<DiffSide>> {
+    let full = root.join(rel);
+    match std::fs::read(&full) {
+        Ok(bytes) => {
+            let executable = is_executable(&full)?;
+            let script = is_script(rel, &bytes[..bytes.len().min(2)], executable);
+            Ok(Some(DiffSide { bytes, script }))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(8192)].contains(&0) || std::str::from_utf8(bytes).is_err()
+}
+
+/// E10-3: per-file diff from version dir `from` to version dir `to`.
+/// Unchanged files are omitted; text files get a unified diff (3 lines of
+/// context), binary or oversized files are only listed. Sorted by path.
+pub fn diff_version_dirs(from: &Path, to: &Path) -> io::Result<Vec<aionui_api_types::SkillFileDiff>> {
+    let mut paths = Vec::new();
+    collect_files(from, from, &mut paths)?;
+    collect_files(to, to, &mut paths)?;
+    paths.sort();
+    paths.dedup();
+    let mut out = Vec::new();
+    for rel in paths {
+        let old = read_side(from, &rel)?;
+        let new = read_side(to, &rel)?;
+        let status = match (&old, &new) {
+            (Some(a), Some(b)) if a.bytes == b.bytes && a.script == b.script => continue,
+            (Some(_), Some(_)) => "modified",
+            (None, Some(_)) => "added",
+            (Some(_), None) => "removed",
+            (None, None) => continue,
+        };
+        let empty: &[u8] = &[];
+        let old_bytes = old.as_ref().map_or(empty, |s| s.bytes.as_slice());
+        let new_bytes = new.as_ref().map_or(empty, |s| s.bytes.as_slice());
+        let script = old.as_ref().is_some_and(|s| s.script) || new.as_ref().is_some_and(|s| s.script);
+        let binary = is_binary(old_bytes) || is_binary(new_bytes);
+        let too_large = !binary && (old_bytes.len() > DIFF_MAX_BYTES || new_bytes.len() > DIFF_MAX_BYTES);
+        let diff = if binary || too_large {
+            None
+        } else {
+            // Both sides are valid UTF-8 (checked by `is_binary`).
+            let a = std::str::from_utf8(old_bytes).unwrap_or_default();
+            let b = std::str::from_utf8(new_bytes).unwrap_or_default();
+            Some(
+                similar::TextDiff::from_lines(a, b)
+                    .unified_diff()
+                    .context_radius(3)
+                    .header(&format!("a/{rel}"), &format!("b/{rel}"))
+                    .to_string(),
+            )
+        };
+        out.push(aionui_api_types::SkillFileDiff {
+            path: rel,
+            status: status.to_string(),
+            binary,
+            script,
+            diff,
+            too_large,
+        });
+    }
+    Ok(out)
+}
+
+/// E10-3: replace the files of the live skill dir with a copy of version
+/// `version_no`. The version itself is never touched (append-only). The new
+/// content is staged next to the versions first, then swapped in with two
+/// renames; on failure the old live dir is put back. A `.git` dir in the live
+/// skill (never part of a snapshot) is carried over.
+pub fn restore_version_into(skills_root: &Path, skill_id: &str, version_no: i64, live_dir: &Path) -> io::Result<()> {
+    let src = version_dir(skills_root, skill_id, version_no)?;
+    if !src.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("skill version {skill_id}/{version_no} has no files"),
+        ));
+    }
+    if !live_dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "live skill directory is missing",
+        ));
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tag = format!("restore-{version_no}-{}-{nanos}", std::process::id());
+    let staging = stage_version_files(skills_root, skill_id, &tag, &src)?;
+    let parked = staging.with_file_name(format!(".old-{tag}"));
+    if let Err(e) = std::fs::rename(live_dir, &parked) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&staging, live_dir) {
+        let _ = std::fs::rename(&parked, live_dir);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    let git = parked.join(".git");
+    if git.is_dir() {
+        let _ = std::fs::rename(&git, live_dir.join(".git"));
+    }
+    // The previous content was recorded as a version before the restore, so
+    // the parked copy holds nothing that is not kept elsewhere.
+    let _ = std::fs::remove_dir_all(&parked);
+    Ok(())
+}
+
 #[cfg(unix)]
 fn is_executable(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
@@ -324,5 +446,73 @@ mod tests {
         store_version(root.path(), "skl_1", 2, src.path()).unwrap();
         assert!(store_version(root.path(), "../evil", 1, src.path()).is_err());
         assert!(store_version(root.path(), "skl_1", 0, src.path()).is_err());
+    }
+
+    #[test]
+    fn diff_lists_changes_and_skips_binary_bodies() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write(a.path(), "SKILL.md", "line1\nline2\n");
+        write(b.path(), "SKILL.md", "line1\nline2 changed\n");
+        write(a.path(), "same.md", "x");
+        write(b.path(), "same.md", "x");
+        write(a.path(), "gone.md", "bye\n");
+        write(b.path(), "scripts/run.sh", "echo hi\n");
+        std::fs::write(a.path().join("img.bin"), [0u8, 1, 2]).unwrap();
+        std::fs::write(b.path().join("img.bin"), [0u8, 1, 3]).unwrap();
+
+        let d = diff_version_dirs(a.path(), b.path()).unwrap();
+        let paths: Vec<_> = d.iter().map(|f| (f.path.as_str(), f.status.as_str())).collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("SKILL.md", "modified"),
+                ("gone.md", "removed"),
+                ("img.bin", "modified"),
+                ("scripts/run.sh", "added"),
+            ]
+        );
+        let skill = &d[0];
+        let text = skill.diff.as_deref().unwrap();
+        assert!(
+            text.contains("--- a/SKILL.md") && text.contains("+++ b/SKILL.md"),
+            "{text}"
+        );
+        assert!(text.contains("-line2\n") && text.contains("+line2 changed\n"), "{text}");
+        assert!(d[2].binary && d[2].diff.is_none());
+        assert!(d[3].script && d[3].diff.as_deref().unwrap().contains("+echo hi"));
+        assert!(diff_version_dirs(a.path(), a.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_swaps_live_dir_and_keeps_the_version() {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("demo");
+        write(&live, "SKILL.md", "# v1");
+        write(&live, "old.md", "o");
+        store_version(root.path(), "skl_r", 1, &live).unwrap();
+        std::fs::remove_file(live.join("old.md")).unwrap();
+        write(&live, "SKILL.md", "# v2");
+        write(&live, "new.md", "n");
+        write(&live, ".git/HEAD", "ref");
+
+        restore_version_into(root.path(), "skl_r", 1, &live).unwrap();
+        assert_eq!(std::fs::read_to_string(live.join("SKILL.md")).unwrap(), "# v1");
+        assert!(live.join("old.md").is_file());
+        assert!(!live.join("new.md").exists());
+        assert!(live.join(".git/HEAD").is_file(), ".git is carried over");
+        let v1 = version_dir(root.path(), "skl_r", 1).unwrap();
+        assert_eq!(std::fs::read_to_string(v1.join("SKILL.md")).unwrap(), "# v1");
+        let leftovers: Vec<_> = std::fs::read_dir(v1.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(
+            restore_version_into(root.path(), "skl_r", 9, &live).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }
