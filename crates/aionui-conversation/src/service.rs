@@ -891,6 +891,9 @@ pub struct ConversationService {
     task_session_repo: Arc<RwLock<Option<Arc<dyn ITaskSessionRepository>>>>,
     /// Work-item board (M8 E6-3). `None` until the composition layer wires it.
     task_board_repo: Arc<RwLock<Option<Arc<dyn aionui_db::ITaskBoardRepository>>>>,
+    /// Skill-evolution evidence sink (M8 E10-6). `None` until wired; a
+    /// returned work item then leaves no evidence.
+    evolution_evidence_repo: Arc<RwLock<Option<Arc<dyn aionui_db::IExperienceArticleRepository>>>>,
     /// Squad run lookup for board cards (M8 E7-6). `None` until the
     /// composition layer wires the team service; cards then omit `squad_run`.
     board_squad_run: Arc<RwLock<Option<Arc<dyn crate::board::BoardSquadRunPort>>>>,
@@ -1056,6 +1059,7 @@ impl ConversationService {
             inbox_push: Arc::new(RwLock::new(None)),
             task_session_repo: Arc::new(RwLock::new(None)),
             task_board_repo: Arc::new(RwLock::new(None)),
+            evolution_evidence_repo: Arc::new(RwLock::new(None)),
             board_squad_run: Arc::new(RwLock::new(None)),
             worktree_binding: Arc::new(RwLock::new(None)),
             governance: Arc::new(RwLock::new(None)),
@@ -1156,6 +1160,16 @@ impl ConversationService {
         if let Ok(mut guard) = self.task_board_repo.write() {
             *guard = Some(repo);
         }
+    }
+
+    pub fn with_evolution_evidence_repo(&self, repo: Arc<dyn aionui_db::IExperienceArticleRepository>) {
+        if let Ok(mut guard) = self.evolution_evidence_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub(crate) fn evolution_evidence_repo(&self) -> Option<Arc<dyn aionui_db::IExperienceArticleRepository>> {
+        self.evolution_evidence_repo.read().ok().and_then(|guard| guard.clone())
     }
 
     pub fn with_board_squad_run_port(&self, port: Arc<dyn crate::board::BoardSquadRunPort>) {

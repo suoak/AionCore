@@ -703,6 +703,10 @@ impl ConversationService {
         if to != from {
             self.note_work_item_closed(user_id, id, to).await;
         }
+        if request.decision == TaskBoardReviewDecision::Reject {
+            self.record_work_item_returned(user_id, id, &current.title, comment.unwrap_or_default())
+                .await;
+        }
         let mut item = item_response(row)?;
         self.decorate_squad_run(user_id, &mut item).await;
         self.publish_board_updated(user_id, TaskBoardChange::Review, from, &item);
@@ -710,6 +714,40 @@ impl ConversationService {
             item,
             decision: comment_response(decision),
         })
+    }
+
+    /// M8 E10-6: a work item sent back from review becomes skill-evolution
+    /// evidence, linked to the work item's conversation. Best effort: a failed
+    /// write is logged and never fails the review.
+    async fn record_work_item_returned(&self, user_id: &str, id: &str, title: &str, comment: &str) {
+        let Some(repo) = self.evolution_evidence_repo() else {
+            return;
+        };
+        let session = match self.task_session_repo() {
+            Ok(sessions) => sessions.get(user_id, id).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let mut body = format!("## 工作项被退回\n\n- 工作项: `{id}`（{title}）\n- 退回意见: {comment}\n");
+        if let Some(session) = session.as_ref() {
+            if !session.objective.trim().is_empty() {
+                body.push_str(&format!("\n### 目标\n\n{}\n", session.objective.trim()));
+            }
+            if !session.acceptance_criteria.trim().is_empty() {
+                body.push_str(&format!("\n### 验收标准\n\n{}\n", session.acceptance_criteria.trim()));
+            }
+        }
+        let title = format!("工作项被退回 · {}", truncate_summary(title, 60));
+        let evidence = aionui_db::EvolutionEvidence {
+            owner_user_id: user_id,
+            signal: aionui_db::EvolutionSignal::WorkItemReturned,
+            ref_id: id,
+            conversation_id: session.as_ref().and_then(|s| s.conversation_id.as_deref()),
+            title: &title,
+            body_md: &body,
+        };
+        if let Err(error) = aionui_db::record_evolution_evidence(repo.as_ref(), &evidence).await {
+            tracing::warn!(task_session_id = %id, %error, "failed to record work item evolution evidence");
+        }
     }
 
     /// M8 E6-5: `todo` + Agent assignee → `in_progress` and an agent

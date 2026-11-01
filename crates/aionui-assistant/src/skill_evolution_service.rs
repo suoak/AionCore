@@ -19,9 +19,10 @@ use aionui_api_types::{
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
-    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, IConversationRepository,
-    IExperienceArticleRepository, ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository,
-    ITeamRepository, SkillEvolutionProposalRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
+    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, EVOLUTION_EVIDENCE_TAG, ExperienceArticleRow,
+    IConversationRepository, IExperienceArticleRepository, ISkillEvolutionProposalRepository,
+    ISkillEvolutionSettingsRepository, ITeamRepository, SkillEvolutionProposalRow, UpdateSkillEvolutionProposalParams,
+    UpsertSkillEvolutionSettingsParams,
 };
 
 use crate::skill_evolution_gate::{self, GateMode, GateRecommendation};
@@ -30,6 +31,28 @@ use crate::skill_evolution_ports::{
     TrajectoryDigest,
 };
 use crate::skill_evolution_prompts;
+
+/// Evidence articles fed to one Proposer run (newest first).
+const MAX_REVIEW_EVIDENCE: usize = 8;
+
+/// Append review evidence the prior notes did not already include, redacted.
+fn merge_evidence_notes(prior: Option<String>, evidence: &[ExperienceArticleRow]) -> Option<String> {
+    let mut out = prior.unwrap_or_default();
+    let mut added = false;
+    for row in evidence {
+        let header = format!("### [{}] {}", row.kind, row.title);
+        if out.contains(&header) {
+            continue;
+        }
+        if !added {
+            out.push_str("\n## 人工审阅证据（批注接受/拒绝、工作项退回）\n\n");
+            added = true;
+        }
+        out.push_str(&format!("{header}\n\n{}\n\n", truncate_chars(&row.body_md, 1200)));
+    }
+    let out = redact_secrets(out.trim());
+    if out.is_empty() { None } else { Some(out) }
+}
 
 fn redact_secrets(input: &str) -> String {
     let mut out = input.to_string();
@@ -1013,9 +1036,11 @@ impl SkillEvolutionService {
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
 
+        let evidence = self.load_review_evidence(user_id, conversation_id).await;
         let prior_notes = self
             .load_prior_evolution_notes(user_id, req.assistant_id.as_deref(), conversation_id)
             .await;
+        let prior_notes = merge_evidence_notes(prior_notes, &evidence);
         let proposer_user = skill_evolution_prompts::proposer_user(
             &pattern_body,
             &digest.digest_md,
@@ -1094,7 +1119,9 @@ impl SkillEvolutionService {
             draft
         };
         let diff = parsed.draft_diff_summary.as_deref().map(redact_secrets);
-        let article_ids = vec![pattern_article.id.clone(), impact_article.id.clone()];
+        let mut article_ids = vec![pattern_article.id.clone(), impact_article.id.clone()];
+        // E10-6: link the human review evidence the Proposer saw.
+        article_ids.extend(evidence.iter().map(|row| row.id.clone()));
         let article_ids_json = serde_json::to_string(&article_ids).unwrap_or_else(|_| "[]".into());
         let gate = skill_evolution_gate::score_draft(&draft, req.try_run_ok);
         let gate_signals = serde_json::to_string(&gate.signals).unwrap_or_else(|_| "[]".into());
@@ -1195,7 +1222,16 @@ impl SkillEvolutionService {
         if script_blocked {
             gate_note = Some("目标技能包含脚本：按规则必须人工审核，已跳过自动应用。".into());
         }
-        let proposal = if gate_passed && !script_blocked {
+        // E10-6: a proposal built on human review evidence (returned work
+        // items, accepted/rejected annotations) always waits for a human.
+        let evidence_blocked = gate_passed && !script_blocked && !evidence.is_empty();
+        if evidence_blocked {
+            gate_note = Some(format!(
+                "提案引用了 {} 条人工审阅证据（批注/工作项退回）：按规则需人工审核，已跳过自动应用。",
+                evidence.len()
+            ));
+        }
+        let proposal = if gate_passed && !script_blocked && !evidence_blocked {
             let pid = proposal.id.clone();
             let _ = self
                 .approve(
@@ -1234,10 +1270,11 @@ impl SkillEvolutionService {
             proposal
         };
 
-        let experience_articles = vec![
+        let mut experience_articles = vec![
             article_row_to_response(pattern_article),
             article_row_to_response(impact_article),
         ];
+        experience_articles.extend(evidence.into_iter().map(article_row_to_response));
 
         Ok(EvolveSkillEvolutionResponse {
             proposal: row_to_response(proposal)?,
@@ -1284,6 +1321,33 @@ impl SkillEvolutionService {
         } else {
             Some(chunks.join("\n"))
         }
+    }
+
+    /// M8 E10-6: E4/E6 review evidence linked to this conversation (owner's
+    /// own articles, any assistant). Empty without a conversation.
+    async fn load_review_evidence(&self, user_id: &str, conversation_id: Option<&str>) -> Vec<ExperienceArticleRow> {
+        let Some(cid) = conversation_id else {
+            return Vec::new();
+        };
+        let rows = self
+            .experience
+            .list_visible(user_id, &[], None, Some("private"), 200)
+            .await
+            .unwrap_or_default();
+        rows.into_iter()
+            .filter(|row| row.owner_user_id == user_id)
+            .filter(|row| {
+                parse_json_string_array(&row.tags)
+                    .iter()
+                    .any(|t| t == EVOLUTION_EVIDENCE_TAG)
+            })
+            .filter(|row| {
+                parse_json_string_array(&row.source_conversation_ids)
+                    .iter()
+                    .any(|s| s == cid)
+            })
+            .take(MAX_REVIEW_EVIDENCE)
+            .collect()
     }
 
     /// Unknown (no apply port) counts as "has scripts", so auto-apply stays off.
@@ -1357,3 +1421,7 @@ impl SkillEvolutionService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "skill_evolution_service_test.rs"]
+mod tests;

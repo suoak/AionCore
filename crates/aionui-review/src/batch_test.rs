@@ -339,3 +339,52 @@ async fn foreign_targets_and_empty_batches_are_rejected_before_storing() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+async fn evidence_rows(fx: &Fixture) -> Vec<(String, String, String, String)> {
+    sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT kind, tags, source_conversation_ids, body_md FROM experience_articles \
+         WHERE owner_user_id = 'u1' ORDER BY created_at, rowid",
+    )
+    .fetch_all(&fx.service.pool)
+    .await
+    .unwrap()
+}
+
+/// M8 E10-6: an annotation that reached the agent becomes evolution evidence
+/// when the user resolves it (accepted) or reopens it (rejected). A thread
+/// that never went to the agent leaves no evidence.
+#[tokio::test]
+async fn delivered_annotations_resolved_or_reopened_become_evolution_evidence() {
+    let fx = fixture(FakeSink::default()).await;
+    let local = annotate(&fx, 3, "local note").await;
+    fx.service.resolve("u1", &local.id).await.unwrap();
+    fx.service.reopen("u1", &local.id).await.unwrap();
+    assert!(
+        evidence_rows(&fx).await.is_empty(),
+        "undelivered threads are not evidence"
+    );
+
+    let sent_thread = annotate(&fx, 7, "rename this helper").await;
+    let request = SendReviewBatchRequest {
+        thread_ids: vec![sent_thread.id.clone()],
+        ..scope_request(&fx, None)
+    };
+    fx.service.send_batch("u1", request).await.unwrap();
+
+    fx.service.resolve("u1", &sent_thread.id).await.unwrap();
+    // Resolve is idempotent: a second resolve is not a second signal.
+    fx.service.resolve("u1", &sent_thread.id).await.unwrap();
+    fx.service.reopen("u1", &sent_thread.id).await.unwrap();
+
+    let rows = evidence_rows(&fx).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let (kind, tags, sources, body) = &rows[0];
+    assert_eq!(kind, "pattern");
+    assert!(tags.contains("\"evidence\"") && tags.contains("signal:annotation_accepted"));
+    assert!(tags.contains(&format!("ref:{}", sent_thread.id)));
+    assert_eq!(sources, r#"["conv-u1"]"#);
+    assert!(body.contains("rename this helper") && body.contains(FILE));
+    let (kind, tags, _, _) = &rows[1];
+    assert_eq!(kind, "rejected_note");
+    assert!(tags.contains("signal:annotation_rejected"));
+}

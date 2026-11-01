@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aionui_common::now_ms;
+use aionui_db::{EvolutionEvidence, EvolutionSignal, SqliteExperienceArticleRepository, record_evolution_evidence};
 use sqlx::{Row, SqlitePool};
 
 use crate::anchor::{self, Anchor, AnchorError, Outcome};
@@ -691,6 +692,7 @@ impl ReviewService {
     pub async fn resolve(&self, user_id: &str, id: &str) -> Result<ReviewThread, ReviewError> {
         let row = self.fetch_row(user_id, id).await?;
         if row.status != ReviewThreadStatus::Resolved {
+            let delivered = row.last_batch_id.is_some();
             let now = now_ms();
             sqlx::query(
                 "UPDATE review_threads SET status = 'resolved', resolved_at = ?, updated_at = ? WHERE id = ? AND user_id = ?",
@@ -701,6 +703,10 @@ impl ReviewService {
             .bind(user_id)
             .execute(&self.pool)
             .await?;
+            if delivered {
+                self.record_evidence(user_id, &row, EvolutionSignal::AnnotationAccepted)
+                    .await;
+            }
         }
         self.load(user_id, id).await
     }
@@ -718,9 +724,53 @@ impl ReviewService {
             .bind(user_id)
             .execute(&self.pool)
             .await?;
+            if row.last_batch_id.is_some() {
+                self.record_evidence(user_id, &row, EvolutionSignal::AnnotationRejected)
+                    .await;
+            }
         }
         // Re-anchor right away: the file may have moved on while resolved.
         self.get(user_id, id).await
+    }
+
+    /// M8 E10-6: an annotation that reached the agent and was then resolved
+    /// (accepted) or reopened (rejected) becomes skill-evolution evidence.
+    /// Best effort: a failed write is logged and never fails the user action.
+    async fn record_evidence(&self, user_id: &str, row: &ThreadRow, signal: EvolutionSignal) {
+        let comments = self
+            .comments_for(std::slice::from_ref(&row.id))
+            .await
+            .unwrap_or_default()
+            .remove(&row.id)
+            .unwrap_or_default();
+        let verdict = match signal {
+            EvolutionSignal::AnnotationAccepted => "批注被接受",
+            _ => "批注被拒绝",
+        };
+        let title = format!("{verdict} · {}:{}-{}", row.file_path, row.start_line, row.end_line);
+        let mut body = format!(
+            "## {verdict}\n\n- 文件: `{}` 第 {}-{} 行\n- 批注线程: `{}`\n",
+            row.file_path, row.start_line, row.end_line, row.id
+        );
+        if let Some(task) = row.task_session_id.as_deref() {
+            body.push_str(&format!("- 工作项: `{task}`\n"));
+        }
+        body.push_str("\n### 讨论\n\n");
+        for comment in &comments {
+            body.push_str(&format!("- **{}**: {}\n", comment.author.as_str(), comment.body.trim()));
+        }
+        let repo = SqliteExperienceArticleRepository::new(self.pool.clone());
+        let evidence = EvolutionEvidence {
+            owner_user_id: user_id,
+            signal,
+            ref_id: &row.id,
+            conversation_id: row.conversation_id.as_deref(),
+            title: &title,
+            body_md: &body,
+        };
+        if let Err(error) = record_evolution_evidence(&repo, &evidence).await {
+            tracing::warn!(thread_id = %row.id, %error, "failed to record annotation evolution evidence");
+        }
     }
 
     /// `POST /api/review-threads/{id}/comments` — a user reply.
