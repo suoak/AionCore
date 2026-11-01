@@ -12747,3 +12747,66 @@ async fn create_is_refused_by_no_yolo_and_audited() {
 
     svc.create("user_1", req_with_mode("default")).await.unwrap();
 }
+
+/// M8 E10-6: a work item sent back from review becomes skill-evolution
+/// evidence; an approval does not.
+#[tokio::test]
+async fn returned_work_item_becomes_evolution_evidence() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{TaskBoardReviewDecision, TaskBoardReviewRequest, TaskBoardStatus as S};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_evolution_evidence_repo(Arc::new(aionui_db::SqliteExperienceArticleRepository::new(
+        db.pool().clone(),
+    )));
+    let id = board_task(&service, TaskSessionMode::Agent).await;
+    async fn to_review(service: &ConversationService, id: &str) {
+        for step in [S::Todo, S::InProgress, S::InReview] {
+            let _ = service
+                .update_task_board("user_1", id, BoardActor::User, move_to(step))
+                .await;
+        }
+    }
+    to_review(&service, &id).await;
+    service
+        .review_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            TaskBoardReviewRequest {
+                decision: TaskBoardReviewDecision::Reject,
+                comment: Some("missing tests".into()),
+            },
+        )
+        .await
+        .unwrap();
+    to_review(&service, &id).await;
+    service
+        .review_task_board(
+            "user_1",
+            &id,
+            BoardActor::User,
+            TaskBoardReviewRequest {
+                decision: TaskBoardReviewDecision::Approve,
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
+        "SELECT kind, title, tags, body_md, visibility FROM experience_articles WHERE owner_user_id = 'user_1'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (kind, title, tags, body, visibility) = &rows[0];
+    assert_eq!(kind, "rejected_note");
+    assert!(title.contains("Board item"));
+    assert!(tags.contains("signal:work_item_returned") && tags.contains(&format!("ref:{id}")));
+    assert!(body.contains("missing tests") && body.contains("Do it"));
+    assert_eq!(visibility, "private");
+}

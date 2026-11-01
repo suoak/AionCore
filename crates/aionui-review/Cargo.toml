@@ -10,6 +10,7 @@ edition.workspace = true
 aionui-api-types.workspace = true
 aionui-auth.workspace = true
 aionui-common.workspace = true
+aionui-db.workspace = true
 aionui-worktree.workspace = true
 async-trait.workspace = true
 axum.workspace = true
@@ -25,5 +26,4 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-aionui-db.workspace = true
 tempfile.workspace = true

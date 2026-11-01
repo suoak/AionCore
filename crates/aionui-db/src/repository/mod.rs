@@ -86,7 +86,9 @@ pub use settings::ISettingsRepository;
 pub use sidebar::{ArchiveScope, ISidebarStore, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin};
 pub use skill::ISkillRepository;
 pub use skill_evolution::{
-    IExperienceArticleRepository, ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository,
+    EVOLUTION_EVIDENCE_TAG, EvolutionEvidence, EvolutionSignal, IExperienceArticleRepository,
+    ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository, evolution_evidence_tags,
+    record_evolution_evidence,
 };
 pub use sqlite_acp_session::SqliteAcpSessionRepository;
 pub use sqlite_agent_center::{
