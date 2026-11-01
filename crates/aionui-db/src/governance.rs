@@ -288,6 +288,9 @@ pub struct LaunchFacts<'a> {
     pub mcp_strict: Option<bool>,
     /// The run edits a user workspace in place (batch `workspace` target).
     pub in_place_workspace: bool,
+    /// The user confirmed full-auto for this launch (Autopilot
+    /// `autopilot_yolo`), whatever `mode` says. Refused under `no_yolo`.
+    pub full_auto: bool,
     pub via: Option<AuditVia>,
 }
 
@@ -302,6 +305,7 @@ impl<'a> LaunchFacts<'a> {
             mode: None,
             mcp_strict: None,
             in_place_workspace: false,
+            full_auto: false,
             via: None,
         }
     }
@@ -344,6 +348,12 @@ pub fn evaluate_policies(policy: &PolicySet, facts: &LaunchFacts<'_>) -> Option<
                 format!("Policy blocks the `{name}` agent backend (banned_backends)."),
             );
         }
+    }
+    if policy.no_yolo && facts.full_auto {
+        return deny(
+            PolicyKey::NoYolo,
+            "Policy forbids Autopilot full-auto (no_yolo); switch the job to Ask.".into(),
+        );
     }
     if let Some(mode) = facts.mode {
         if policy.no_yolo && is_full_auto_mode(mode, facts.agent_type, facts.backend) {
@@ -696,6 +706,7 @@ impl GovernanceService {
             "mode": facts.mode,
             "mcp_strict": facts.mcp_strict,
             "in_place_workspace": facts.in_place_workspace,
+            "full_auto": facts.full_auto,
         }));
         if let Some((kind, id)) = facts.target {
             event = event.with_target(kind, id);

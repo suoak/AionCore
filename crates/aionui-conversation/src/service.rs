@@ -919,6 +919,10 @@ pub struct ConversationAgentTurnRequest {
     pub files: Vec<String>,
     pub inject_skills: Vec<String>,
     pub required_runtime_mode: Option<String>,
+    /// The turn runs a user-confirmed full-auto job (Autopilot
+    /// `autopilot_yolo`). Checked against the E12 `no_yolo` policy before the
+    /// turn starts, even when no runtime mode is forced.
+    pub full_auto_confirmed: bool,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
@@ -1373,6 +1377,7 @@ impl ConversationService {
                     files: Vec::new(),
                     inject_skills: Vec::new(),
                     required_runtime_mode: None,
+                    full_auto_confirmed: false,
                     persist_user_message: true,
                     user_message_hidden: true,
                     on_started: None,
@@ -2282,6 +2287,7 @@ impl ConversationService {
                     files: Vec::new(),
                     inject_skills: Vec::new(),
                     required_runtime_mode: None,
+                    full_auto_confirmed: false,
                     persist_user_message: true,
                     user_message_hidden: true,
                     on_started: None,
@@ -6870,14 +6876,15 @@ impl ConversationService {
         validate_planning_turn_content(runtime_tool_policy, &request.content)?;
 
         reject_deprecated_runtime_row(&row)?;
-        // M8 E12-3: a runtime-forced mode (cron full-auto) is checked before
-        // the turn starts; a denial fails the run and is audited.
-        if let Some(mode) = request
+        // M8 E12-3: a runtime-forced mode (cron full-auto) or a confirmed
+        // Autopilot full-auto run is checked before the turn starts; a denial
+        // fails the run and is audited.
+        let forced_mode = request
             .required_runtime_mode
             .as_deref()
             .map(str::trim)
-            .filter(|mode| !mode.is_empty())
-        {
+            .filter(|mode| !mode.is_empty());
+        if forced_mode.is_some() || request.full_auto_confirmed {
             let row_extra: serde_json::Value =
                 serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
             let backend = row_extra
@@ -6888,7 +6895,8 @@ impl ConversationService {
             facts.target = Some(("conversation", request.conversation_id.as_str()));
             facts.agent_type = string_to_enum::<AgentType>(&row.r#type).ok();
             facts.backend = backend;
-            facts.mode = Some(mode);
+            facts.mode = forced_mode;
+            facts.full_auto = request.full_auto_confirmed;
             facts.via = Some(aionui_db::AuditVia::Cron);
             self.enforce_launch_policy(&request.user_id, &facts).await?;
         }
