@@ -1212,3 +1212,65 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
         .expect("mallory should exist");
     assert!(repo.list_all_for_user(&user_b.id).await.unwrap().is_empty());
 }
+
+// ── M8 E12: no_yolo covers Autopilot full-auto ──────────────────────
+
+#[tokio::test]
+async fn no_yolo_refuses_autopilot_full_auto_on_create_and_update() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    // Ask-mode Autopilot job created before the policy is switched on.
+    let mut ask = create_job_body("Autopilot Ask");
+    ask["autopilot"] = json!(true);
+    let created = create_job(&mut app, &services, &token, &csrf, ask).await;
+    let job_id = created["id"].as_str().expect("job id").to_owned();
+
+    let req = json_with_token(
+        "PUT",
+        "/api/governance/policies/no_yolo",
+        json!({ "value": true }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut yolo = create_job_body("Autopilot Yolo");
+    yolo["autopilot"] = json!(true);
+    yolo["autopilot_yolo"] = json!(true);
+    let req = json_with_token("POST", "/api/cron/jobs", yolo, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/cron/jobs/{job_id}"),
+        json!({ "autopilot_yolo": true }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Ask stays allowed under no_yolo.
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/cron/jobs/{job_id}"),
+        json!({ "name": "Autopilot Ask (renamed)" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let denials = services
+        .audit_events
+        .list(&aionui_db::AuditEventFilter {
+            action: Some("policy.deny".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(denials.len(), 2, "{denials:?}");
+}
