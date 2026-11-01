@@ -4394,6 +4394,7 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
+            full_auto_confirmed: false,
             persist_user_message: true,
             user_message_hidden: true,
             on_started: None,
@@ -4923,6 +4924,7 @@ async fn run_agent_turn_notifies_settlement_hooks_once_after_completion() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
+            full_auto_confirmed: false,
             persist_user_message: true,
             user_message_hidden: true,
             on_started: None,
@@ -5442,6 +5444,7 @@ async fn run_agent_turn_applies_required_runtime_mode_after_stream_subscription(
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: Some("yolo".to_owned()),
+            full_auto_confirmed: false,
             persist_user_message: true,
             user_message_hidden: true,
             on_started: None,
@@ -6412,6 +6415,7 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
+            full_auto_confirmed: false,
             persist_user_message: true,
             user_message_hidden: true,
             on_started: None,
@@ -10203,6 +10207,7 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: Some("default".to_owned()),
+            full_auto_confirmed: false,
             persist_user_message: true,
             user_message_hidden: true,
             on_started: None,
@@ -12809,6 +12814,67 @@ async fn returned_work_item_becomes_evolution_evidence() {
     assert!(tags.contains("signal:work_item_returned") && tags.contains(&format!("ref:{id}")));
     assert!(body.contains("missing tests") && body.contains("Do it"));
     assert_eq!(visibility, "private");
+}
+
+// M8 E12: an Autopilot full-auto run (`autopilot_yolo`) carries no forced
+// runtime mode, yet `no_yolo` must still refuse it before the turn starts.
+#[tokio::test]
+async fn autopilot_full_auto_turn_is_refused_by_no_yolo_and_audited() {
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new("placeholder"),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let db = init_database_memory().await.unwrap();
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(db.pool().clone()));
+    let governance = Arc::new(aionui_db::GovernanceService::new(
+        Arc::new(aionui_db::SqliteGovernanceRepository::new(db.pool().clone())),
+        Some(aionui_db::AuditSink::new(audit.clone())),
+        false,
+    ));
+    service.with_governance(governance.clone());
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let turn = |full_auto_confirmed: bool| ConversationAgentTurnRequest {
+        user_id: "user_1".into(),
+        conversation_id: conv.id.clone(),
+        content: "autopilot run".into(),
+        files: Vec::new(),
+        inject_skills: Vec::new(),
+        required_runtime_mode: None,
+        full_auto_confirmed,
+        persist_user_message: true,
+        user_message_hidden: true,
+        on_started: None,
+    };
+
+    governance
+        .set_policy("user_1", aionui_db::PolicyKey::NoYolo, &json!(true), None)
+        .await
+        .unwrap();
+    let err = service.run_agent_turn(turn(true)).await.unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    assert!(task_mgr.captured_options().is_empty(), "no agent turn started");
+    let denials = audit
+        .list(&aionui_db::AuditEventFilter {
+            action: Some("policy.deny".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(denials.len(), 1);
+
+    // An Ask run (no full-auto confirmation) is unaffected by no_yolo.
+    let outcome = service.run_agent_turn(turn(false)).await.unwrap();
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
 }
 
 // ---- M8 E6-7: read-only GitHub Issue import ----
