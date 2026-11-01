@@ -383,6 +383,53 @@ impl ISkillRepository for SqliteSkillRepository {
             .await?;
         Ok(())
     }
+
+    async fn list_team_shared_for_user(&self, user_id: &str, team_id: &str) -> Result<Vec<SkillRow>, DbError> {
+        let rows = sqlx::query_as::<_, SkillRow>(
+            "SELECT * FROM skills \
+             WHERE visibility = 'team' AND team_id = ? AND user_id IS NOT NULL AND user_id != ? \
+               AND deleted_at IS NULL AND enabled = 1 AND review_status IN ('none', 'approved') \
+             ORDER BY updated_at DESC, name ASC",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_team_all(&self, team_id: &str) -> Result<Vec<SkillRow>, DbError> {
+        let rows = sqlx::query_as::<_, SkillRow>(
+            "SELECT * FROM skills \
+             WHERE visibility = 'team' AND team_id = ? AND user_id IS NOT NULL AND deleted_at IS NULL \
+             ORDER BY updated_at DESC, name ASC",
+        )
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn find_team_shared_by_name_for_user(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        name: &str,
+    ) -> Result<Option<SkillRow>, DbError> {
+        let row = sqlx::query_as::<_, SkillRow>(
+            "SELECT * FROM skills \
+             WHERE visibility = 'team' AND team_id = ? AND user_id IS NOT NULL AND user_id != ? AND name = ? \
+               AND deleted_at IS NULL AND enabled = 1 AND review_status IN ('none', 'approved') \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
 }
 
 #[cfg(test)]
@@ -743,5 +790,74 @@ mod tests {
         assert_eq!(a_records[0].operation_id, USER_A);
         assert_eq!(b_records.len(), 1);
         assert_eq!(b_records[0].operation_id, USER_B);
+    }
+
+    #[tokio::test]
+    async fn team_shared_skills_are_other_users_published_and_usable_only() {
+        let (repo, db) = setup().await;
+        let mk = |name: &'static str| UpsertSkillParams {
+            name,
+            description: Some("d"),
+            path: "/tmp/x",
+            source: "user",
+            enabled: true,
+        };
+        let shared = repo.upsert_for_user(USER_B, mk("shared")).await.unwrap();
+        let _private = repo.upsert_for_user(USER_B, mk("private")).await.unwrap();
+        let held = repo.upsert_for_user(USER_B, mk("held")).await.unwrap();
+        let mine = repo.upsert_for_user(USER_A, mk("mine")).await.unwrap();
+        for (id, status) in [(&shared.id, "none"), (&held.id, "pending"), (&mine.id, "none")] {
+            sqlx::query(
+                "UPDATE skills SET visibility = 'team', team_id = 'installation', review_status = ? WHERE id = ?",
+            )
+            .bind(status)
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let names: Vec<String> = repo
+            .list_team_shared_for_user(USER_A, "installation")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["shared".to_string()]);
+        let mut all: Vec<String> = repo
+            .list_team_all("installation")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        all.sort();
+        assert_eq!(all, vec!["held".to_string(), "mine".to_string(), "shared".to_string()]);
+        assert!(
+            repo.list_team_shared_for_user(USER_A, "other")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.find_team_shared_by_name_for_user(USER_A, "installation", "shared")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.find_team_shared_by_name_for_user(USER_A, "installation", "held")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Your own team skill is listed through list_for_user, not here.
+        assert!(
+            repo.find_team_shared_by_name_for_user(USER_A, "installation", "mine")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

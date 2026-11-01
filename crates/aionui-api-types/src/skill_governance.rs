@@ -104,6 +104,31 @@ pub struct SetVisibilityRequest {
     pub team_id: Option<String>,
 }
 
+/// E10-5: one skill in the installation team library.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSkillInfo {
+    pub skill_id: String,
+    pub name: String,
+    pub description: String,
+    pub owner_user_id: String,
+    /// `none` | `pending` | `approved` | `rejected`
+    pub review_status: String,
+    /// Published by the caller.
+    pub mine: bool,
+    pub updated_at: i64,
+}
+
+/// E10-5: `GET /api/skills/team`. `enabled` is false outside multi-user role
+/// modes; the UI then hides the team entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSkillLibraryResponse {
+    pub enabled: bool,
+    pub team_id: Option<String>,
+    /// Owner / admin: may publish, unpublish and review team skills.
+    pub can_manage: bool,
+    pub skills: Vec<TeamSkillInfo>,
+}
+
 /// E10-3: one changed file between two versions. Unchanged files are omitted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillFileDiff {

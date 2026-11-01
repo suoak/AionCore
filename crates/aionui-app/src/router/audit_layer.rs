@@ -296,6 +296,13 @@ const AUDIT_RULES: &[AuditRule] = &[
     ),
     rule(
         "POST",
+        "/api/skills/id/{skill_id}/copy-to-private",
+        "skill.copy_private",
+        "skill",
+        &["skill_id"],
+    ),
+    rule(
+        "POST",
         "/api/skills/id/{skill_id}/versions/{version_no}/restore",
         "skill.restore",
         "skill",

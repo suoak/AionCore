@@ -63,9 +63,9 @@ pub use skill_evolution::{
     SkillEvolutionSettingsRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
 };
 pub use skill_source::{
-    SKILL_ORIGIN_APPS, SKILL_REVIEW_STATUSES, SKILL_SOURCE_KINDS, SKILL_TRUST_LEVELS, SKILL_VERSION_CREATORS,
-    SKILL_VISIBILITIES, SkillGovernanceRow, SkillSourceRow, SkillVersionRow, evolution_auto_apply_allowed,
-    review_status_is_live,
+    INSTALLATION_TEAM_ID, SKILL_ORIGIN_APPS, SKILL_REVIEW_STATUSES, SKILL_SOURCE_KINDS, SKILL_TRUST_LEVELS,
+    SKILL_VERSION_CREATORS, SKILL_VISIBILITIES, SkillGovernanceRow, SkillSourceRow, SkillVersionRow,
+    evolution_auto_apply_allowed, review_status_is_live,
 };
 pub use squad::{SQUAD_LEADER_MODES, SQUAD_VISIBILITIES, SquadTemplateRow};
 pub use system_settings::SystemSettings;

@@ -148,6 +148,7 @@ async fn list_skills(
             source: to_source_response(s.source),
             registry_origin: s.registry_origin,
             skill_id: s.skill_id,
+            team_shared: s.team_shared,
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))

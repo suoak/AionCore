@@ -9,6 +9,9 @@ pub const SKILL_TRUST_LEVELS: &[&str] = &["trusted", "untrusted"];
 pub const SKILL_VERSION_CREATORS: &[&str] = &["user", "import", "evolution"];
 pub const SKILL_REVIEW_STATUSES: &[&str] = &["none", "pending", "approved", "rejected"];
 pub const SKILL_VISIBILITIES: &[&str] = &["private", "team"];
+/// E10-5: each installation is one implicit team. Team skills carry this
+/// `team_id`; publishing is only offered when multi-user roles are active.
+pub const INSTALLATION_TEAM_ID: &str = "installation";
 
 /// Row mapping for `skill_sources`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

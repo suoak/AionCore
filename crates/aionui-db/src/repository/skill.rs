@@ -108,6 +108,30 @@ pub trait ISkillRepository: Send + Sync {
     async fn delete_registry_install_by_skill_for_user(&self, _user_id: &str, _skill_id: &str) -> Result<(), DbError> {
         Ok(())
     }
+
+    /// E10-5: usable team skills published to `team_id` by *other* users
+    /// (enabled, not deleted, review gate passed). The caller's own skills
+    /// come from [`Self::list_for_user`].
+    async fn list_team_shared_for_user(&self, _user_id: &str, _team_id: &str) -> Result<Vec<SkillRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// E10-5: every non-deleted skill published to `team_id`, any owner and
+    /// any review state (the team library filters by role).
+    async fn list_team_all(&self, _team_id: &str) -> Result<Vec<SkillRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// E10-5: one usable team skill of another user by name (see
+    /// [`Self::list_team_shared_for_user`]).
+    async fn find_team_shared_by_name_for_user(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _name: &str,
+    ) -> Result<Option<SkillRow>, DbError> {
+        Ok(None)
+    }
 }
 
 /// Parameters for creating or updating a skill row.
