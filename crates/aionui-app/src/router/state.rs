@@ -1632,7 +1632,11 @@ pub async fn build_extension_states(
             source_repo: Arc::new(aionui_db::SqliteSkillSourceRepository::new(
                 services.database.pool().clone(),
             )),
-            team_roles: Arc::new(aionui_extension::skill_governance::NoTeamRoles),
+            // E10-5: the installation is one implicit team; owner/admin roles
+            // (E12 governance) manage it, and only when multi-user roles are active.
+            team_roles: Arc::new(aionui_extension::skill_governance::InstallationTeamRoles::new(
+                services.governance.clone(),
+            )),
         }),
     };
 

@@ -268,7 +268,8 @@ pub use skill_evolution::{
 pub use skill_governance::{
     ImportFromSourceRequest, ImportFromSourceResponse, ImportSourceKind, ReviewDecision, ReviewSkillRequest,
     SetVisibilityRequest, SkillFileDiff, SkillGovernanceInfo, SkillRestoreResponse, SkillSourceDetailResponse,
-    SkillSourceInfo, SkillSourceSyncResult, SkillVersionDiffResponse, SkillVersionInfo,
+    SkillSourceInfo, SkillSourceSyncResult, SkillVersionDiffResponse, SkillVersionInfo, TeamSkillInfo,
+    TeamSkillLibraryResponse,
 };
 pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,

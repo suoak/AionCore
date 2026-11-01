@@ -45,6 +45,10 @@ pub struct SkillListItemResponse {
     /// Absent for entries not backed by the skills table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
+    /// E10-5: a team skill published by another user (read-only for you;
+    /// copy it to make a private, editable one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub team_shared: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -409,6 +413,7 @@ mod tests {
             source: SkillSourceResponse::Custom,
             registry_origin: None,
             skill_id: None,
+            team_shared: false,
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["name"], "my-skill");
@@ -435,6 +440,7 @@ mod tests {
             source: SkillSourceResponse::Builtin,
             registry_origin: None,
             skill_id: None,
+            team_shared: false,
         };
         let json = serde_json::to_value(&item).unwrap();
         // Project-wide wire contract: relative_location stays snake_case.

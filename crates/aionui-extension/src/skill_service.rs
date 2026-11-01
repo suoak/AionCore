@@ -291,6 +291,9 @@ pub struct SkillListItem {
     /// `skills.id` when the item comes from the DB catalog (E10-2: lets the UI
     /// open `/api/skills/id/{skill_id}/source`). `None` for disk-only entries.
     pub skill_id: Option<String>,
+    /// E10-5: published to the installation team by another user. Usable,
+    /// but only its owner or a team admin can change it.
+    pub team_shared: bool,
 }
 
 /// List all available skills (built-in + user custom), deduplicated.
@@ -391,6 +394,7 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 source: SkillSource::Builtin,
                 registry_origin: None,
                 skill_id: None,
+                team_shared: false,
             });
         }
     }
@@ -419,6 +423,7 @@ async fn list_builtin_skills_from_disk(dir: &Path) -> Vec<SkillListItem> {
                 source: SkillSource::Builtin,
                 registry_origin: None,
                 skill_id: None,
+                team_shared: false,
             });
         }
     }
@@ -1490,6 +1495,17 @@ async fn resolve_skill_source_path_with_repo_for_user(
     if auto.is_dir() {
         return Ok(Some(auto));
     }
+    // E10-5: a team skill published by another user (review gate already
+    // applied by the query). Own and builtin skills of the same name win.
+    if let Some(row) = repo
+        .find_team_shared_by_name_for_user(user_id, aionui_db::models::INSTALLATION_TEAM_ID, name)
+        .await?
+    {
+        let path = PathBuf::from(&row.path);
+        if path.is_dir() {
+            return Ok(Some(path));
+        }
+    }
     // Per-job cron skill dirs are intentionally NOT probed as a fallback:
     // they hold user content (job prompts) and must resolve only through
     // a repo row owned by the requesting user.
@@ -1634,6 +1650,20 @@ async fn list_skills_from_repo(
             installed_version: origin.installed_version.clone(),
         });
         items.push(skill_row_to_list_item(paths, row, description, registry_origin));
+    }
+    // E10-5: team skills published by other users, unless a skill of the same
+    // name is already visible (your own or a builtin wins).
+    for row in repo
+        .list_team_shared_for_user(user_id, aionui_db::models::INSTALLATION_TEAM_ID)
+        .await?
+    {
+        if items.iter().any(|i| i.name == row.name) {
+            continue;
+        }
+        let description = row.description.clone().unwrap_or_default();
+        let mut item = skill_row_to_list_item(paths, row, description, None);
+        item.team_shared = true;
+        items.push(item);
     }
     Ok(items)
 }
@@ -1813,6 +1843,7 @@ fn skill_row_to_list_item(
 
     SkillListItem {
         skill_id: Some(row.id),
+        team_shared: false,
         name: row.name,
         description,
         location,
@@ -1865,6 +1896,7 @@ async fn list_user_skills_from_disk(paths: &SkillPaths) -> Result<Vec<SkillListI
             source: SkillSource::Custom,
             registry_origin: None,
             skill_id: None,
+            team_shared: false,
         })
         .collect())
 }
