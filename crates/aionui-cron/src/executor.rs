@@ -770,6 +770,7 @@ impl JobExecutor {
             files: vec![],
             inject_skills: skill_names.clone(),
             required_runtime_mode: job.required_runtime_mode().map(ToOwned::to_owned),
+            full_auto_confirmed: job.autopilot && job.autopilot_yolo,
             persist_user_message: true,
             user_message_hidden: true,
             on_started,

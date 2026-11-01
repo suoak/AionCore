@@ -102,6 +102,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                     files: request.files.clone(),
                     inject_skills: Vec::new(),
                     required_runtime_mode: None,
+                    full_auto_confirmed: false,
                     persist_user_message: false,
                     user_message_hidden: false,
                     on_started: on_started.clone(),

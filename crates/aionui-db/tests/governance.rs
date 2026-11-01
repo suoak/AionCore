@@ -261,3 +261,25 @@ fn policy_values_are_normalised() {
     assert_eq!(PolicyKey::parse("no_yolo"), Some(PolicyKey::NoYolo));
     assert_eq!(PolicyKey::parse("nope"), None);
 }
+
+// M8 E12: Autopilot full-auto (`autopilot_yolo`) carries no forced mode, so
+// `no_yolo` checks the explicit confirmation flag.
+#[tokio::test]
+async fn no_yolo_refuses_confirmed_full_auto_without_a_mode() {
+    let (svc, audit) = service(false).await;
+    let mut facts = LaunchFacts::new(LaunchSurface::Cron);
+    facts.target = Some(("cron_job", "j1"));
+    facts.full_auto = true;
+    // Off by default.
+    svc.check_launch("u1", &facts).await.unwrap();
+
+    svc.set_policy("u1", PolicyKey::NoYolo, &json!(true), None)
+        .await
+        .unwrap();
+    let denial = svc.check_launch("u1", &facts).await.unwrap_err();
+    assert_eq!(denial.key, "no_yolo");
+    assert!(denial.message.contains("Autopilot"), "{}", denial.message);
+    facts.full_auto = false;
+    svc.check_launch("u1", &facts).await.unwrap();
+    assert_eq!(actions(&audit).await.iter().filter(|a| *a == "policy.deny").count(), 1);
+}

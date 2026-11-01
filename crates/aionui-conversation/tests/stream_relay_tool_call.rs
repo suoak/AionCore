@@ -391,6 +391,7 @@ async fn run_agent_turn_with_empty_call_id_tool_call_is_not_persisted() {
             files: Vec::new(),
             inject_skills: Vec::new(),
             required_runtime_mode: None,
+            full_auto_confirmed: false,
             persist_user_message: false,
             user_message_hidden: false,
             on_started: None,

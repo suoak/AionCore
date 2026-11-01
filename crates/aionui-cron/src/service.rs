@@ -114,7 +114,8 @@ impl CronService {
 
     /// Reject an enabled job whose unattended mode violates policy
     /// (`no_yolo`, `force_sandbox`, `banned_backends`). Autopilot Ask jobs
-    /// carry no forced mode and are only checked for banned backends.
+    /// carry no forced mode and are only checked for banned backends;
+    /// Autopilot full-auto (`autopilot_yolo`) is refused under `no_yolo`.
     async fn enforce_job_launch_policy(&self, user_id: &str, job: &CronJob) -> Result<(), CronError> {
         if !job.enabled {
             return Ok(());
@@ -143,6 +144,9 @@ impl CronService {
             .as_ref()
             .and_then(|config| config.assistant_id.as_deref());
         facts.mode = job.required_runtime_mode();
+        // E12 no_yolo also covers the Autopilot full-auto confirmation, which
+        // may carry no forced mode of its own.
+        facts.full_auto = job.autopilot && job.autopilot_yolo;
         facts.via = Some(aionui_db::AuditVia::Cron);
         governance
             .check_launch(user_id, &facts)
