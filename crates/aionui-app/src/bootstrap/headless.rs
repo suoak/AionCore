@@ -69,13 +69,15 @@ mod tests {
 
     #[test]
     fn non_headless_always_ok() {
-        assert!(validate_headless_bind(HeadlessBindRequest {
-            headless: false,
-            host: "0.0.0.0",
-            local: true,
-            allow_non_loopback_bind: false,
-        })
-        .is_ok());
+        assert!(
+            validate_headless_bind(HeadlessBindRequest {
+                headless: false,
+                host: "0.0.0.0",
+                local: true,
+                allow_non_loopback_bind: false,
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -105,13 +107,15 @@ mod tests {
 
     #[test]
     fn headless_allows_wildcard_with_opt_in() {
-        assert!(validate_headless_bind(HeadlessBindRequest {
-            headless: true,
-            host: "0.0.0.0",
-            local: false,
-            allow_non_loopback_bind: true,
-        })
-        .is_ok());
+        assert!(
+            validate_headless_bind(HeadlessBindRequest {
+                headless: true,
+                host: "0.0.0.0",
+                local: false,
+                allow_non_loopback_bind: true,
+            })
+            .is_ok()
+        );
     }
 
     #[test]

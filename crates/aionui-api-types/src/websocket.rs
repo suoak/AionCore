@@ -28,8 +28,7 @@ impl EventCursor {
     /// True when `other` is strictly after `self` in the same epoch, or any
     /// event from a newer epoch.
     pub const fn precedes(self, other: EventCursor) -> bool {
-        other.epoch > self.epoch
-            || (other.epoch == self.epoch && other.sequence > self.sequence)
+        other.epoch > self.epoch || (other.epoch == self.epoch && other.sequence > self.sequence)
     }
 }
 
@@ -121,8 +120,7 @@ mod tests {
 
     #[test]
     fn websocket_message_cursor_roundtrip_and_legacy() {
-        let msg = WebSocketMessage::new("ping", serde_json::Value::Null)
-            .with_cursor(EventCursor::new(3, 42));
+        let msg = WebSocketMessage::new("ping", serde_json::Value::Null).with_cursor(EventCursor::new(3, 42));
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["cursor"]["epoch"], 3);
         assert_eq!(v["cursor"]["sequence"], 42);

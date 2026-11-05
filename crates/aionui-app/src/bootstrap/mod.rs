@@ -6,8 +6,8 @@
 
 mod builtin_skills;
 mod environment;
-mod headless;
 mod error;
+mod headless;
 mod instance_guard;
 mod parent_exit;
 mod shutdown_watchdog;
@@ -15,8 +15,8 @@ mod tracing_init;
 mod work_dir;
 
 pub use environment::{ServerEnvironment, init_data_layer, init_environment};
-pub(crate) use headless::{HeadlessBindRequest, headless_ready_line, validate_headless_bind};
 pub(crate) use error::{BootstrapError, BootstrapErrorCode};
+pub(crate) use headless::{HeadlessBindRequest, headless_ready_line, validate_headless_bind};
 pub(crate) use instance_guard::wait_for_instance_guard;
 pub(crate) use parent_exit::{ParentExitSignal, parent_exit_signal};
 pub(crate) use shutdown_watchdog::ShutdownWatchdog;

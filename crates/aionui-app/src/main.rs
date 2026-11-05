@@ -157,10 +157,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
             let listener = commands::bind_http_listener(&mut env.config).await?;
             if cli.headless {
                 // Stable machine-readable banner for SSH tunnel / smoke scripts.
-                println!(
-                    "{}",
-                    bootstrap::headless_ready_line(&env.config.host, env.config.port)
-                );
+                println!("{}", bootstrap::headless_ready_line(&env.config.host, env.config.port));
             }
             let database = bootstrap::init_data_layer(&env.config).await?;
             let services = AppServices::from_config(database, &env.config).await.map_err(|error| {
