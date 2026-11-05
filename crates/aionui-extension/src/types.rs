@@ -796,7 +796,7 @@ pub struct ResolvedAgentTool {
     pub handler: Option<String>,
 }
 
-/// Resolved background service declaration (not spawned by this slice).
+/// Resolved background service declaration (start/stop via Host runtime).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedBackgroundService {
     pub extension_name: String,
