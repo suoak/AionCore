@@ -279,7 +279,6 @@ pub struct ExtModelProvider {
     pub models: Vec<String>,
 }
 
-
 /// Command-palette entry contributed by an extension (Plugin Contract v1).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtCommand {
