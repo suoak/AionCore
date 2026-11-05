@@ -3,11 +3,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::error::AssistantError;
 use aionui_api_types::{
     CreateLocalKbSourceRequest, LocalKbSearchHit, LocalKbSearchRequest, LocalKbSettingsResponse, LocalKbSourceResponse,
     UpdateLocalKbSettingsRequest,
 };
-use aionui_common::ApiError;
 use aionui_db::{
     CreateLocalKbDocumentParams, CreateLocalKbSourceParams, ILocalKbRepository, UpsertLocalKbSettingsParams,
 };
@@ -31,7 +31,7 @@ impl LocalKbService {
         Self { repo }
     }
 
-    pub async fn get_settings(&self, user_id: &str) -> Result<LocalKbSettingsResponse, ApiError> {
+    pub async fn get_settings(&self, user_id: &str) -> Result<LocalKbSettingsResponse, AssistantError> {
         match self.repo.get_settings(user_id).await.map_err(db_err)? {
             Some(row) => Ok(LocalKbSettingsResponse {
                 enabled: row.enabled != 0,
@@ -48,7 +48,7 @@ impl LocalKbService {
         &self,
         user_id: &str,
         req: UpdateLocalKbSettingsRequest,
-    ) -> Result<LocalKbSettingsResponse, ApiError> {
+    ) -> Result<LocalKbSettingsResponse, AssistantError> {
         let row = self
             .repo
             .upsert_settings(UpsertLocalKbSettingsParams {
@@ -63,7 +63,7 @@ impl LocalKbService {
         })
     }
 
-    pub async fn list_sources(&self, user_id: &str) -> Result<Vec<LocalKbSourceResponse>, ApiError> {
+    pub async fn list_sources(&self, user_id: &str) -> Result<Vec<LocalKbSourceResponse>, AssistantError> {
         let sources = self.repo.list_sources(user_id).await.map_err(db_err)?;
         let mut out = Vec::with_capacity(sources.len());
         for s in sources {
@@ -89,14 +89,16 @@ impl LocalKbService {
         &self,
         user_id: &str,
         req: CreateLocalKbSourceRequest,
-    ) -> Result<LocalKbSourceResponse, ApiError> {
+    ) -> Result<LocalKbSourceResponse, AssistantError> {
         let kind = req.kind.trim().to_ascii_lowercase();
         if !matches!(kind.as_str(), "text" | "file" | "directory") {
-            return Err(ApiError::BadRequest("kind must be text, file, or directory".into()));
+            return Err(AssistantError::BadRequest(
+                "kind must be text, file, or directory".into(),
+            ));
         }
         let label = req.label.trim();
         if label.is_empty() {
-            return Err(ApiError::BadRequest("label is required".into()));
+            return Err(AssistantError::BadRequest("label is required".into()));
         }
 
         let source_id = Uuid::now_v7().to_string();
@@ -106,10 +108,10 @@ impl LocalKbService {
             "text" => {
                 let body = req.text.as_deref().unwrap_or("").trim();
                 if body.is_empty() {
-                    return Err(ApiError::BadRequest("text is required for kind=text".into()));
+                    return Err(AssistantError::BadRequest("text is required for kind=text".into()));
                 }
                 if body.len() > MAX_TEXT_BYTES {
-                    return Err(ApiError::BadRequest("text exceeds 2 MiB limit".into()));
+                    return Err(AssistantError::BadRequest("text exceeds 2 MiB limit".into()));
                 }
                 let source = self
                     .repo
@@ -140,7 +142,7 @@ impl LocalKbService {
                 })
             }
             "file" => {
-                let path = origin.ok_or_else(|| ApiError::BadRequest("origin_path required for file".into()))?;
+                let path = origin.ok_or_else(|| AssistantError::BadRequest("origin_path required for file".into()))?;
                 let content = read_text_file(Path::new(path))?;
                 let source = self
                     .repo
@@ -167,10 +169,13 @@ impl LocalKbService {
                 })
             }
             "directory" => {
-                let path = origin.ok_or_else(|| ApiError::BadRequest("origin_path required for directory".into()))?;
+                let path =
+                    origin.ok_or_else(|| AssistantError::BadRequest("origin_path required for directory".into()))?;
                 let files = collect_dir_texts(Path::new(path))?;
                 if files.is_empty() {
-                    return Err(ApiError::BadRequest("directory has no supported text files".into()));
+                    return Err(AssistantError::BadRequest(
+                        "directory has no supported text files".into(),
+                    ));
                 }
                 let source = self
                     .repo
@@ -200,24 +205,28 @@ impl LocalKbService {
         }
     }
 
-    pub async fn delete_source(&self, user_id: &str, source_id: &str) -> Result<(), ApiError> {
+    pub async fn delete_source(&self, user_id: &str, source_id: &str) -> Result<(), AssistantError> {
         let deleted = self.repo.delete_source(user_id, source_id).await.map_err(db_err)?;
         if !deleted {
-            return Err(ApiError::NotFound("local-kb source not found".into()));
+            return Err(AssistantError::NotFound("local-kb source not found".into()));
         }
         Ok(())
     }
 
-    pub async fn search(&self, user_id: &str, req: LocalKbSearchRequest) -> Result<Vec<LocalKbSearchHit>, ApiError> {
+    pub async fn search(
+        &self,
+        user_id: &str,
+        req: LocalKbSearchRequest,
+    ) -> Result<Vec<LocalKbSearchHit>, AssistantError> {
         let settings = self.get_settings(user_id).await?;
         if !settings.enabled {
-            return Err(ApiError::BadRequest(
+            return Err(AssistantError::BadRequest(
                 "local-kb is disabled (default OFF); enable it before searching".into(),
             ));
         }
         let q = req.query.trim();
         if q.is_empty() {
-            return Err(ApiError::BadRequest("query is required".into()));
+            return Err(AssistantError::BadRequest("query is required".into()));
         }
         let limit = req.limit.clamp(1, 100) as i64;
         let rows = self.repo.search_documents(user_id, q, limit).await.map_err(db_err)?;
@@ -244,7 +253,7 @@ impl LocalKbService {
         title: &str,
         body: &str,
         relative_path: Option<&str>,
-    ) -> Result<(), ApiError> {
+    ) -> Result<(), AssistantError> {
         let hash = hex::encode(Sha256::digest(body.as_bytes()));
         let id = Uuid::now_v7().to_string();
         self.repo
@@ -263,32 +272,35 @@ impl LocalKbService {
     }
 }
 
-fn db_err(err: aionui_db::DbError) -> ApiError {
-    ApiError::Internal(err.to_string())
+fn db_err(err: aionui_db::DbError) -> AssistantError {
+    AssistantError::from(err)
 }
 
-fn read_text_file(path: &Path) -> Result<String, ApiError> {
+fn read_text_file(path: &Path) -> Result<String, AssistantError> {
     if !path.is_file() {
-        return Err(ApiError::BadRequest(format!("not a file: {}", path.display())));
+        return Err(AssistantError::BadRequest(format!("not a file: {}", path.display())));
     }
-    let meta = std::fs::metadata(path).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let meta = std::fs::metadata(path).map_err(|e| AssistantError::BadRequest(e.to_string()))?;
     if meta.len() as usize > MAX_TEXT_BYTES {
-        return Err(ApiError::BadRequest("file exceeds 2 MiB limit".into()));
+        return Err(AssistantError::BadRequest("file exceeds 2 MiB limit".into()));
     }
-    let bytes = std::fs::read(path).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    String::from_utf8(bytes).map_err(|_| ApiError::BadRequest("file is not valid UTF-8 text".into()))
+    let bytes = std::fs::read(path).map_err(|e| AssistantError::BadRequest(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| AssistantError::BadRequest("file is not valid UTF-8 text".into()))
 }
 
-fn collect_dir_texts(root: &Path) -> Result<Vec<(String, String)>, ApiError> {
+fn collect_dir_texts(root: &Path) -> Result<Vec<(String, String)>, AssistantError> {
     if !root.is_dir() {
-        return Err(ApiError::BadRequest(format!("not a directory: {}", root.display())));
+        return Err(AssistantError::BadRequest(format!(
+            "not a directory: {}",
+            root.display()
+        )));
     }
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let entries = std::fs::read_dir(&dir).map_err(|e| AssistantError::BadRequest(e.to_string()))?;
         for entry in entries {
-            let entry = entry.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let entry = entry.map_err(|e| AssistantError::BadRequest(e.to_string()))?;
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
@@ -331,7 +343,7 @@ fn make_snippet(body: &str, query: &str) -> String {
     let mut chars = body.chars().skip(begin).take(take);
     let mut s: String = chars.by_ref().collect();
     if begin > 0 {
-        s.insert_str(0, "…");
+        s.insert(0, '…');
     }
     if chars.next().is_some() || begin + take < body.chars().count() {
         // if truncated from end

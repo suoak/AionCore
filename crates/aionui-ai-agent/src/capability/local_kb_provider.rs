@@ -57,7 +57,7 @@ fn snippet_for(doc: &LocalKbDocumentRow, query: &str, max_chars: usize) -> Strin
     let end = (start + q.len() + 160).min(body.len());
     let mut snip = body[begin..end].to_string();
     if begin > 0 {
-        snip.insert_str(0, "…");
+        snip.insert(0, '…');
     }
     if end < body.len() {
         snip.push('…');
