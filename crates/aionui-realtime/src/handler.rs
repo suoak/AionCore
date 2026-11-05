@@ -233,7 +233,6 @@ fn send_realtime_error(state: &WsHandlerState, conn_id: ConnectionId, error: Rea
     state.manager.send_to(conn_id, error.into_event());
 }
 
-
 /// E14: replay retained live events after the client's last acknowledged cursor.
 ///
 /// Missing `event_log` or missing cursor → `resume.complete` with `status=unavailable`
@@ -635,11 +634,9 @@ mod tests {
         let mut state = test_state(manager);
         state.event_log = Some(log);
 
-        let resume = serde_json::to_string(
-            &WebSocketMessage::new("resume", json!({}))
-                .with_cursor(EventCursor::new(1, 1)),
-        )
-        .unwrap();
+        let resume =
+            serde_json::to_string(&WebSocketMessage::new("resume", json!({})).with_cursor(EventCursor::new(1, 1)))
+                .unwrap();
         handle_text_message(conn_id, "user-1", &resume, &state);
 
         // expect b, c, then resume.complete

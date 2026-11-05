@@ -3,8 +3,8 @@
 //! Brand: CSBU WorkMate. No AGPL. Bounded RAM only — not durable journal replay.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_api_types::{EventCursor, WebSocketMessage};
 use serde_json::Value;
