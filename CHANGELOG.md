@@ -84,6 +84,7 @@
 
 ### Bug Fixes
 
+* **deps:** bump calamine 0.37 → 0.38 (RUSTSEC-2026-0436 CFB/OLE2 panic/OOM) ([#229](https://github.com/suoak/AionCore/issues/229)) ([2c3089d](https://github.com/suoak/AionCore/commit/2c3089dc76e64e1e8a8dd965a588b767c85a00a2))
 * **cron:** buffer Autopilot reports until the notifier is installed (M8) ([#226](https://github.com/suoak/AionCore/issues/226)) ([6d849e3](https://github.com/suoak/AionCore/commit/6d849e36ff023e4cec2169934ce2238976caff0c))
 * **security:** persist @@ session delivery grants across restarts (E1 tail ③) ([#170](https://github.com/suoak/AionCore/issues/170)) ([d3ee378](https://github.com/suoak/AionCore/commit/d3ee378268b38914a9c9cafd9b932f9d3b957c07))
 * **security:** scope /api/teams reads for agent tokens to own teams (E1 tail ②) ([#169](https://github.com/suoak/AionCore/issues/169)) ([ddcf8c1](https://github.com/suoak/AionCore/commit/ddcf8c1b00e8e6ff1a5a13f6d3e3c2c137bdf924))
