@@ -935,14 +935,14 @@ pub fn build_delivery_state(services: &AppServices) -> DeliveryRouterState {
     }
 }
 
-/// Build Skill Evolution router state (经验库 / 技能提案 + Phase 2 evolve/apply).
-
+/// Build local-kb router state (M9 E15). Default OFF; not KnowHub / experience.
 pub fn build_local_kb_state(services: &AppServices) -> LocalKbRouterState {
     let repo = Arc::new(SqliteLocalKbRepository::new(services.database.pool().clone()));
     let service = Arc::new(LocalKbService::new(repo));
     LocalKbRouterState { service }
 }
 
+/// Build Skill Evolution router state (经验库 / 技能提案 + Phase 2 evolve/apply).
 pub fn build_skill_evolution_state(
     services: &AppServices,
     provider_service: aionui_system::ProviderService,
