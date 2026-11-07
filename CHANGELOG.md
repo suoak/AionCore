@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.1](https://github.com/suoak/AionCore/compare/v0.4.0...v0.4.1) (2026-11-07)
+
+
+### Features
+
+* **extension:** add bounded experimental source reader ([#243](https://github.com/suoak/AionCore/issues/243)) ([9878069](https://github.com/suoak/AionCore/commit/987806917272656c459d89a21ea28be7e2443cc8))
+* **extension:** add opt-in Linux pure-JSON JS helper ([#240](https://github.com/suoak/AionCore/issues/240)) ([4e97e71](https://github.com/suoak/AionCore/commit/4e97e71d25c968d91643470d683de8e2a3a0978d))
+* **extension:** guard experimental JS helper on parent exit ([#242](https://github.com/suoak/AionCore/issues/242)) ([5644979](https://github.com/suoak/AionCore/commit/5644979eda846f95637f7c14b03f8298eb9d0ae7))
+* **extension:** Host invoke / tool gate / background service runtime (M9 E13) ([#238](https://github.com/suoak/AionCore/issues/238)) ([c162106](https://github.com/suoak/AionCore/commit/c16210695a311c057e67df33614c94e327304f87))
+* **extension:** parse Plugin Contract v1 contributes (M9 E13) ([#230](https://github.com/suoak/AionCore/issues/230)) ([277e234](https://github.com/suoak/AionCore/commit/277e2343ff502cad8ca16432944c444905d84bc9))
+* **extension:** resolve Plugin Contract v1 contributes at runtime (M9 E13) ([#236](https://github.com/suoak/AionCore/issues/236)) ([e069f42](https://github.com/suoak/AionCore/commit/e069f42768128ad081013c302f5fba9ff4647832))
+* **extension:** supervise opt-in fixed Core JS helper calls ([#241](https://github.com/suoak/AionCore/issues/241)) ([9a2471c](https://github.com/suoak/AionCore/commit/9a2471ca76dace5d5f68aedccb59c4107380fe4d))
+* **governance:** filter member assistant catalog by run permissions (M9 E12-p2) ([#231](https://github.com/suoak/AionCore/issues/231)) ([554389b](https://github.com/suoak/AionCore/commit/554389b469ce4a0d6be3485c98283056d6c70cb7))
+* **host:** --headless Host + loopback/auth + EventCursor (M9 E14) ([#232](https://github.com/suoak/AionCore/issues/232)) ([3f70875](https://github.com/suoak/AionCore/commit/3f708750aa551c8c7b5eeffae929e007191977f1))
+* **hub:** enterprise curated marketplace gate (M9 E13) ([#235](https://github.com/suoak/AionCore/issues/235)) ([c39560a](https://github.com/suoak/AionCore/commit/c39560a182c5ec137e3fb454edb7f1ce4c33bfab))
+* **local-kb:** M9 E15 local knowledge base provider (default OFF) ([#234](https://github.com/suoak/AionCore/issues/234)) ([04fdd1a](https://github.com/suoak/AionCore/commit/04fdd1a927b07c234fe75b323ece785a00b5fbe1))
+* **realtime:** durable NDJSON event journal across Host restarts (M9 E14) ([#237](https://github.com/suoak/AionCore/issues/237)) ([1200b78](https://github.com/suoak/AionCore/commit/1200b789617fbcbc4a8f340491007983cdadf090))
+* **realtime:** in-memory epoch/sequence event resume ring (M9 E14) ([#233](https://github.com/suoak/AionCore/issues/233)) ([3236fc4](https://github.com/suoak/AionCore/commit/3236fc4bde09bbd251d5a1a05bb0215f743caf0c))
+
+
+### Bug Fixes
+
+* **codex:** canonicalize execution workspace before spawn ([#239](https://github.com/suoak/AionCore/issues/239)) ([f092efc](https://github.com/suoak/AionCore/commit/f092efc03ac3e2a0cf442d764d04ee225fdcf2ed))
+* **extension:** compare curated SRI integrity case-sensitively ([#244](https://github.com/suoak/AionCore/issues/244)) ([e1cb105](https://github.com/suoak/AionCore/commit/e1cb105bed63353266301312d7e40408640edff5))
+
 ## [0.4.0](https://github.com/suoak/AionCore/compare/v0.2.20...v0.4.0) (2026-11-05)
 
 ### Behavior Changes
