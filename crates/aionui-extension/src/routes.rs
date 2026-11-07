@@ -1001,17 +1001,19 @@ mod tests {
     }
 
     async fn make_state_with_extension() -> (ExtensionRouterState, tempfile::TempDir, PathBuf) {
+        make_state_with_manifest(serde_json::json!({"name": "hello", "version": "1.0.0"})).await
+    }
+
+    async fn make_state_with_manifest(
+        manifest: serde_json::Value,
+    ) -> (ExtensionRouterState, tempfile::TempDir, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let ext_root = tmp.path().join("extensions");
         let ext_dir = ext_root.join("hello");
         std::fs::create_dir_all(ext_dir.join("settings")).unwrap();
         std::fs::write(
             ext_dir.join("aion-extension.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "name": "hello",
-                "version": "1.0.0"
-            }))
-            .unwrap(),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
         std::fs::write(ext_dir.join("settings").join("index.html"), "<h1>Hello</h1>").unwrap();
@@ -1028,6 +1030,45 @@ mod tests {
             .unwrap();
 
         (ExtensionRouterState::new(registry), tmp, ext_dir)
+    }
+
+    #[tokio::test]
+    async fn agent_tool_route_does_not_trust_client_plan_mode() {
+        let (state, _tmp, _ext_dir) = make_state_with_manifest(serde_json::json!({
+            "name": "hello",
+            "version": "1.0.0",
+            "contributes": {
+                "agentTools": [
+                    {"id": "demo.read", "name": "Read", "planSafeActions": true},
+                    {"id": "demo.write", "name": "Write", "planSafeActions": false}
+                ]
+            }
+        }))
+        .await;
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        for plan_mode in [None, Some(false), Some(true)] {
+            for (action, expected) in [("read", StatusCode::OK), ("write", StatusCode::FORBIDDEN)] {
+                let mut payload = serde_json::json!({"id": format!("ext-hello-demo.{action}")});
+                if let Some(value) = plan_mode {
+                    payload["planMode"] = serde_json::json!(value);
+                }
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/extensions/agent-tools/invoke")
+                            .header("content-type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                // The safe positive control also proves a missing fixture did
+                // not make every request fail with a misleading 404.
+                assert_eq!(response.status(), expected, "action={action}, plan_mode={plan_mode:?}");
+            }
+        }
     }
 
     #[tokio::test]
