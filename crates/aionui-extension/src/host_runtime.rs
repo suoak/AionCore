@@ -320,7 +320,17 @@ fn resolve_service_script(ext_dir: &str, entry_point: &str) -> Result<PathBuf, E
     {
         return Err(ExtensionError::PathTraversal(entry_point.to_owned()));
     }
-    Ok(Path::new(ext_dir).join(path))
+    // Resolve both sides before comparing components: lexical checks do not
+    // prevent a script or an intermediate directory from being a symlink.
+    let root = std::fs::canonicalize(ext_dir).map_err(|_| ExtensionError::PathTraversal(entry_point.to_owned()))?;
+    let script =
+        std::fs::canonicalize(root.join(path)).map_err(|_| ExtensionError::PathTraversal(entry_point.to_owned()))?;
+    if !script.starts_with(&root) || !script.is_file() {
+        return Err(ExtensionError::PathTraversal(entry_point.to_owned()));
+    }
+    // Launch the resolved path, not the original symlink path. Curated plugin
+    // files must not be modified concurrently with service startup.
+    Ok(script)
 }
 
 fn now_ms() -> u64 {
@@ -390,12 +400,40 @@ mod tests {
 
     #[test]
     fn resolve_service_script_rejects_traversal() {
-        assert!(resolve_service_script("/ext", "../evil.sh").is_err());
-        assert!(resolve_service_script("/ext", "/abs.sh").is_err());
-        let ok = resolve_service_script("/ext", "services/worker.sh").unwrap();
-        assert_eq!(ok, PathBuf::from("/ext/services/worker.sh"));
-        let from_url = resolve_service_script("/ext", "/api/extensions/demo.ext/assets/services/worker.sh").unwrap();
-        assert_eq!(from_url, PathBuf::from("/ext/services/worker.sh"));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("services")).unwrap();
+        std::fs::write(dir.path().join("services/worker.sh"), "exit 0\n").unwrap();
+        let root = dir.path().to_str().unwrap();
+        let expected = std::fs::canonicalize(dir.path().join("services/worker.sh")).unwrap();
+        assert!(resolve_service_script(root, "../evil.sh").is_err());
+        assert!(resolve_service_script(root, "/abs.sh").is_err());
+        assert!(resolve_service_script(root, "missing.sh").is_err());
+        assert!(resolve_service_script(root, "services").is_err());
+        assert_eq!(resolve_service_script(root, "services/worker.sh").unwrap(), expected);
+        assert_eq!(
+            resolve_service_script(root, "/api/extensions/demo.ext/assets/services/worker.sh").unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_service_script_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("worker.sh"), "exit 0\n").unwrap();
+        symlink(outside.path().join("worker.sh"), dir.path().join("script-link.sh")).unwrap();
+        symlink(outside.path(), dir.path().join("directory-link")).unwrap();
+        let root = dir.path().to_str().unwrap();
+        assert!(resolve_service_script(root, "script-link.sh").is_err());
+        assert!(resolve_service_script(root, "directory-link/worker.sh").is_err());
+        std::fs::write(dir.path().join("inside.sh"), "exit 0\n").unwrap();
+        symlink(dir.path().join("inside.sh"), dir.path().join("inside-link.sh")).unwrap();
+        assert_eq!(
+            resolve_service_script(root, "inside-link.sh").unwrap(),
+            std::fs::canonicalize(dir.path().join("inside.sh")).unwrap()
+        );
     }
 
     #[test]
