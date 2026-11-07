@@ -25,7 +25,7 @@ use crate::types::{
 /// In-process tracker for started background services (per Host process).
 #[derive(Default)]
 pub struct BackgroundServiceManager {
-    inner: Mutex<HashMap<String, RunningService>>,
+    inner: Mutex<HashMap<(String, String, String), RunningService>>,
 }
 
 struct RunningService {
@@ -53,16 +53,42 @@ impl BackgroundServiceManager {
         Self::default()
     }
 
-    fn key(extension_name: &str, service_id: &str) -> String {
-        format!("{extension_name}\0{service_id}")
+    fn key(user_id: &str, extension_name: &str, service_id: &str) -> (String, String, String) {
+        (user_id.to_owned(), extension_name.to_owned(), service_id.to_owned())
     }
 
-    pub async fn status_for(&self, services: &[ResolvedBackgroundService]) -> Vec<BackgroundServiceStatus> {
-        let guard = self.inner.lock().await;
+    // Only a confirmed exit allows a replacement process. Keep the handle on
+    // probe errors so an uncertain state cannot create duplicate services.
+    fn reap_exited(services: &mut HashMap<(String, String, String), RunningService>, key: &(String, String, String)) {
+        let exited = match services.get_mut(key) {
+            Some(service) => match service.child.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    warn!(%error, extension = %service.extension_name, service = %service.service_id,
+                        "could not inspect background service; retaining handle");
+                    false
+                }
+            },
+            None => false,
+        };
+        if exited {
+            services.remove(key);
+        }
+    }
+
+    pub async fn status_for(
+        &self,
+        user_id: &str,
+        services: &[ResolvedBackgroundService],
+    ) -> Vec<BackgroundServiceStatus> {
+        let mut guard = self.inner.lock().await;
         services
             .iter()
             .map(|svc| {
-                let running = guard.get(&Self::key(&svc.extension_name, &svc.id));
+                let key = Self::key(user_id, &svc.extension_name, &svc.id);
+                Self::reap_exited(&mut guard, &key);
+                let running = guard.get(&key);
                 BackgroundServiceStatus {
                     id: svc.id.clone(),
                     extension_name: svc.extension_name.clone(),
@@ -74,17 +100,18 @@ impl BackgroundServiceManager {
             .collect()
     }
 
-    pub async fn is_running(&self, extension_name: &str, service_id: &str) -> bool {
-        self.inner
-            .lock()
-            .await
-            .contains_key(&Self::key(extension_name, service_id))
+    pub async fn is_running(&self, user_id: &str, extension_name: &str, service_id: &str) -> bool {
+        let key = Self::key(user_id, extension_name, service_id);
+        let mut guard = self.inner.lock().await;
+        Self::reap_exited(&mut guard, &key);
+        guard.contains_key(&key)
     }
 
     /// Start a curated background service. `entry_point` must resolve under `ext.directory`
     /// (relative path or already-normalized asset URL path segment). Requires `shell` permission.
     pub async fn start(
         &self,
+        user_id: &str,
         ext: &LoadedExtension,
         service: &ResolvedBackgroundService,
     ) -> Result<BackgroundServiceStatus, ExtensionError> {
@@ -99,8 +126,9 @@ impl BackgroundServiceManager {
             return Err(ExtensionError::HookNotFound(script.display().to_string()));
         }
 
-        let key = Self::key(&service.extension_name, &service.id);
+        let key = Self::key(user_id, &service.extension_name, &service.id);
         let mut guard = self.inner.lock().await;
+        Self::reap_exited(&mut guard, &key);
         if guard.contains_key(&key) {
             let running = guard.get(&key).expect("just checked");
             return Ok(BackgroundServiceStatus {
@@ -149,10 +177,11 @@ impl BackgroundServiceManager {
 
     pub async fn stop(
         &self,
+        user_id: &str,
         extension_name: &str,
         service_id: &str,
     ) -> Result<BackgroundServiceStatus, ExtensionError> {
-        let key = Self::key(extension_name, service_id);
+        let key = Self::key(user_id, extension_name, service_id);
         let mut guard = self.inner.lock().await;
         let Some(mut running) = guard.remove(&key) else {
             return Ok(BackgroundServiceStatus {
@@ -396,6 +425,53 @@ mod tests {
             icon: None,
         }];
         assert!(panel_hint_for_command(&panels, &cmd).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_services_are_reaped_only_for_the_requested_user() {
+        let manager = BackgroundServiceManager::new();
+        for user in ["alice", "bob"] {
+            let mut child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            // Synchronize on exit, not a timing-dependent sleep.
+            child.wait().await.unwrap();
+            manager.inner.lock().await.insert(
+                BackgroundServiceManager::key(user, "demo", "worker"),
+                RunningService {
+                    extension_name: "demo".into(),
+                    service_id: "worker".into(),
+                    pid,
+                    child,
+                    started_at_ms: 1,
+                },
+            );
+        }
+        assert!(!manager.is_running("alice", "demo", "worker").await);
+        assert!(
+            manager
+                .inner
+                .lock()
+                .await
+                .contains_key(&BackgroundServiceManager::key("bob", "demo", "worker"))
+        );
+        assert!(!manager.is_running("bob", "demo", "worker").await);
+        assert!(manager.inner.lock().await.is_empty());
+    }
+
+    #[test]
+    fn service_keys_are_scoped_to_authenticated_user() {
+        assert_ne!(
+            BackgroundServiceManager::key("alice", "demo", "worker"),
+            BackgroundServiceManager::key("bob", "demo", "worker")
+        );
+        assert_ne!(
+            BackgroundServiceManager::key("a\0b", "c", "worker"),
+            BackgroundServiceManager::key("a", "b\0c", "worker")
+        );
     }
 
     #[test]

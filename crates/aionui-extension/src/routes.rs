@@ -556,7 +556,7 @@ struct InvokeAgentToolRequest {
     id: String,
     #[serde(default)]
     extension_name: Option<String>,
-    /// When true, Host enforces D13-2 `planSafeActions`.
+    /// Untrusted client hint; never authorizes non-plan-safe tool execution.
     #[serde(default)]
     plan_mode: bool,
     #[serde(default)]
@@ -610,7 +610,9 @@ async fn invoke_agent_tool(
     let tool = host_runtime::find_agent_tool(&tools, &req.id, req.extension_name.as_deref())
         .cloned()
         .ok_or_else(|| ApiError::NotFound(format!("Agent tool not found: {}", req.id)))?;
-    if let Err(err) = host_runtime::gate_plan_safe(&tool, req.plan_mode) {
+    // No authoritative session/run context is bound to this endpoint yet.
+    // Fail closed regardless of the client hint, including false or omission.
+    if let Err(err) = host_runtime::gate_plan_safe(&tool, true) {
         return Err(ApiError::Forbidden(err.to_string()));
     }
     // v1 curated Host: record accept; JS/sandbox handler IPC is follow-up.
@@ -619,7 +621,7 @@ async fn invoke_agent_tool(
         user_id = %user.id,
         tool_id = %tool.id,
         extension = %tool.extension_name,
-        plan_mode = req.plan_mode,
+        requested_plan_mode = req.plan_mode,
         "extension agent tool invoke accepted"
     );
     let result = AgentToolInvokeResult {
@@ -637,7 +639,7 @@ async fn get_background_services_status(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let items = state.registry.get_background_services_for_user(&user.id).await;
-    let status = state.host_runtime.background.status_for(&items).await;
+    let status = state.host_runtime.background.status_for(&user.id, &items).await;
     Ok(Json(ApiResponse::ok(serde_json::to_value(&status).unwrap_or_default())))
 }
 
@@ -666,7 +668,7 @@ async fn start_background_service(
     let status = state
         .host_runtime
         .background
-        .start(&ext, &service)
+        .start(&user.id, &ext, &service)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(serde_json::to_value(&status).unwrap_or_default())))
@@ -686,7 +688,7 @@ async fn stop_background_service(
     let status = state
         .host_runtime
         .background
-        .stop(&service.extension_name, &service.id)
+        .stop(&user.id, &service.extension_name, &service.id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(serde_json::to_value(&status).unwrap_or_default())))
