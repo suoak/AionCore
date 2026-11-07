@@ -21,10 +21,8 @@ use serde_json::json;
 
 use crate::asset_paths::normalize_relative_asset_path;
 use crate::error::ExtensionError;
+use crate::host_runtime::{self, AgentToolInvokeResult, CommandInvokeResult, HostRuntime};
 use crate::permission::{build_permission_summary, calculate_risk_level};
-use crate::host_runtime::{
-    self, AgentToolInvokeResult, CommandInvokeResult, HostRuntime,
-};
 use crate::registry::ExtensionRegistry;
 
 impl From<ExtensionError> for ApiError {
@@ -187,8 +185,14 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         )
         .route("/api/extensions/commands/invoke", post(invoke_command))
         .route("/api/extensions/agent-tools/invoke", post(invoke_agent_tool))
-        .route("/api/extensions/background-services/start", post(start_background_service))
-        .route("/api/extensions/background-services/stop", post(stop_background_service))
+        .route(
+            "/api/extensions/background-services/start",
+            post(start_background_service),
+        )
+        .route(
+            "/api/extensions/background-services/stop",
+            post(stop_background_service),
+        )
         .route(
             "/api/extensions/{extension_name}/assets/{*asset_path}",
             get(get_extension_asset),

@@ -19,8 +19,7 @@ use tracing::{info, warn};
 
 use crate::error::ExtensionError;
 use crate::types::{
-    ExtPermissions, LoadedExtension, ResolvedAgentTool, ResolvedBackgroundService, ResolvedCommand,
-    ResolvedPanel,
+    ExtPermissions, LoadedExtension, ResolvedAgentTool, ResolvedBackgroundService, ResolvedCommand, ResolvedPanel,
 };
 
 /// In-process tracker for started background services (per Host process).
@@ -265,17 +264,16 @@ pub fn find_background_service<'a>(
 }
 
 /// Prefer a panel whose id shares the command's local suffix.
-pub fn panel_hint_for_command<'a>(
-    panels: &'a [ResolvedPanel],
-    command: &ResolvedCommand,
-) -> Option<&'a ResolvedPanel> {
+pub fn panel_hint_for_command<'a>(panels: &'a [ResolvedPanel], command: &ResolvedCommand) -> Option<&'a ResolvedPanel> {
     let local = command
         .id
         .strip_prefix(&format!("ext-{}-", command.extension_name))
         .unwrap_or(command.id.as_str());
     panels.iter().find(|p| {
         p.extension_name == command.extension_name
-            && (p.id == command.id || p.id.ends_with(&format!("-{local}")) || p.id == format!("ext-{}-{local}", command.extension_name))
+            && (p.id == command.id
+                || p.id.ends_with(&format!("-{local}"))
+                || p.id == format!("ext-{}-{local}", command.extension_name))
     })
 }
 
@@ -396,11 +394,7 @@ mod tests {
         assert!(resolve_service_script("/ext", "/abs.sh").is_err());
         let ok = resolve_service_script("/ext", "services/worker.sh").unwrap();
         assert_eq!(ok, PathBuf::from("/ext/services/worker.sh"));
-        let from_url = resolve_service_script(
-            "/ext",
-            "/api/extensions/demo.ext/assets/services/worker.sh",
-        )
-        .unwrap();
+        let from_url = resolve_service_script("/ext", "/api/extensions/demo.ext/assets/services/worker.sh").unwrap();
         assert_eq!(from_url, PathBuf::from("/ext/services/worker.sh"));
     }
 
