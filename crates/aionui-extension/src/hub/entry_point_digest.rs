@@ -40,6 +40,14 @@ impl std::fmt::Debug for EntryPointDigestBinding {
 }
 
 impl EntryPointDigestBinding {
+    /// Construct a binding from already-validated non-empty entry path + canonical SRI.
+    ///
+    /// `pub(crate)` so sibling contribute binders (e.g. workPanelViews) can reuse the
+    /// same opaque type without exposing a public invent-digest API.
+    pub(crate) fn new(entry_point: String, integrity: String) -> Self {
+        Self { entry_point, integrity }
+    }
+
     pub fn entry_point(&self) -> &str {
         &self.entry_point
     }
@@ -79,10 +87,10 @@ pub fn expected_entry_point_integrity(
             if panel.entry_point.is_empty() {
                 return Err(EntryPointDigestError::EntryPointMissing);
             }
-            Ok(EntryPointDigestBinding {
-                entry_point: panel.entry_point.clone(),
-                integrity: integrity.to_owned(),
-            })
+            Ok(EntryPointDigestBinding::new(
+                panel.entry_point.clone(),
+                integrity.to_owned(),
+            ))
         }
     }
 }
@@ -286,9 +294,10 @@ mod tests {
     }
 
     #[test]
-    fn work_panel_views_do_not_gain_entry_point_integrity_this_knife() {
-        // Documented scope: standalone panels only. workPanelViews keep parsing
-        // without an integrity field; unknown integrity keys are ignored.
+    fn panels_binder_still_ignores_work_panel_views() {
+        // Panels binder remains scoped to contributes.panels. A workPanelViews-only
+        // id is PanelNotFound here even when entryPointIntegrity is present on the view
+        // (sibling binder covers workPanelViews separately).
         let sri = sri_sha512(b"view");
         let raw = format!(
             r#"{{"name":"demo.plugin","version":"1.0.0","contributes":{{"workPanelViews":[{{"id":"side","title":"Side","entryPoint":"v.html","entryPointIntegrity":"{sri}"}}]}}}}"#
@@ -297,7 +306,10 @@ mod tests {
         let views = &manifest.contributes.as_ref().unwrap().work_panel_views;
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].entry_point, "v.html");
-        // No ExtWorkPanelView.entry_point_integrity field exists this knife.
-        assert!(expected_entry_point_integrity(&manifest, "side") == Err(EntryPointDigestError::PanelNotFound));
+        assert_eq!(views[0].entry_point_integrity.as_deref(), Some(sri.as_str()));
+        assert_eq!(
+            expected_entry_point_integrity(&manifest, "side"),
+            Err(EntryPointDigestError::PanelNotFound)
+        );
     }
 }
