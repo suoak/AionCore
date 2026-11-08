@@ -83,3 +83,7 @@ existing planSafeActions gate:
 
 Curated HubInstaller still does **not** auto-install bindings. Not execution
 auth / Node-shell unlock / M9/E13 complete.
+
+## Related: panel entryPointIntegrity
+
+See `entry-point-digest-binding.md` for the parallel optional field on `ExtPanel` (declaration only; choice B after Host retain map).

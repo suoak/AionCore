@@ -11,6 +11,7 @@ pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionEr
     validate_name(&manifest.name)?;
     validate_version(&manifest.version)?;
     validate_agent_tool_handler_digests(manifest)?;
+    validate_panel_entry_point_digests(manifest)?;
     Ok(())
 }
 
@@ -33,6 +34,32 @@ fn validate_agent_tool_handler_digests(manifest: &ExtensionManifest) -> Result<(
         if tool.handler.as_deref().is_none_or(str::is_empty) {
             return Err(ExtensionError::ManifestValidation(
                 "agent tool handlerIntegrity requires a non-empty handler path".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fail closed when an optional panel entry-point digest is present but malformed.
+///
+/// Missing/None remains allowed for back-compat and does **not** mean verified.
+/// Scoped to standalone `contributes.panels` only (not workPanelViews / background).
+fn validate_panel_entry_point_digests(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
+    let Some(contributes) = manifest.contributes.as_ref() else {
+        return Ok(());
+    };
+    for panel in &contributes.panels {
+        let Some(integrity) = panel.entry_point_integrity.as_deref() else {
+            continue;
+        };
+        if !is_canonical_sha512_sri(integrity) {
+            return Err(ExtensionError::ManifestValidation(
+                "panel entryPointIntegrity must be a canonical sha512 SRI".into(),
+            ));
+        }
+        if panel.entry_point.is_empty() {
+            return Err(ExtensionError::ManifestValidation(
+                "panel entryPointIntegrity requires a non-empty entryPoint".into(),
             ));
         }
     }
@@ -254,10 +281,16 @@ fn normalize_panel(value: &mut Value) {
         return;
     };
     move_key(obj, "entryPoint", "entry_point");
+    // ExtPanel-only integrity field (workPanelViews use a separate normalizer).
+    move_key(obj, "entryPointIntegrity", "entry_point_integrity");
 }
 
 fn normalize_work_panel_view(value: &mut Value) {
-    normalize_panel(value);
+    // entryPoint only — entryPointIntegrity is ExtPanel-scoped this knife.
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    move_key(obj, "entryPoint", "entry_point");
 }
 
 fn normalize_agent_tool(value: &mut Value) {
