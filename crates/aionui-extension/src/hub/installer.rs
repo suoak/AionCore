@@ -109,6 +109,10 @@ impl HubInstaller {
         }
 
         // M9 E13 curated marketplace gate (D13-1): curated/allowlist + optional sign.
+        // Soft gate only — does NOT retain SignatureCheckedManifest. HubInstaller holds
+        // path strings only and must NOT File::open(ext_dir) to invent a trusted root.
+        // Host layers that already have check_signed_manifest + a Host-opened directory
+        // File should call hub::try_retain_curated_signed_root / HostRuntime::try_retain_*.
         let manifest_path = ext_dir.join(EXTENSION_MANIFEST_FILE);
         let manifest_bytes = std::fs::read(&manifest_path).ok();
         if let Err(gate) = evaluate_install(&entry, manifest_bytes.as_deref()) {
@@ -163,6 +167,7 @@ impl HubInstaller {
             return HubResult::err(error);
         }
 
+        // Soft gate only; signed-root retain requires Host File — see try_retain_curated_signed_root.
         let manifest_path = ext_dir.join(EXTENSION_MANIFEST_FILE);
         let manifest_bytes = std::fs::read(&manifest_path).ok();
         if let Err(gate) = evaluate_install(&entry, manifest_bytes.as_deref()) {

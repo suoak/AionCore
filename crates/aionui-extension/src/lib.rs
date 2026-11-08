@@ -56,7 +56,10 @@ pub use watcher::ExtensionWatcher;
 
 pub use external_paths::ExternalPathsManager;
 pub use host_runtime::{BackgroundServiceManager, CheckedAgentToolPrepare, HostRuntime};
-pub use hub::{HubIndexManager, HubInstaller};
+pub use hub::{
+    CuratedSignedRetainOutcome, HubIndexManager, HubInstaller, retain_checked_signed_root,
+    try_retain_curated_signed_root,
+};
 pub use hub_routes::{HubRouterState, hub_routes};
 pub use routes::{ExtensionRouterState, extension_asset_session_routes, extension_routes};
 pub use signed_root_binding::{SignedRootBindingError, SignedRootBindingStore};

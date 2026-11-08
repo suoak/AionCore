@@ -1633,9 +1633,10 @@ pub async fn build_extension_states(
     );
 
     let mut ext_state = ExtensionRouterState::new(registry.clone());
-    // Library-first Host plumbing: app prepare adapter is available; bindings are
-    // still only created via explicit SignedRootBindingStore::install (never from
-    // LoadedExtension.directory). Missing binding → integrity_binding_unavailable.
+    // Library-first Host plumbing: app prepare adapter is available. Bindings are
+    // created only via explicit SignedRootBindingStore::install / HostRuntime
+    // try_retain_curated_signed_root (never from LoadedExtension.directory or
+    // HubInstaller path strings). Missing binding → integrity_binding_unavailable.
     ext_state.host_runtime = ext_state.host_runtime.with_checked_prepare(std::sync::Arc::new(
         crate::extension_js_invoke_prepare_adapter::AppCheckedAgentToolPrepare,
     ));
