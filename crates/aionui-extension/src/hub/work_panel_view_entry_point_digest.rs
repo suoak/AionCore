@@ -7,7 +7,7 @@
 //! can form a host-mediated binding; this module alone does not authorize view
 //! load/execution, prove curation/owner/root or read entry-point files.
 //!
-//! Scoped to `contributes.workPanelViews` only (not standalone panels / background).
+//! Scoped to `contributes.workPanelViews` only (panels / backgroundServices have siblings).
 use super::entry_point_digest::EntryPointDigestBinding;
 use super::signed_manifest::SignatureCheckedManifest;
 use super::sri_format::is_canonical_sha512_sri;

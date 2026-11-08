@@ -1,4 +1,4 @@
-# Optional entry-point digest binding (panels + workPanelViews)
+# Optional entry-point digest binding (panels + workPanelViews + backgroundServices)
 
 ## Why the panels knife (choice B, PR252)
 
@@ -32,6 +32,17 @@ panels binder with a contribute-kind switch) so:
 - a workPanelViews id never resolves through the panels binder (and vice versa),
   even when string ids collide across contribute arrays.
 
+### Background services (`contributes.backgroundServices`) — sibling knife
+
+`ExtBackgroundService` may include the same optional `entryPointIntegrity` field
+and validation rules. Sibling binder (not a kind switch) so:
+
+- panels / workPanelViews binders and their error enums stay unchanged;
+- a backgroundServices id never resolves through panels/workPanelViews binders
+  (and vice versa), even when string ids collide;
+- HostRuntime service start / spawn is **not** changed to require integrity yet
+  (declaration + binder only; no inventing Host directory `File` from path strings).
+
 ## What absence means
 
 **Missing/None does not mean verified.** Back-compat manifests without the field
@@ -52,23 +63,32 @@ continue to parse.
   exact view id; duplicate ids → `AmbiguousViewId`.
 - `bind_work_panel_view_entry_point_digest_from_signed(&SignatureCheckedManifest, view_id)`.
 
-Both binders reuse opaque `EntryPointDigestBinding`. Present invalid SRI, or
+### Background services (sibling)
+
+- `expected_background_service_entry_point_integrity(&ExtensionManifest, service_id)` —
+  exact service id; duplicate ids → `AmbiguousServiceId`.
+- `bind_background_service_entry_point_digest_from_signed(&SignatureCheckedManifest, service_id)`.
+
+All binders reuse opaque `EntryPointDigestBinding`. Present invalid SRI, or
 present SRI with empty `entryPoint`, is rejected at `parse_manifest` /
 `validate_manifest` (fail closed).
 
 ## Trust limits
 
-Declaration only. Does **not** authorize panel/view load/execution, invent
-signed-root bindings, change installer/routes/gates, or complete M9/E13. No
-entry-point file IO in these helpers.
+Declaration only. Does **not** authorize panel/view load/execution or background
+service start, invent signed-root bindings, change installer/routes/gates, or
+complete M9/E13. No entry-point file IO in these helpers. Does **not** invent
+Host directory `File` from path strings (HostRuntime path containment stays as-is).
 
 ## Host composition (app)
 
 `aionui_app::extension_js_panel_source::load_checked_panel_source_from_signed`
-composes the **panels** binder with `read_checked_source` against a Host-supplied
-trusted root. Missing integrity remains `NotPresent` (no unchecked fallback).
-Success returns the same owned verified source `String`. Still not panel-load/
-iframe auth, curation/owner/root proof, or M9/E13 completion.
+and `extension_js_work_panel_view_source::load_checked_work_panel_view_source_from_signed`
+compose the panels / workPanelViews binders with `read_checked_source` against a
+Host-supplied trusted root. Missing integrity remains `NotPresent` (no unchecked
+fallback). Success returns the same owned verified source `String`. Still not
+panel/view-load/iframe auth, curation/owner/root proof, or M9/E13 completion.
 
-**No workPanelViews app compose in the sibling knife** — extension-crate field +
-validate + binder only until a deliberate Host call site exists.
+**No backgroundServices app compose / HostRuntime start-path change in this sibling
+knife** — extension-crate field + validate + binder only until a deliberate Host
+call site exists that already holds a trusted root (not path-string invention).
