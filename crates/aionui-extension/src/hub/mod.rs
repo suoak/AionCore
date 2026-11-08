@@ -1,5 +1,6 @@
 pub mod curated;
 pub mod curated_signed_retain;
+pub mod entry_point_digest;
 pub mod handler_digest;
 pub mod index_manager;
 pub mod installer;
@@ -12,6 +13,9 @@ pub use curated::{
 };
 pub use curated_signed_retain::{
     CuratedSignedRetainOutcome, retain_checked_signed_root, try_retain_curated_signed_root,
+};
+pub use entry_point_digest::{
+    EntryPointDigestBinding, EntryPointDigestError, bind_entry_point_digest_from_signed, expected_entry_point_integrity,
 };
 pub use handler_digest::{
     HandlerDigestBinding, HandlerDigestError, bind_handler_digest_from_signed, expected_handler_integrity,

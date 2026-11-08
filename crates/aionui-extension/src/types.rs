@@ -297,6 +297,13 @@ pub struct ExtPanel {
     pub title: String,
     #[serde(alias = "entryPoint")]
     pub entry_point: String,
+    /// Optional expected entry-point file SRI (`sha512-...`). Missing/None is NOT verified.
+    ///
+    /// When present it must be the canonical SHA-512 SRI string and `entry_point`
+    /// must be non-empty. Presence alone does not authorize panel load or execution;
+    /// Host must still bind/trust this digest and verify bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "entryPointIntegrity")]
+    pub entry_point_integrity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }

@@ -233,6 +233,7 @@ mod tests {
             id: "board".into(),
             title: "Board".into(),
             entry_point: "panels/board.html".into(),
+            entry_point_integrity: None,
             icon: None,
         }];
         let resolved = resolve_panels(&panels, "demo.ext", Path::new("/tmp"));
