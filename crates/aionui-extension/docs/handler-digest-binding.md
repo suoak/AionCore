@@ -67,3 +67,23 @@ HTTP `POST /api/extensions/agent-tools/invoke` cannot call that helper yet:
 root, and `aionui-extension` must not depend on `aionui-app`. The route therefore
 refuses with `integrity_binding_unavailable` after the existing planSafeActions
 gate rather than inventing trust or claiming stub dispatch. Not M9/E13 complete.
+
+
+## Host signed-root binding store + prepare hook
+
+`SignedRootBindingStore` (extension) holds Host-installed
+`(SignatureCheckedManifest, trusted root File)` keyed by extension name. Install
+is explicit: key must equal `checked.name()`, and `root` must already be a
+Host-opened directory FD. Never opens `LoadedExtension.directory` and never
+re-parses unsigned manifests.
+
+`HostRuntime` carries the store plus an optional `CheckedAgentToolPrepare` hook
+(implemented in `aionui-app` as `AppCheckedAgentToolPrepare` →
+`prepare_checked_agent_tool_invoke`). Agent-tool invoke resolves:
+
+1. missing hook or missing binding → `integrity_binding_unavailable`
+2. binding present → prepare → non-executing `handler_integrity_checked` ack or
+   fixed refuse reason on bind/check failure
+
+Curated HubInstaller still does **not** auto-install bindings. Not execution
+auth / Node-shell unlock / M9/E13 complete.

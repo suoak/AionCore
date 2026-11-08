@@ -13,6 +13,8 @@ pub mod extension_js_client;
 pub mod extension_js_handler_source;
 /// Host invoke prep: checked load → non-executing ack or refuse (no fake route wiring).
 pub mod extension_js_invoke_checked;
+/// App adapter implementing extension CheckedAgentToolPrepare (crate-boundary bridge).
+pub mod extension_js_invoke_prepare_adapter;
 pub mod extension_js_source;
 mod github_issue_source;
 mod router;

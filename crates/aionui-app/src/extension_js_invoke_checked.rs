@@ -6,11 +6,10 @@
 //! success). Missing `handlerIntegrity` is Digest `NotPresent` / refuse — never
 //! dispatched.
 //!
-//! HTTP routes today do **not** hold `SignatureCheckedManifest` or a Host-trusted
-//! root (`ExtensionRouterState` is registry + host_runtime only). Do not invent
-//! those from `LoadedExtension.directory` or re-parsed unsigned manifests. Until
-//! Host plumbing exists, the extension route must refuse with
-//! `integrity_binding_unavailable` rather than fake a checked load.
+//! Host plumbing: `SignedRootBindingStore` + `CheckedAgentToolPrepare` (app adapter)
+//! can retain and consume an explicit binding. Missing binding/hook still refuses
+//! with `integrity_binding_unavailable`. Do not invent trust from
+//! `LoadedExtension.directory` or re-parsed unsigned manifests.
 //!
 //! Not execution authorization, not M9/E13 completion, not a Node/shell unlock.
 use crate::extension_js_checked_source::IntegrityCheckedSource;
