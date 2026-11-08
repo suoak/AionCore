@@ -599,7 +599,7 @@ async fn invoke_command(
     Ok(Json(ApiResponse::ok(serde_json::to_value(result).unwrap_or_default())))
 }
 
-/// `POST /api/extensions/agent-tools/invoke` — gate planSafeActions; refuse without integrity binding.
+/// `POST /api/extensions/agent-tools/invoke` — gate planSafeActions; Host signed-root binding or refuse.
 async fn invoke_agent_tool(
     State(state): State<ExtensionRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -615,19 +615,21 @@ async fn invoke_agent_tool(
     if let Err(err) = host_runtime::gate_plan_safe(&tool, true) {
         return Err(ApiError::Forbidden(err.to_string()));
     }
-    // Host does not yet retain SignatureCheckedManifest + trusted root on this
-    // path (see ExtensionRouterState). Refuse rather than invent trust or claim
-    // handler_stub success. When plumbing exists, call app
-    // prepare_checked_agent_tool_invoke before any non-executing ack.
+    // Host may retain an explicit signed-root binding on host_runtime.signed_roots
+    // and an app prepare hook. Missing either → integrity_binding_unavailable.
+    // Never invent trust from LoadedExtension.directory / unsigned re-parse.
     let _ = req.arguments;
+    let result = host_runtime::resolve_agent_tool_invoke(&state.host_runtime, tool);
     tracing::info!(
         user_id = %user.id,
-        tool_id = %tool.id,
-        extension = %tool.extension_name,
+        tool_id = %result.tool.id,
+        extension = %result.tool.extension_name,
         requested_plan_mode = req.plan_mode,
-        "extension agent tool invoke refused: integrity binding unavailable"
+        status = result.status,
+        reason = ?result.reason,
+        dispatched = result.dispatched,
+        "extension agent tool invoke resolved via host integrity binding"
     );
-    let result = host_runtime::refuse_agent_tool_without_integrity_binding(tool);
     Ok(Json(ApiResponse::ok(serde_json::to_value(result).unwrap_or_default())))
 }
 

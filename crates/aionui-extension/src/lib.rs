@@ -21,6 +21,7 @@ pub mod registry;
 mod registry_helpers;
 pub mod resolvers;
 pub mod routes;
+pub mod signed_root_binding;
 pub mod skill_governance;
 pub mod skill_registry;
 pub mod skill_remote_fetch;
@@ -54,10 +55,11 @@ pub use types::*;
 pub use watcher::ExtensionWatcher;
 
 pub use external_paths::ExternalPathsManager;
-pub use host_runtime::{BackgroundServiceManager, HostRuntime};
+pub use host_runtime::{BackgroundServiceManager, CheckedAgentToolPrepare, HostRuntime};
 pub use hub::{HubIndexManager, HubInstaller};
 pub use hub_routes::{HubRouterState, hub_routes};
 pub use routes::{ExtensionRouterState, extension_asset_session_routes, extension_routes};
+pub use signed_root_binding::{SignedRootBindingError, SignedRootBindingStore};
 pub use skill_registry::{SkillHubClient, SkillRegistryService};
 pub use skill_routes::{SkillRouterState, skill_routes};
 pub use skill_service::{

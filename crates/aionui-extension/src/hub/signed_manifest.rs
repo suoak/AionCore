@@ -50,6 +50,9 @@ pub enum SignedManifestError {
 /// No unchecked constructor, Default, Deserialize or raw-data Debug formatter.
 /// Consumers must use this snapshot, not reread a path after verification.
 /// This does not attest handler bytes, root/owner, curation or future key validity.
+/// `Clone` is allowed so Host can retain and look up the same verified snapshot;
+/// it still copies only Host-held checked bytes (never a path reread).
+#[derive(Clone)]
 pub struct SignatureCheckedManifest {
     raw: Box<[u8]>,
     name: String,

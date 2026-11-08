@@ -8,6 +8,7 @@
 //! Brand: CSBU WorkMate. Curated-only (D13-1); no arbitrary third-party sandbox.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,6 +19,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::error::ExtensionError;
+use crate::hub::signed_manifest::SignatureCheckedManifest;
+use crate::signed_root_binding::SignedRootBindingStore;
 use crate::types::{
     ExtPermissions, LoadedExtension, ResolvedAgentTool, ResolvedBackgroundService, ResolvedCommand, ResolvedPanel,
 };
@@ -216,17 +219,45 @@ impl BackgroundServiceManager {
     }
 }
 
+/// App/Host callback that turns an explicit signed-root binding into an invoke decision.
+///
+/// Implemented in `aionui-app` (calls `prepare_checked_agent_tool_invoke`) so the
+/// extension crate does not depend on app. Default on [`HostRuntime`] is `None` →
+/// refuse `integrity_binding_unavailable`. Success path must stay non-executing
+/// (`dispatched=false`) unless a later knife separately authorizes supervisor use.
+pub trait CheckedAgentToolPrepare: Send + Sync {
+    fn prepare(
+        &self,
+        tool: &ResolvedAgentTool,
+        local_tool_id: &str,
+        checked: &SignatureCheckedManifest,
+        root: &File,
+    ) -> AgentToolInvokeResult;
+}
+
 /// Shared Host runtime handles hanging off [`crate::routes::ExtensionRouterState`].
 #[derive(Clone, Default)]
 pub struct HostRuntime {
     pub background: Arc<BackgroundServiceManager>,
+    /// Host-installed `(SignatureCheckedManifest, trusted root File)` by extension name.
+    pub signed_roots: Arc<SignedRootBindingStore>,
+    /// Optional app-side prepare hook. Absent → binding cannot be consumed.
+    pub checked_prepare: Option<Arc<dyn CheckedAgentToolPrepare>>,
 }
 
 impl HostRuntime {
     pub fn new() -> Self {
         Self {
             background: Arc::new(BackgroundServiceManager::new()),
+            signed_roots: Arc::new(SignedRootBindingStore::new()),
+            checked_prepare: None,
         }
+    }
+
+    /// Attach the app prepare adapter. Library/Host wiring only — not an HTTP surface.
+    pub fn with_checked_prepare(mut self, prepare: Arc<dyn CheckedAgentToolPrepare>) -> Self {
+        self.checked_prepare = Some(prepare);
+        self
     }
 }
 
@@ -255,10 +286,9 @@ pub const INTEGRITY_BINDING_UNAVAILABLE_REASON: &str = "integrity_binding_unavai
 
 /// Refuse agent-tool invoke when integrity binding cannot be established.
 ///
-/// `ExtensionRouterState` today holds only registry + host_runtime — no signed
-/// snapshot and no Host-trusted root. Do not invent those from extension
-/// directories or unsigned manifests. Never returns `handler_stub` success or
-/// `dispatched: true`. Not execution authorization.
+/// Missing Host-installed signed-root binding and/or prepare hook → this refuse.
+/// Do not invent trust from `LoadedExtension.directory` or unsigned re-parse.
+/// Never returns `handler_stub` success or `dispatched: true`. Not execution auth.
 pub fn refuse_agent_tool_without_integrity_binding(tool: ResolvedAgentTool) -> AgentToolInvokeResult {
     AgentToolInvokeResult {
         status: "refused",
@@ -266,6 +296,31 @@ pub fn refuse_agent_tool_without_integrity_binding(tool: ResolvedAgentTool) -> A
         dispatched: false,
         reason: Some(INTEGRITY_BINDING_UNAVAILABLE_REASON),
     }
+}
+
+/// Local tool id as declared in the signed manifest (`search`), not the resolved
+/// `ext-{name}-{id}` form used on HTTP.
+pub fn local_agent_tool_id(tool: &ResolvedAgentTool) -> &str {
+    let prefix = format!("ext-{}-", tool.extension_name);
+    tool.id.strip_prefix(&prefix).unwrap_or(tool.id.as_str())
+}
+
+/// Fail-closed invoke decision using Host-owned store + optional prepare hook.
+///
+/// - No prepare hook → `integrity_binding_unavailable`
+/// - No installed binding for `tool.extension_name` → same refuse
+/// - Else call the Host/app prepare hook with the retained snapshot + root FD
+///
+/// Never opens `LoadedExtension.directory`. Not execution authorization.
+pub fn resolve_agent_tool_invoke(host: &HostRuntime, tool: ResolvedAgentTool) -> AgentToolInvokeResult {
+    let Some(prepare) = host.checked_prepare.as_ref() else {
+        return refuse_agent_tool_without_integrity_binding(tool);
+    };
+    let Some((checked, root)) = host.signed_roots.lookup_clone(&tool.extension_name) else {
+        return refuse_agent_tool_without_integrity_binding(tool);
+    };
+    let local_id = local_agent_tool_id(&tool).to_owned();
+    prepare.prepare(&tool, &local_id, &checked, &root)
 }
 
 /// Resolve a command by full resolved id (`ext-name-local`) or local id + extension.
@@ -424,6 +479,124 @@ mod tests {
         assert_eq!(result.reason, Some(INTEGRITY_BINDING_UNAVAILABLE_REASON));
         assert_ne!(result.reason, Some("handler_stub"));
         assert_eq!(result.tool, tool);
+    }
+
+    #[test]
+    fn local_agent_tool_id_strips_ext_prefix() {
+        let tool = ResolvedAgentTool {
+            extension_name: "demo.plugin".into(),
+            id: "ext-demo.plugin-search".into(),
+            name: "Search".into(),
+            description: None,
+            plan_safe_actions: true,
+            handler: None,
+        };
+        assert_eq!(local_agent_tool_id(&tool), "search");
+    }
+
+    #[test]
+    fn resolve_without_prepare_hook_refuses_unavailable() {
+        let host = HostRuntime::new();
+        let tool = ResolvedAgentTool {
+            extension_name: "demo.plugin".into(),
+            id: "ext-demo.plugin-search".into(),
+            name: "Search".into(),
+            description: None,
+            plan_safe_actions: true,
+            handler: None,
+        };
+        let result = resolve_agent_tool_invoke(&host, tool);
+        assert_eq!(result.status, "refused");
+        assert!(!result.dispatched);
+        assert_eq!(result.reason, Some(INTEGRITY_BINDING_UNAVAILABLE_REASON));
+    }
+
+    struct StubPrepare;
+    impl CheckedAgentToolPrepare for StubPrepare {
+        fn prepare(
+            &self,
+            tool: &ResolvedAgentTool,
+            local_tool_id: &str,
+            checked: &SignatureCheckedManifest,
+            _root: &File,
+        ) -> AgentToolInvokeResult {
+            assert_eq!(local_tool_id, "search");
+            assert_eq!(checked.name(), "demo.plugin");
+            AgentToolInvokeResult {
+                status: "accepted",
+                tool: tool.clone(),
+                dispatched: false,
+                reason: Some("handler_integrity_checked"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_with_binding_and_prepare_returns_hook_result() {
+        use crate::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
+        use crate::hub::signed_manifest::{SignedManifestEntry, check_signed_manifest};
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::collections::{HashMap, HashSet};
+
+        let signing_key = SigningKey::from_bytes(&[19; 32]);
+        let policy = CuratedInstallPolicy::new(
+            HashSet::new(),
+            false,
+            HashMap::from([("fixture".into(), signing_key.verifying_key())]),
+        );
+        let raw = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
+        let integrity = sri_sha512(raw);
+        let signature = hex::encode(
+            signing_key
+                .sign(signature_payload("demo.plugin", "1.0.0", &integrity).as_bytes())
+                .to_bytes(),
+        );
+        let checked = check_signed_manifest(
+            &policy,
+            &SignedManifestEntry {
+                name: "demo.plugin",
+                version: "1.0.0",
+                pubkey_id: Some("fixture"),
+                integrity: Some(&integrity),
+                signature: Some(&signature),
+            },
+            raw,
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = File::open(temp.path()).unwrap();
+
+        let host = HostRuntime::new().with_checked_prepare(Arc::new(StubPrepare));
+        host.signed_roots.install("demo.plugin", checked, root).unwrap();
+        let tool = ResolvedAgentTool {
+            extension_name: "demo.plugin".into(),
+            id: "ext-demo.plugin-search".into(),
+            name: "Search".into(),
+            description: None,
+            plan_safe_actions: true,
+            handler: None,
+        };
+        let result = resolve_agent_tool_invoke(&host, tool);
+        assert_eq!(result.status, "accepted");
+        assert!(!result.dispatched);
+        assert_eq!(result.reason, Some("handler_integrity_checked"));
+        assert_ne!(result.reason, Some("handler_stub"));
+    }
+
+    #[test]
+    fn resolve_with_prepare_but_no_binding_still_unavailable() {
+        let host = HostRuntime::new().with_checked_prepare(Arc::new(StubPrepare));
+        let tool = ResolvedAgentTool {
+            extension_name: "demo.plugin".into(),
+            id: "ext-demo.plugin-search".into(),
+            name: "Search".into(),
+            description: None,
+            plan_safe_actions: true,
+            handler: None,
+        };
+        let result = resolve_agent_tool_invoke(&host, tool);
+        assert_eq!(result.status, "refused");
+        assert_eq!(result.reason, Some(INTEGRITY_BINDING_UNAVAILABLE_REASON));
     }
 
     #[test]
