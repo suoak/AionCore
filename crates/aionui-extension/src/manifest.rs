@@ -12,6 +12,7 @@ pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionEr
     validate_version(&manifest.version)?;
     validate_agent_tool_handler_digests(manifest)?;
     validate_panel_entry_point_digests(manifest)?;
+    validate_work_panel_view_entry_point_digests(manifest)?;
     Ok(())
 }
 
@@ -43,7 +44,7 @@ fn validate_agent_tool_handler_digests(manifest: &ExtensionManifest) -> Result<(
 /// Fail closed when an optional panel entry-point digest is present but malformed.
 ///
 /// Missing/None remains allowed for back-compat and does **not** mean verified.
-/// Scoped to standalone `contributes.panels` only (not workPanelViews / background).
+/// Scoped to standalone `contributes.panels` only (workPanelViews have a sibling validator).
 fn validate_panel_entry_point_digests(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
     let Some(contributes) = manifest.contributes.as_ref() else {
         return Ok(());
@@ -60,6 +61,32 @@ fn validate_panel_entry_point_digests(manifest: &ExtensionManifest) -> Result<()
         if panel.entry_point.is_empty() {
             return Err(ExtensionError::ManifestValidation(
                 "panel entryPointIntegrity requires a non-empty entryPoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fail closed when an optional workPanelView entry-point digest is present but malformed.
+///
+/// Missing/None remains allowed for back-compat and does **not** mean verified.
+/// Scoped to `contributes.workPanelViews` only (standalone panels have a sibling validator).
+fn validate_work_panel_view_entry_point_digests(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
+    let Some(contributes) = manifest.contributes.as_ref() else {
+        return Ok(());
+    };
+    for view in &contributes.work_panel_views {
+        let Some(integrity) = view.entry_point_integrity.as_deref() else {
+            continue;
+        };
+        if !is_canonical_sha512_sri(integrity) {
+            return Err(ExtensionError::ManifestValidation(
+                "workPanelView entryPointIntegrity must be a canonical sha512 SRI".into(),
+            ));
+        }
+        if view.entry_point.is_empty() {
+            return Err(ExtensionError::ManifestValidation(
+                "workPanelView entryPointIntegrity requires a non-empty entryPoint".into(),
             ));
         }
     }
@@ -281,16 +308,17 @@ fn normalize_panel(value: &mut Value) {
         return;
     };
     move_key(obj, "entryPoint", "entry_point");
-    // ExtPanel-only integrity field (workPanelViews use a separate normalizer).
+    // ExtPanel integrity field (workPanelViews use a separate normalizer).
     move_key(obj, "entryPointIntegrity", "entry_point_integrity");
 }
 
 fn normalize_work_panel_view(value: &mut Value) {
-    // entryPoint only — entryPointIntegrity is ExtPanel-scoped this knife.
     let Some(obj) = value.as_object_mut() else {
         return;
     };
     move_key(obj, "entryPoint", "entry_point");
+    // ExtWorkPanelView integrity field (panels use a separate normalizer).
+    move_key(obj, "entryPointIntegrity", "entry_point_integrity");
 }
 
 fn normalize_agent_tool(value: &mut Value) {
