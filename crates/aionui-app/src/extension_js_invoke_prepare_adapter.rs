@@ -6,7 +6,7 @@
 //! and is dropped here (first knife: no supervisor hand-off). On Err → refuse
 //! with the fixed category reason. Not execution authorization / E13 complete.
 
-use crate::extension_js_invoke_checked::prepare_checked_agent_tool_invoke;
+use crate::extension_js_invoke_checked::{CheckedInvokePrepared, prepare_checked_agent_tool_invoke};
 use aionui_extension::host_runtime::{AgentToolInvokeResult, CheckedAgentToolPrepare};
 use aionui_extension::hub::signed_manifest::SignatureCheckedManifest;
 use aionui_extension::types::ResolvedAgentTool;
@@ -30,10 +30,10 @@ impl CheckedAgentToolPrepare for AppCheckedAgentToolPrepare {
                 // handing it to the experimental supervisor without new gates.
                 let _host_private = prepared.into_checked_source();
                 AgentToolInvokeResult {
-                    status: "accepted",
+                    status: CheckedInvokePrepared::ACK_STATUS,
                     tool: tool.clone(),
                     dispatched: false,
-                    reason: Some("handler_integrity_checked"),
+                    reason: Some(CheckedInvokePrepared::ACK_REASON),
                 }
             }
             Err(err) => AgentToolInvokeResult {

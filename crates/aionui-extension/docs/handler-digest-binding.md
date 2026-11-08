@@ -53,21 +53,14 @@ root. Missing integrity remains `NotPresent` (no unchecked fallback). Success
 returns the same owned verified source `String`. Still not execution auth,
 curation/owner/root proof, or M9/E13 completion.
 
-
-## Host invoke prep (app) + route refuse
+## Host invoke prep (app)
 
 `aionui_app::extension_js_invoke_checked::prepare_checked_agent_tool_invoke`
 wraps the composition into a fail-closed invoke decision: Ok → non-executing
 ack tokens (`handler_integrity_checked`, `dispatched=false`) with Host-private
 source; Err → fixed refuse reasons (`handler_integrity_not_present`, …). Never
-`handler_stub` success on bind/check failure.
-
-HTTP `POST /api/extensions/agent-tools/invoke` cannot call that helper yet:
-`ExtensionRouterState` has no Host-held `SignatureCheckedManifest` or trusted
-root, and `aionui-extension` must not depend on `aionui-app`. The route therefore
-refuses with `integrity_binding_unavailable` after the existing planSafeActions
-gate rather than inventing trust or claiming stub dispatch. Not M9/E13 complete.
-
+`handler_stub` success on bind/check failure. Still not execution auth or
+M9/E13 complete.
 
 ## Host signed-root binding store + prepare hook
 
@@ -75,11 +68,14 @@ gate rather than inventing trust or claiming stub dispatch. Not M9/E13 complete.
 `(SignatureCheckedManifest, trusted root File)` keyed by extension name. Install
 is explicit: key must equal `checked.name()`, and `root` must already be a
 Host-opened directory FD. Never opens `LoadedExtension.directory` and never
-re-parses unsigned manifests.
+re-parses unsigned manifests. The store starts empty; nothing invents a binding
+from directory strings or unsigned manifests.
 
 `HostRuntime` carries the store plus an optional `CheckedAgentToolPrepare` hook
 (implemented in `aionui-app` as `AppCheckedAgentToolPrepare` →
-`prepare_checked_agent_tool_invoke`). Agent-tool invoke resolves:
+`prepare_checked_agent_tool_invoke`). Agent-tool invoke
+(`POST /api/extensions/agent-tools/invoke`) resolves via that hook after the
+existing planSafeActions gate:
 
 1. missing hook or missing binding → `integrity_binding_unavailable`
 2. binding present → prepare → non-executing `handler_integrity_checked` ack or
