@@ -39,8 +39,9 @@ impl IntegrityCheckedSource {
 ///
 /// The expected hash is a trusted HOST input precondition, not proof of its own
 /// provenance. Optional `handlerIntegrity` may declare an expected SRI inside a
-/// signed snapshot; Host composition (`load_checked_handler_source_from_signed`)
-/// wires that binding to this API. Matching this parameter alone still does not
+/// signed snapshot; Host compositions (`load_checked_handler_source_from_signed`,
+/// `load_checked_panel_source_from_signed`) wire those bindings to this API.
+/// Matching this parameter alone still does not
 /// authorize execution or establish curation, owner or immutable files.
 ///
 /// Disabled/non-Linux builds immediately return Unavailable regardless of inputs.

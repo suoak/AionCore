@@ -42,3 +42,11 @@ Present invalid SRI, or present SRI with empty `entryPoint`, is rejected at
 Declaration only. Does **not** authorize panel load/execution, invent signed-root
 bindings, change installer/routes/gates, or complete M9/E13. No entry-point file IO
 in these helpers.
+
+## Host composition (app)
+
+`aionui_app::extension_js_panel_source::load_checked_panel_source_from_signed`
+composes this binder with `read_checked_source` against a Host-supplied trusted
+root. Missing integrity remains `NotPresent` (no unchecked fallback). Success
+returns the same owned verified source `String`. Still not panel-load/iframe
+auth, curation/owner/root proof, or M9/E13 completion. Standalone `panels` only.

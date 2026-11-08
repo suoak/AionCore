@@ -15,6 +15,8 @@ pub mod extension_js_handler_source;
 pub mod extension_js_invoke_checked;
 /// App adapter implementing extension CheckedAgentToolPrepare (crate-boundary bridge).
 pub mod extension_js_invoke_prepare_adapter;
+/// Host composition: signed panel binding → checked entry-point source (no panel-load auth).
+pub mod extension_js_panel_source;
 pub mod extension_js_source;
 mod github_issue_source;
 mod router;
