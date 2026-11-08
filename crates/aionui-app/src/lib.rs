@@ -18,6 +18,8 @@ pub mod extension_js_invoke_prepare_adapter;
 /// Host composition: signed panel binding → checked entry-point source (no panel-load auth).
 pub mod extension_js_panel_source;
 pub mod extension_js_source;
+/// Host composition: signed workPanelView binding → checked entry-point source (no view-load auth).
+pub mod extension_js_work_panel_view_source;
 mod github_issue_source;
 mod router;
 mod services;
