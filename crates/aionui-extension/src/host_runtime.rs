@@ -19,7 +19,12 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::error::ExtensionError;
-use crate::hub::signed_manifest::SignatureCheckedManifest;
+use crate::hub::curated::CuratedInstallPolicy;
+use crate::hub::curated_signed_retain::{
+    CuratedSignedRetainOutcome, retain_checked_signed_root as retain_checked_into_store,
+    try_retain_curated_signed_root as try_retain_into_store,
+};
+use crate::hub::signed_manifest::{SignatureCheckedManifest, SignedManifestEntry};
 use crate::signed_root_binding::SignedRootBindingStore;
 use crate::types::{
     ExtPermissions, LoadedExtension, ResolvedAgentTool, ResolvedBackgroundService, ResolvedCommand, ResolvedPanel,
@@ -258,6 +263,30 @@ impl HostRuntime {
     pub fn with_checked_prepare(mut self, prepare: Arc<dyn CheckedAgentToolPrepare>) -> Self {
         self.checked_prepare = Some(prepare);
         self
+    }
+
+    /// Host-facing curated retain: strict `check_signed_manifest` then optional bind.
+    ///
+    /// Pass a Host-opened directory `File`, or `None` to leave unbound — never invent
+    /// a root from `LoadedExtension.directory` / install path strings.
+    /// Signature failure → no binding. See [`crate::hub::curated_signed_retain::try_retain_curated_signed_root`].
+    pub fn try_retain_curated_signed_root(
+        &self,
+        policy: &CuratedInstallPolicy,
+        entry: &SignedManifestEntry<'_>,
+        raw_manifest: &[u8],
+        trusted_root: Option<File>,
+    ) -> CuratedSignedRetainOutcome {
+        try_retain_into_store(&self.signed_roots, policy, entry, raw_manifest, trusted_root)
+    }
+
+    /// Retain an already-checked snapshot when a trusted root FD is available.
+    pub fn retain_checked_signed_root(
+        &self,
+        checked: SignatureCheckedManifest,
+        trusted_root: Option<File>,
+    ) -> CuratedSignedRetainOutcome {
+        retain_checked_into_store(&self.signed_roots, checked, trusted_root)
     }
 }
 
@@ -597,6 +626,51 @@ mod tests {
         let result = resolve_agent_tool_invoke(&host, tool);
         assert_eq!(result.status, "refused");
         assert_eq!(result.reason, Some(INTEGRITY_BINDING_UNAVAILABLE_REASON));
+    }
+
+    #[test]
+    fn host_try_retain_success_then_missing_root_fail_closed() {
+        use crate::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
+        use crate::hub::curated_signed_retain::CuratedSignedRetainOutcome;
+        use crate::hub::signed_manifest::SignedManifestEntry;
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::collections::{HashMap, HashSet};
+
+        let signing_key = SigningKey::from_bytes(&[19; 32]);
+        let policy = CuratedInstallPolicy::new(
+            HashSet::new(),
+            false,
+            HashMap::from([("fixture".into(), signing_key.verifying_key())]),
+        );
+        let raw = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
+        let integrity = sri_sha512(raw);
+        let signature = hex::encode(
+            signing_key
+                .sign(signature_payload("demo.plugin", "1.0.0", &integrity).as_bytes())
+                .to_bytes(),
+        );
+        let entry = SignedManifestEntry {
+            name: "demo.plugin",
+            version: "1.0.0",
+            pubkey_id: Some("fixture"),
+            integrity: Some(&integrity),
+            signature: Some(&signature),
+        };
+        let host = HostRuntime::new();
+        let temp = tempfile::tempdir().unwrap();
+        let root = File::open(temp.path()).unwrap();
+        assert_eq!(
+            host.try_retain_curated_signed_root(&policy, &entry, raw, Some(root)),
+            CuratedSignedRetainOutcome::Retained
+        );
+        assert!(host.signed_roots.contains("demo.plugin"));
+
+        let host2 = HostRuntime::new();
+        assert_eq!(
+            host2.try_retain_curated_signed_root(&policy, &entry, raw, None),
+            CuratedSignedRetainOutcome::RootHandleMissing
+        );
+        assert!(host2.signed_roots.is_empty());
     }
 
     #[test]
