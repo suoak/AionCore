@@ -15,7 +15,7 @@ use crate::loader::{ScanPath, resolve_scan_paths};
 use crate::registry_helpers::{
     build_state_map, load_and_validate, merge_persisted_states, run_deactivation_hooks, to_summary,
 };
-use crate::resolvers::{resolve_all_contributions, resolve_i18n_for_all};
+use crate::resolvers::{resolve_all_contributions_with_roots, resolve_i18n_for_all};
 use crate::signed_root_binding::SignedRootBindingStore;
 use crate::state::ExtensionStateStore;
 use crate::types::{
@@ -140,7 +140,7 @@ impl ExtensionRegistry {
         let extensions = self.run_activation_hooks(extensions, &persisted).await;
 
         // 6. Resolve contributions.
-        let contributions = resolve_all_installed_contributions(&extensions);
+        let contributions = resolve_all_installed_contributions(&extensions, self.signed_roots().as_deref());
 
         // 7. Persist updated states.
         let states = build_state_map(&extensions);
@@ -194,7 +194,7 @@ impl ExtensionRegistry {
 
         let extensions = merge_persisted_states(extensions, &persisted);
         let extensions = self.run_activation_hooks(extensions, &persisted).await;
-        let contributions = resolve_all_installed_contributions(&extensions);
+        let contributions = resolve_all_installed_contributions(&extensions, self.signed_roots().as_deref());
 
         let states = build_state_map(&extensions);
         self.state_store.set_all(states).await;
@@ -533,12 +533,15 @@ impl ExtensionRegistry {
     }
 }
 
-fn resolve_all_installed_contributions(extensions: &[LoadedExtension]) -> ResolvedContributions {
+fn resolve_all_installed_contributions(
+    extensions: &[LoadedExtension],
+    signed_roots: Option<&SignedRootBindingStore>,
+) -> ResolvedContributions {
     let mut installed = extensions.to_vec();
     for extension in &mut installed {
         extension.state.enabled = true;
     }
-    resolve_all_contributions(&installed)
+    resolve_all_contributions_with_roots(&installed, signed_roots)
 }
 
 fn retain_contributions(contributions: &mut ResolvedContributions, enabled: &HashSet<String>) {

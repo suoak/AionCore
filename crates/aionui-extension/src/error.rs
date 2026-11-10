@@ -42,6 +42,11 @@ pub enum ExtensionError {
     #[error("Theme CSS file not found: {0}")]
     ThemeCssNotFound(String),
 
+    /// Bound+files theme CSS could not be read through the retained-root verifier
+    /// (unlisted, mismatched, symlink, unreadable, or not UTF-8). Fixed categories only.
+    #[error("Theme CSS could not be verified: {0}")]
+    ThemeCssUnverified(&'static str),
+
     #[error("Contribution resolution failed for '{extension_name}': {reason}")]
     ResolutionFailed { extension_name: String, reason: String },
 

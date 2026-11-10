@@ -45,6 +45,9 @@ impl From<ExtensionError> for ApiError {
             ExtensionError::InvalidWebuiRouteNamespace { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::ReservedWebuiRoute { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::ThemeCssNotFound(path) => ApiError::NotFound(format!("Theme CSS not found: {path}")),
+            ExtensionError::ThemeCssUnverified(reason) => {
+                ApiError::Forbidden(format!("Theme CSS could not be verified: {reason}"))
+            }
             ExtensionError::HookTimeout { .. } => ApiError::Internal(err.to_string()),
             ExtensionError::HookFailed { .. } => ApiError::Internal(err.to_string()),
             ExtensionError::HookNotFound(path) => ApiError::NotFound(format!("Hook script not found: {path}")),
@@ -1508,6 +1511,7 @@ mod tests {
     const V_TAB: &[u8] = b"<h1>settings</h1>";
     const V_ICON: &[u8] = b"<svg></svg>";
     const V_COVER: &[u8] = b"PNGCOVER";
+    const V_THEME_CSS: &[u8] = b":root{--bg:#000}";
 
     /// Bound+files serve of settings-tab, icon and theme-cover paths (the kinds slice J now
     /// requires to be listed). Same retained-root / O_NOFOLLOW / SRI path as slice F; unlisted 403.
@@ -1529,6 +1533,7 @@ mod tests {
         std::fs::write(ext_dir.join("settings/index.html"), "EVIL-TAB").unwrap();
         std::fs::write(ext_dir.join("icons/gear.svg"), "EVIL-ICON").unwrap();
         std::fs::write(ext_dir.join("themes/cover.png"), "EVIL-COVER").unwrap();
+        std::fs::write(ext_dir.join("themes/dark.css"), "EVIL-CSS").unwrap();
         let host_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(host_root.path().join("settings")).unwrap();
         std::fs::create_dir_all(host_root.path().join("icons")).unwrap();
@@ -1536,6 +1541,7 @@ mod tests {
         std::fs::write(host_root.path().join("settings/index.html"), V_TAB).unwrap();
         std::fs::write(host_root.path().join("icons/gear.svg"), V_ICON).unwrap();
         std::fs::write(host_root.path().join("themes/cover.png"), V_COVER).unwrap();
+        std::fs::write(host_root.path().join("themes/dark.css"), V_THEME_CSS).unwrap();
         std::fs::write(host_root.path().join("unlisted.css"), "x").unwrap();
         let signed = serde_json::to_vec(&serde_json::json!({
             "name": "hello", "version": "1.0.0",
@@ -1543,6 +1549,7 @@ mod tests {
                 {"path": "settings/index.html", "integrity": sri_sha512(V_TAB)},
                 {"path": "icons/gear.svg", "integrity": sri_sha512(V_ICON)},
                 {"path": "themes/cover.png", "integrity": sri_sha512(V_COVER)},
+                {"path": "themes/dark.css", "integrity": sri_sha512(V_THEME_CSS)},
             ],
             "contributes": {
                 "settingsTabs": [{"id": "t", "label": "T", "url": "settings/index.html", "icon": "icons/gear.svg"}],
@@ -1567,15 +1574,169 @@ mod tests {
         assert_eq!((status, body.as_str()), (StatusCode::OK, "<svg></svg>"));
         let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/themes/cover.png").await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "PNGCOVER"));
-        // css_file is not asset-served; an unlisted path is refused even if present on the root.
-        assert_eq!(
-            asset_status(&router, "/api/extensions/hello/assets/themes/dark.css").await,
-            StatusCode::FORBIDDEN
-        );
+        // css_file is now listed (required for bound resolve) so a request for it is verified-served.
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/themes/dark.css").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, ":root{--bg:#000}"));
         assert_eq!(
             asset_status(&router, "/api/extensions/hello/assets/unlisted.css").await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    /// Themes API inlines CSS: for bound+files the bytes come from the retained root, not ext_dir.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_files_get_themes_inlines_verified_css() {
+        use crate::hub::curated::sri_sha512;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ext_root = tmp.path().join("extensions");
+        let ext_dir = ext_root.join("hello");
+        std::fs::create_dir_all(ext_dir.join("themes")).unwrap();
+        let loaded = serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "contributes": {
+                "themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css"}]
+            }
+        });
+        std::fs::write(
+            ext_dir.join("aion-extension.json"),
+            serde_json::to_vec_pretty(&loaded).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(ext_dir.join("themes/dark.css"), "EVIL-CSS").unwrap();
+
+        let host_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_root.path().join("themes")).unwrap();
+        std::fs::write(host_root.path().join("themes/dark.css"), V_THEME_CSS).unwrap();
+        let signed = serde_json::to_vec(&serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "files": [{"path": "themes/dark.css", "integrity": sri_sha512(V_THEME_CSS)}],
+            "contributes": {
+                "themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css"}]
+            }
+        }))
+        .unwrap();
+        std::fs::write(host_root.path().join("aion-extension.json"), &signed).unwrap();
+
+        let store = ExtensionStateStore::new(tmp.path().join("states.json"));
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let registry = ExtensionRegistry::new(store, bus, "1.0.0".into());
+        let state = ExtensionRouterState::new(registry.clone());
+        // Same store the Host wires before initialize, so resolve sees the binding.
+        registry.set_signed_roots(state.host_runtime.signed_roots.clone());
+        state
+            .host_runtime
+            .signed_roots
+            .install(
+                "hello",
+                check_for_hello(&signed),
+                std::fs::File::open(host_root.path()).unwrap(),
+            )
+            .unwrap();
+        registry
+            .initialize_with_scan_paths(vec![ScanPath {
+                path: ext_root,
+                source: ExtensionSource::Env,
+            }])
+            .await
+            .unwrap();
+
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/extensions/themes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let themes = body["data"].as_array().unwrap();
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0]["css"], ":root{--bg:#000}");
+        assert_ne!(themes[0]["css"], "EVIL-CSS");
+        let _ = tmp;
+        let _ = host_root;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_files_get_themes_omits_theme_when_css_is_unverified() {
+        use crate::hub::curated::sri_sha512;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ext_root = tmp.path().join("extensions");
+        let ext_dir = ext_root.join("hello");
+        std::fs::create_dir_all(ext_dir.join("themes")).unwrap();
+        let loaded = serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "contributes": {
+                "themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css"}]
+            }
+        });
+        std::fs::write(
+            ext_dir.join("aion-extension.json"),
+            serde_json::to_vec_pretty(&loaded).unwrap(),
+        )
+        .unwrap();
+        // Loaded dir has valid-looking CSS; the retained root's listed file is tampered.
+        std::fs::write(ext_dir.join("themes/dark.css"), V_THEME_CSS).unwrap();
+        let host_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_root.path().join("themes")).unwrap();
+        std::fs::write(host_root.path().join("themes/dark.css"), "tampered").unwrap();
+        let signed = serde_json::to_vec(&serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "files": [{"path": "themes/dark.css", "integrity": sri_sha512(V_THEME_CSS)}],
+            "contributes": {
+                "themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css"}]
+            }
+        }))
+        .unwrap();
+        std::fs::write(host_root.path().join("aion-extension.json"), &signed).unwrap();
+
+        let store = ExtensionStateStore::new(tmp.path().join("states.json"));
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let registry = ExtensionRegistry::new(store, bus, "1.0.0".into());
+        let state = ExtensionRouterState::new(registry.clone());
+        registry.set_signed_roots(state.host_runtime.signed_roots.clone());
+        state
+            .host_runtime
+            .signed_roots
+            .install(
+                "hello",
+                check_for_hello(&signed),
+                std::fs::File::open(host_root.path()).unwrap(),
+            )
+            .unwrap();
+        registry
+            .initialize_with_scan_paths(vec![ScanPath {
+                path: ext_root,
+                source: ExtensionSource::Env,
+            }])
+            .await
+            .unwrap();
+
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/extensions/themes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert!(body["data"].as_array().unwrap().is_empty(), "{body}");
+        let _ = tmp;
+        let _ = host_root;
     }
 
     #[tokio::test]
