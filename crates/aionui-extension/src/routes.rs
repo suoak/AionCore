@@ -1584,6 +1584,103 @@ mod tests {
     }
 
     /// Themes API inlines CSS: for bound+files the bytes come from the retained root, not ext_dir.
+    /// Bound extension fixture for the i18n route: the loaded dir holds EVIL json, the retained
+    /// root holds the signed one (`good` unless `root_body` overrides it).
+    #[cfg(unix)]
+    async fn i18n_bound_router(root_body: &[u8], signed_body: &[u8]) -> (Router, tempfile::TempDir, tempfile::TempDir) {
+        use crate::hub::curated::sri_sha512;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ext_root = tmp.path().join("extensions");
+        let ext_dir = ext_root.join("hello");
+        std::fs::create_dir_all(ext_dir.join("i18n")).unwrap();
+        let loaded = serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "i18n": {"locales": ["en"], "directory": "i18n"}
+        });
+        std::fs::write(
+            ext_dir.join("aion-extension.json"),
+            serde_json::to_vec_pretty(&loaded).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(ext_dir.join("i18n/en.json"), r#"{"k":"EVIL"}"#).unwrap();
+        let host_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_root.path().join("i18n")).unwrap();
+        std::fs::write(host_root.path().join("i18n/en.json"), root_body).unwrap();
+        let signed = serde_json::to_vec(&serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "files": [{"path": "i18n/en.json", "integrity": sri_sha512(signed_body)}],
+            "i18n": {"locales": ["en"], "directory": "i18n"}
+        }))
+        .unwrap();
+        std::fs::write(host_root.path().join("aion-extension.json"), &signed).unwrap();
+        let store = ExtensionStateStore::new(tmp.path().join("states.json"));
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let registry = ExtensionRegistry::new(store, bus, "1.0.0".into());
+        let state = ExtensionRouterState::new(registry.clone());
+        registry.set_signed_roots(state.host_runtime.signed_roots.clone());
+        state
+            .host_runtime
+            .signed_roots
+            .install(
+                "hello",
+                check_for_hello(&signed),
+                std::fs::File::open(host_root.path()).unwrap(),
+            )
+            .unwrap();
+        registry
+            .initialize_with_scan_paths(vec![ScanPath {
+                path: ext_root,
+                source: ExtensionSource::Env,
+            }])
+            .await
+            .unwrap();
+        (
+            extension_routes(state).layer(Extension(CurrentUser::local_default())),
+            tmp,
+            host_root,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn post_i18n(router: &Router, locale: &str) -> serde_json::Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extensions/i18n")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"locale": locale}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        body["data"].clone()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_files_i18n_route_returns_verified_root_messages() {
+        let good: &[u8] = br#"{"k":"good"}"#;
+        let (router, _tmp, _root) = i18n_bound_router(good, good).await;
+        let data = post_i18n(&router, "en").await;
+        assert_eq!(data["hello"]["k"], "good");
+        assert!(post_i18n(&router, "fr").await.as_object().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_files_i18n_route_omits_extension_when_root_file_is_tampered() {
+        let good: &[u8] = br#"{"k":"good"}"#;
+        // Retained root now holds different bytes than the signed SRI; loaded dir is never consulted.
+        let (router, _tmp, _root) = i18n_bound_router(br#"{"k":"tampered"}"#, good).await;
+        let data = post_i18n(&router, "en").await;
+        assert!(data.as_object().unwrap().is_empty(), "{data}");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn bound_files_get_themes_inlines_verified_css() {

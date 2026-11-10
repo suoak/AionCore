@@ -135,7 +135,18 @@ pub fn resolve_i18n_for_all(
     extensions: &[LoadedExtension],
     locale: &str,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
-    let ext_data: Vec<(String, Option<crate::types::I18nConfig>, String)> = extensions
+    resolve_i18n_for_all_with_roots(extensions, locale, None)
+}
+
+/// Like [`resolve_i18n_for_all`], but a bound extension whose signed snapshot declares `files`
+/// has its locale files read through the retained root (slice L): no fallback to the loaded
+/// directory.
+pub(crate) fn resolve_i18n_for_all_with_roots(
+    extensions: &[LoadedExtension],
+    locale: &str,
+    signed_roots: Option<&SignedRootBindingStore>,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let ext_data: Vec<_> = extensions
         .iter()
         .filter(|ext| ext.state.enabled)
         .map(|ext| {
@@ -143,11 +154,12 @@ pub fn resolve_i18n_for_all(
                 ext.manifest.name.clone(),
                 ext.manifest.i18n.clone(),
                 ext.directory.clone(),
+                signed_roots.and_then(|store| store.lookup_clone(&ext.manifest.name)),
             )
         })
         .collect();
 
-    i18n::resolve_i18n_for_locale(&ext_data, locale)
+    i18n::resolve_i18n_for_locale_bound(&ext_data, locale)
 }
 
 #[cfg(test)]
