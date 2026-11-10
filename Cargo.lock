@@ -483,6 +483,7 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -730,6 +731,7 @@ dependencies = [
  "http-body-util",
  "include_dir",
  "junction",
+ "libc",
  "mime_guess",
  "notify",
  "reqwest",

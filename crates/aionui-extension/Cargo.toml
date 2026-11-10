@@ -41,6 +41,10 @@ tempfile.workspace = true
 [target.'cfg(windows)'.dependencies]
 junction = "1"
 
+# openat/mkdirat for the Host-owned local package install root (unix only).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 async-trait.workspace = true
 http-body-util.workspace = true

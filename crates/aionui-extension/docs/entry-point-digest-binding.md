@@ -110,3 +110,15 @@ unparseable retained snapshot refuses every asset of the extension. Other assets
 (css/icons) and undeclared entry points keep legacy serving (undeclared ≠ verified).
 Residual: hard-link aliases of a declared entry file are not detected. Serving *from* checked
 source remains unwired (no honest Host root `File`).
+
+**Local signed-package install (honest root)**: `hub::install_local_signed_package` (unix, not wired
+to any route, no network) takes an *already-local* zip, re-checks `check_signed_manifest`, validates
+the whole archive first (canonical names only; no `..`/absolute/backslash/symlink/special entries;
+no duplicates incl. case-fold; entry/size budgets) and accepts only a strict allow-list: the manifest
+(byte-identical to the signed bytes) plus files whose SRI the signed manifest declares
+(`entryPointIntegrity`, `handlerIntegrity`), each SRI-verified. Anything else → refused. Only then it
+`mkdirat`s a new `0700` directory relative to a Host-held parent handle, keeps the `openat` handle from
+that creation as the root, writes via `openat(O_EXCL|O_NOFOLLOW)` relative to it and retains
+`(SignatureCheckedManifest, root)` in `SignedRootBindingStore`. That root feeds the app
+`load_checked_*_source_from_signed` helpers (chain test under `experimental-extension-js`).
+Residual: packages with css/icons need a future signed file list; a partial root is left on I/O error.
