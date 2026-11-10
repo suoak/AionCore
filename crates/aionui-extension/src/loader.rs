@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
-use crate::constants::{EXTENSION_API_VERSION, EXTENSION_MANIFEST_FILE, EXTENSIONS_DIR_NAME};
+use crate::constants::{
+    EXTENSION_API_VERSION, EXTENSION_MANIFEST_FILE, EXTENSIONS_DIR_NAME, SIGNED_EXTENSIONS_DIR_NAME,
+};
 use crate::manifest::parse_manifest_in_dir;
 use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
 
@@ -47,6 +49,15 @@ pub fn resolve_scan_paths_for_data_dir(data_dir: &Path) -> Vec<ScanPath> {
     let env_path = std::env::var("AIONUI_EXTENSIONS_PATH").ok();
     let e2e_mode = is_e2e_test_mode();
     resolve_scan_paths_inner(env_path.as_deref(), e2e_mode, Some(data_dir))
+}
+
+/// Scan path of the Host signed-install directory. Highest priority when signed install is enabled:
+/// an extension the Host installed from a signed package must not be shadowed by an unsigned copy.
+pub fn signed_extensions_scan_path(data_dir: &Path) -> ScanPath {
+    ScanPath {
+        path: data_dir.join(SIGNED_EXTENSIONS_DIR_NAME),
+        source: ExtensionSource::Local,
+    }
 }
 
 /// Resolve the install target directory using the same priority order as
@@ -181,7 +192,32 @@ fn scan_directory(dir: &Path, source: ExtensionSource) -> Vec<LoadedExtension> {
         }
 
         let manifest_path = entry_path.join(EXTENSION_MANIFEST_FILE);
-        match load_single_extension(&manifest_path, &entry_path, source) {
+        // Host signed-install layout (M9 E13 slice G): a name directory without a root manifest but
+        // with a well-formed `current` marker is loaded from its marked version directory. This is
+        // discovery only (path strings, no trust); bindings come solely from install / restore.
+        let (manifest_path, load_dir) = if manifest_path.is_file() {
+            (manifest_path, entry_path.clone())
+        } else if let Some(version_dir) = crate::hub::host_package_install::resolve_current_version_dir(&entry_path) {
+            (version_dir.join(EXTENSION_MANIFEST_FILE), version_dir)
+        } else {
+            (manifest_path, entry_path.clone())
+        };
+        let result = load_single_extension(&manifest_path, &load_dir, source).and_then(|ext| {
+            if load_dir != entry_path
+                && !crate::hub::host_package_install::loaded_identity_matches_layout(
+                    &ext.manifest.name,
+                    &ext.manifest.version,
+                    &entry_path,
+                    &load_dir,
+                )
+            {
+                return Err(crate::error::ExtensionError::ManifestValidation(
+                    "signed-install layout identity does not match the manifest".into(),
+                ));
+            }
+            Ok(ext)
+        });
+        match result {
             Ok(ext) => {
                 debug!(name = %ext.manifest.name, dir = %entry_path.display(), "loaded extension");
                 loaded.push(ext);
@@ -734,5 +770,73 @@ mod tests {
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].path, data_dir.join(EXTENSIONS_DIR_NAME));
         assert_eq!(paths[0].source, ExtensionSource::Local);
+    }
+
+    #[cfg(unix)]
+    mod signed_layout {
+        use super::super::*;
+        use crate::hub::host_package_install::encode_component;
+        use serde_json::json;
+
+        fn marker(name: &str, version: &str, component: &str) -> Vec<u8> {
+            serde_json::to_vec(&json!({
+                "v": 1, "name": name, "version": version, "component": component,
+                "pubkey_id": "k", "integrity": "i", "signature": "s"
+            }))
+            .unwrap()
+        }
+
+        fn install_layout(root: &Path, name: &str, version: &str, manifest_name: &str, manifest_version: &str) {
+            let n = encode_component(name).unwrap();
+            let v = encode_component(version).unwrap();
+            let vdir = root.join(&n).join(&v);
+            std::fs::create_dir_all(&vdir).unwrap();
+            std::fs::write(
+                vdir.join(EXTENSION_MANIFEST_FILE),
+                serde_json::to_vec(&json!({"name": manifest_name, "version": manifest_version})).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.join(&n).join("current"), marker(name, version, &v)).unwrap();
+        }
+
+        #[test]
+        fn marked_version_dir_is_loaded_and_unmarked_or_inconsistent_layouts_are_not() {
+            let tmp = tempfile::tempdir().unwrap();
+            install_layout(tmp.path(), "demo.plugin", "1.0.0", "demo.plugin", "1.0.0");
+            // Manifest identity disagrees with the layout it was found under.
+            install_layout(tmp.path(), "other", "1.0.0", "someone.else", "1.0.0");
+            // Version directory without a marker.
+            std::fs::create_dir_all(tmp.path().join("nomarker/1.0.0")).unwrap();
+            std::fs::write(
+                tmp.path().join("nomarker/1.0.0").join(EXTENSION_MANIFEST_FILE),
+                br#"{"name":"nomarker","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            // Symlinked marker.
+            install_layout(tmp.path(), "linked", "1.0.0", "linked", "1.0.0");
+            std::fs::remove_file(tmp.path().join("linked/current")).unwrap();
+            std::fs::write(tmp.path().join("real-marker"), marker("linked", "1.0.0", "1.0.0")).unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("real-marker"), tmp.path().join("linked/current")).unwrap();
+            let loaded = scan_directory(tmp.path(), ExtensionSource::Local);
+            let names: Vec<_> = loaded.iter().map(|e| e.manifest.name.as_str()).collect();
+            assert_eq!(names, ["demo.plugin"]);
+            assert!(loaded[0].directory.ends_with("demo.plugin/1.0.0"));
+        }
+
+        #[test]
+        fn legacy_root_manifest_still_wins_over_any_marker() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("legacy");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(EXTENSION_MANIFEST_FILE),
+                br#"{"name":"legacy","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("current"), marker("x", "1.0.0", "1.0.0")).unwrap();
+            let loaded = scan_directory(tmp.path(), ExtensionSource::Local);
+            assert_eq!(loaded.len(), 1);
+            assert!(loaded[0].directory.ends_with("legacy"));
+        }
     }
 }

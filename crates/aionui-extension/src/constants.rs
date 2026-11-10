@@ -4,6 +4,9 @@ pub const EXTENSION_MANIFEST_FILE: &str = "aion-extension.json";
 /// Default subdirectory name for extensions.
 pub const EXTENSIONS_DIR_NAME: &str = "extensions";
 
+/// Host-owned directory (inside the Host data dir) for signed-package installs (M9 E13 slice G).
+pub const SIGNED_EXTENSIONS_DIR_NAME: &str = "extensions-signed";
+
 /// Current extension API version.
 pub const EXTENSION_API_VERSION: &str = "1.0.0";
 

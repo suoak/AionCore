@@ -240,7 +240,11 @@ pub async fn build_module_states(
         "startup: extension states built"
     );
 
-    let scan_paths = resolve_scan_paths_for_data_dir(&services.data_dir);
+    let mut scan_paths = resolve_scan_paths_for_data_dir(&services.data_dir);
+    if hub_state.installer.signed_install_enabled() {
+        // Highest priority: a signed install must not be shadowed by an unsigned copy of the same name.
+        scan_paths.insert(0, aionui_extension::signed_extensions_scan_path(&services.data_dir));
+    }
     if let Err(error) = ext_state.registry.initialize_with_scan_paths(scan_paths).await {
         tracing::warn!(
             code = "BOOTSTRAP_DEGRADED_EXTENSION_REGISTRY",
@@ -1623,7 +1627,6 @@ pub async fn build_extension_states(
 
     let hub_dir = resolve_install_target_dir_for_data_dir(&skill_data_dir);
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());
-    let installer = HubInstaller::new(index_manager.clone(), registry.clone());
 
     let ext_paths_mgr = Arc::new(ExternalPathsManager::new(&skill_data_dir).await);
     let skill_registry_service = SkillRegistryService::new(
@@ -1633,6 +1636,16 @@ pub async fn build_extension_states(
     );
 
     let mut ext_state = ExtensionRouterState::new(registry.clone());
+    // M9 E13 slice G: only with a configured signature policy, the Host opens its own signed-install
+    // directory once, sweeps abandoned staging and re-binds verified installs into the SAME binding
+    // store the routes / prepare adapter read. Without a policy this is `None` and nothing changes.
+    let signed_install = crate::host_signed_extensions::build_host_signed_install(
+        &skill_data_dir,
+        aionui_extension::hub::curated::CuratedInstallPolicy::from_env(),
+        ext_state.host_runtime.signed_roots.clone(),
+    )
+    .await;
+    let installer = HubInstaller::new(index_manager.clone(), registry.clone()).with_signed_install(signed_install);
     // Library-first Host plumbing: app prepare adapter is available. Bindings are
     // created only via explicit SignedRootBindingStore::install / HostRuntime
     // try_retain_curated_signed_root (never from LoadedExtension.directory or

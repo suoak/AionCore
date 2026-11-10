@@ -7,6 +7,7 @@ pub mod handler_digest;
 mod host_fs;
 pub mod host_package_install;
 pub mod host_package_restore;
+pub mod host_signed_install;
 pub mod index_manager;
 pub mod installer;
 pub mod local_package_install;
@@ -33,14 +34,16 @@ pub use handler_digest::{
     HandlerDigestBinding, HandlerDigestError, bind_handler_digest_from_signed, expected_handler_integrity,
 };
 pub use host_package_install::{
-    AutoInstallOptions, AutoInstallReport, HostExtensionsParent, InstallKind, StagingSweepReport,
-    install_local_signed_package_auto, sweep_abandoned_staging,
+    AutoInstallOptions, AutoInstallReport, HostExtensionsParent, InstallKind, StagingSweepReport, UninstallOutcome,
+    install_local_signed_package_auto, sweep_abandoned_staging, uninstall_local_signed_package,
 };
 pub use host_package_restore::{RestoreRejection, RestoreReport, restore_installed_extensions};
+pub use host_signed_install::{HostSignedInstall, StartupReport, signature_policy_configured};
 pub use index_manager::HubIndexManager;
 pub use installer::HubInstaller;
 pub use local_package_install::{
     LocalPackageError, LocalPackageInstalled, LocalPackageLimits, LocalPackageSource, install_local_signed_package,
+    read_package_manifest,
 };
 pub use sri_format::{CANONICAL_SHA512_SRI_LEN, is_canonical_sha512_sri};
 pub use verified_asset::{
