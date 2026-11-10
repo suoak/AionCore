@@ -232,6 +232,55 @@ mod enabled_tests {
             other => panic!("expected Checked(Reader(_)), got {other:?}"),
         }
     }
+
+    /// Chain proof: Host-created root from the local signed package install feeds the
+    /// existing checked-source compose (no path-string reopen anywhere).
+    #[test]
+    fn local_package_install_root_feeds_checked_panel_source() {
+        use aionui_extension::hub::{LocalPackageLimits, LocalPackageSource, install_local_signed_package};
+        use aionui_extension::signed_root_binding::SignedRootBindingStore;
+        use std::io::Write;
+
+        let body = "<html><body>pkg</body></html>\n";
+        let sri = sri_sha512(body.as_bytes());
+        let raw = manifest_json(&format!(
+            r#"[{{"id":"board","title":"Board","entryPoint":"panels/board.html","entryPointIntegrity":"{sri}"}}]"#
+        ));
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        writer.start_file("aion-extension.json", opts).unwrap();
+        writer.write_all(raw.as_bytes()).unwrap();
+        writer.start_file("panels/board.html", opts).unwrap();
+        writer.write_all(body.as_bytes()).unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+
+        let (integrity, signature) = sign(raw.as_bytes(), "demo.plugin", "1.0.0");
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = File::open(parent_dir.path()).unwrap();
+        let store = SignedRootBindingStore::new();
+        install_local_signed_package(
+            &store,
+            &policy(),
+            &LocalPackageSource {
+                entry: SignedManifestEntry {
+                    name: "demo.plugin",
+                    version: "1.0.0",
+                    pubkey_id: Some("fixture"),
+                    integrity: Some(&integrity),
+                    signature: Some(&signature),
+                },
+                raw_manifest: raw.as_bytes(),
+                package_zip: &archive,
+            },
+            &parent,
+            "demo-1.0.0",
+            LocalPackageLimits::default(),
+        )
+        .unwrap();
+        let (snapshot, root) = store.lookup_clone("demo.plugin").unwrap();
+        let source = load_checked_panel_source_from_signed(&snapshot, "board", &root).unwrap();
+        assert_eq!(source.as_str().as_bytes(), body.as_bytes());
+    }
 }
 
 #[cfg(all(test, not(all(feature = "experimental-extension-js", target_os = "linux"))))]

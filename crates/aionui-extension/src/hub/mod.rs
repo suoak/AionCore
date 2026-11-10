@@ -5,6 +5,7 @@ pub mod entry_point_digest;
 pub mod handler_digest;
 pub mod index_manager;
 pub mod installer;
+pub mod local_package_install;
 pub mod signed_manifest;
 pub mod sri_format;
 pub mod work_panel_view_entry_point_digest;
@@ -28,6 +29,9 @@ pub use handler_digest::{
 };
 pub use index_manager::HubIndexManager;
 pub use installer::HubInstaller;
+pub use local_package_install::{
+    LocalPackageError, LocalPackageInstalled, LocalPackageLimits, LocalPackageSource, install_local_signed_package,
+};
 pub use sri_format::{CANONICAL_SHA512_SRI_LEN, is_canonical_sha512_sri};
 pub use work_panel_view_entry_point_digest::{
     WorkPanelViewEntryPointDigestError, bind_work_panel_view_entry_point_digest_from_signed,
