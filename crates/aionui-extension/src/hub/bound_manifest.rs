@@ -74,15 +74,8 @@ fn read_root_manifest(root: &File) -> Result<Vec<u8>, ()> {
     read_root_manifest_impl(root)
 }
 
-#[cfg(unix)]
 fn read_root_manifest_impl(root: &File) -> Result<Vec<u8>, ()> {
-    super::host_fs::read_file_under(root, EXTENSION_MANIFEST_FILE, MAX_MANIFEST_BYTES as u64).map_err(|_| ())
-}
-
-/// Non-unix: no FD-relative reader. A binding must never fall back to a path-string read.
-#[cfg(not(unix))]
-fn read_root_manifest_impl(_root: &File) -> Result<Vec<u8>, ()> {
-    Err(())
+    super::verified_reader::read_file_under(root, EXTENSION_MANIFEST_FILE, MAX_MANIFEST_BYTES as u64).map_err(|_| ())
 }
 
 #[cfg(all(test, unix))]

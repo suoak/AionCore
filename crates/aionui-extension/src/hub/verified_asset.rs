@@ -123,15 +123,17 @@ impl FilesIndex {
 }
 
 /// Blocking: read the listed file below the retained `root` and compare it to `integrity`.
-#[cfg(unix)]
+///
+/// Uses the platform verified reader ([`super::verified_reader`]): FD-relative `openat(O_NOFOLLOW)`
+/// on unix, handle-relative `NtCreateFile` with reparse refusal on Windows, `Unsupported`
+/// (→ [`VerifiedAssetError::Unavailable`]) elsewhere. Never a path read.
 pub fn read_verified_listed(root: &File, path: &str, integrity: &str) -> Result<VerifiedAsset, VerifiedAssetError> {
-    let bytes = super::host_fs::read_file_under(root, path, MAX_VERIFIED_ASSET_BYTES).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            VerifiedAssetError::Missing
-        } else {
-            VerifiedAssetError::Unreadable
-        }
-    })?;
+    let bytes =
+        super::verified_reader::read_file_under(root, path, MAX_VERIFIED_ASSET_BYTES).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => VerifiedAssetError::Missing,
+            std::io::ErrorKind::Unsupported => VerifiedAssetError::Unavailable,
+            _ => VerifiedAssetError::Unreadable,
+        })?;
     if sri_sha512(&bytes) != integrity {
         return Err(VerifiedAssetError::IntegrityMismatch);
     }
@@ -139,13 +141,6 @@ pub fn read_verified_listed(root: &File, path: &str, integrity: &str) -> Result<
         path: path.to_owned(),
         bytes,
     })
-}
-
-/// Non-unix: no FD-relative reader exists yet; fail closed (never a path read).
-#[cfg(not(unix))]
-pub fn read_verified_listed(root: &File, path: &str, integrity: &str) -> Result<VerifiedAsset, VerifiedAssetError> {
-    let _ = (root, path, integrity, sri_sha512(b""));
-    Err(VerifiedAssetError::Unavailable)
 }
 
 #[cfg(all(test, unix))]
