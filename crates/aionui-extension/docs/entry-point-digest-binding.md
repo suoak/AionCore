@@ -99,3 +99,14 @@ service declares `entryPointIntegrity` in the loaded manifest, or in a Host-reta
 snapshot (`SignedRootBindingStore::lookup_checked`); an inconclusive signed snapshot also
 refuses. Undeclared services keep the legacy path spawn (undeclared, never "verified").
 Actually spawning *from* checked source remains unwired.
+
+**Asset-serve gate (panels / workPanelViews)**: `GET /api/extensions/{name}/assets/*` and the
+token (`asset-session`) variant read bytes by canonical path with no integrity check.
+`asset_integrity_gate::AssetIntegrityGate` therefore **refuses** a request for exactly the
+entry-point file of any `contributes.panels` / `workPanelViews` entry that declares
+`entryPointIntegrity` (loaded manifest, or Host-retained signed snapshot via
+`SignedRootBindingStore::lookup_checked`), including symlink aliases of that file. An
+unparseable retained snapshot refuses every asset of the extension. Other assets
+(css/icons) and undeclared entry points keep legacy serving (undeclared ≠ verified).
+Residual: hard-link aliases of a declared entry file are not detected. Serving *from* checked
+source remains unwired (no honest Host root `File`).
