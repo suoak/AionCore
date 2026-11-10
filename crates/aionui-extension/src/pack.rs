@@ -773,7 +773,7 @@ mod tests {
         let tmp = sample();
         write(tmp.path(), "a", b"x");
         write(tmp.path(), "A/b", b"y");
-        if tmp.path().join("a").is_file() {
+        if tmp.path().join("a").is_file() && tmp.path().join("A").join("b").is_file() {
             assert!(matches!(
                 pack_extension_dir(tmp.path(), &PackOptions::default()),
                 Err(PackError::CaseFoldCollision(_, _))
