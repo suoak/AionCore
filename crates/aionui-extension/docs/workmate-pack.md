@@ -25,7 +25,7 @@ workmate-pack <dir> [--zip-out <file>] [--manifest-out <file>] [--update-manifes
 
 ## Rules (all refuse, none silently skip)
 Symlinks and non-regular files; non-UTF-8, non-canonical (`\`, `..`, empty components) or
-control-character names; case-fold collisions (also with `aion-extension.json`); `$file:` references
+control-character names; names that cannot exist on Windows (DOS device names such as `con`/`aux`/`nul`/`com1`, trailing dot or space, `: * ? " < > |`, over 255 UTF-16 units — Windows is a required platform, so such a package is refused at pack time); case-fold collisions (also with `aion-extension.json`); `$file:` references
 in the manifest; more than 512 entries (files + manifest), a file over 8 MiB, more than 32 MiB in
 total, a manifest over 256 KiB; and any manifest the Host would refuse (`parse_manifest` runs on the
 result, so e.g. a referenced asset that is not in the directory, or a declared
