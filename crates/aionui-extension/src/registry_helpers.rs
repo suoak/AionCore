@@ -177,6 +177,7 @@ mod tests {
                 contributes: None,
                 lifecycle: None,
                 i18n: None,
+                files: Vec::new(),
             },
             directory: format!("/tmp/ext/{name}"),
             source: ExtensionSource::Local,

@@ -451,6 +451,18 @@ pub struct LifecycleHooks {
     pub on_deactivate: Option<String>,
 }
 
+/// One packaged file declared by the manifest's top-level `files` list (M9 E13).
+///
+/// Declaration only: `path` is a canonical relative path and `integrity` a canonical
+/// sha512 SRI. Neither value proves anything until a Host checks real bytes against
+/// them, and an unknown extra field is refused rather than ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestFile {
+    pub path: String,
+    pub integrity: String,
+}
+
 /// Complete extension manifest parsed from `aion-extension.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtensionManifest {
@@ -484,6 +496,10 @@ pub struct ExtensionManifest {
     pub lifecycle: Option<LifecycleHooks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i18n: Option<I18nConfig>,
+    /// Packaged file list (`files`). Omitted/empty means "no declared package files";
+    /// it never means unlisted extras are acceptable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ManifestFile>,
 }
 
 // ---------------------------------------------------------------------------

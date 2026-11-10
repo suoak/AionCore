@@ -153,6 +153,7 @@ mod tests {
                 contributes,
                 lifecycle: None,
                 i18n: None,
+                files: Vec::new(),
             },
             directory: "/tmp/ext".to_owned(),
             source: ExtensionSource::Local,

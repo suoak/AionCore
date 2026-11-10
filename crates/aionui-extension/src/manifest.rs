@@ -1,9 +1,10 @@
-use crate::constants::RESERVED_NAME_PREFIXES;
+use crate::asset_paths::canonical_relative_path;
+use crate::constants::{EXTENSION_MANIFEST_FILE, RESERVED_NAME_PREFIXES};
 use crate::error::ExtensionError;
 use crate::hub::is_canonical_sha512_sri;
 use crate::types::ExtensionManifest;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Validate an extension manifest for required fields, name format, and version format.
@@ -14,7 +15,125 @@ pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionEr
     validate_panel_entry_point_digests(manifest)?;
     validate_work_panel_view_entry_point_digests(manifest)?;
     validate_background_service_entry_point_digests(manifest)?;
+    validate_manifest_files(manifest)?;
     Ok(())
+}
+
+/// Upper bound on top-level `files` entries (parse-time; Host install budgets are separate).
+pub const MAX_MANIFEST_FILES: usize = 1024;
+
+/// Fail closed on a malformed top-level `files` list (M9 E13 slice A: parse/validate only).
+///
+/// Every `path` must be an exact canonical relative path and every `integrity` a canonical
+/// sha512 SRI. Duplicates (also case-folded), directory-prefix clashes (also case-folded),
+/// the manifest file itself and more than [`MAX_MANIFEST_FILES`] entries are refused.
+///
+/// When `files` is non-empty, every contribution integrity declaration
+/// (`entryPointIntegrity` / `handlerIntegrity`) must also appear in `files` with the same
+/// path and the same SRI. Manifests without `files` keep the existing per-entry behaviour
+/// unchanged. This is declaration consistency only: it reads no file, proves no bytes, and
+/// an omitted list never means unlisted extras are verified.
+fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
+    if manifest.files.is_empty() {
+        return Ok(());
+    }
+    if manifest.files.len() > MAX_MANIFEST_FILES {
+        return Err(ExtensionError::ManifestValidation(
+            "manifest files list exceeds the maximum entry count".into(),
+        ));
+    }
+    let mut declared: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut folded: Vec<String> = Vec::with_capacity(manifest.files.len());
+    let mut folded_seen: HashSet<String> = HashSet::with_capacity(manifest.files.len());
+    let manifest_fold = EXTENSION_MANIFEST_FILE.to_lowercase();
+    for file in &manifest.files {
+        if canonical_relative_path(&file.path).is_none() {
+            return Err(ExtensionError::ManifestValidation(
+                "manifest files path must be a canonical relative path".into(),
+            ));
+        }
+        if !is_canonical_sha512_sri(&file.integrity) {
+            return Err(ExtensionError::ManifestValidation(
+                "manifest files integrity must be a canonical sha512 SRI".into(),
+            ));
+        }
+        let fold = file.path.to_lowercase();
+        if fold == manifest_fold {
+            return Err(ExtensionError::ManifestValidation(
+                "manifest files must not list the manifest itself".into(),
+            ));
+        }
+        if !folded_seen.insert(fold.clone()) {
+            return Err(ExtensionError::ManifestValidation(
+                "manifest files contains a duplicate path".into(),
+            ));
+        }
+        folded.push(fold);
+        declared.insert(file.path.as_str(), file.integrity.as_str());
+    }
+    // A listed path may not be a directory prefix of another (`a` vs `a/b`), case-folded.
+    for fold in &folded {
+        let mut end = 0;
+        while let Some(pos) = fold[end..].find('/') {
+            end += pos;
+            if folded_seen.contains(&fold[..end]) {
+                return Err(ExtensionError::ManifestValidation(
+                    "manifest files contains a path that is a directory prefix of another".into(),
+                ));
+            }
+            end += 1;
+        }
+    }
+    for (path, integrity) in declared_contribution_integrity(manifest) {
+        let canonical = canonical_relative_path(path).ok_or_else(|| {
+            ExtensionError::ManifestValidation(
+                "contribution integrity path must be a canonical relative path when files is declared".into(),
+            )
+        })?;
+        match declared.get(canonical.as_str()) {
+            Some(listed) if *listed == integrity => {}
+            Some(_) => {
+                return Err(ExtensionError::ManifestValidation(
+                    "contribution integrity conflicts with the files list".into(),
+                ));
+            }
+            None => {
+                return Err(ExtensionError::ManifestValidation(
+                    "contribution integrity path is missing from the files list".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `(path, integrity)` for every contribution that declares an integrity (already validated).
+fn declared_contribution_integrity(manifest: &ExtensionManifest) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    let Some(c) = manifest.contributes.as_ref() else {
+        return out;
+    };
+    for p in &c.panels {
+        if let Some(i) = p.entry_point_integrity.as_deref() {
+            out.push((p.entry_point.as_str(), i));
+        }
+    }
+    for v in &c.work_panel_views {
+        if let Some(i) = v.entry_point_integrity.as_deref() {
+            out.push((v.entry_point.as_str(), i));
+        }
+    }
+    for s in &c.background_services {
+        if let Some(i) = s.entry_point_integrity.as_deref() {
+            out.push((s.entry_point.as_str(), i));
+        }
+    }
+    for t in &c.agent_tools {
+        if let Some(i) = t.handler_integrity.as_deref() {
+            out.push((t.handler.as_deref().unwrap_or_default(), i));
+        }
+    }
+    out
 }
 
 /// Fail closed when an optional handler digest is present but malformed or unbound.
@@ -584,6 +703,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         };
         assert!(validate_manifest(&manifest).is_ok());
     }
@@ -607,6 +727,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::ManifestValidation(_)));
@@ -631,6 +752,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(
@@ -660,6 +782,7 @@ mod tests {
                 contributes: None,
                 lifecycle: None,
                 i18n: None,
+                files: Vec::new(),
             };
             assert!(
                 validate_manifest(&manifest).is_err(),
@@ -687,6 +810,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         };
         assert!(validate_manifest(&manifest).is_err());
     }
@@ -710,6 +834,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::ManifestValidation(_)));
@@ -734,6 +859,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::InvalidVersion { .. }));
@@ -759,6 +885,7 @@ mod tests {
                 contributes: None,
                 lifecycle: None,
                 i18n: None,
+                files: Vec::new(),
             };
             assert!(
                 validate_manifest(&manifest).is_ok(),
@@ -873,5 +1000,232 @@ mod tests {
         assert_eq!(webui[0].routes[0].handler, "webui/collector.js");
         assert_eq!(webui[0].routes[0].method, "GET");
         assert_eq!(webui[1].directory, "assets");
+    }
+
+    // -- top-level `files` list (M9 E13 slice A) --
+
+    fn sri(data: &[u8]) -> String {
+        crate::hub::sri_sha512(data)
+    }
+
+    fn files_manifest(files: serde_json::Value, contributes: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "name": "demo.plugin",
+            "version": "1.0.0",
+            "files": files,
+            "contributes": contributes,
+        }))
+        .unwrap()
+    }
+
+    fn panel(entry: &str, integrity: Option<&str>) -> serde_json::Value {
+        let mut p = json!({"id": "board", "title": "Board", "entryPoint": entry});
+        if let Some(i) = integrity {
+            p["entryPointIntegrity"] = json!(i);
+        }
+        json!({"panels": [p]})
+    }
+
+    fn is_validation_err(r: Result<ExtensionManifest, ExtensionError>) -> bool {
+        matches!(r, Err(ExtensionError::ManifestValidation(_)))
+    }
+
+    #[test]
+    fn files_list_parses_and_round_trips() {
+        let a = sri(b"a");
+        let b = sri(b"b");
+        let bytes = files_manifest(
+            json!([{"path": "panels/board.html", "integrity": a}, {"path": "icons/logo.svg", "integrity": b}]),
+            json!({}),
+        );
+        let m = parse_manifest(&bytes).unwrap();
+        assert_eq!(m.files.len(), 2);
+        assert_eq!(m.files[0].path, "panels/board.html");
+        assert_eq!(m.files[1].integrity, b);
+    }
+
+    #[test]
+    fn omitted_or_empty_files_is_back_compat_and_not_verified() {
+        let m = parse_manifest(br#"{"name":"demo.plugin","version":"1.0.0"}"#).unwrap();
+        assert!(m.files.is_empty());
+        let m = parse_manifest(&files_manifest(json!([]), json!({}))).unwrap();
+        assert!(m.files.is_empty());
+        // The empty list serializes away (no new field on legacy manifests).
+        assert!(!serde_json::to_string(&m).unwrap().contains("\"files\""));
+    }
+
+    #[test]
+    fn legacy_contribution_integrity_without_files_is_unchanged() {
+        let i = sri(b"x");
+        let m = parse_manifest(&files_manifest(json!([]), panel("panels/board.html", Some(&i)))).unwrap();
+        assert!(m.files.is_empty());
+    }
+
+    #[test]
+    fn files_entry_rejects_bad_path_forms() {
+        let good = sri(b"x");
+        for bad in [
+            "",
+            "../a",
+            "/a",
+            "a/../b",
+            "./a",
+            "a//b",
+            "a/./b",
+            "a/",
+            "a\\b",
+            "a\0b",
+            "C:\\x",
+            "aion-extension.json",
+            "AION-Extension.JSON",
+        ] {
+            let bytes = files_manifest(json!([{"path": bad, "integrity": good}]), json!({}));
+            assert!(is_validation_err(parse_manifest(&bytes)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn files_entry_rejects_bad_integrity_forms() {
+        let good = sri(b"x");
+        let mut bad_pad = good.clone().into_bytes();
+        bad_pad[92] = b'B';
+        let bad_pad = String::from_utf8(bad_pad).unwrap();
+        for bad in [
+            String::new(),
+            "sha256-abc".to_owned(),
+            good.to_uppercase(),
+            format!("{good} "),
+            good[..94].to_owned(),
+            bad_pad,
+        ] {
+            let bytes = files_manifest(json!([{"path": "a.css", "integrity": bad}]), json!({}));
+            assert!(is_validation_err(parse_manifest(&bytes)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn files_entry_rejects_unknown_or_missing_fields() {
+        let good = sri(b"x");
+        for entry in [
+            json!({"path": "a.css", "integrity": good, "mode": "0777"}),
+            json!({"path": "a.css"}),
+            json!({"integrity": good}),
+        ] {
+            let bytes = files_manifest(json!([entry]), json!({}));
+            assert!(matches!(parse_manifest(&bytes), Err(ExtensionError::JsonParse(_))));
+        }
+        // Legacy non-object shape is refused too, not silently ignored.
+        let bytes = files_manifest(json!(["a.css"]), json!({}));
+        assert!(matches!(parse_manifest(&bytes), Err(ExtensionError::JsonParse(_))));
+    }
+
+    #[test]
+    fn files_list_rejects_duplicates_including_case_folded() {
+        let i = sri(b"x");
+        let j = sri(b"y");
+        for list in [
+            json!([{"path": "a.css", "integrity": i}, {"path": "a.css", "integrity": j}]),
+            json!([{"path": "a.css", "integrity": i}, {"path": "A.CSS", "integrity": i}]),
+        ] {
+            assert!(is_validation_err(parse_manifest(&files_manifest(list, json!({})))));
+        }
+    }
+
+    #[test]
+    fn files_list_rejects_directory_prefix_clash_including_case_folded() {
+        let i = sri(b"x");
+        for (a, b) in [("a", "a/b.css"), ("a/b", "a/b/c.css"), ("Icons", "icons/logo.svg")] {
+            let list = json!([{"path": a, "integrity": i}, {"path": b, "integrity": i}]);
+            assert!(
+                is_validation_err(parse_manifest(&files_manifest(list.clone(), json!({})))),
+                "{a} {b}"
+            );
+            // Order must not matter.
+            let rev = json!([{"path": b, "integrity": i}, {"path": a, "integrity": i}]);
+            assert!(
+                is_validation_err(parse_manifest(&files_manifest(rev, json!({})))),
+                "{b} {a}"
+            );
+        }
+        // Sibling names sharing a string prefix are not directory clashes.
+        let ok = json!([{"path": "a", "integrity": i}, {"path": "ab/c.css", "integrity": i}]);
+        assert!(parse_manifest(&files_manifest(ok, json!({}))).is_ok());
+    }
+
+    #[test]
+    fn files_list_count_is_bounded() {
+        let i = sri(b"x");
+        let build = |n: usize| {
+            let list: Vec<_> = (0..n)
+                .map(|k| json!({"path": format!("f/{k}.css"), "integrity": i}))
+                .collect();
+            files_manifest(json!(list), json!({}))
+        };
+        assert!(parse_manifest(&build(MAX_MANIFEST_FILES)).is_ok());
+        assert!(is_validation_err(parse_manifest(&build(MAX_MANIFEST_FILES + 1))));
+    }
+
+    #[test]
+    fn contribution_integrity_must_match_files_entry_when_files_declared() {
+        let i = sri(b"panel");
+        let other = sri(b"other");
+        let css = sri(b"css");
+        // Same path + same SRI: accepted (css ships via files only).
+        let ok = files_manifest(
+            json!([{"path": "panels/board.html", "integrity": i}, {"path": "panels/board.css", "integrity": css}]),
+            panel("panels/board.html", Some(&i)),
+        );
+        assert!(parse_manifest(&ok).is_ok());
+        // Contribution path absent from files.
+        let missing = files_manifest(
+            json!([{"path": "panels/board.css", "integrity": css}]),
+            panel("panels/board.html", Some(&i)),
+        );
+        assert!(is_validation_err(parse_manifest(&missing)));
+        // Different SRI for the same path.
+        let conflict = files_manifest(
+            json!([{"path": "panels/board.html", "integrity": other}]),
+            panel("panels/board.html", Some(&i)),
+        );
+        assert!(is_validation_err(parse_manifest(&conflict)));
+        // Non-canonical contribution path cannot silently match a files entry.
+        let noncanon = files_manifest(
+            json!([{"path": "panels/board.html", "integrity": i}]),
+            panel("./panels/board.html", Some(&i)),
+        );
+        assert!(is_validation_err(parse_manifest(&noncanon)));
+        // A contribution without integrity is not forced into files.
+        let no_decl = files_manifest(
+            json!([{"path": "panels/board.css", "integrity": css}]),
+            panel("panels/board.html", None),
+        );
+        assert!(parse_manifest(&no_decl).is_ok());
+    }
+
+    #[test]
+    fn all_contribution_kinds_are_cross_checked_against_files() {
+        let i = sri(b"x");
+        let other = sri(b"y");
+        let contributes = |kind: &str| match kind {
+            "workPanelViews" => {
+                json!({"workPanelViews": [{"id": "v", "title": "V", "entryPoint": "v.html", "entryPointIntegrity": i}]})
+            }
+            "backgroundServices" => {
+                json!({"backgroundServices": [{"id": "s", "entryPoint": "s.js", "entryPointIntegrity": i}]})
+            }
+            _ => json!({"agentTools": [{"id": "t", "name": "T", "handler": "t.js", "handlerIntegrity": i}]}),
+        };
+        for (kind, path) in [
+            ("workPanelViews", "v.html"),
+            ("backgroundServices", "s.js"),
+            ("agentTools", "t.js"),
+        ] {
+            let ok = files_manifest(json!([{"path": path, "integrity": i}]), contributes(kind));
+            assert!(parse_manifest(&ok).is_ok(), "{kind}");
+            let conflict = files_manifest(json!([{"path": path, "integrity": other}]), contributes(kind));
+            assert!(is_validation_err(parse_manifest(&conflict)), "{kind}");
+            let missing = files_manifest(json!([{"path": "z.css", "integrity": i}]), contributes(kind));
+            assert!(is_validation_err(parse_manifest(&missing)), "{kind}");
+        }
     }
 }
