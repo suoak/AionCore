@@ -24,6 +24,8 @@ pub enum SignedRootBindingError {
     RootUnavailable,
     /// Supplied FD metadata is not a directory.
     RootNotDirectory,
+    /// `install_new` refused because a binding for that extension already exists.
+    AlreadyBound,
 }
 
 /// One Host-retained `(signed snapshot, trusted root FD)` pair.
@@ -87,6 +89,30 @@ impl SignedRootBindingStore {
             return Err(SignedRootBindingError::RootNotDirectory);
         }
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(extension_key.to_owned(), SignedRootBinding { checked, root });
+        Ok(())
+    }
+
+    /// Like [`install`](Self::install) but never replaces: if a binding for the extension already
+    /// exists the call fails with `AlreadyBound` and the live binding is untouched (checked and
+    /// inserted under one lock, so concurrent callers cannot both win).
+    pub fn install_new(
+        &self,
+        extension_key: &str,
+        checked: SignatureCheckedManifest,
+        root: File,
+    ) -> Result<(), SignedRootBindingError> {
+        if extension_key != checked.name() {
+            return Err(SignedRootBindingError::IdentityMismatch);
+        }
+        let meta = root.metadata().map_err(|_| SignedRootBindingError::RootUnavailable)?;
+        if !meta.is_dir() {
+            return Err(SignedRootBindingError::RootNotDirectory);
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.contains_key(extension_key) {
+            return Err(SignedRootBindingError::AlreadyBound);
+        }
         guard.insert(extension_key.to_owned(), SignedRootBinding { checked, root });
         Ok(())
     }

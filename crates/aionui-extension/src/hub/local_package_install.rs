@@ -93,6 +93,12 @@ pub enum LocalPackageError {
     ManifestMismatch,
     IntegrityMismatch,
     InvalidDirName,
+    /// Host auto-install: that `{name}/{version}` directory already exists (no replace here).
+    AlreadyInstalled,
+    /// Host auto-install: the extension already has a live binding (no switch here).
+    AlreadyBound,
+    /// Host auto-install: placing the finished staging directory failed.
+    PlaceFailed,
     ParentNotDirectory,
     RootCreateFailed,
     WriteFailed,
@@ -115,9 +121,9 @@ pub struct LocalPackageInstalled {
 }
 
 /// Verified, fully validated package contents ready to be written.
-struct ValidatedPackage {
+pub(super) struct ValidatedPackage {
     /// `(relative path with '/', verified bytes)` — includes the manifest.
-    files: Vec<(String, Vec<u8>)>,
+    pub(super) files: Vec<(String, Vec<u8>)>,
 }
 
 fn canonical_relative(name: &str) -> Option<String> {
@@ -192,7 +198,7 @@ fn legacy_contribution_declarations(manifest: &crate::types::ExtensionManifest) 
     declared
 }
 
-fn validate_package(
+pub(super) fn validate_package(
     checked: &SignatureCheckedManifest,
     package_zip: &[u8],
     limits: LocalPackageLimits,
@@ -278,7 +284,7 @@ fn valid_root_dir_name(name: &str) -> bool {
 }
 
 #[cfg(unix)]
-mod sys {
+pub(super) mod sys {
     use std::ffi::CString;
     use std::fs::File;
     use std::io;
@@ -289,7 +295,7 @@ mod sys {
     }
 
     /// `mkdirat(dir, name, 0700)`; `exist_ok` tolerates `EEXIST` (caller still verifies via openat).
-    pub fn mkdirat(dir: &File, name: &str, exist_ok: bool) -> io::Result<()> {
+    pub(in crate::hub) fn mkdirat(dir: &File, name: &str, exist_ok: bool) -> io::Result<()> {
         let c = cstr(name)?;
         // SAFETY: valid dirfd borrowed for the call; `c` is a NUL-terminated owned CString.
         let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
@@ -304,7 +310,7 @@ mod sys {
     }
 
     /// `openat` returning an owned `File`. Always adds `O_CLOEXEC | O_NOFOLLOW`.
-    pub fn openat(dir: &File, name: &str, flags: i32, mode: u32) -> io::Result<File> {
+    pub(in crate::hub) fn openat(dir: &File, name: &str, flags: i32, mode: u32) -> io::Result<File> {
         let c = cstr(name)?;
         // SAFETY: valid dirfd borrowed for the call; `c` is NUL-terminated; mode is a plain int.
         let fd = unsafe {
@@ -332,7 +338,7 @@ fn create_root(parent: &File, dir_name: &str) -> Result<File, LocalPackageError>
 }
 
 #[cfg(unix)]
-fn write_file_under(root: &File, rel: &str, bytes: &[u8]) -> Result<(), LocalPackageError> {
+pub(super) fn write_file_under(root: &File, rel: &str, bytes: &[u8]) -> Result<(), LocalPackageError> {
     use std::io::Write;
     let parts: Vec<&str> = rel.split('/').collect();
     let (last, dirs) = parts.split_last().ok_or(LocalPackageError::WriteFailed)?;
