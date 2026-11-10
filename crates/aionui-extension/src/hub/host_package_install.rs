@@ -1,15 +1,20 @@
-//! Host-owned automatic install layout for an **already-local** signed package (M9 E13 slice C).
+//! Host-owned automatic install, upgrade and replace of an **already-local** signed package
+//! (M9 E13 slices C + D).
 //!
-//! The customer only hands over a package. The Host supplies its own extensions parent directory
-//! handle ([`HostExtensionsParent`], opened once by the Host from its own trusted location — this
-//! module never opens a path, and never derives a directory from the manifest, the package or
-//! `LoadedExtension.directory`). Everything below is relative to that handle:
+//! The customer only hands over a package; upgrading means handing over a newer one. The Host
+//! supplies its own extensions parent directory handle ([`HostExtensionsParent`], opened once by
+//! the Host from its own trusted location — this module never opens a path, and never derives a
+//! directory from the manifest, the package or `LoadedExtension.directory`). Everything below is
+//! relative to that handle:
 //!
 //! ```text
 //! {parent}/                    Host-held directory handle
 //!   {name-component}/          one directory per signed extension name
-//!     .wip-{nonce}/            staging for ONE attempt; renamed to the version dir on success
-//!     {version-component}/     the installed root (the retained handle is this very inode)
+//!     current                  regular file (never a symlink): which version is installed
+//!     {version-component}/     installed root (the retained handle is this very inode)
+//!     .wip-{nonce}/            staging for ONE attempt
+//!     .old-{nonce}/            superseded root awaiting deletion
+//!     .current.tmp-{nonce}     temp file for the atomic `current` switch
 //! ```
 //!
 //! # Naming (derived from the signed identity, never chosen by the customer)
@@ -17,47 +22,80 @@
 //! component: bytes in `[A-Za-z0-9_-]` (and `.` after the first byte) are kept, every other byte —
 //! including a leading `.`, `~`, `/`, `\`, NUL, spaces and all non-ASCII — becomes `~XX` (upper hex).
 //! The mapping is injective, so two identities never share a component, and no component can be
-//! `.`, `..`, start with `.wip-`, or contain a separator. Over 255 bytes after encoding fails closed
+//! `.`, `..`, start with a dot, or contain a separator. Over 255 bytes after encoding fails closed
 //! (never truncated). `demo.plugin` / `1.0.0` stays readable as `demo.plugin/1.0.0`.
 //!
-//! # Flow (fail closed, no live-binding change before everything is ready)
+//! # Flow (fail closed; the live binding changes only once the new root is complete)
 //! 1. signature check and whole-archive validation in memory (no filesystem effect on failure);
-//! 2. refuse if the store already binds this extension name (`AlreadyBound`: switching an
-//!    existing live binding is the later atomic-upgrade slice) or the version directory exists
-//!    (`AlreadyInstalled`: no replace here);
-//! 3. create/open the name directory (`mkdirat` + `openat(O_DIRECTORY|O_NOFOLLOW)`), exclusively
-//!    create `.wip-{nonce}`, write the verified files into it with the 261 `O_EXCL|O_NOFOLLOW` rules;
-//! 4. place it with a no-replace rename to the version component, then
-//!    `SignedRootBindingStore::install_new` the staging handle (same inode, never reopened).
+//! 2. policy from the *installed* version (the live binding, else a valid `current` marker):
+//!    newer ⇒ upgrade, equal ⇒ replace (repair), older ⇒ `DowngradeRefused` unless the Host sets
+//!    [`AutoInstallOptions::allow_downgrade`] (an explicit rollback action; a signed older package
+//!    replayed by anyone else must not roll an extension back);
+//! 3. create/open the name directory, exclusively create `.wip-{nonce}`, write the verified files
+//!    (261 `O_EXCL|O_NOFOLLOW` rules) — the old version stays untouched and live;
+//! 4. place: no-replace rename to the version component when it is free; when a real directory is
+//!    already there (same-version replace) an atomic **exchange** (`RENAME_EXCHANGE` / Apple
+//!    `RENAME_SWAP`) puts the new tree in place and the old tree under `.old-{nonce}` in one step —
+//!    there is no instant with the version directory missing (platforms without an exchange
+//!    primitive refuse that case with `PlaceFailed`, still fail closed);
+//! 5. atomically switch the `current` marker (temp file + `renameat`, skipped when already
+//!    identical), then replace the live binding in the store. Both happen only after step 4;
+//! 6. delete superseded roots (`.old-{nonce}`, and the previous version directory named by the old
+//!    binding/marker) FD-relative and no-follow. In-flight users of the old root keep their open
+//!    handles; path-string readers of the old tree (none are wired to this installer yet) must be
+//!    switched before relying on this deletion.
 //!
-//! # Cleanup (deletes only what this attempt created)
-//! Any failure after staging removes that attempt's `.wip-{nonce}` tree (or, if the rename already
-//! happened but binding failed, the version directory this call just created) with an FD-relative,
-//! `O_NOFOLLOW` walk: never a path string, never following symlinks, never the parent, never a
-//! pre-existing version directory. A name directory this call created is removed only if empty.
-//! [`sweep_abandoned_staging`] clears `.wip-*` directories left by a crashed attempt; call it at
-//! Host start before installing (it cannot tell a crashed attempt from a concurrent live one).
+//! Any failure after placement undoes it (version directory removed, or exchanged back) and leaves
+//! the previous binding and marker as they were.
+//!
+//! # `current` marker
+//! A small JSON file written by the Host: marker version, signed name, signed version, the version
+//! component, and the signed entry metadata (`pubkey_id`, `integrity`, `signature`) so a restarted
+//! Host can re-run `check_signed_manifest`. It is not trusted by itself: restore re-verifies the
+//! signature against the Host policy and the files against their SRIs (see `host_package_restore`).
+//!
+//! # Cleanup (deletes only what this attempt created or that is clearly superseded)
+//! FD-relative, `O_NOFOLLOW`, depth-bounded; never a path string, never the parent, never anything
+//! a symlink points to. [`sweep_abandoned_staging`] clears `.wip-*`, `.old-*` and stray
+//! `.current.tmp-*` left by a crashed attempt; call it at Host start before installing (it cannot
+//! tell a crashed attempt from a concurrent live one — the parent also serializes this process's
+//! own install/sweep/restore calls with an internal lock; other processes must not share it).
 //!
 //! # Not
-//! No `current` marker, upgrade/replace, restart re-retain, `.old-*` handling (slice D), no route,
-//! network, exec, permission/HTTP/plan-safe change; not execution authorization or owner proof
-//! beyond the Host holding `parent`. Unix only; other targets return `Unsupported`.
+//! No route, network, exec, permission/HTTP/plan-safe change; not execution authorization or owner
+//! proof beyond the Host holding `parent`. A crash between placing a *new* version directory and
+//! writing the marker leaves an unreferenced version directory (harmless; replaced on the next
+//! install of that version). Unix only; other targets return `Unsupported`.
 
 use std::fs::File;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
 
 use super::curated::CuratedInstallPolicy;
-use super::local_package_install::{LocalPackageError, LocalPackageInstalled, LocalPackageLimits, LocalPackageSource};
+use super::local_package_install::{LocalPackageError, LocalPackageLimits, LocalPackageSource};
+use super::signed_manifest::SignatureCheckedManifest;
 use crate::signed_root_binding::SignedRootBindingStore;
 
 /// Maximum bytes of one encoded directory component (typical filesystem `NAME_MAX`).
 const MAX_COMPONENT_BYTES: usize = 255;
 /// Prefix of this module's staging directories.
-const STAGING_PREFIX: &str = ".wip-";
+pub(super) const STAGING_PREFIX: &str = ".wip-";
+/// Prefix of superseded-root directories awaiting deletion.
+pub(super) const SUPERSEDED_PREFIX: &str = ".old-";
+/// Prefix of the temp file used to switch the marker atomically.
+pub(super) const MARKER_TMP_PREFIX: &str = ".current.tmp-";
+/// File name of the Host-owned marker inside a name directory.
+pub(super) const MARKER_FILE: &str = "current";
+/// The marker is a few hundred bytes; anything bigger is refused unread.
+pub(super) const MAX_MARKER_BYTES: u64 = 4096;
 
 /// The Host's own extensions parent directory handle. The caller must obtain the `File` itself
 /// (from its trusted data dir at startup); there is deliberately no constructor from a path.
 pub struct HostExtensionsParent {
-    dir: File,
+    pub(super) dir: File,
+    /// Serializes this process's install / sweep / restore calls on the parent.
+    pub(super) lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for HostExtensionsParent {
@@ -70,7 +108,10 @@ impl HostExtensionsParent {
     /// Wrap a Host-opened directory handle; refuses anything that is not a directory.
     pub fn new(dir: File) -> Result<Self, LocalPackageError> {
         match dir.metadata() {
-            Ok(m) if m.is_dir() => Ok(Self { dir }),
+            Ok(m) if m.is_dir() => Ok(Self {
+                dir,
+                lock: Mutex::new(()),
+            }),
             _ => Err(LocalPackageError::ParentNotDirectory),
         }
     }
@@ -81,6 +122,58 @@ impl HostExtensionsParent {
 pub struct StagingSweepReport {
     pub removed: usize,
     pub failed: usize,
+}
+
+/// Host choices for one install. Defaults are the safe customer path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoInstallOptions {
+    /// Allow installing an older version than the installed one. Off by default: only an explicit
+    /// Host rollback action should set it.
+    pub allow_downgrade: bool,
+}
+
+/// What the install did relative to what was installed before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallKind {
+    /// Nothing was installed (no live binding and no valid marker).
+    Fresh,
+    /// A newer version replaced the installed one.
+    Upgraded,
+    /// The same version was installed again (atomic repair/replace).
+    Reinstalled,
+    /// An older version replaced the installed one (`allow_downgrade`).
+    Downgraded,
+}
+
+/// Result of a successful install (no paths/handles exposed; the root lives in the store).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoInstallReport {
+    pub files_written: usize,
+    pub kind: InstallKind,
+}
+
+/// Host-written `current` marker content (see module docs). Not trusted on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CurrentMarker {
+    pub(super) v: u32,
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) component: String,
+    pub(super) pubkey_id: String,
+    pub(super) integrity: String,
+    pub(super) signature: String,
+}
+
+impl CurrentMarker {
+    /// Shape check only: the component must look like one `encode_component` output.
+    pub(super) fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() as u64 > MAX_MARKER_BYTES {
+            return None;
+        }
+        let m: Self = serde_json::from_slice(bytes).ok()?;
+        (m.v == 1 && is_encoded_component(&m.component)).then_some(m)
+    }
 }
 
 /// Encode one signed identity string as a single safe directory component (see module docs).
@@ -104,17 +197,63 @@ pub(crate) fn encode_component(value: &str) -> Option<String> {
     Some(out)
 }
 
-/// Install `source` under the Host parent at `{name}/{version}` (derived from the signed manifest).
+/// True iff `value` has exactly the shape `encode_component` produces.
+pub(super) fn is_encoded_component(value: &str) -> bool {
+    let b = value.as_bytes();
+    if b.is_empty() || b.len() > MAX_COMPONENT_BYTES || b[0] == b'.' {
+        return false;
+    }
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'~' => {
+                if i + 3 > b.len() {
+                    return false;
+                }
+                let hex = &b[i + 1..i + 3];
+                if !hex.iter().all(|c| matches!(c, b'0'..=b'9' | b'A'..=b'F')) {
+                    return false;
+                }
+                i += 3;
+            }
+            c if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.' => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Serialize the marker for `checked` + the signed entry metadata of `source`.
+fn marker_bytes(
+    checked: &SignatureCheckedManifest,
+    source: &LocalPackageSource<'_>,
+    version_component: &str,
+) -> Result<Vec<u8>, LocalPackageError> {
+    let marker = CurrentMarker {
+        v: 1,
+        name: checked.name().to_owned(),
+        version: checked.version().to_owned(),
+        component: version_component.to_owned(),
+        pubkey_id: source.entry.pubkey_id.unwrap_or_default().to_owned(),
+        integrity: source.entry.integrity.unwrap_or_default().to_owned(),
+        signature: source.entry.signature.unwrap_or_default().to_owned(),
+    };
+    serde_json::to_vec(&marker).map_err(|_| LocalPackageError::MarkerWriteFailed)
+}
+
+/// Install, upgrade or replace `source` under the Host parent at `{name}/{version}` (both derived
+/// from the signed manifest) and switch the extension's live binding to it.
 ///
-/// See the module docs for the exact flow, the refusals (`AlreadyBound`, `AlreadyInstalled`) and
-/// the cleanup rules. Nothing is retained and no live binding is touched on any error.
+/// See the module docs for the flow, the downgrade/same-version policy and the cleanup rules.
+/// Nothing is retained, no live binding or marker is changed on any error.
 pub fn install_local_signed_package_auto(
     store: &SignedRootBindingStore,
     policy: &CuratedInstallPolicy,
     source: &LocalPackageSource<'_>,
     parent: &HostExtensionsParent,
     limits: LocalPackageLimits,
-) -> Result<LocalPackageInstalled, LocalPackageError> {
+    options: AutoInstallOptions,
+) -> Result<AutoInstallReport, LocalPackageError> {
     use super::local_package_install::validate_package;
     use super::signed_manifest::check_signed_manifest;
 
@@ -123,9 +262,8 @@ pub fn install_local_signed_package_auto(
     let package = validate_package(&checked, source.package_zip, limits)?;
     let name_component = encode_component(checked.name()).ok_or(LocalPackageError::InvalidDirName)?;
     let version_component = encode_component(checked.version()).ok_or(LocalPackageError::InvalidDirName)?;
-    if store.contains(checked.name()) {
-        return Err(LocalPackageError::AlreadyBound);
-    }
+    let marker = marker_bytes(&checked, source, &version_component)?;
+    let _guard = parent.lock.lock().unwrap_or_else(|e| e.into_inner());
     imp::install(
         store,
         checked,
@@ -133,154 +271,37 @@ pub fn install_local_signed_package_auto(
         &parent.dir,
         &name_component,
         &version_component,
+        &marker,
+        options,
     )
 }
 
-/// Remove `.wip-*` staging directories left under the Host parent by a crashed attempt.
+/// Remove leftovers of crashed attempts under the Host parent: `.wip-*` and `.old-*` directories
+/// and stray `.current.tmp-*` files directly inside name directories.
 ///
-/// Walks `parent` → each real (non-symlink, non-dot) directory → entries named `.wip-*` that are
-/// real directories, deleting them FD-relative with `O_NOFOLLOW`. Version directories, files,
-/// symlinks, dot-entries at the parent level and everything else are left alone.
+/// Walks `parent` → each real (non-symlink, non-dot) directory → matching real entries, deleting
+/// FD-relative with `O_NOFOLLOW`. Version directories, `current`, other files, symlinks and
+/// dot-entries at the parent level are left alone.
 pub fn sweep_abandoned_staging(parent: &HostExtensionsParent) -> StagingSweepReport {
+    let _guard = parent.lock.lock().unwrap_or_else(|e| e.into_inner());
     imp::sweep(&parent.dir)
 }
 
 #[cfg(unix)]
 mod imp {
-    use std::ffi::{CStr, CString};
     use std::fs::File;
-    use std::io;
-    use std::os::fd::AsRawFd;
 
-    use super::super::local_package_install::{
-        LocalPackageError, LocalPackageInstalled, ValidatedPackage, sys as base, write_file_under,
+    use super::super::host_fs::{
+        Kind, kind_nofollow, list_dir, read_file_under, remove_tree_at, rename_exchange, rename_noreplace, unlinkat,
+        write_file_atomic,
     };
+    use super::super::local_package_install::{LocalPackageError, ValidatedPackage, sys as base, write_file_under};
     use super::super::signed_manifest::SignatureCheckedManifest;
-    use super::{STAGING_PREFIX, StagingSweepReport};
-    use crate::signed_root_binding::{SignedRootBindingError, SignedRootBindingStore};
-
-    /// Our own trees are shallow (zip names are bounded); anything deeper is refused, not followed.
-    const MAX_REMOVE_DEPTH: u32 = 64;
-
-    fn cstr(name: &str) -> io::Result<CString> {
-        CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Kind {
-        Dir,
-        Other,
-    }
-
-    /// `fstatat(AT_SYMLINK_NOFOLLOW)`: `Ok(None)` when absent.
-    fn kind_nofollow(dir: &File, name: &str) -> io::Result<Option<Kind>> {
-        let c = cstr(name)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: dirfd borrowed for the call, `c` NUL-terminated, `st` a valid out pointer.
-        let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            return if err.raw_os_error() == Some(libc::ENOENT) {
-                Ok(None)
-            } else {
-                Err(err)
-            };
-        }
-        Ok(Some(if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            Kind::Dir
-        } else {
-            Kind::Other
-        }))
-    }
-
-    fn unlinkat(dir: &File, name: &str, flags: i32) -> io::Result<()> {
-        let c = cstr(name)?;
-        // SAFETY: dirfd borrowed for the call, `c` NUL-terminated.
-        if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flags) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    /// UTF-8 entry names of an open directory (non-UTF-8 names are skipped; `.`/`..` excluded).
-    fn list_dir(dir: &File) -> io::Result<Vec<String>> {
-        // SAFETY: duplicating a valid fd; the duplicate is owned by the DIR* on success.
-        let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if dup < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `dup` is a fresh directory fd we own; fdopendir takes ownership on success.
-        let dirp = unsafe { libc::fdopendir(dup) };
-        if dirp.is_null() {
-            let err = io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so `dup` is still ours to close.
-            unsafe { libc::close(dup) };
-            return Err(err);
-        }
-        let mut names = Vec::new();
-        loop {
-            // SAFETY: `dirp` is a valid open DIR*; the returned entry is read before the next call.
-            let ent = unsafe { libc::readdir(dirp) };
-            if ent.is_null() {
-                break;
-            }
-            // SAFETY: d_name is a NUL-terminated array inside the entry returned by readdir.
-            let raw = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
-            if let Ok(name) = raw.to_str()
-                && name != "."
-                && name != ".."
-            {
-                names.push(name.to_owned());
-            }
-        }
-        // SAFETY: closing the DIR* we opened (also closes `dup`).
-        unsafe { libc::closedir(dirp) };
-        Ok(names)
-    }
-
-    /// Delete the directory tree `name` under `parent`, FD-relative, never following symlinks.
-    fn remove_tree_at(parent: &File, name: &str, depth: u32) -> io::Result<()> {
-        if depth > MAX_REMOVE_DEPTH {
-            return Err(io::Error::from(io::ErrorKind::InvalidData));
-        }
-        // openat adds O_NOFOLLOW: a symlink (or non-directory) named `name` fails here.
-        let dir = base::openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-        for entry in list_dir(&dir)? {
-            match kind_nofollow(&dir, &entry)? {
-                Some(Kind::Dir) => remove_tree_at(&dir, &entry, depth + 1)?,
-                Some(Kind::Other) => unlinkat(&dir, &entry, 0)?,
-                None => {}
-            }
-        }
-        unlinkat(parent, name, libc::AT_REMOVEDIR)
-    }
-
-    /// `renameat` that never replaces an existing destination.
-    fn rename_noreplace(dir: &File, from: &str, to: &str) -> io::Result<()> {
-        let (f, t) = (cstr(from)?, cstr(to)?);
-        let fd = dir.as_raw_fd();
-        #[cfg(target_os = "linux")]
-        // SAFETY: valid dirfd (twice), NUL-terminated names.
-        let rc = unsafe { libc::renameat2(fd, f.as_ptr(), fd, t.as_ptr(), libc::RENAME_NOREPLACE) };
-        #[cfg(target_vendor = "apple")]
-        // SAFETY: valid dirfd (twice), NUL-terminated names.
-        let rc = unsafe { libc::renameatx_np(fd, f.as_ptr(), fd, t.as_ptr(), libc::RENAME_EXCL) };
-        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-        let rc = {
-            // No atomic no-replace primitive: refuse when the destination exists (best effort).
-            if kind_nofollow(dir, to)?.is_some() {
-                return Err(io::Error::from_raw_os_error(libc::EEXIST));
-            }
-            // SAFETY: valid dirfd (twice), NUL-terminated names.
-            unsafe { libc::renameat(fd, f.as_ptr(), fd, t.as_ptr()) }
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
+    use super::{
+        AutoInstallOptions, AutoInstallReport, CurrentMarker, InstallKind, MARKER_FILE, MARKER_TMP_PREFIX,
+        MAX_MARKER_BYTES, STAGING_PREFIX, SUPERSEDED_PREFIX, StagingSweepReport, encode_component,
+    };
+    use crate::signed_root_binding::SignedRootBindingStore;
 
     fn nonce() -> Option<String> {
         let mut bytes = [0u8; 8];
@@ -288,10 +309,47 @@ mod imp {
         Some(hex::encode(bytes))
     }
 
-    fn is_exists(err: &io::Error) -> bool {
-        matches!(err.raw_os_error(), Some(libc::EEXIST) | Some(libc::ENOTEMPTY))
+    /// Where the new tree went, so a later failure can put things back.
+    enum Placement {
+        /// The version slot was free; the staging directory was renamed into it.
+        New,
+        /// A real directory was there; trees were exchanged and the old one lives at `old_name`.
+        Swapped { old_name: String },
     }
 
+    fn undo(name_dir: &File, version_component: &str, placement: &Placement) {
+        match placement {
+            Placement::New => {
+                let _ = remove_tree_at(name_dir, version_component, 0);
+            }
+            Placement::Swapped { old_name } => {
+                // Exchange back: old tree returns to the version slot, the new tree lands at
+                // `old_name` and is removed. If the exchange back fails, nothing is deleted.
+                if rename_exchange(name_dir, old_name, version_component).is_ok() {
+                    let _ = remove_tree_at(name_dir, old_name, 0);
+                }
+            }
+        }
+    }
+
+    /// Decide what this install is, from the installed version (binding first, else valid marker).
+    fn classify(prior: Option<&str>, new: &str, allow_downgrade: bool) -> Result<InstallKind, LocalPackageError> {
+        let Some(prior) = prior else {
+            return Ok(InstallKind::Fresh);
+        };
+        // An unparsable prior (tampered marker) gives no policy signal: treat as nothing installed.
+        let (Ok(p), Ok(n)) = (semver::Version::parse(prior), semver::Version::parse(new)) else {
+            return Ok(InstallKind::Fresh);
+        };
+        match n.cmp(&p) {
+            std::cmp::Ordering::Greater => Ok(InstallKind::Upgraded),
+            std::cmp::Ordering::Equal => Ok(InstallKind::Reinstalled),
+            std::cmp::Ordering::Less if allow_downgrade => Ok(InstallKind::Downgraded),
+            std::cmp::Ordering::Less => Err(LocalPackageError::DowngradeRefused),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn install(
         store: &SignedRootBindingStore,
         checked: SignatureCheckedManifest,
@@ -299,7 +357,9 @@ mod imp {
         parent: &File,
         name_component: &str,
         version_component: &str,
-    ) -> Result<LocalPackageInstalled, LocalPackageError> {
+        marker: &[u8],
+        options: AutoInstallOptions,
+    ) -> Result<AutoInstallReport, LocalPackageError> {
         // Exclusive create tells us whether this call made the name directory (for tidy cleanup).
         let created_name = match base::mkdirat(parent, name_component, false) {
             Ok(()) => true,
@@ -309,7 +369,7 @@ mod imp {
         let result = (|| {
             let name_dir = base::openat(parent, name_component, libc::O_RDONLY | libc::O_DIRECTORY, 0)
                 .map_err(|_| LocalPackageError::RootCreateFailed)?;
-            stage_place_retain(store, checked, package, &name_dir, version_component)
+            stage_place_switch(store, checked, package, &name_dir, version_component, marker, options)
         })();
         if result.is_err() && created_name {
             // rmdir only succeeds on an empty directory: never removes anything that has content.
@@ -318,19 +378,40 @@ mod imp {
         result
     }
 
-    fn stage_place_retain(
+    fn stage_place_switch(
         store: &SignedRootBindingStore,
         checked: SignatureCheckedManifest,
         package: ValidatedPackage,
         name_dir: &File,
         version_component: &str,
-    ) -> Result<LocalPackageInstalled, LocalPackageError> {
-        match kind_nofollow(name_dir, version_component) {
-            Ok(None) => {}
-            Ok(Some(_)) => return Err(LocalPackageError::AlreadyInstalled),
-            Err(_) => return Err(LocalPackageError::PlaceFailed),
+        marker: &[u8],
+        options: AutoInstallOptions,
+    ) -> Result<AutoInstallReport, LocalPackageError> {
+        // --- policy: what is installed now? -------------------------------------------------
+        let bound_version = store.lookup_checked(checked.name()).map(|c| c.version().to_owned());
+        let old_marker = read_file_under(name_dir, MARKER_FILE, MAX_MARKER_BYTES)
+            .ok()
+            .and_then(|bytes| CurrentMarker::parse(&bytes).map(|m| (m, bytes)))
+            .filter(|(m, _)| m.name == checked.name());
+        let prior_version = bound_version
+            .clone()
+            .or_else(|| old_marker.as_ref().map(|(m, _)| m.version.clone()));
+        let kind = classify(prior_version.as_deref(), checked.version(), options.allow_downgrade)?;
+        // Previous version directories to delete once the switch commits (never the new slot).
+        let mut superseded: Vec<String> = Vec::new();
+        for candidate in [
+            bound_version.as_deref().and_then(encode_component),
+            old_marker.as_ref().map(|(m, _)| m.component.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if candidate != version_component && !superseded.contains(&candidate) {
+                superseded.push(candidate);
+            }
         }
-        // Exclusive staging directory for this attempt only.
+
+        // --- stage -------------------------------------------------------------------------
         let mut staged: Option<(String, File)> = None;
         for _ in 0..8 {
             let wip = format!(
@@ -354,36 +435,81 @@ mod imp {
             }
         }
         let (wip, root) = staged.ok_or(LocalPackageError::RootCreateFailed)?;
-
+        let drop_staging = |err: LocalPackageError| {
+            let _ = remove_tree_at(name_dir, &wip, 0);
+            err
+        };
         for (rel, bytes) in &package.files {
-            if let Err(e) = write_file_under(&root, rel, bytes) {
-                let _ = remove_tree_at(name_dir, &wip, 0);
-                return Err(e);
+            write_file_under(&root, rel, bytes).map_err(&drop_staging)?;
+        }
+        // The store requires a directory handle; check before anything becomes visible.
+        if !root.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(drop_staging(LocalPackageError::RootCreateFailed));
+        }
+
+        // --- place (the previous version, if any, is still live and untouched in the store) --
+        let placement = match kind_nofollow(name_dir, version_component) {
+            Ok(None) => {
+                rename_noreplace(name_dir, &wip, version_component)
+                    .map_err(|_| drop_staging(LocalPackageError::PlaceFailed))?;
+                Placement::New
+            }
+            Ok(Some(Kind::Dir)) => {
+                rename_exchange(name_dir, &wip, version_component)
+                    .map_err(|_| drop_staging(LocalPackageError::PlaceFailed))?;
+                // The old tree now sits at `wip`; relabel it as superseded (best effort).
+                let relabeled = nonce()
+                    .map(|n| format!("{SUPERSEDED_PREFIX}{n}"))
+                    .filter(|old| rename_noreplace(name_dir, &wip, old).is_ok());
+                Placement::Swapped {
+                    old_name: relabeled.unwrap_or_else(|| wip.clone()),
+                }
+            }
+            Ok(Some(_)) => return Err(drop_staging(LocalPackageError::VersionSlotBlocked)),
+            Err(_) => return Err(drop_staging(LocalPackageError::PlaceFailed)),
+        };
+        let _ = name_dir.sync_all();
+
+        // --- switch: marker first (persistent truth), then the live binding ---------------------
+        let marker_unchanged = old_marker.as_ref().is_some_and(|(_, bytes)| bytes == marker);
+        if !marker_unchanged {
+            let tmp = match nonce() {
+                Some(n) => format!("{MARKER_TMP_PREFIX}{n}"),
+                None => {
+                    undo(name_dir, version_component, &placement);
+                    return Err(LocalPackageError::MarkerWriteFailed);
+                }
+            };
+            if write_file_atomic(name_dir, &tmp, MARKER_FILE, marker).is_err() {
+                undo(name_dir, version_component, &placement);
+                return Err(LocalPackageError::MarkerWriteFailed);
             }
         }
-        if let Err(e) = rename_noreplace(name_dir, &wip, version_component) {
-            let _ = remove_tree_at(name_dir, &wip, 0);
-            return Err(if is_exists(&e) {
-                LocalPackageError::AlreadyInstalled
-            } else {
-                LocalPackageError::PlaceFailed
-            });
-        }
-        let _ = name_dir.sync_all();
-        // `root` is the staging inode, now named `version_component`. Switch only now.
         let key = checked.name().to_owned();
         let files_written = package.files.len();
-        match store.install_new(&key, checked, root) {
-            Ok(()) => Ok(LocalPackageInstalled { files_written }),
-            Err(e) => {
-                // We just created this version directory; remove it so a retry is not blocked.
-                let _ = remove_tree_at(name_dir, version_component, 0);
-                Err(match e {
-                    SignedRootBindingError::AlreadyBound => LocalPackageError::AlreadyBound,
-                    other => LocalPackageError::Retain(other),
-                })
+        // `root` is the staging inode, now named `version_component`. Replace the live binding.
+        if let Err(e) = store.install(&key, checked, root) {
+            // Only reachable if the root handle died after the pre-check; marker already names the
+            // new version, so a restart would restore it. Report, do not delete anything further.
+            return Err(LocalPackageError::Retain(e));
+        }
+
+        // --- cleanup superseded roots (best effort; sweep catches leftovers) -------------------
+        if let Placement::Swapped { old_name } = &placement {
+            let _ = remove_tree_at(name_dir, old_name, 0);
+        }
+        for previous in superseded {
+            if !matches!(kind_nofollow(name_dir, &previous), Ok(Some(Kind::Dir))) {
+                continue;
+            }
+            let Some(old) = nonce().map(|n| format!("{SUPERSEDED_PREFIX}{n}")) else {
+                continue;
+            };
+            if rename_noreplace(name_dir, &previous, &old).is_ok() {
+                let _ = remove_tree_at(name_dir, &old, 0);
             }
         }
+        Ok(AutoInstallReport { files_written, kind })
     }
 
     pub(super) fn sweep(parent: &File) -> StagingSweepReport {
@@ -404,12 +530,14 @@ mod imp {
             };
             let mut removed_here = 0;
             for child in children {
-                if !child.starts_with(STAGING_PREFIX)
-                    || !matches!(kind_nofollow(&name_dir, &child), Ok(Some(Kind::Dir)))
-                {
-                    continue;
-                }
-                match remove_tree_at(&name_dir, &child, 0) {
+                let is_dir_leftover = child.starts_with(STAGING_PREFIX) || child.starts_with(SUPERSEDED_PREFIX);
+                let is_tmp_marker = child.starts_with(MARKER_TMP_PREFIX);
+                let outcome = match kind_nofollow(&name_dir, &child) {
+                    Ok(Some(Kind::Dir)) if is_dir_leftover => remove_tree_at(&name_dir, &child, 0),
+                    Ok(Some(Kind::Regular)) if is_tmp_marker => unlinkat(&name_dir, &child, 0),
+                    _ => continue,
+                };
+                match outcome {
                     Ok(()) => {
                         report.removed += 1;
                         removed_here += 1;
@@ -430,11 +558,12 @@ mod imp {
 mod imp {
     use std::fs::File;
 
-    use super::super::local_package_install::{LocalPackageError, LocalPackageInstalled, ValidatedPackage};
+    use super::super::local_package_install::{LocalPackageError, ValidatedPackage};
     use super::super::signed_manifest::SignatureCheckedManifest;
-    use super::StagingSweepReport;
+    use super::{AutoInstallOptions, AutoInstallReport, StagingSweepReport};
     use crate::signed_root_binding::SignedRootBindingStore;
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn install(
         _store: &SignedRootBindingStore,
         _checked: SignatureCheckedManifest,
@@ -442,7 +571,9 @@ mod imp {
         _parent: &File,
         _name_component: &str,
         _version_component: &str,
-    ) -> Result<LocalPackageInstalled, LocalPackageError> {
+        _marker: &[u8],
+        _options: AutoInstallOptions,
+    ) -> Result<AutoInstallReport, LocalPackageError> {
         Err(LocalPackageError::Unsupported)
     }
 
@@ -465,7 +596,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use zip::write::SimpleFileOptions;
 
-    const PANEL: &[u8] = b"<p>panel</p>";
     const CSS: &[u8] = b"p{}";
 
     fn key() -> SigningKey {
@@ -483,16 +613,19 @@ mod tests {
     struct Pkg {
         name: String,
         version: String,
+        panel: Vec<u8>,
         raw: Vec<u8>,
         integrity: String,
         signature: String,
         zip: Vec<u8>,
     }
 
-    fn pkg_with(name: &str, version: &str, extra: &[(&str, &[u8])], tamper_css: bool) -> Pkg {
+    /// `tag` makes the panel bytes differ between packages of the same version (replace tests).
+    fn pkg_full(name: &str, version: &str, tag: &str, extra: &[(&str, &[u8])], tamper_css: bool) -> Pkg {
+        let panel = format!("<p>{version}-{tag}</p>").into_bytes();
         let raw = format!(
             r#"{{"name":{name:?},"version":{version:?},"files":[{{"path":"panels/board.html","integrity":"{}"}},{{"path":"panels/board.css","integrity":"{}"}}]}}"#,
-            sri_sha512(PANEL),
+            sri_sha512(&panel),
             sri_sha512(CSS)
         )
         .into_bytes();
@@ -506,7 +639,7 @@ mod tests {
         let css: &[u8] = if tamper_css { b"evil{}" } else { CSS };
         let mut all: Vec<(&str, &[u8])> = vec![
             ("aion-extension.json", &raw),
-            ("panels/board.html", PANEL),
+            ("panels/board.html", &panel),
             ("panels/board.css", css),
         ];
         all.extend_from_slice(extra);
@@ -518,11 +651,16 @@ mod tests {
         Pkg {
             name: name.into(),
             version: version.into(),
+            panel,
             raw,
             integrity,
             signature,
             zip,
         }
+    }
+
+    fn pkg_with(name: &str, version: &str, extra: &[(&str, &[u8])], tamper_css: bool) -> Pkg {
+        pkg_full(name, version, "a", extra, tamper_css)
     }
 
     fn pkg(version: &str) -> Pkg {
@@ -563,14 +701,19 @@ mod tests {
         }
     }
 
-    fn install(env: &Env, p: &Pkg) -> Result<LocalPackageInstalled, LocalPackageError> {
+    fn install_opts(env: &Env, p: &Pkg, allow_downgrade: bool) -> Result<AutoInstallReport, LocalPackageError> {
         install_local_signed_package_auto(
             &env.store,
             &policy(),
             &source(p),
             &env.parent,
             LocalPackageLimits::default(),
+            AutoInstallOptions { allow_downgrade },
         )
+    }
+
+    fn install(env: &Env, p: &Pkg) -> Result<AutoInstallReport, LocalPackageError> {
+        install_opts(env, p, false)
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -585,6 +728,19 @@ mod tests {
     fn assert_parent_empty(env: &Env) {
         assert!(names(&env.parent_path).is_empty(), "{:?}", names(&env.parent_path));
         assert!(env.store.is_empty());
+    }
+
+    fn name_dir(env: &Env) -> PathBuf {
+        env.parent_path.join("demo.plugin")
+    }
+
+    fn bound_version(env: &Env) -> String {
+        env.store.lookup_checked("demo.plugin").unwrap().version().to_owned()
+    }
+
+    fn marker_version(env: &Env) -> String {
+        let bytes = std::fs::read(name_dir(env).join("current")).unwrap();
+        CurrentMarker::parse(&bytes).unwrap().version
     }
 
     fn decode(component: &str) -> String {
@@ -627,12 +783,26 @@ mod tests {
                 "{c}"
             );
             assert_eq!(decode(&c), s);
+            assert!(is_encoded_component(&c), "{c}");
             assert!(seen.insert(c), "collision for {s}");
         }
-        // Exactly at the limit is fine; one byte over fails closed (no truncation).
         assert!(encode_component(&"a".repeat(255)).is_some());
         assert!(encode_component(&"a".repeat(256)).is_none());
         assert!(encode_component(&format!("{}+", "a".repeat(253))).is_none());
+        for bad in [
+            "",
+            ".x",
+            "..",
+            "a/b",
+            "a~",
+            "a~2",
+            "a~zz",
+            "a~2f",
+            "a b",
+            &"a".repeat(256),
+        ] {
+            assert!(!is_encoded_component(bad), "{bad:?}");
+        }
     }
 
     #[test]
@@ -647,17 +817,27 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_uses_derived_name_version_layout_and_leaves_no_staging() {
+    fn fresh_install_uses_derived_layout_writes_marker_and_leaves_no_staging() {
         let env = env();
         let p = pkg("1.0.0");
         let out = install(&env, &p).unwrap();
         assert_eq!(out.files_written, 3);
+        assert_eq!(out.kind, InstallKind::Fresh);
         assert_eq!(names(&env.parent_path), vec!["demo.plugin"]);
-        assert_eq!(names(&env.parent_path.join("demo.plugin")), vec!["1.0.0"]);
-        let root = env.parent_path.join("demo.plugin/1.0.0");
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+        let root = name_dir(&env).join("1.0.0");
         assert_eq!(std::fs::read(root.join("panels/board.css")).unwrap(), CSS);
         assert_eq!(std::fs::read(root.join("aion-extension.json")).unwrap(), p.raw);
         assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        let marker_path = name_dir(&env).join("current");
+        let meta = std::fs::symlink_metadata(&marker_path).unwrap();
+        assert!(meta.file_type().is_file() && meta.mode() & 0o777 == 0o600);
+        let m = CurrentMarker::parse(&std::fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(
+            (m.name.as_str(), m.version.as_str(), m.component.as_str()),
+            ("demo.plugin", "1.0.0", "1.0.0")
+        );
+        assert_eq!(m.signature, p.signature);
         let (snap, fd) = env.store.lookup_clone("demo.plugin").unwrap();
         assert_eq!(snap.version(), "1.0.0");
         let (a, b) = (fd.metadata().unwrap(), std::fs::metadata(&root).unwrap());
@@ -672,15 +852,16 @@ mod tests {
     fn hostile_signed_identity_cannot_escape_the_parent() {
         let env = env();
         let p = pkg_with("../escape", "1.0.0+b/../../x", &[], false);
-        // Semver rejects the version, so use a legal build-metadata version for the install itself.
         assert!(install(&env, &p).is_err());
         assert_parent_empty(&env);
 
         let p = pkg_with("../escape", "1.0.0+b.1", &[], false);
         install(&env, &p).unwrap();
         assert_eq!(names(&env.parent_path), vec!["~2E.~2Fescape"]);
-        assert_eq!(names(&env.parent_path.join("~2E.~2Fescape")), vec!["1.0.0~2Bb.1"]);
-        // Nothing was created beside `extensions/` inside the temp dir.
+        assert_eq!(
+            names(&env.parent_path.join("~2E.~2Fescape")),
+            vec!["1.0.0~2Bb.1", "current"]
+        );
         assert_eq!(names(env.tmp.path()), vec!["extensions"]);
         assert!(env.store.contains("../escape"));
     }
@@ -708,51 +889,136 @@ mod tests {
     }
 
     #[test]
-    fn same_version_twice_is_refused_and_original_is_untouched() {
+    fn upgrade_switches_after_ready_and_removes_the_superseded_version() {
         let env = env();
         install(&env, &pkg("1.0.0")).unwrap();
-        let fresh_store = SignedRootBindingStore::new();
-        let again = install_local_signed_package_auto(
-            &fresh_store,
-            &policy(),
-            &source(&pkg("1.0.0")),
-            &env.parent,
-            LocalPackageLimits::default(),
+        let (_, old_root) = env.store.lookup_clone("demo.plugin").unwrap();
+        let out = install(&env, &pkg("2.0.0")).unwrap();
+        assert_eq!(out.kind, InstallKind::Upgraded);
+        assert_eq!(names(&name_dir(&env)), vec!["2.0.0", "current"]);
+        assert_eq!(bound_version(&env), "2.0.0");
+        assert_eq!(marker_version(&env), "2.0.0");
+        let (_, new_root) = env.store.lookup_clone("demo.plugin").unwrap();
+        let (a, b) = (
+            new_root.metadata().unwrap(),
+            std::fs::metadata(name_dir(&env).join("2.0.0")).unwrap(),
         );
-        assert_eq!(again, Err(LocalPackageError::AlreadyInstalled));
-        assert!(fresh_store.is_empty());
-        assert_eq!(names(&env.parent_path.join("demo.plugin")), vec!["1.0.0"]);
+        assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+        // An in-flight holder of the old root still has a valid handle.
+        assert!(old_root.metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn same_version_reinstall_replaces_atomically_and_keeps_marker() {
+        let env = env();
+        install(&env, &pkg_full("demo.plugin", "1.0.0", "old", &[], false)).unwrap();
+        let marker_before = std::fs::read(name_dir(&env).join("current")).unwrap();
+        let newer = pkg_full("demo.plugin", "1.0.0", "fixed", &[], false);
+        let out = install(&env, &newer).unwrap();
+        assert_eq!(out.kind, InstallKind::Reinstalled);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
         assert_eq!(
-            std::fs::read(env.parent_path.join("demo.plugin/1.0.0/panels/board.css")).unwrap(),
-            CSS
+            std::fs::read(name_dir(&env).join("1.0.0/panels/board.html")).unwrap(),
+            newer.panel
+        );
+        let (_, root) = env.store.lookup_clone("demo.plugin").unwrap();
+        let (a, b) = (
+            root.metadata().unwrap(),
+            std::fs::metadata(name_dir(&env).join("1.0.0")).unwrap(),
+        );
+        assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()), "binding follows the new inode");
+        // Signed bytes differ (different panel SRI), so the marker legitimately changed.
+        assert_ne!(std::fs::read(name_dir(&env).join("current")).unwrap(), marker_before);
+        // Identical package again: marker bytes are unchanged and nothing is left behind.
+        let marker_now = std::fs::read(name_dir(&env).join("current")).unwrap();
+        assert_eq!(install(&env, &newer).unwrap().kind, InstallKind::Reinstalled);
+        assert_eq!(std::fs::read(name_dir(&env).join("current")).unwrap(), marker_now);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+    }
+
+    #[test]
+    fn downgrade_is_refused_unless_the_host_explicitly_allows_it() {
+        let env = env();
+        install(&env, &pkg("2.0.0")).unwrap();
+        assert_eq!(install(&env, &pkg("1.0.0")), Err(LocalPackageError::DowngradeRefused));
+        assert_eq!(names(&name_dir(&env)), vec!["2.0.0", "current"]);
+        assert_eq!(
+            (bound_version(&env), marker_version(&env)),
+            ("2.0.0".into(), "2.0.0".into())
+        );
+        // Pre-release of the same triple is older too.
+        assert_eq!(
+            install(&env, &pkg("2.0.0-rc.1")),
+            Err(LocalPackageError::DowngradeRefused)
+        );
+        let out = install_opts(&env, &pkg("1.0.0"), true).unwrap();
+        assert_eq!(out.kind, InstallKind::Downgraded);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+        assert_eq!(
+            (bound_version(&env), marker_version(&env)),
+            ("1.0.0".into(), "1.0.0".into())
         );
     }
 
     #[test]
-    fn live_binding_is_never_switched_and_other_versions_are_not_written() {
+    fn policy_uses_the_marker_when_nothing_is_bound_yet() {
         let env = env();
-        install(&env, &pkg("1.0.0")).unwrap();
-        assert_eq!(install(&env, &pkg("2.0.0")), Err(LocalPackageError::AlreadyBound));
-        assert_eq!(names(&env.parent_path.join("demo.plugin")), vec!["1.0.0"]);
-        assert_eq!(env.store.lookup_checked("demo.plugin").unwrap().version(), "1.0.0");
+        install(&env, &pkg("2.0.0")).unwrap();
+        env.store.clear(); // as after a restart, before restore
+        assert_eq!(install(&env, &pkg("1.0.0")), Err(LocalPackageError::DowngradeRefused));
+        let out = install(&env, &pkg("3.0.0")).unwrap();
+        assert_eq!(out.kind, InstallKind::Upgraded);
+        assert_eq!(
+            names(&name_dir(&env)),
+            vec!["3.0.0", "current"],
+            "marker-named 2.0.0 superseded"
+        );
     }
 
     #[test]
-    fn symlinks_named_like_name_or_version_dirs_are_not_followed() {
+    fn bad_or_symlinked_marker_is_ignored_for_policy_and_rewritten_without_following() {
+        let env = env();
+        std::fs::create_dir(name_dir(&env)).unwrap();
+        std::fs::write(name_dir(&env).join("current"), b"garbage").unwrap();
+        assert_eq!(install(&env, &pkg("1.0.0")).unwrap().kind, InstallKind::Fresh);
+        assert_eq!(marker_version(&env), "1.0.0");
+
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::remove_file(name_dir(&env).join("current")).unwrap();
+        std::os::unix::fs::symlink(&target, name_dir(&env).join("current")).unwrap();
+        env.store.clear();
+        assert_eq!(install(&env, &pkg("2.0.0")).unwrap().kind, InstallKind::Fresh);
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        let meta = std::fs::symlink_metadata(name_dir(&env).join("current")).unwrap();
+        assert!(meta.file_type().is_file(), "marker is a regular file again");
+        assert_eq!(marker_version(&env), "2.0.0");
+    }
+
+    #[test]
+    fn blocked_version_slot_is_refused_and_staging_is_removed() {
+        let env = env();
+        install(&env, &pkg("1.0.0")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(name_dir(&env)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), name_dir(&env).join("2.0.0")).unwrap();
+        assert_eq!(install(&env, &pkg("2.0.0")), Err(LocalPackageError::VersionSlotBlocked));
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "2.0.0", "current"]);
+        assert_eq!(
+            (bound_version(&env), marker_version(&env)),
+            ("1.0.0".into(), "1.0.0".into())
+        );
+    }
+
+    #[test]
+    fn symlink_named_like_the_name_dir_is_not_followed() {
         let env = env();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), env.parent_path.join("demo.plugin")).unwrap();
         assert_eq!(install(&env, &pkg("1.0.0")), Err(LocalPackageError::RootCreateFailed));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-        assert!(env.store.is_empty());
-        std::fs::remove_file(env.parent_path.join("demo.plugin")).unwrap();
-
-        std::fs::create_dir(env.parent_path.join("demo.plugin")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), env.parent_path.join("demo.plugin/1.0.0")).unwrap();
-        assert_eq!(install(&env, &pkg("1.0.0")), Err(LocalPackageError::AlreadyInstalled));
-        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
-        // A name directory we did not create is left in place, with no staging left in it.
-        assert_eq!(names(&env.parent_path.join("demo.plugin")), vec!["1.0.0"]);
         assert!(env.store.is_empty());
     }
 
@@ -767,74 +1033,123 @@ mod tests {
     }
 
     #[test]
-    fn write_failure_removes_only_this_attempts_staging_and_a_created_name_dir() {
+    fn write_failure_keeps_the_live_version_and_removes_only_this_attempts_staging() {
         let env = env();
+        // Created name dir is removed again when nothing was installed.
         let p = pkg("1.0.0");
-        // "a" is written as a file, then "a/b" needs "a" as a directory => WriteFailed mid-extract.
-        let package = validated(vec![("a", b"1"), ("a/b", b"2")]);
         let dir = File::open(&env.parent_path).unwrap();
-        let r = imp::install(&env.store, checked_for(&p), package, &dir, "demo.plugin", "1.0.0");
+        let bad = || validated(vec![("a", b"1"), ("a/b", b"2")]);
+        let r = imp::install(
+            &env.store,
+            checked_for(&p),
+            bad(),
+            &dir,
+            "demo.plugin",
+            "1.0.0",
+            b"{}",
+            AutoInstallOptions::default(),
+        );
         assert_eq!(r.unwrap_err(), LocalPackageError::WriteFailed);
         assert_parent_empty(&env);
 
-        // Pre-existing name dir with a sibling version: keep both, drop only the staging.
-        std::fs::create_dir_all(env.parent_path.join("demo.plugin/0.9.0")).unwrap();
-        let package = validated(vec![("a", b"1"), ("a/b", b"2")]);
-        let r = imp::install(&env.store, checked_for(&p), package, &dir, "demo.plugin", "1.0.0");
+        install(&env, &pkg("1.0.0")).unwrap();
+        let p2 = pkg("2.0.0");
+        let r = imp::install(
+            &env.store,
+            checked_for(&p2),
+            bad(),
+            &dir,
+            "demo.plugin",
+            "2.0.0",
+            b"{}",
+            AutoInstallOptions::default(),
+        );
         assert_eq!(r.unwrap_err(), LocalPackageError::WriteFailed);
-        assert_eq!(names(&env.parent_path.join("demo.plugin")), vec!["0.9.0"]);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+        assert_eq!(
+            (bound_version(&env), marker_version(&env)),
+            ("1.0.0".into(), "1.0.0".into())
+        );
     }
 
     #[test]
-    fn binding_failure_after_placement_removes_the_new_version_dir_only() {
+    fn marker_switch_failure_undoes_a_new_placement() {
         let env = env();
-        let p = pkg("1.0.0");
-        // Simulate a racing binder: the early public check is bypassed by calling imp directly.
-        env.store
-            .install_new("demo.plugin", checked_for(&p), File::open(&env.parent_path).unwrap())
-            .unwrap();
-        std::fs::create_dir_all(env.parent_path.join("demo.plugin/0.9.0")).unwrap();
-        let dir = File::open(&env.parent_path).unwrap();
-        let package = validated(vec![("aion-extension.json", &p.raw)]);
-        let r = imp::install(&env.store, checked_for(&p), package, &dir, "demo.plugin", "1.0.0");
-        assert_eq!(r.unwrap_err(), LocalPackageError::AlreadyBound);
-        assert_eq!(names(&env.parent_path.join("demo.plugin")), vec!["0.9.0"]);
-        assert_eq!(env.store.len(), 1);
+        std::fs::create_dir_all(name_dir(&env).join("current")).unwrap(); // rename over a dir fails
+        assert_eq!(install(&env, &pkg("1.0.0")), Err(LocalPackageError::MarkerWriteFailed));
+        assert_eq!(names(&name_dir(&env)), vec!["current"]);
+        assert!(env.store.is_empty());
     }
 
     #[test]
-    fn sweep_removes_only_wip_directories_and_never_follows_symlinks() {
+    fn marker_switch_failure_exchanges_a_replaced_version_back() {
+        let env = env();
+        let old = pkg_full("demo.plugin", "1.0.0", "old", &[], false);
+        install(&env, &old).unwrap();
+        // Make the marker unwritable (a directory now) so the replace must roll back.
+        std::fs::remove_file(name_dir(&env).join("current")).unwrap();
+        std::fs::create_dir(name_dir(&env).join("current")).unwrap();
+        let newer = pkg_full("demo.plugin", "1.0.0", "new", &[], false);
+        assert_eq!(install(&env, &newer), Err(LocalPackageError::MarkerWriteFailed));
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+        assert_eq!(
+            std::fs::read(name_dir(&env).join("1.0.0/panels/board.html")).unwrap(),
+            old.panel,
+            "old tree is back in the version slot"
+        );
+        assert_eq!(bound_version(&env), "1.0.0");
+    }
+
+    #[test]
+    fn concurrent_installs_serialize_into_a_consistent_state() {
+        let env = env();
+        let (a, b) = (pkg("1.0.0"), pkg("2.0.0"));
+        std::thread::scope(|s| {
+            for p in [&a, &b] {
+                let env = &env;
+                s.spawn(move || {
+                    for _ in 0..3 {
+                        install_opts(env, p, true).unwrap();
+                    }
+                });
+            }
+        });
+        let v = marker_version(&env);
+        assert_eq!(bound_version(&env), v);
+        assert_eq!(names(&name_dir(&env)), vec![v.clone(), "current".to_owned()]);
+    }
+
+    #[test]
+    fn sweep_removes_only_leftovers_and_never_follows_symlinks() {
         let env = env();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("precious"), b"keep").unwrap();
         let root = &env.parent_path;
-        // Crashed attempt with nested content and a symlink pointing outside.
         let wip = root.join("a/.wip-deadbeef");
         std::fs::create_dir_all(wip.join("x/y")).unwrap();
         std::fs::write(wip.join("x/y/f"), b"f").unwrap();
         std::os::unix::fs::symlink(outside.path(), wip.join("x/link")).unwrap();
         std::os::unix::fs::symlink(outside.path().join("precious"), wip.join("filelink")).unwrap();
-        // Things that must survive.
+        std::fs::create_dir_all(root.join("a/.old-cafe/z")).unwrap();
+        std::fs::write(root.join("a/.current.tmp-1"), b"t").unwrap();
+        // Survivors.
         std::fs::create_dir_all(root.join("a/1.0.0")).unwrap();
         std::fs::write(root.join("a/1.0.0/keep"), b"k").unwrap();
+        std::fs::write(root.join("a/current"), b"c").unwrap();
         std::fs::write(root.join("a/.wip-regular-file"), b"not a dir").unwrap();
         std::fs::create_dir_all(root.join(".hidden/.wip-x")).unwrap();
-        std::fs::create_dir_all(root.join("b/.old-1")).unwrap();
         std::fs::write(root.join("top-level-file"), b"t").unwrap();
         std::fs::create_dir_all(outside.path().join(".wip-z")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("linkdir")).unwrap();
-        // Name dir that only held a staging dir disappears once empty.
         std::fs::create_dir_all(root.join("c/.wip-1")).unwrap();
 
         let report = sweep_abandoned_staging(&env.parent);
-        assert_eq!(report, StagingSweepReport { removed: 2, failed: 0 });
-        assert!(!wip.exists());
+        assert_eq!(report, StagingSweepReport { removed: 4, failed: 0 });
+        assert!(!wip.exists() && !root.join("a/.old-cafe").exists() && !root.join("a/.current.tmp-1").exists());
         assert!(!root.join("c").exists());
-        assert!(root.join("a/1.0.0/keep").exists());
+        assert!(root.join("a/1.0.0/keep").exists() && root.join("a/current").exists());
         assert!(root.join("a/.wip-regular-file").exists());
-        assert!(root.join(".hidden/.wip-x").exists());
-        assert!(root.join("b/.old-1").exists());
-        assert!(root.join("top-level-file").exists());
+        assert!(root.join(".hidden/.wip-x").exists() && root.join("top-level-file").exists());
         assert_eq!(std::fs::read(outside.path().join("precious")).unwrap(), b"keep");
         assert!(outside.path().join(".wip-z").exists(), "symlinked dir was not entered");
         assert!(
@@ -851,6 +1166,217 @@ mod tests {
         let env = env();
         install(&env, &pkg("1.0.0")).unwrap();
         assert_eq!(sweep_abandoned_staging(&env.parent), StagingSweepReport::default());
-        assert!(env.parent_path.join("demo.plugin/1.0.0/aion-extension.json").exists());
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+        // The parent handle is long-lived: later sweeps must list it again from the start.
+        std::fs::create_dir_all(name_dir(&env).join(".wip-late")).unwrap();
+        assert_eq!(
+            sweep_abandoned_staging(&env.parent),
+            StagingSweepReport { removed: 1, failed: 0 }
+        );
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+    }
+
+    // ---- restart: restore_installed_extensions --------------------------------------------
+
+    use super::super::host_package_restore::{RestoreRejection, restore_installed_extensions};
+
+    fn restore(env: &Env) -> (SignedRootBindingStore, crate::hub::host_package_restore::RestoreReport) {
+        let fresh = SignedRootBindingStore::new();
+        let report = restore_installed_extensions(&fresh, &policy(), &env.parent, LocalPackageLimits::default());
+        (fresh, report)
+    }
+
+    #[test]
+    fn restart_restores_the_marker_named_version_with_the_opened_directory_handle() {
+        let env = env();
+        install(&env, &pkg("1.0.0")).unwrap();
+        install(&env, &pkg("2.0.0")).unwrap();
+        install(&env, &pkg_with("other.plugin", "0.5.0", &[], false)).unwrap();
+        let (store, report) = restore(&env);
+        assert_eq!(report.restored, 2);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        let (snap, root) = store.lookup_clone("demo.plugin").unwrap();
+        assert_eq!(snap.version(), "2.0.0");
+        let (a, b) = (
+            root.metadata().unwrap(),
+            std::fs::metadata(name_dir(&env).join("2.0.0")).unwrap(),
+        );
+        assert_eq!(
+            (a.dev(), a.ino()),
+            (b.dev(), b.ino()),
+            "root is the handle opened under the parent"
+        );
+        assert!(store.contains("other.plugin"));
+        // Restore deletes nothing and a second restore never replaces a binding.
+        assert_eq!(names(&name_dir(&env)), vec!["2.0.0", "current"]);
+        let again = restore_installed_extensions(&store, &policy(), &env.parent, LocalPackageLimits::default());
+        assert_eq!(again.restored, 0);
+        assert!(
+            again
+                .rejected
+                .iter()
+                .all(|(_, why)| *why == RestoreRejection::AlreadyBound)
+        );
+    }
+
+    #[test]
+    fn restore_then_upgrade_continues_from_the_restored_binding() {
+        let env = env();
+        install(&env, &pkg("1.0.0")).unwrap();
+        let (store, report) = restore(&env);
+        assert_eq!(report.restored, 1);
+        let out = install_local_signed_package_auto(
+            &store,
+            &policy(),
+            &source(&pkg("1.1.0")),
+            &env.parent,
+            LocalPackageLimits::default(),
+            AutoInstallOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(out.kind, InstallKind::Upgraded);
+        assert_eq!(names(&name_dir(&env)), vec!["1.1.0", "current"]);
+    }
+
+    fn rejected_with(env: &Env) -> Vec<RestoreRejection> {
+        let (store, report) = restore(env);
+        assert_eq!(report.restored, 0, "{:?}", report.rejected);
+        assert!(store.is_empty());
+        report.rejected.into_iter().map(|(_, why)| why).collect()
+    }
+
+    #[test]
+    fn restore_fails_closed_on_marker_problems() {
+        let env = env();
+        install(&env, &pkg("1.0.0")).unwrap();
+        let marker = name_dir(&env).join("current");
+        let good = std::fs::read(&marker).unwrap();
+
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::MarkerMissing]);
+        for garbage in [
+            b"garbage".to_vec(),
+            vec![b'x'; 5000],
+            br#"{"v":2}"#.to_vec(),
+            String::from_utf8(good.clone())
+                .unwrap()
+                .replace("\"component\":\"1.0.0\"", "\"component\":\"../x\"")
+                .into_bytes(),
+            String::from_utf8(good.clone())
+                .unwrap()
+                .replace("}", ",\"extra\":1}")
+                .into_bytes(),
+        ] {
+            std::fs::write(&marker, garbage).unwrap();
+            assert_eq!(rejected_with(&env), vec![RestoreRejection::MarkerInvalid]);
+        }
+        // Marker as a symlink, directory or FIFO is never read through / blocked on.
+        std::fs::remove_file(&marker).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("m"), &good).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("m"), &marker).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::MarkerInvalid]);
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::MarkerInvalid]);
+        std::fs::remove_dir(&marker).unwrap();
+        let c = std::ffi::CString::new(marker.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path in a temp dir.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::MarkerInvalid]);
+    }
+
+    #[test]
+    fn restore_never_guesses_a_version_or_follows_a_swapped_directory() {
+        let env = env();
+        install(&env, &pkg("1.0.0")).unwrap();
+        // Another version directory exists, but the marker names 1.0.0: only 1.0.0 may be used.
+        std::fs::create_dir(name_dir(&env).join("9.9.9")).unwrap();
+        let root = name_dir(&env).join("1.0.0");
+
+        // Name directory renamed so the marker's signed name no longer encodes to it.
+        let moved = env.parent_path.join("moved.plugin");
+        std::fs::rename(name_dir(&env), &moved).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::IdentityMismatch]);
+        std::fs::rename(&moved, name_dir(&env)).unwrap();
+
+        // Version directory replaced by a symlink to an identical copy: O_NOFOLLOW refuses it.
+        let copy = env.tmp.path().join("copy");
+        std::fs::rename(&root, &copy).unwrap();
+        std::os::unix::fs::symlink(&copy, &root).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::VersionDirMissing]);
+        std::fs::remove_file(&root).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::VersionDirMissing]);
+        std::fs::rename(&copy, &root).unwrap();
+        let (store, report) = restore(&env);
+        assert_eq!((report.restored, store.len()), (1, 1));
+    }
+
+    #[test]
+    fn restore_reverifies_signature_manifest_and_every_listed_file() {
+        let env = env();
+        install(&env, &pkg("1.0.0")).unwrap();
+        let root = name_dir(&env).join("1.0.0");
+
+        let css = root.join("panels/board.css");
+        std::fs::write(&css, b"evil{}").unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::IntegrityMismatch]);
+        std::fs::remove_file(&css).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::CoveredFileMissing]);
+        std::fs::write(&css, CSS).unwrap();
+
+        let manifest = root.join("aion-extension.json");
+        let raw = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, [raw.as_slice(), b" "].concat()).unwrap();
+        assert!(matches!(
+            rejected_with(&env).as_slice(),
+            [RestoreRejection::Signature(_)]
+        ));
+        std::fs::write(&manifest, &raw).unwrap();
+        std::fs::remove_file(&manifest).unwrap();
+        assert_eq!(rejected_with(&env), vec![RestoreRejection::ManifestUnreadable]);
+        std::fs::write(&manifest, &raw).unwrap();
+
+        // Marker signature/key tampered, or a Host policy that no longer trusts the key.
+        let marker_path = name_dir(&env).join("current");
+        let good = std::fs::read_to_string(&marker_path).unwrap();
+        let sig = pkg("1.0.0").signature;
+        std::fs::write(&marker_path, good.replace(&sig, &"0".repeat(128))).unwrap();
+        assert!(matches!(
+            rejected_with(&env).as_slice(),
+            [RestoreRejection::Signature(_)]
+        ));
+        std::fs::write(&marker_path, &good).unwrap();
+        let empty_policy = CuratedInstallPolicy::new(HashSet::new(), false, HashMap::new());
+        let fresh = SignedRootBindingStore::new();
+        let report = restore_installed_extensions(&fresh, &empty_policy, &env.parent, LocalPackageLimits::default());
+        assert!(matches!(
+            report.rejected.as_slice(),
+            [(_, RestoreRejection::Signature(_))]
+        ));
+        assert!(fresh.is_empty());
+        let (store, report) = restore(&env);
+        assert_eq!((report.restored, store.len()), (1, 1));
+    }
+
+    #[test]
+    fn one_bad_extension_does_not_stop_the_others() {
+        let env = env();
+        install(&env, &pkg("1.0.0")).unwrap();
+        install(&env, &pkg_with("other.plugin", "0.5.0", &[], false)).unwrap();
+        std::fs::write(name_dir(&env).join("1.0.0/panels/board.css"), b"evil{}").unwrap();
+        std::fs::create_dir(env.parent_path.join("not-an-extension")).unwrap();
+        let (store, report) = restore(&env);
+        assert_eq!(report.restored, 1);
+        assert!(store.contains("other.plugin") && !store.contains("demo.plugin"));
+        let mut why: Vec<_> = report.rejected.iter().map(|(n, w)| (n.as_str(), *w)).collect();
+        why.sort_by_key(|(n, _)| *n);
+        assert_eq!(
+            why,
+            vec![
+                ("demo.plugin", RestoreRejection::IntegrityMismatch),
+                ("not-an-extension", RestoreRejection::MarkerMissing)
+            ]
+        );
     }
 }
