@@ -53,6 +53,8 @@ const DEFAULT_USER_ID: &str = "system_default_user";
 // Fixture — router + temp dirs + services
 // ---------------------------------------------------------------------------
 
+type CancelledAgentExecution = (String, String, String, String);
+
 /// Hold onto the temp dirs for the lifetime of the fixture so on-disk
 /// fixtures survive until the test returns.
 #[allow(dead_code)]
@@ -60,7 +62,7 @@ struct Fixture {
     app: axum::Router,
     services: AppServices,
     agent_center: Arc<AgentCenterService>,
-    cancelled_agent_executions: Arc<Mutex<Vec<(String, String, String, String)>>>,
+    cancelled_agent_executions: Arc<Mutex<Vec<CancelledAgentExecution>>>,
     fail_next_agent_cancellation: Arc<AtomicBool>,
     token: String,
     csrf: String,
@@ -74,7 +76,7 @@ struct Fixture {
 }
 
 struct RecordingAgentExecutionCanceller {
-    calls: Arc<Mutex<Vec<(String, String, String, String)>>>,
+    calls: Arc<Mutex<Vec<CancelledAgentExecution>>>,
     fail_next: Arc<AtomicBool>,
 }
 
