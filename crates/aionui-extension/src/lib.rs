@@ -19,6 +19,7 @@ pub mod hub_routes;
 pub mod lifecycle;
 pub mod loader;
 pub mod manifest;
+pub mod pack;
 pub mod permission;
 pub mod registry;
 mod registry_helpers;
