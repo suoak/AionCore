@@ -23,6 +23,7 @@ use crate::asset_integrity_gate::{AssetIntegrityGate, AssetServeGateError};
 use crate::asset_paths::normalize_relative_asset_path;
 use crate::error::ExtensionError;
 use crate::host_runtime::{self, CommandInvokeResult, HostRuntime};
+use crate::hub::{FilesIndex, VerifiedAssetError, read_verified_listed};
 use crate::permission::{build_permission_summary, calculate_risk_level};
 use crate::registry::ExtensionRegistry;
 
@@ -752,6 +753,48 @@ fn asset_gate_refusal(err: AssetServeGateError) -> ApiError {
     ))
 }
 
+fn verified_asset_refusal(err: VerifiedAssetError) -> ApiError {
+    match err {
+        VerifiedAssetError::Missing => ApiError::NotFound("Extension asset not found".into()),
+        other => ApiError::Forbidden(format!("Extension asset refused: {}", other.reason())),
+    }
+}
+
+/// `Ok(None)` only when there is no retained binding or its signed snapshot declares no `files`
+/// (verified serve not applicable). Otherwise the asset is served verified or refused.
+async fn try_verified_serve(
+    state: &ExtensionRouterState,
+    extension_name: &str,
+    asset_path: &str,
+    cache_control: &'static str,
+) -> Result<Option<Response>, ApiError> {
+    let Some((checked, root)) = state.host_runtime.signed_roots.lookup_clone(extension_name) else {
+        return Ok(None);
+    };
+    let Some(index) = FilesIndex::from_signed(&checked).map_err(verified_asset_refusal)? else {
+        return Ok(None);
+    };
+    let relative_path = normalize_relative_asset_path(asset_path).ok_or_else(|| {
+        ApiError::Forbidden(format!(
+            "Asset path escapes extension root: {extension_name}/{asset_path}"
+        ))
+    })?;
+    let (listed_path, integrity) = index.resolve(&relative_path).map_err(verified_asset_refusal)?;
+    let (listed_path, integrity) = (listed_path.to_owned(), integrity.to_owned());
+    let asset = tokio::task::spawn_blocking(move || read_verified_listed(&root, &listed_path, &integrity))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(verified_asset_refusal)?;
+    let content_type = content_type_for_path(FsPath::new(asset.path()));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::from(asset.into_bytes()))
+        .map(Some)
+        .map_err(|err| ApiError::Internal(err.to_string()))
+}
+
 async fn serve_extension_asset(
     state: &ExtensionRouterState,
     user_id: &str,
@@ -768,8 +811,17 @@ async fn serve_extension_asset(
         return Err(ApiError::NotFound(format!("Extension not found: {extension_name}")));
     }
 
-    // E13: declared panel/workPanelView entryPointIntegrity cannot be enforced by a path
-    // serve (no honest Host root File) → refuse that entry point; never an unchecked serve.
+    // E13 slice F: a Host-retained signed root whose snapshot declares `files` is served ONLY
+    // by verified serve (listed path, FD-relative O_NOFOLLOW read through the retained root,
+    // bytes compared to the signed SRI). Every failure there is a refusal; there is no fallback
+    // to the path-string serve below.
+    if let Some(response) = try_verified_serve(state, extension_name, asset_path, cache_control).await? {
+        return Ok(response);
+    }
+
+    // Legacy / no retained binding / snapshot without `files`: unchanged behaviour. Declared
+    // panel/workPanelView entryPointIntegrity cannot be enforced by a path serve → refuse that
+    // entry point; never an unchecked serve.
     let signed = state.host_runtime.signed_roots.lookup_checked(extension_name);
     let integrity_gate = AssetIntegrityGate::new(&ext.manifest, signed.as_ref()).map_err(asset_gate_refusal)?;
 
@@ -1246,6 +1298,212 @@ mod tests {
             asset_status(&router, "/api/extensions/hello/assets/panels/board.css").await,
             StatusCode::OK
         );
+    }
+
+    // -- slice F: verified serve from the retained signed root --
+
+    const V_HTML: &[u8] = b"<p>verified board</p>";
+    const V_CSS: &[u8] = b"p{color:green}";
+
+    fn signed_files_manifest() -> Vec<u8> {
+        use crate::hub::curated::sri_sha512;
+        serde_json::to_vec(&serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "files": [
+                {"path": "panels/board.html", "integrity": sri_sha512(V_HTML)},
+                {"path": "panels/board.css", "integrity": sri_sha512(V_CSS)},
+            ],
+            "contributes": {"panels": [{"id": "board", "title": "Board", "entryPoint": "panels/board.html"}]}
+        }))
+        .unwrap()
+    }
+
+    fn check_for_hello(raw: &[u8]) -> crate::hub::signed_manifest::SignatureCheckedManifest {
+        use crate::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
+        use crate::hub::signed_manifest::{SignedManifestEntry, check_signed_manifest};
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::collections::{HashMap, HashSet};
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let policy = CuratedInstallPolicy::new(
+            HashSet::new(),
+            false,
+            HashMap::from([("fixture".into(), key.verifying_key())]),
+        );
+        let integrity = sri_sha512(raw);
+        let signature = hex::encode(
+            key.sign(signature_payload("hello", "1.0.0", &integrity).as_bytes())
+                .to_bytes(),
+        );
+        check_signed_manifest(
+            &policy,
+            &SignedManifestEntry {
+                name: "hello",
+                version: "1.0.0",
+                pubkey_id: Some("fixture"),
+                integrity: Some(&integrity),
+                signature: Some(&signature),
+            },
+            raw,
+        )
+        .unwrap()
+    }
+
+    /// Router whose on-disk extension dir holds DIFFERENT (evil) bytes than the retained root.
+    async fn verified_fixture() -> (Router, ExtensionRouterState, tempfile::TempDir, tempfile::TempDir) {
+        let (state, tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(false)).await;
+        std::fs::create_dir_all(ext_dir.join("panels")).unwrap();
+        std::fs::write(ext_dir.join("panels/board.html"), "EVIL-HTML").unwrap();
+        std::fs::write(ext_dir.join("panels/board.css"), "EVIL-CSS").unwrap();
+        let host_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_root.path().join("panels")).unwrap();
+        std::fs::write(host_root.path().join("panels/board.html"), V_HTML).unwrap();
+        std::fs::write(host_root.path().join("panels/board.css"), V_CSS).unwrap();
+        std::fs::write(host_root.path().join("unlisted.txt"), "x").unwrap();
+        let checked = check_for_hello(&signed_files_manifest());
+        let root = std::fs::File::open(host_root.path()).unwrap();
+        state.host_runtime.signed_roots.install("hello", checked, root).unwrap();
+        let router = extension_routes(state.clone()).layer(Extension(CurrentUser::local_default()));
+        (router, state, tmp, host_root)
+    }
+
+    async fn asset_body(router: &Router, uri: &str) -> (StatusCode, String, Option<String>) {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let ctype = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_owned());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned(), ctype)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_serve_returns_retained_root_bytes_for_entry_and_other_listed_files() {
+        let (router, _state, _tmp, _root) = verified_fixture().await;
+        let (status, body, ctype) = asset_body(&router, "/api/extensions/hello/assets/panels/board.html").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "<p>verified board</p>"));
+        assert_eq!(ctype.as_deref(), Some("text/html"));
+        let (status, body, ctype) = asset_body(&router, "/api/extensions/hello/assets/./panels/board.css").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "p{color:green}"));
+        assert_eq!(ctype.as_deref(), Some("text/css"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_serve_also_covers_the_asset_session_route() {
+        let (_router, state, _tmp, _root) = verified_fixture().await;
+        let (token, _) = state
+            .asset_tokens
+            .issue(&CurrentUser::local_default().id, "hello")
+            .unwrap();
+        let router = extension_asset_session_routes(state);
+        let base = format!("/api/extensions/hello/asset-session/{token}");
+        let (status, body, _) = asset_body(&router, &format!("{base}/panels/board.html")).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "<p>verified board</p>"));
+        let (status, _, _) = asset_body(&router, &format!("{base}/settings/index.html")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_serve_refuses_unlisted_paths_even_if_present_on_disk_or_in_root() {
+        let (router, _state, _tmp, _root) = verified_fixture().await;
+        for uri in [
+            "/api/extensions/hello/assets/settings/index.html", // on disk, not listed
+            "/api/extensions/hello/assets/unlisted.txt",        // in root, not listed
+            "/api/extensions/hello/assets/aion-extension.json", // manifest is never listed
+            "/api/extensions/hello/assets/panels",
+            "/api/extensions/hello/assets/panels/BOARD.html",
+            "/api/extensions/hello/assets/%2E%2E%2Fsecret.txt",
+        ] {
+            assert_eq!(asset_status(&router, uri).await, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_serve_refuses_tampered_symlinked_and_missing_listed_files_without_path_fallback() {
+        let (router, _state, _tmp, root) = verified_fixture().await;
+        std::fs::write(root.path().join("panels/board.css"), "p{color:blue}").unwrap();
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.css").await,
+            StatusCode::FORBIDDEN
+        );
+        std::fs::remove_file(root.path().join("panels/board.html")).unwrap();
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
+            StatusCode::NOT_FOUND
+        );
+        // A symlink with matching bytes is still refused; the on-disk copy is never consulted.
+        std::fs::write(root.path().join("real.html"), V_HTML).unwrap();
+        std::os::unix::fs::symlink(root.path().join("real.html"), root.path().join("panels/board.html")).unwrap();
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_serve_uses_signed_files_not_the_loaded_manifest() {
+        // Loaded manifest declares per-entry integrity for a different body; the retained signed
+        // snapshot (files) is what decides, and it is served verified (no legacy 403 gate).
+        let (state, _tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(true)).await;
+        write_panel_assets(&ext_dir);
+        let host_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_root.path().join("panels")).unwrap();
+        std::fs::write(host_root.path().join("panels/board.html"), V_HTML).unwrap();
+        std::fs::write(host_root.path().join("panels/board.css"), V_CSS).unwrap();
+        state
+            .host_runtime
+            .signed_roots
+            .install(
+                "hello",
+                check_for_hello(&signed_files_manifest()),
+                std::fs::File::open(host_root.path()).unwrap(),
+            )
+            .unwrap();
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/panels/board.html").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "<p>verified board</p>"));
+    }
+
+    #[tokio::test]
+    async fn without_retained_binding_files_manifest_keeps_legacy_gate_for_entries() {
+        // No binding: unchanged behaviour. The loaded manifest's files-inherited integrity gates
+        // the entry (403); a path serve of other assets is exactly what it was before.
+        let sri = crate::hub::curated::sri_sha512(b"<p>board</p>");
+        let manifest = serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "files": [{"path": "panels/board.html", "integrity": sri}],
+            "contributes": {"panels": [{"id": "board", "title": "Board", "entryPoint": "panels/board.html"}]}
+        });
+        let (state, _tmp, ext_dir) = make_state_with_manifest(manifest).await;
+        write_panel_assets(&ext_dir);
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.css").await,
+            StatusCode::OK
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removing_the_binding_returns_to_legacy_behaviour() {
+        let (router, state, _tmp, _root) = verified_fixture().await;
+        assert!(state.host_runtime.signed_roots.remove("hello"));
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/panels/board.css").await;
+        // Legacy path serve of the on-disk copy (loaded manifest has no integrity).
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "EVIL-CSS"));
     }
 
     #[tokio::test]
