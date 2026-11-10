@@ -12,6 +12,7 @@ pub mod installer;
 pub mod local_package_install;
 pub mod signed_manifest;
 pub mod sri_format;
+pub mod verified_asset;
 pub mod work_panel_view_entry_point_digest;
 
 pub use background_service_entry_point_digest::{
@@ -42,6 +43,9 @@ pub use local_package_install::{
     LocalPackageError, LocalPackageInstalled, LocalPackageLimits, LocalPackageSource, install_local_signed_package,
 };
 pub use sri_format::{CANONICAL_SHA512_SRI_LEN, is_canonical_sha512_sri};
+pub use verified_asset::{
+    FilesIndex, MAX_VERIFIED_ASSET_BYTES, VerifiedAsset, VerifiedAssetError, read_verified_listed,
+};
 pub use work_panel_view_entry_point_digest::{
     WorkPanelViewEntryPointDigestError, bind_work_panel_view_entry_point_digest_from_signed,
     expected_work_panel_view_entry_point_integrity,
