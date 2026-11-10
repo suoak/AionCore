@@ -279,4 +279,46 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn integrity_inherited_from_files_binds_exactly_like_declared() {
+        let sri = sri_sha512(b"inherit body");
+        let head = r#"{"name":"demo.plugin","version":"1.0.0""#;
+        let files_only = format!(
+            r#"{head},"files":[{{"path":"tools/run.js","integrity":"{sri}"}}],"contributes":{{"agentTools":[{{"id":"tool","name":"Tool","handler":"tools/run.js"}}]}}}}"#
+        );
+        let declared = format!(
+            r#"{head},"contributes":{{"agentTools":[{{"id":"tool","name":"Tool","handler":"tools/run.js","handlerIntegrity":"{sri}"}}]}}}}"#
+        );
+        let a = parse_manifest(files_only.as_bytes()).unwrap();
+        let b = parse_manifest(declared.as_bytes()).unwrap();
+        let ba = expected_handler_integrity(&a, "tool").unwrap();
+        let bb = expected_handler_integrity(&b, "tool").unwrap();
+        assert_eq!(ba.handler(), bb.handler());
+        assert_eq!(ba.integrity(), bb.integrity());
+        assert_eq!(ba.integrity(), sri);
+        // The signed-snapshot binder re-parses the same bytes and yields the same binding.
+        let sa = bind_handler_digest_from_signed(&checked(files_only.as_bytes()), "tool").unwrap();
+        assert_eq!(sa.integrity(), sri);
+        assert_eq!(sa.handler(), "tools/run.js");
+        // An entry that is not listed in `files` is refused at parse: no binder can ever see it.
+        let unlisted = files_only.replace(r#""path":"tools/run.js""#, r#""path":"other.bin""#);
+        assert!(parse_manifest(unlisted.as_bytes()).is_err());
+        // ...and the signing check itself refuses such a snapshot, so no signed binding can exist.
+        let (integrity, signature) = sign(unlisted.as_bytes(), "demo.plugin", "1.0.0");
+        assert!(
+            check_signed_manifest(
+                &policy(),
+                &SignedManifestEntry {
+                    name: "demo.plugin",
+                    version: "1.0.0",
+                    pubkey_id: Some("fixture"),
+                    integrity: Some(&integrity),
+                    signature: Some(&signature),
+                },
+                unlisted.as_bytes(),
+            )
+            .is_err()
+        );
+    }
 }

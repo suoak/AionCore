@@ -180,6 +180,38 @@ mod tests {
         );
     }
 
+    fn files_only_json() -> String {
+        format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{{"path":"services/worker.sh","integrity":"{}"}}],"contributes":{{"backgroundServices":[{{"id":"w","entryPoint":"services/worker.sh"}}]}}}}"#,
+            sri()
+        )
+    }
+
+    #[test]
+    fn integrity_inherited_from_files_refuses_exactly_like_declared() {
+        let inherited = parse_manifest(files_only_json().as_bytes()).unwrap();
+        let declared = manifest(&format!(
+            r#"[{{"id":"w","entryPoint":"services/worker.sh","entryPointIntegrity":"{}"}}]"#,
+            sri()
+        ));
+        for m in [&inherited, &declared] {
+            assert_eq!(
+                gate_background_service_start(m, &resolved("w"), None),
+                Err(BackgroundServiceStartGateError::DeclaredIntegrityCannotBeChecked)
+            );
+        }
+    }
+
+    #[test]
+    fn files_only_signed_snapshot_refuses_even_if_loaded_manifest_stripped() {
+        let snapshot = checked(files_only_json().as_bytes());
+        let stripped = manifest(r#"[{"id":"w","entryPoint":"services/worker.sh"}]"#);
+        assert_eq!(
+            gate_background_service_start(&stripped, &resolved("w"), Some(&snapshot)),
+            Err(BackgroundServiceStartGateError::SignedIntegrityCannotBeChecked)
+        );
+    }
+
     #[test]
     fn declared_integrity_on_other_service_does_not_block_this_one() {
         let json = format!(

@@ -281,6 +281,64 @@ mod enabled_tests {
         let source = load_checked_panel_source_from_signed(&snapshot, "board", &root).unwrap();
         assert_eq!(source.as_str().as_bytes(), body.as_bytes());
     }
+
+    /// Declare-once chain proof: the panel carries **no** `entryPointIntegrity`; its SRI comes from
+    /// the top-level `files` list. Install -> retained root -> checked load must behave exactly like
+    /// the per-entry-declared package, and a tampered root file must still be refused.
+    #[test]
+    fn files_only_package_inherits_integrity_through_install_and_checked_load() {
+        use aionui_extension::hub::{LocalPackageLimits, LocalPackageSource, install_local_signed_package};
+        use aionui_extension::signed_root_binding::SignedRootBindingStore;
+        use std::io::Write;
+
+        let body = "<html><body>files-only</body></html>\n";
+        let sri = sri_sha512(body.as_bytes());
+        let raw = format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{{"path":"panels/board.html","integrity":"{sri}"}}],"contributes":{{"panels":[{{"id":"board","title":"Board","entryPoint":"panels/board.html"}}]}}}}"#
+        );
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        writer.start_file("aion-extension.json", opts).unwrap();
+        writer.write_all(raw.as_bytes()).unwrap();
+        writer.start_file("panels/board.html", opts).unwrap();
+        writer.write_all(body.as_bytes()).unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+
+        let (integrity, signature) = sign(raw.as_bytes(), "demo.plugin", "1.0.0");
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = File::open(parent_dir.path()).unwrap();
+        let store = SignedRootBindingStore::new();
+        install_local_signed_package(
+            &store,
+            &policy(),
+            &LocalPackageSource {
+                entry: SignedManifestEntry {
+                    name: "demo.plugin",
+                    version: "1.0.0",
+                    pubkey_id: Some("fixture"),
+                    integrity: Some(&integrity),
+                    signature: Some(&signature),
+                },
+                raw_manifest: raw.as_bytes(),
+                package_zip: &archive,
+            },
+            &parent,
+            "demo-files-only",
+            LocalPackageLimits::default(),
+        )
+        .unwrap();
+        let (snapshot, root) = store.lookup_clone("demo.plugin").unwrap();
+        let source = load_checked_panel_source_from_signed(&snapshot, "board", &root).unwrap();
+        assert_eq!(source.as_str().as_bytes(), body.as_bytes());
+
+        // Post-install tamper of the retained root is caught by the checked reader (inherited SRI is enforced).
+        std::fs::write(
+            parent_dir.path().join("demo-files-only/panels/board.html"),
+            "<html>evil</html>",
+        )
+        .unwrap();
+        assert!(load_checked_panel_source_from_signed(&snapshot, "board", &root).is_err());
+    }
 }
 
 #[cfg(all(test, not(all(feature = "experimental-extension-js", target_os = "linux"))))]

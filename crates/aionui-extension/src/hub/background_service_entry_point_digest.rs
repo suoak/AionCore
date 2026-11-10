@@ -351,4 +351,47 @@ mod tests {
             Err(BackgroundServiceEntryPointDigestError::ServiceNotFound)
         );
     }
+
+    #[test]
+    fn integrity_inherited_from_files_binds_exactly_like_declared() {
+        let sri = sri_sha512(b"inherit body");
+        let head = r#"{"name":"demo.plugin","version":"1.0.0""#;
+        let files_only = format!(
+            r#"{head},"files":[{{"path":"services/worker.sh","integrity":"{sri}"}}],"contributes":{{"backgroundServices":[{{"id":"worker","entryPoint":"services/worker.sh"}}]}}}}"#
+        );
+        let declared = format!(
+            r#"{head},"contributes":{{"backgroundServices":[{{"id":"worker","entryPoint":"services/worker.sh","entryPointIntegrity":"{sri}"}}]}}}}"#
+        );
+        let a = parse_manifest(files_only.as_bytes()).unwrap();
+        let b = parse_manifest(declared.as_bytes()).unwrap();
+        let ba = expected_background_service_entry_point_integrity(&a, "worker").unwrap();
+        let bb = expected_background_service_entry_point_integrity(&b, "worker").unwrap();
+        assert_eq!(ba.entry_point(), bb.entry_point());
+        assert_eq!(ba.integrity(), bb.integrity());
+        assert_eq!(ba.integrity(), sri);
+        // The signed-snapshot binder re-parses the same bytes and yields the same binding.
+        let sa =
+            bind_background_service_entry_point_digest_from_signed(&checked(files_only.as_bytes()), "worker").unwrap();
+        assert_eq!(sa.integrity(), sri);
+        assert_eq!(sa.entry_point(), "services/worker.sh");
+        // An entry that is not listed in `files` is refused at parse: no binder can ever see it.
+        let unlisted = files_only.replace(r#""path":"services/worker.sh""#, r#""path":"other.bin""#);
+        assert!(parse_manifest(unlisted.as_bytes()).is_err());
+        // ...and the signing check itself refuses such a snapshot, so no signed binding can exist.
+        let (integrity, signature) = sign(unlisted.as_bytes(), "demo.plugin", "1.0.0");
+        assert!(
+            check_signed_manifest(
+                &policy(),
+                &SignedManifestEntry {
+                    name: "demo.plugin",
+                    version: "1.0.0",
+                    pubkey_id: Some("fixture"),
+                    integrity: Some(&integrity),
+                    signature: Some(&signature),
+                },
+                unlisted.as_bytes(),
+            )
+            .is_err()
+        );
+    }
 }

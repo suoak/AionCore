@@ -22,20 +22,60 @@ pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionEr
 /// Upper bound on top-level `files` entries (parse-time; Host install budgets are separate).
 pub const MAX_MANIFEST_FILES: usize = 1024;
 
-/// Fail closed on a malformed top-level `files` list (M9 E13 slice A: parse/validate only).
+/// Fail closed on a malformed top-level `files` list, then enforce the contribution rules.
 ///
-/// Every `path` must be an exact canonical relative path and every `integrity` a canonical
-/// sha512 SRI. Duplicates (also case-folded), directory-prefix clashes (also case-folded),
-/// the manifest file itself and more than [`MAX_MANIFEST_FILES`] entries are refused.
+/// List rules (M9 E13 slice A): every `path` must be an exact canonical relative path and every
+/// `integrity` a canonical sha512 SRI. Duplicates (also case-folded), directory-prefix clashes
+/// (also case-folded), the manifest file itself and more than [`MAX_MANIFEST_FILES`] entries are
+/// refused.
 ///
-/// When `files` is non-empty, every contribution integrity declaration
-/// (`entryPointIntegrity` / `handlerIntegrity`) must also appear in `files` with the same
-/// path and the same SRI. Manifests without `files` keep the existing per-entry behaviour
-/// unchanged. This is declaration consistency only: it reads no file, proves no bytes, and
-/// an omitted list never means unlisted extras are verified.
+/// Contribution rules (M9 E13 integrity inheritance): when `files` is non-empty, every
+/// contribution entry that names a package file — panel / workPanelView / backgroundService
+/// `entryPoint` and agentTool `handler` — must be a canonical path listed in `files`, and its
+/// integrity field must carry **exactly** the listed SRI. `parse_manifest` fills a missing field
+/// from `files` (see [`inherit_integrity_from_files`]), so on a parsed manifest every downstream
+/// binder and gate reads inherited integrity from the very same field as declared integrity. A typed
+/// manifest that was not inherited (field still `None`) is refused here rather than treated as
+/// undeclared. Manifests without `files` keep the existing per-entry behaviour unchanged.
+/// Declaration consistency only: it reads no file, proves no bytes, and an omitted list never
+/// means unlisted extras are verified.
 fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
-    if manifest.files.is_empty() {
+    let Some(declared) = validate_files_list(manifest)? else {
         return Ok(());
+    };
+    for (path, integrity) in contribution_file_entries(manifest) {
+        let canonical = canonical_relative_path(path).ok_or_else(|| {
+            ExtensionError::ManifestValidation(
+                "contribution entry point must be a canonical relative path when files is declared".into(),
+            )
+        })?;
+        let Some(listed) = declared.get(canonical.as_str()) else {
+            return Err(ExtensionError::ManifestValidation(
+                "contribution entry point is missing from the files list".into(),
+            ));
+        };
+        match integrity {
+            Some(i) if i == *listed => {}
+            Some(_) => {
+                return Err(ExtensionError::ManifestValidation(
+                    "contribution integrity conflicts with the files list".into(),
+                ));
+            }
+            None => {
+                return Err(ExtensionError::ManifestValidation(
+                    "contribution integrity was not inherited from the files list".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `files` list itself. `Ok(None)` when no list is declared; otherwise the
+/// `path -> integrity` map of the (now known well-formed) list.
+fn validate_files_list(manifest: &ExtensionManifest) -> Result<Option<BTreeMap<&str, &str>>, ExtensionError> {
+    if manifest.files.is_empty() {
+        return Ok(None);
     }
     if manifest.files.len() > MAX_MANIFEST_FILES {
         return Err(ExtensionError::ManifestValidation(
@@ -84,56 +124,85 @@ fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), Extension
             end += 1;
         }
     }
-    for (path, integrity) in declared_contribution_integrity(manifest) {
-        let canonical = canonical_relative_path(path).ok_or_else(|| {
-            ExtensionError::ManifestValidation(
-                "contribution integrity path must be a canonical relative path when files is declared".into(),
-            )
-        })?;
-        match declared.get(canonical.as_str()) {
-            Some(listed) if *listed == integrity => {}
-            Some(_) => {
-                return Err(ExtensionError::ManifestValidation(
-                    "contribution integrity conflicts with the files list".into(),
-                ));
-            }
-            None => {
-                return Err(ExtensionError::ManifestValidation(
-                    "contribution integrity path is missing from the files list".into(),
-                ));
-            }
-        }
-    }
-    Ok(())
+    Ok(Some(declared))
 }
 
-/// `(path, integrity)` for every contribution that declares an integrity (already validated).
-fn declared_contribution_integrity(manifest: &ExtensionManifest) -> Vec<(&str, &str)> {
+/// `(path, integrity)` for every contribution entry that names a package file: panel /
+/// workPanelView / backgroundService `entryPoint` and agentTool `handler`. Entries with no path
+/// (empty `entryPoint`, absent `handler`) name no file and are skipped.
+fn contribution_file_entries(manifest: &ExtensionManifest) -> Vec<(&str, Option<&str>)> {
     let mut out = Vec::new();
     let Some(c) = manifest.contributes.as_ref() else {
         return out;
     };
-    for p in &c.panels {
-        if let Some(i) = p.entry_point_integrity.as_deref() {
-            out.push((p.entry_point.as_str(), i));
-        }
+    for p in c.panels.iter().filter(|p| !p.entry_point.is_empty()) {
+        out.push((p.entry_point.as_str(), p.entry_point_integrity.as_deref()));
     }
-    for v in &c.work_panel_views {
-        if let Some(i) = v.entry_point_integrity.as_deref() {
-            out.push((v.entry_point.as_str(), i));
-        }
+    for v in c.work_panel_views.iter().filter(|v| !v.entry_point.is_empty()) {
+        out.push((v.entry_point.as_str(), v.entry_point_integrity.as_deref()));
     }
-    for s in &c.background_services {
-        if let Some(i) = s.entry_point_integrity.as_deref() {
-            out.push((s.entry_point.as_str(), i));
-        }
+    for s in c.background_services.iter().filter(|s| !s.entry_point.is_empty()) {
+        out.push((s.entry_point.as_str(), s.entry_point_integrity.as_deref()));
     }
     for t in &c.agent_tools {
-        if let Some(i) = t.handler_integrity.as_deref() {
-            out.push((t.handler.as_deref().unwrap_or_default(), i));
+        if let Some(handler) = t.handler.as_deref().filter(|h| !h.is_empty()) {
+            out.push((handler, t.handler_integrity.as_deref()));
         }
     }
     out
+}
+
+/// Declare-once authoring (M9 E13): when `files` is non-empty, give every contribution entry that
+/// names a package file the integrity listed for that path in `files`, unless the entry already
+/// carries its own value (which `validate_manifest` then requires to equal the listed one).
+///
+/// Runs inside `parse_manifest`, **before** validation, on the typed manifest every binder and
+/// gate reads, so inherited integrity is stored in the same `entry_point_integrity` /
+/// `handler_integrity` fields as declared integrity and is indistinguishable from it downstream
+/// (asset-serve gate, background-start gate, panel / workPanelView / backgroundService / tool
+/// binders, install allow-list). It never invents an integrity: an entry whose path is not a
+/// canonical path listed in `files` is refused. Without `files` nothing changes.
+fn inherit_integrity_from_files(manifest: &mut ExtensionManifest) -> Result<(), ExtensionError> {
+    if manifest.files.is_empty() {
+        return Ok(());
+    }
+    let listed: BTreeMap<String, String> = manifest
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.integrity.clone()))
+        .collect();
+    let Some(c) = manifest.contributes.as_mut() else {
+        return Ok(());
+    };
+    let mut slots: Vec<(&str, &mut Option<String>)> = Vec::new();
+    for p in c.panels.iter_mut().filter(|p| !p.entry_point.is_empty()) {
+        slots.push((p.entry_point.as_str(), &mut p.entry_point_integrity));
+    }
+    for v in c.work_panel_views.iter_mut().filter(|v| !v.entry_point.is_empty()) {
+        slots.push((v.entry_point.as_str(), &mut v.entry_point_integrity));
+    }
+    for s in c.background_services.iter_mut().filter(|s| !s.entry_point.is_empty()) {
+        slots.push((s.entry_point.as_str(), &mut s.entry_point_integrity));
+    }
+    for t in c.agent_tools.iter_mut() {
+        if let Some(handler) = t.handler.as_deref().filter(|h| !h.is_empty()) {
+            slots.push((handler, &mut t.handler_integrity));
+        }
+    }
+    for (path, slot) in slots {
+        let canonical = canonical_relative_path(path).ok_or_else(|| {
+            ExtensionError::ManifestValidation(
+                "contribution entry point must be a canonical relative path when files is declared".into(),
+            )
+        })?;
+        let integrity = listed.get(&canonical).ok_or_else(|| {
+            ExtensionError::ManifestValidation("contribution entry point is missing from the files list".into())
+        })?;
+        if slot.is_none() {
+            *slot = Some(integrity.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Fail closed when an optional handler digest is present but malformed or unbound.
@@ -292,7 +361,10 @@ fn parse_manifest_inner(json_bytes: &[u8], extension_dir: Option<&Path>) -> Resu
         manifest_json = resolve_file_refs(manifest_json, dir, &mut visited)?;
     }
     normalize_manifest_json(&mut manifest_json);
-    let manifest: ExtensionManifest = serde_json::from_value(manifest_json)?;
+    let mut manifest: ExtensionManifest = serde_json::from_value(manifest_json)?;
+    // Well-formed `files` first (clear errors), then declare-once inheritance, then full validation.
+    validate_files_list(&manifest)?;
+    inherit_integrity_from_files(&mut manifest)?;
     validate_manifest(&manifest)?;
     Ok(manifest)
 }
@@ -1194,12 +1266,138 @@ mod tests {
             panel("./panels/board.html", Some(&i)),
         );
         assert!(is_validation_err(parse_manifest(&noncanon)));
-        // A contribution without integrity is not forced into files.
+        // A contribution without integrity whose path is not in files is refused (no unlisted entry).
         let no_decl = files_manifest(
             json!([{"path": "panels/board.css", "integrity": css}]),
             panel("panels/board.html", None),
         );
-        assert!(parse_manifest(&no_decl).is_ok());
+        assert!(is_validation_err(parse_manifest(&no_decl)));
+    }
+
+    fn kind_contributes(kind: &str, path: &str, integrity: Option<&str>) -> serde_json::Value {
+        let mut v = match kind {
+            "panels" => json!({"id": "p", "title": "P", "entryPoint": path}),
+            "workPanelViews" => json!({"id": "v", "title": "V", "entryPoint": path}),
+            "backgroundServices" => json!({"id": "s", "entryPoint": path}),
+            _ => json!({"id": "t", "name": "T", "handler": path}),
+        };
+        if let Some(i) = integrity {
+            let key = if kind == "agentTools" {
+                "handlerIntegrity"
+            } else {
+                "entryPointIntegrity"
+            };
+            v[key] = json!(i);
+        }
+        json!({ kind: [v] })
+    }
+
+    fn inherited(m: &ExtensionManifest, kind: &str) -> Option<String> {
+        let c = m.contributes.as_ref().unwrap();
+        match kind {
+            "panels" => c.panels[0].entry_point_integrity.clone(),
+            "workPanelViews" => c.work_panel_views[0].entry_point_integrity.clone(),
+            "backgroundServices" => c.background_services[0].entry_point_integrity.clone(),
+            _ => c.agent_tools[0].handler_integrity.clone(),
+        }
+    }
+
+    const KINDS: [(&str, &str); 4] = [
+        ("panels", "p.html"),
+        ("workPanelViews", "v.html"),
+        ("backgroundServices", "s.js"),
+        ("agentTools", "t.js"),
+    ];
+
+    #[test]
+    fn files_only_declaration_inherits_integrity_for_every_kind() {
+        let i = sri(b"x");
+        for (kind, path) in KINDS {
+            let only_files = files_manifest(
+                json!([{"path": path, "integrity": i}]),
+                kind_contributes(kind, path, None),
+            );
+            let declared = files_manifest(
+                json!([{"path": path, "integrity": i}]),
+                kind_contributes(kind, path, Some(&i)),
+            );
+            let a = parse_manifest(&only_files).unwrap();
+            let b = parse_manifest(&declared).unwrap();
+            assert_eq!(inherited(&a, kind).as_deref(), Some(i.as_str()), "{kind}");
+            // Inherited and declared manifests are identical typed values.
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::to_value(&b).unwrap(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn inheritance_refuses_unlisted_noncanonical_and_conflicting_entries() {
+        let i = sri(b"x");
+        let other = sri(b"y");
+        for (kind, path) in KINDS {
+            let unlisted = files_manifest(
+                json!([{"path": "z.css", "integrity": i}]),
+                kind_contributes(kind, path, None),
+            );
+            assert!(is_validation_err(parse_manifest(&unlisted)), "{kind} unlisted");
+            for bad in [format!("./{path}"), format!("a/../{path}"), path.to_uppercase()] {
+                let m = files_manifest(
+                    json!([{"path": path, "integrity": i}]),
+                    kind_contributes(kind, &bad, None),
+                );
+                assert!(is_validation_err(parse_manifest(&m)), "{kind} {bad}");
+            }
+            let conflict = files_manifest(
+                json!([{"path": path, "integrity": i}]),
+                kind_contributes(kind, path, Some(&other)),
+            );
+            assert!(is_validation_err(parse_manifest(&conflict)), "{kind} conflict");
+            // A malformed per-entry SRI is not replaced by the listed one.
+            let malformed = files_manifest(
+                json!([{"path": path, "integrity": i}]),
+                kind_contributes(kind, path, Some("sha512-bad")),
+            );
+            assert!(is_validation_err(parse_manifest(&malformed)), "{kind} malformed");
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_without_files_never_inherits() {
+        for (kind, path) in KINDS {
+            for files in [None, Some(json!([]))] {
+                let mut raw = json!({"name": "demo.plugin", "version": "1.0.0", "contributes": kind_contributes(kind, path, None)});
+                if let Some(f) = files {
+                    raw["files"] = f;
+                }
+                let m = parse_manifest(&serde_json::to_vec(&raw).unwrap()).unwrap();
+                assert_eq!(inherited(&m, kind), None, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_agent_tool_handler_and_empty_entry_point_need_no_files_entry() {
+        let i = sri(b"x");
+        let tool = json!({"agentTools": [{"id": "t", "name": "T"}]});
+        let m = parse_manifest(&files_manifest(json!([{"path": "a.css", "integrity": i}]), tool)).unwrap();
+        assert!(m.contributes.unwrap().agent_tools[0].handler_integrity.is_none());
+    }
+
+    #[test]
+    fn validate_manifest_refuses_typed_files_manifest_that_did_not_inherit() {
+        let i = sri(b"x");
+        let bytes = files_manifest(
+            json!([{"path": "p.html", "integrity": i}]),
+            kind_contributes("panels", "p.html", None),
+        );
+        let mut m = parse_manifest(&bytes).unwrap();
+        assert!(validate_manifest(&m).is_ok());
+        // Hand-clearing the inherited field must never read as "undeclared": validation refuses it.
+        m.contributes.as_mut().unwrap().panels[0].entry_point_integrity = None;
+        assert!(is_validation_err(validate_manifest(&m).map(|()| m.clone())));
     }
 
     #[test]
