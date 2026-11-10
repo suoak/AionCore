@@ -19,6 +19,7 @@ use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, now_ms};
 use serde_json::json;
 
+use crate::asset_integrity_gate::{AssetIntegrityGate, AssetServeGateError};
 use crate::asset_paths::normalize_relative_asset_path;
 use crate::error::ExtensionError;
 use crate::host_runtime::{self, CommandInvokeResult, HostRuntime};
@@ -744,6 +745,13 @@ async fn get_extension_asset_with_token(
     serve_extension_asset(&state, &user_id, &extension_name, &asset_path, "private, max-age=600").await
 }
 
+fn asset_gate_refusal(err: AssetServeGateError) -> ApiError {
+    ApiError::Forbidden(format!(
+        "Extension asset refused: {} (declared entryPointIntegrity cannot be enforced by a path serve)",
+        err.reason()
+    ))
+}
+
 async fn serve_extension_asset(
     state: &ExtensionRouterState,
     user_id: &str,
@@ -760,6 +768,11 @@ async fn serve_extension_asset(
         return Err(ApiError::NotFound(format!("Extension not found: {extension_name}")));
     }
 
+    // E13: declared panel/workPanelView entryPointIntegrity cannot be enforced by a path
+    // serve (no honest Host root File) → refuse that entry point; never an unchecked serve.
+    let signed = state.host_runtime.signed_roots.lookup_checked(extension_name);
+    let integrity_gate = AssetIntegrityGate::new(&ext.manifest, signed.as_ref()).map_err(asset_gate_refusal)?;
+
     let canonical_root = tokio::fs::canonicalize(&ext.directory)
         .await
         .map_err(map_asset_lookup_error)?;
@@ -769,6 +782,9 @@ async fn serve_extension_asset(
             "Asset path escapes extension root: {extension_name}/{asset_path}"
         ))
     })?;
+    integrity_gate
+        .check_requested(&relative_path)
+        .map_err(asset_gate_refusal)?;
 
     let requested_path = canonical_root.join(&relative_path);
     let canonical_asset = tokio::fs::canonicalize(&requested_path)
@@ -781,6 +797,11 @@ async fn serve_extension_asset(
             canonical_asset.display()
         )));
     }
+
+    integrity_gate
+        .check_canonical(&canonical_root, &canonical_asset)
+        .await
+        .map_err(asset_gate_refusal)?;
 
     let bytes = tokio::fs::read(&canonical_asset)
         .await
@@ -1080,6 +1101,151 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn asset_status(router: &Router, uri: &str) -> StatusCode {
+        router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn write_panel_assets(ext_dir: &std::path::Path) {
+        std::fs::create_dir_all(ext_dir.join("panels")).unwrap();
+        std::fs::write(ext_dir.join("panels/board.html"), "<p>board</p>").unwrap();
+        std::fs::write(ext_dir.join("panels/board.css"), "p{}").unwrap();
+    }
+
+    fn integrity_panel_manifest(with_integrity: bool) -> serde_json::Value {
+        let mut panel = serde_json::json!({"id": "board", "title": "Board", "entryPoint": "panels/board.html"});
+        if with_integrity {
+            panel["entryPointIntegrity"] = serde_json::json!(crate::hub::curated::sri_sha512(b"<p>board</p>"));
+        }
+        serde_json::json!({"name": "hello", "version": "1.0.0", "contributes": {"panels": [panel]}})
+    }
+
+    #[tokio::test]
+    async fn asset_route_refuses_declared_panel_entry_but_serves_other_assets() {
+        let (state, _tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(true)).await;
+        write_panel_assets(&ext_dir);
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/./panels/board.html").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.css").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/settings/index.html").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_route_serves_undeclared_panel_entry_legacy() {
+        let (state, _tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(false)).await;
+        write_panel_assets(&ext_dir);
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
+            StatusCode::OK
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn asset_route_refuses_symlink_alias_of_declared_entry() {
+        let (state, _tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(true)).await;
+        write_panel_assets(&ext_dir);
+        std::os::unix::fs::symlink(ext_dir.join("panels/board.html"), ext_dir.join("alias.html")).unwrap();
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/alias.html").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_session_route_refuses_declared_work_panel_view_entry() {
+        let mut manifest = integrity_panel_manifest(false);
+        manifest["contributes"] = serde_json::json!({"workPanelViews": [{
+            "id": "v", "title": "V", "entryPoint": "panels/board.html",
+            "entryPointIntegrity": crate::hub::curated::sri_sha512(b"<p>board</p>")
+        }]});
+        let (state, _tmp, ext_dir) = make_state_with_manifest(manifest).await;
+        write_panel_assets(&ext_dir);
+        let (token, _) = state
+            .asset_tokens
+            .issue(&CurrentUser::local_default().id, "hello")
+            .unwrap();
+        let router = extension_routes(state.clone())
+            .layer(Extension(CurrentUser::local_default()))
+            .merge(extension_asset_session_routes(state));
+        let base = format!("/api/extensions/hello/asset-session/{token}");
+        assert_eq!(
+            asset_status(&router, &format!("{base}/panels/board.html")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            asset_status(&router, &format!("{base}/panels/board.css")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_route_refuses_entry_declared_only_in_host_retained_signed_snapshot() {
+        use crate::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
+        use crate::hub::signed_manifest::{SignedManifestEntry, check_signed_manifest};
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::collections::{HashMap, HashSet};
+
+        // Loaded manifest has NO integrity (stripped); signed snapshot declares it.
+        let (state, tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(false)).await;
+        write_panel_assets(&ext_dir);
+        let signed_raw = serde_json::to_vec(&integrity_panel_manifest(true)).unwrap();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let policy = CuratedInstallPolicy::new(
+            HashSet::new(),
+            false,
+            HashMap::from([("fixture".into(), key.verifying_key())]),
+        );
+        let integrity = sri_sha512(&signed_raw);
+        let signature = hex::encode(
+            key.sign(signature_payload("hello", "1.0.0", &integrity).as_bytes())
+                .to_bytes(),
+        );
+        let checked = check_signed_manifest(
+            &policy,
+            &SignedManifestEntry {
+                name: "hello",
+                version: "1.0.0",
+                pubkey_id: Some("fixture"),
+                integrity: Some(&integrity),
+                signature: Some(&signature),
+            },
+            &signed_raw,
+        )
+        .unwrap();
+        // Honest Host-created root for the test: the tempdir the test itself created.
+        let root = std::fs::File::open(tmp.path()).unwrap();
+        state.host_runtime.signed_roots.install("hello", checked, root).unwrap();
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/panels/board.css").await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
