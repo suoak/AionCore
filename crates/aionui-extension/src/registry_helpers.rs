@@ -4,8 +4,10 @@ use std::path::Path;
 use tracing::{debug, warn};
 
 use crate::dependency::{DependencyValidationResult, validate_dependencies};
+use crate::hub::bound_manifest::pin_bound_manifests;
 use crate::lifecycle::{HookKind, execute_hook, resolve_hook_path};
 use crate::loader::{ScanPath, filter_by_engine_compatibility, load_all};
+use crate::signed_root_binding::SignedRootBindingStore;
 use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
 
 // ---------------------------------------------------------------------------
@@ -46,9 +48,15 @@ pub(crate) fn to_summary(ext: &LoadedExtension) -> ExtensionSummary {
 pub(crate) fn load_and_validate(
     scan_paths: &[ScanPath],
     app_version: &str,
+    signed_roots: Option<&SignedRootBindingStore>,
 ) -> (Vec<LoadedExtension>, DependencyValidationResult) {
     let loaded = load_all(scan_paths);
     debug!(count = loaded.len(), "loaded extension manifests");
+
+    // Slice H: pin (or drop) bound extensions before engine/dependency decisions, so a tampered
+    // disk manifest cannot inject contributions or dependencies the signature did not cover.
+    let loaded = pin_bound_manifests(loaded, signed_roots);
+    debug!(count = loaded.len(), "after signed-snapshot pin");
 
     let filtered = filter_by_engine_compatibility(loaded, app_version);
     debug!(count = filtered.len(), "after engine compatibility filter");

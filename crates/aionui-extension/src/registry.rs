@@ -16,6 +16,7 @@ use crate::registry_helpers::{
     build_state_map, load_and_validate, merge_persisted_states, run_deactivation_hooks, to_summary,
 };
 use crate::resolvers::{resolve_all_contributions, resolve_i18n_for_all};
+use crate::signed_root_binding::SignedRootBindingStore;
 use crate::state::ExtensionStateStore;
 use crate::types::{
     ExtensionLifecyclePayload, ExtensionState, ExtensionSystemEvent, LoadedExtension, ResolvedAcpAdapter,
@@ -45,6 +46,9 @@ pub struct ExtensionRegistry {
     state_store: ExtensionStateStore,
     broadcaster: Arc<dyn EventBroadcaster>,
     app_version: String,
+    /// Shared with HostRuntime when the Host wires signed install (slice G). All clones see
+    /// the same pointer; `None` keeps today's unbound/legacy behaviour.
+    signed_roots: Arc<std::sync::Mutex<Option<Arc<SignedRootBindingStore>>>>,
 }
 
 struct RegistryInner {
@@ -75,7 +79,21 @@ impl ExtensionRegistry {
             state_store,
             broadcaster,
             app_version,
+            signed_roots: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Point this registry (and every clone) at the Host's signed-root store.
+    ///
+    /// Must be called before [`initialize_with_scan_paths`] / [`hot_reload`] so bound extensions
+    /// are pinned to their signed snapshot. Passing the same `Arc` the Host restores into is
+    /// required; a different store would not see those bindings.
+    pub fn set_signed_roots(&self, store: Arc<SignedRootBindingStore>) {
+        *self.signed_roots.lock().unwrap_or_else(|e| e.into_inner()) = Some(store);
+    }
+
+    fn signed_roots(&self) -> Option<Arc<SignedRootBindingStore>> {
+        self.signed_roots.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -111,7 +129,8 @@ impl ExtensionRegistry {
         debug!(count = scan_paths.len(), "resolved scan paths");
 
         // 1-3. Load, filter, validate (all sync/blocking).
-        let (extensions, dep_result) = load_and_validate(&scan_paths, &self.app_version);
+        let (extensions, dep_result) =
+            load_and_validate(&scan_paths, &self.app_version, self.signed_roots().as_deref());
 
         // 4. Merge persisted states.
         let persisted = self.state_store.load().await?;
@@ -166,7 +185,8 @@ impl ExtensionRegistry {
         run_deactivation_hooks(&current_exts).await;
 
         // 3. Reload pipeline (same as initialize but reuses existing scan paths).
-        let (extensions, _dep_result) = load_and_validate(&scan_paths, &self.app_version);
+        let (extensions, _dep_result) =
+            load_and_validate(&scan_paths, &self.app_version, self.signed_roots().as_deref());
 
         // Use in-memory state (not file) to preserve pending writes that
         // haven't been flushed yet by the debounce timer.

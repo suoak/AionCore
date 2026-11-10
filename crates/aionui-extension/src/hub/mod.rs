@@ -1,4 +1,5 @@
 pub mod background_service_entry_point_digest;
+pub(crate) mod bound_manifest;
 pub mod curated;
 pub mod curated_signed_retain;
 pub mod entry_point_digest;
