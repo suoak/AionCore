@@ -741,6 +741,13 @@ mod tests {
 
     #[test]
     fn case_fold_collisions_are_refused_including_with_the_manifest() {
+        // On a case-insensitive filesystem (Windows, default macOS) the aliasing writes below may
+        // legitimately fail or overwrite; the helper must not panic there.
+        fn write(root: &Path, rel: &str, bytes: &[u8]) {
+            let p = root.join(rel);
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            let _ = std::fs::write(p, bytes);
+        }
         let tmp = sample();
         write(tmp.path(), "Panels/Board.html", b"x");
         // On a case-insensitive filesystem the write above aliases; only assert when distinct.
@@ -880,6 +887,9 @@ mod tests {
         assert_eq!(zip_names(&out.zip), [EXTENSION_MANIFEST_FILE]);
         let mut a = zip::ZipArchive::new(std::io::Cursor::new(&out.zip)).unwrap();
         let mut e = a.by_index(0).unwrap();
+        // The zip crate records unix mode bits differently when built for Windows; the Host
+        // installer only looks at the file-type bits, so only unix pins the exact mode.
+        #[cfg(unix)]
         assert_eq!(e.unix_mode().map(|m| m & 0o777), Some(0o644));
         let mut buf = Vec::new();
         e.read_to_end(&mut buf).unwrap();
