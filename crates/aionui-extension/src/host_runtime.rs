@@ -18,6 +18,7 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::background_service_start_gate::gate_background_service_start;
 use crate::error::ExtensionError;
 use crate::hub::curated::CuratedInstallPolicy;
 use crate::hub::curated_signed_retain::{
@@ -117,17 +118,35 @@ impl BackgroundServiceManager {
 
     /// Start a curated background service. `entry_point` must resolve under `ext.directory`
     /// (relative path or already-normalized asset URL path segment). Requires `shell` permission.
+    ///
+    /// Equivalent to [`Self::start_with_signed`] with no Host-retained signed snapshot.
     pub async fn start(
         &self,
         user_id: &str,
         ext: &LoadedExtension,
         service: &ResolvedBackgroundService,
     ) -> Result<BackgroundServiceStatus, ExtensionError> {
+        self.start_with_signed(user_id, ext, service, None).await
+    }
+
+    /// Like [`Self::start`], with an optional Host-retained signature-checked snapshot.
+    ///
+    /// M9 E13 fail-closed gate: a path spawn cannot enforce `entryPointIntegrity`, so a
+    /// service that declares it (loaded manifest or signed snapshot) is refused before any
+    /// path resolution or spawn. Undeclared services keep the legacy path spawn (not "verified").
+    pub async fn start_with_signed(
+        &self,
+        user_id: &str,
+        ext: &LoadedExtension,
+        service: &ResolvedBackgroundService,
+        signed: Option<&SignatureCheckedManifest>,
+    ) -> Result<BackgroundServiceStatus, ExtensionError> {
         if service.extension_name != ext.manifest.name {
             return Err(ExtensionError::NotFound(service.id.clone()));
         }
         let perms = ext.manifest.permissions.clone().unwrap_or_default();
         ensure_shell_permission(&perms)?;
+        gate_background_service_start(&ext.manifest, service, signed).map_err(ExtensionError::from)?;
 
         let script = resolve_service_script(&ext.directory, &service.entry_point)?;
         if !script.exists() {

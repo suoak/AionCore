@@ -9,7 +9,7 @@
 //! start/execution, prove curation/owner/root or read entry-point files.
 //!
 //! Scoped to `contributes.backgroundServices` only (not panels / workPanelViews).
-//! Does not change HostRuntime service spawn paths.
+//! HostRuntime start only *refuses* declared integrity (see `background_service_start_gate`); it does not spawn from checked source.
 use super::entry_point_digest::EntryPointDigestBinding;
 use super::signed_manifest::SignatureCheckedManifest;
 use super::sri_format::is_canonical_sha512_sri;
