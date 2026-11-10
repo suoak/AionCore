@@ -44,8 +44,9 @@ pub const MAX_MANIFEST_FILES: usize = 1024;
 /// `avatar`) must also be a canonical path listed in `files`. Remote `http(s)` URLs are not
 /// package files. Theme `css_file` is also required (inlined at resolve, not asset-served, but
 /// read through the same retained-root verifier when bound+`files`). Paths that are not actually
-/// asset-served or verified today (webui directory/handlers, skills, i18n, hooks, manifest-level
-/// `icon`) are not forced into the list.
+/// asset-served or verified today (webui directory/handlers, skills, hooks, manifest-level `icon`)
+/// are not forced into the list. i18n `{directory}/{locale}.json` for every declared locale must
+/// also be listed (read through the retained root when bound).
 /// Declaration consistency only: it reads no file, proves no bytes, and an omitted list never
 /// means unlisted extras are verified.
 fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
@@ -103,6 +104,24 @@ fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), Extension
             return Err(ExtensionError::ManifestValidation(
                 "theme css_file is missing from the files list".into(),
             ));
+        }
+    }
+    // Slice L: i18n is read at query time as `{directory}/{locale}.json` for each declared locale.
+    // When `files` is declared every such path must be a canonical listed file, so a bound read
+    // can verify it. Declaring a locale without shipping+listing its file is refused.
+    if let Some(i18n) = manifest.i18n.as_ref() {
+        for locale in &i18n.locales {
+            let joined = crate::resolvers::i18n::locale_file_path(i18n, locale);
+            let canonical = canonical_relative_path(&joined).ok_or_else(|| {
+                ExtensionError::ManifestValidation(
+                    "i18n locale file must be a canonical relative path when files is declared".into(),
+                )
+            })?;
+            if !declared.contains_key(canonical.as_str()) {
+                return Err(ExtensionError::ManifestValidation(
+                    "i18n locale file is missing from the files list".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -191,7 +210,7 @@ fn contribution_file_entries(manifest: &ExtensionManifest) -> Vec<(&str, Option<
 
 /// Local (non-`http(s)`) paths that contribution resolvers turn into `/api/extensions/{name}/assets/…`
 /// URLs and that `serve_extension_asset` therefore serves. Remote URLs are skipped. This is only the
-/// set that is actually asset-served today; theme CSS, webui directories, skills, i18n and hooks are
+/// set that is actually asset-served today; webui directories, skills and hooks are
 /// not included (they are read or resolved some other way — see the slice J design note).
 fn push_local_served_asset<'a>(out: &mut Vec<&'a str>, value: Option<&'a str>) {
     let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
@@ -1631,6 +1650,57 @@ mod tests {
         let i = sri(b"x");
         let webui = json!({"webui": [{"id": "ui", "directory": "ui", "routes": [{"path": "/x", "method": "GET", "handler": "ui/h.js"}]}]});
         assert!(parse_manifest(&files_manifest(json!([{"path": "a.css", "integrity": i}]), webui)).is_ok());
+    }
+
+    fn i18n_manifest(files: serde_json::Value, i18n: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "name": "demo.plugin", "version": "1.0.0", "files": files, "i18n": i18n,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn i18n_locale_files_must_be_listed_when_files_is_declared() {
+        let i = sri(b"x");
+        let cfg = json!({"locales": ["en", "zh-CN"], "directory": "i18n"});
+        let both = json!([{"path": "i18n/en.json", "integrity": i}, {"path": "i18n/zh-CN.json", "integrity": i}]);
+        assert!(parse_manifest(&i18n_manifest(both, cfg.clone())).is_ok());
+        let one = json!([{"path": "i18n/en.json", "integrity": i}]);
+        assert!(is_validation_err(parse_manifest(&i18n_manifest(one, cfg.clone()))));
+        // Default directory + legacy localesDir spelling.
+        let legacy = json!({"locales": ["en"], "localesDir": "lang"});
+        let listed = json!([{"path": "lang/en.json", "integrity": i}]);
+        assert!(parse_manifest(&i18n_manifest(listed, legacy.clone())).is_ok());
+        let wrong = json!([{"path": "i18n/en.json", "integrity": i}]);
+        assert!(is_validation_err(parse_manifest(&i18n_manifest(wrong, legacy))));
+        let defaulted = json!({"locales": ["en"]});
+        let listed = json!([{"path": "i18n/en.json", "integrity": i}]);
+        assert!(parse_manifest(&i18n_manifest(listed, defaulted)).is_ok());
+    }
+
+    #[test]
+    fn i18n_non_canonical_locale_path_is_refused_when_files_is_declared() {
+        let i = sri(b"x");
+        for (locale, dir) in [("../x", "i18n"), ("en", "."), ("en", "./i18n"), ("a/../b", "i18n")] {
+            let cfg = json!({"locales": [locale], "directory": dir});
+            let list = json!([{"path": "i18n/en.json", "integrity": i}]);
+            assert!(
+                is_validation_err(parse_manifest(&i18n_manifest(list, cfg))),
+                "{locale} {dir}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_i18n_without_files_is_unchanged() {
+        for files in [None, Some(json!([]))] {
+            let mut raw = json!({"name": "demo.plugin", "version": "1.0.0",
+                "i18n": {"locales": ["en", "../odd"], "directory": "."}});
+            if let Some(f) = files {
+                raw["files"] = f;
+            }
+            assert!(parse_manifest(&serde_json::to_vec(&raw).unwrap()).is_ok());
+        }
     }
 
     #[test]

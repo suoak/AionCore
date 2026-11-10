@@ -15,7 +15,7 @@ use crate::loader::{ScanPath, resolve_scan_paths};
 use crate::registry_helpers::{
     build_state_map, load_and_validate, merge_persisted_states, run_deactivation_hooks, to_summary,
 };
-use crate::resolvers::{resolve_all_contributions_with_roots, resolve_i18n_for_all};
+use crate::resolvers::{resolve_all_contributions_with_roots, resolve_i18n_for_all_with_roots};
 use crate::signed_root_binding::SignedRootBindingStore;
 use crate::state::ExtensionStateStore;
 use crate::types::{
@@ -508,7 +508,11 @@ impl ExtensionRegistry {
         user_id: &str,
         locale: &str,
     ) -> HashMap<String, HashMap<String, String>> {
-        resolve_i18n_for_all(&self.extensions_for_user(user_id).await, locale)
+        resolve_i18n_for_all_with_roots(
+            &self.extensions_for_user(user_id).await,
+            locale,
+            self.signed_roots().as_deref(),
+        )
     }
 
     /// Whether the registry has been initialized.
