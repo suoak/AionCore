@@ -3,6 +3,7 @@ pub mod curated;
 pub mod curated_signed_retain;
 pub mod entry_point_digest;
 pub mod handler_digest;
+pub mod host_package_install;
 pub mod index_manager;
 pub mod installer;
 pub mod local_package_install;
@@ -26,6 +27,9 @@ pub use entry_point_digest::{
 };
 pub use handler_digest::{
     HandlerDigestBinding, HandlerDigestError, bind_handler_digest_from_signed, expected_handler_integrity,
+};
+pub use host_package_install::{
+    HostExtensionsParent, StagingSweepReport, install_local_signed_package_auto, sweep_abandoned_staging,
 };
 pub use index_manager::HubIndexManager;
 pub use installer::HubInstaller;
