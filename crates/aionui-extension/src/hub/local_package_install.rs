@@ -93,12 +93,14 @@ pub enum LocalPackageError {
     ManifestMismatch,
     IntegrityMismatch,
     InvalidDirName,
-    /// Host auto-install: that `{name}/{version}` directory already exists (no replace here).
-    AlreadyInstalled,
-    /// Host auto-install: the extension already has a live binding (no switch here).
-    AlreadyBound,
     /// Host auto-install: placing the finished staging directory failed.
     PlaceFailed,
+    /// Host auto-install: the version slot holds something that is not a real directory.
+    VersionSlotBlocked,
+    /// Host auto-install: an older version than the installed one, without `allow_downgrade`.
+    DowngradeRefused,
+    /// Host auto-install: the `current` marker could not be switched; the change was undone.
+    MarkerWriteFailed,
     ParentNotDirectory,
     RootCreateFailed,
     WriteFailed,
@@ -133,7 +135,7 @@ fn canonical_relative(name: &str) -> Option<String> {
 /// Allow-listed non-manifest files declared by the signed manifest: path -> expected SRI.
 ///
 /// Non-empty top-level `files` is the sole list; otherwise the legacy contribution-declared set.
-fn covered_files(checked: &SignatureCheckedManifest) -> Result<BTreeMap<String, String>, LocalPackageError> {
+pub(super) fn covered_files(checked: &SignatureCheckedManifest) -> Result<BTreeMap<String, String>, LocalPackageError> {
     let manifest = parse_manifest(checked.raw_bytes())
         .map_err(|_| LocalPackageError::Signature(SignedManifestError::InvalidManifest))?;
     let declared: Vec<(String, String)> = if manifest.files.is_empty() {

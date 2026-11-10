@@ -3,7 +3,10 @@ pub mod curated;
 pub mod curated_signed_retain;
 pub mod entry_point_digest;
 pub mod handler_digest;
+#[cfg(unix)]
+mod host_fs;
 pub mod host_package_install;
+pub mod host_package_restore;
 pub mod index_manager;
 pub mod installer;
 pub mod local_package_install;
@@ -29,8 +32,10 @@ pub use handler_digest::{
     HandlerDigestBinding, HandlerDigestError, bind_handler_digest_from_signed, expected_handler_integrity,
 };
 pub use host_package_install::{
-    HostExtensionsParent, StagingSweepReport, install_local_signed_package_auto, sweep_abandoned_staging,
+    AutoInstallOptions, AutoInstallReport, HostExtensionsParent, InstallKind, StagingSweepReport,
+    install_local_signed_package_auto, sweep_abandoned_staging,
 };
+pub use host_package_restore::{RestoreRejection, RestoreReport, restore_installed_extensions};
 pub use index_manager::HubIndexManager;
 pub use installer::HubInstaller;
 pub use local_package_install::{
