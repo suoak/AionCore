@@ -6,6 +6,8 @@ pub mod entry_point_digest;
 pub mod handler_digest;
 #[cfg(unix)]
 mod host_fs;
+#[cfg(windows)]
+mod host_fs_windows;
 pub mod host_package_install;
 pub mod host_package_restore;
 pub mod host_signed_install;
@@ -15,6 +17,7 @@ pub mod local_package_install;
 pub mod signed_manifest;
 pub mod sri_format;
 pub mod verified_asset;
+pub(crate) mod verified_reader;
 pub mod work_panel_view_entry_point_digest;
 
 pub use background_service_entry_point_digest::{

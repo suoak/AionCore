@@ -40,6 +40,16 @@ tempfile.workspace = true
 # only on Windows targets to avoid building it on Linux/macOS.
 [target.'cfg(windows)'.dependencies]
 junction = "1"
+# Handle-relative `NtCreateFile` for the Host verified reader (E13 W1). Already in the
+# lockfile at this version via aionui-app; MIT OR Apache-2.0.
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 # openat/mkdirat for the Host-owned local package install root (unix only).
 [target.'cfg(unix)'.dependencies]

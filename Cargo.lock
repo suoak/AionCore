@@ -747,6 +747,7 @@ dependencies = [
  "tower",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
