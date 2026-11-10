@@ -8,12 +8,26 @@
 //!
 //! # What the signature covers (and therefore what is extracted)
 //! `check_signed_manifest` signs the manifest bytes only. The only other bytes the signed
-//! manifest can vouch for are files whose expected SRI it declares: `entryPointIntegrity`
-//! (panels, workPanelViews, backgroundServices) and `handlerIntegrity` (agentTools). So the
-//! package is **strict allow-list**: the manifest (byte-identical to the signed bytes) plus
-//! those integrity-declared files (each SRI-verified). Any other file entry is
-//! `EntryNotCoveredBySignature`; a missing covered file is `CoveredFileMissing`. Packages that
-//! ship css/icons/etc. are therefore rejected until a signed file list exists.
+//! manifest can vouch for are files whose expected SRI it declares. The package is a
+//! **strict allow-list** of exactly one of two sets, chosen by the signed manifest itself:
+//!
+//! * **`files` declared (non-empty):** the manifest (byte-identical to the signed bytes) plus
+//!   **exactly** the paths in the top-level `files` list, each SRI-verified. Manifest validation
+//!   already guarantees every `entryPointIntegrity` / `handlerIntegrity` is also in `files` with
+//!   the same SRI, so `files` is the single authoring list (css/icons/assets ship this way).
+//! * **`files` omitted or empty (legacy):** the manifest plus only the files whose SRI the
+//!   contributions declare (`entryPointIntegrity` for panels / workPanelViews /
+//!   backgroundServices, `handlerIntegrity` for agentTools), exactly as before. Existing signed
+//!   packages keep installing; a package that wants other assets must declare them in `files`.
+//!
+//! Either way any other file entry is `EntryNotCoveredBySignature`, and a missing listed or
+//! declared file is `CoveredFileMissing`. There is never a union with "looks like an asset"
+//! extras and no fallback from one mode to the other.
+//!
+//! # Verification order
+//! Each allow-listed entry is read once (bounded) and its SRI checked against those exact bytes
+//! during whole-archive validation; only the verified bytes are written afterwards. A mismatch
+//! rejects before the root is created.
 //!
 //! # Fail-closed validation (before any filesystem effect)
 //! Non-canonical/absolute/`..`/backslash/NUL names, symlink or special-mode entries, duplicate
@@ -43,6 +57,9 @@ use crate::manifest::parse_manifest;
 use crate::signed_root_binding::{SignedRootBindingError, SignedRootBindingStore};
 
 /// Hard bounds applied before/while reading the archive.
+///
+/// Defaults (512 entries / 8 MiB per file / 32 MiB total) fit a typical css + icon package; they
+/// are still bounded, and the Host may pass tighter or looser values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalPackageLimits {
     pub max_entries: usize,
@@ -53,9 +70,9 @@ pub struct LocalPackageLimits {
 impl Default for LocalPackageLimits {
     fn default() -> Self {
         Self {
-            max_entries: 256,
-            max_file_bytes: 4 * 1024 * 1024,
-            max_total_bytes: 16 * 1024 * 1024,
+            max_entries: 512,
+            max_file_bytes: 8 * 1024 * 1024,
+            max_total_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -107,10 +124,47 @@ fn canonical_relative(name: &str) -> Option<String> {
     canonical_relative_path(name)
 }
 
-/// Integrity-covered files declared by the signed manifest: path -> expected SRI.
+/// Allow-listed non-manifest files declared by the signed manifest: path -> expected SRI.
+///
+/// Non-empty top-level `files` is the sole list; otherwise the legacy contribution-declared set.
 fn covered_files(checked: &SignatureCheckedManifest) -> Result<BTreeMap<String, String>, LocalPackageError> {
     let manifest = parse_manifest(checked.raw_bytes())
         .map_err(|_| LocalPackageError::Signature(SignedManifestError::InvalidManifest))?;
+    let declared: Vec<(String, String)> = if manifest.files.is_empty() {
+        legacy_contribution_declarations(&manifest)
+    } else {
+        manifest
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.integrity.clone()))
+            .collect()
+    };
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (path, sri) in declared {
+        let rel = canonical_relative(&path).ok_or(LocalPackageError::InvalidCoveredPath)?;
+        if rel == EXTENSION_MANIFEST_FILE {
+            return Err(LocalPackageError::InvalidCoveredPath);
+        }
+        match out.get(&rel) {
+            Some(existing) if *existing != sri => return Err(LocalPackageError::ConflictingCoveredDigest),
+            _ => {
+                out.insert(rel, sri);
+            }
+        }
+    }
+    // No covered path may be a directory prefix of another covered path (file vs dir clash).
+    for a in out.keys() {
+        for b in out.keys() {
+            if a != b && b.starts_with(&format!("{a}/")) {
+                return Err(LocalPackageError::InvalidCoveredPath);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Legacy (no `files`) coverage: `(path, SRI)` for each contribution integrity declaration.
+fn legacy_contribution_declarations(manifest: &crate::types::ExtensionManifest) -> Vec<(String, String)> {
     let mut declared: Vec<(String, String)> = Vec::new();
     if let Some(c) = manifest.contributes.as_ref() {
         for p in &c.panels {
@@ -135,28 +189,7 @@ fn covered_files(checked: &SignatureCheckedManifest) -> Result<BTreeMap<String, 
             }
         }
     }
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for (path, sri) in declared {
-        let rel = canonical_relative(&path).ok_or(LocalPackageError::InvalidCoveredPath)?;
-        if rel == EXTENSION_MANIFEST_FILE {
-            return Err(LocalPackageError::InvalidCoveredPath);
-        }
-        match out.get(&rel) {
-            Some(existing) if *existing != sri => return Err(LocalPackageError::ConflictingCoveredDigest),
-            _ => {
-                out.insert(rel, sri);
-            }
-        }
-    }
-    // No covered path may be a directory prefix of another covered path (file vs dir clash).
-    for a in out.keys() {
-        for b in out.keys() {
-            if a != b && b.starts_with(&format!("{a}/")) {
-                return Err(LocalPackageError::InvalidCoveredPath);
-            }
-        }
-    }
-    Ok(out)
+    declared
 }
 
 fn validate_package(
@@ -740,5 +773,306 @@ mod tests {
             Err(LocalPackageError::InvalidCoveredPath)
         );
         assert_nothing_created(&env);
+    }
+
+    // -- slice B: top-level `files` is the install allow-list --
+
+    const CSS: &[u8] = b"p{color:red}";
+    const ICON: &[u8] = b"<svg/>";
+
+    /// Manifest listing panel + handler (contribution-declared, so they MUST be in `files`) + css + icon.
+    fn files_manifest_json(extra: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut list = vec![
+            ("panels/board.html", PANEL),
+            ("tools/run.js", HANDLER),
+            ("panels/board.css", CSS),
+            ("icons/logo.svg", ICON),
+        ];
+        list.extend_from_slice(extra);
+        let files: Vec<String> = list
+            .iter()
+            .map(|(p, b)| format!(r#"{{"path":"{p}","integrity":"{}"}}"#, sri_sha512(b)))
+            .collect();
+        format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{}],"contributes":{{"panels":[{{"id":"p","title":"P","entryPoint":"panels/board.html","entryPointIntegrity":"{}"}}],"agentTools":[{{"id":"t","name":"T","planSafeActions":true,"handler":"tools/run.js","handlerIntegrity":"{}"}}]}}}}"#,
+            files.join(","),
+            sri_sha512(PANEL),
+            sri_sha512(HANDLER)
+        )
+        .into_bytes()
+    }
+
+    fn files_entries(raw: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("aion-extension.json", raw.to_vec()),
+            ("panels/board.html", PANEL.to_vec()),
+            ("tools/run.js", HANDLER.to_vec()),
+            ("panels/board.css", CSS.to_vec()),
+            ("icons/logo.svg", ICON.to_vec()),
+        ]
+    }
+
+    #[test]
+    fn files_list_installs_css_and_icons_with_verified_bytes() {
+        let env = env();
+        let f = fixture(files_manifest_json(&[]));
+        let zip = zip_owned(&files_entries(&f.raw));
+        let out = run(&env, &f, &zip, "demo-files", LocalPackageLimits::default()).unwrap();
+        assert_eq!(out.files_written, 5);
+        let root = env.parent_path.join("demo-files");
+        assert_eq!(std::fs::read(root.join("panels/board.css")).unwrap(), CSS);
+        assert_eq!(std::fs::read(root.join("icons/logo.svg")).unwrap(), ICON);
+        assert_eq!(std::fs::read(root.join("panels/board.html")).unwrap(), PANEL);
+        assert!(env.store.lookup_clone("demo.plugin").is_some());
+    }
+
+    #[test]
+    fn files_list_rejects_unlisted_extra_file() {
+        let env = env();
+        let f = fixture(files_manifest_json(&[]));
+        let mut entries = files_entries(&f.raw);
+        entries.push(("panels/extra.css", b"x{}".to_vec()));
+        assert_eq!(
+            run(&env, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::EntryNotCoveredBySignature)
+        );
+        assert_nothing_created(&env);
+    }
+
+    #[test]
+    fn files_list_rejects_missing_listed_file_even_if_not_contribution_declared() {
+        let env = env();
+        let f = fixture(files_manifest_json(&[]));
+        for missing in [
+            "panels/board.css",
+            "icons/logo.svg",
+            "panels/board.html",
+            "tools/run.js",
+        ] {
+            let entries: Vec<_> = files_entries(&f.raw)
+                .into_iter()
+                .filter(|(n, _)| *n != missing)
+                .collect();
+            assert_eq!(
+                run(&env, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+                Err(LocalPackageError::CoveredFileMissing),
+                "{missing}"
+            );
+        }
+        assert_nothing_created(&env);
+    }
+
+    #[test]
+    fn files_list_rejects_tampered_bytes_for_every_listed_file() {
+        let env = env();
+        let f = fixture(files_manifest_json(&[]));
+        for i in 1..5 {
+            let mut entries = files_entries(&f.raw);
+            entries[i].1 = b"tampered".to_vec();
+            assert_eq!(
+                run(&env, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+                Err(LocalPackageError::IntegrityMismatch),
+                "entry {i}"
+            );
+        }
+        assert_nothing_created(&env);
+    }
+
+    #[test]
+    fn files_list_manifest_must_still_equal_signed_bytes_and_be_present() {
+        let env = env();
+        let f = fixture(files_manifest_json(&[]));
+        let mut entries = files_entries(&f.raw);
+        entries[0].1 = [f.raw.as_slice(), b" "].concat();
+        assert_eq!(
+            run(&env, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::ManifestMismatch)
+        );
+        let entries: Vec<_> = files_entries(&f.raw).into_iter().skip(1).collect();
+        assert_eq!(
+            run(&env, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::ManifestMismatch)
+        );
+        assert_nothing_created(&env);
+    }
+
+    #[test]
+    fn files_list_keeps_path_safety_symlink_and_case_fold_rules() {
+        let env = env();
+        let f = fixture(files_manifest_json(&[]));
+        for bad in ["../evil.js", "/abs.js", "a\\b.js", "./panels/board.css", "panels//x"] {
+            let mut entries = files_entries(&f.raw);
+            entries.push((bad, b"x".to_vec()));
+            assert_eq!(
+                run(&env, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+                Err(LocalPackageError::UnsafeEntryName),
+                "{bad}"
+            );
+        }
+        let mut entries = files_entries(&f.raw);
+        entries.push(("Panels/Board.CSS", CSS.to_vec()));
+        assert_eq!(
+            run(&env, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::DuplicateEntry)
+        );
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        w.start_file("aion-extension.json", SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(&f.raw).unwrap();
+        w.add_symlink("panels/board.css", "/etc/passwd", SimpleFileOptions::default())
+            .unwrap();
+        let zip = w.finish().unwrap().into_inner();
+        assert_eq!(
+            run(&env, &f, &zip, "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::SymlinkOrSpecialEntry)
+        );
+        assert_nothing_created(&env);
+    }
+
+    #[test]
+    fn files_list_may_not_list_the_manifest_itself() {
+        let env = env();
+        let raw = format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{{"path":"aion-extension.json","integrity":"{}"}}]}}"#,
+            sri_sha512(b"x")
+        )
+        .into_bytes();
+        let f = fixture(raw);
+        let zip = zip_owned(&[("aion-extension.json", f.raw.clone())]);
+        assert_eq!(
+            run(&env, &f, &zip, "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::Signature(SignedManifestError::InvalidManifest))
+        );
+        assert_nothing_created(&env);
+    }
+
+    #[test]
+    fn files_list_only_manifest_package_has_no_other_files() {
+        // `files` present but only listing one asset: contribution-less manifest, exactly that asset.
+        let env = env();
+        let raw = format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{{"path":"a.css","integrity":"{}"}}]}}"#,
+            sri_sha512(CSS)
+        )
+        .into_bytes();
+        let f = fixture(raw);
+        let ok = zip_owned(&[("aion-extension.json", f.raw.clone()), ("a.css", CSS.to_vec())]);
+        assert_eq!(
+            run(&env, &f, &ok, "d", LocalPackageLimits::default())
+                .unwrap()
+                .files_written,
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_without_files_keeps_contribution_only_coverage() {
+        // Same as the pre-slice-B behaviour: declared files install; css is still refused.
+        let env = env();
+        let f = fixture(manifest_json());
+        let zip = zip_owned(&good_entries(&f.raw));
+        assert_eq!(
+            run(&env, &f, &zip, "legacy", LocalPackageLimits::default())
+                .unwrap()
+                .files_written,
+            3
+        );
+        let env2 = self::env();
+        let mut entries = good_entries(&f.raw);
+        entries.push(("panels/board.css", CSS.to_vec()));
+        assert_eq!(
+            run(&env2, &f, &zip_owned(&entries), "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::EntryNotCoveredBySignature)
+        );
+        assert_nothing_created(&env2);
+    }
+
+    #[test]
+    fn empty_files_array_is_legacy_not_a_license_for_extras() {
+        let env = env();
+        let raw = format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[],"contributes":{{"panels":[{{"id":"p","title":"P","entryPoint":"panels/board.html","entryPointIntegrity":"{}"}}]}}}}"#,
+            sri_sha512(PANEL)
+        )
+        .into_bytes();
+        let f = fixture(raw);
+        let ok = zip_owned(&[
+            ("aion-extension.json", f.raw.clone()),
+            ("panels/board.html", PANEL.to_vec()),
+        ]);
+        assert_eq!(
+            run(&env, &f, &ok, "d", LocalPackageLimits::default())
+                .unwrap()
+                .files_written,
+            2
+        );
+        let env2 = self::env();
+        let extra = zip_owned(&[
+            ("aion-extension.json", f.raw.clone()),
+            ("panels/board.html", PANEL.to_vec()),
+            ("x.css", CSS.to_vec()),
+        ]);
+        assert_eq!(
+            run(&env2, &f, &extra, "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::EntryNotCoveredBySignature)
+        );
+        assert_nothing_created(&env2);
+    }
+
+    #[test]
+    fn default_limits_are_the_modest_bump_and_still_bounded() {
+        let d = LocalPackageLimits::default();
+        assert_eq!(
+            (d.max_entries, d.max_file_bytes, d.max_total_bytes),
+            (512, 8 << 20, 32 << 20)
+        );
+    }
+
+    #[test]
+    fn typical_asset_package_fits_default_limits_but_over_budget_is_refused() {
+        // 300 small assets (> old 256 entry cap) and a 5 MiB asset (> old 4 MiB per-file cap).
+        let big = vec![7u8; 5 * 1024 * 1024];
+        let small: Vec<(String, Vec<u8>)> = (0..300)
+            .map(|i| (format!("assets/{i}.txt"), vec![i as u8; 8]))
+            .collect();
+        let mut listed: Vec<(String, Vec<u8>)> = small.clone();
+        listed.push(("assets/big.bin".into(), big.clone()));
+        let files: Vec<String> = listed
+            .iter()
+            .map(|(p, b)| format!(r#"{{"path":"{p}","integrity":"{}"}}"#, sri_sha512(b)))
+            .collect();
+        let raw = format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{}]}}"#,
+            files.join(",")
+        )
+        .into_bytes();
+        let f = fixture(raw);
+        let mut entries: Vec<(&str, Vec<u8>)> = vec![("aion-extension.json", f.raw.clone())];
+        entries.extend(listed.iter().map(|(p, b)| (p.as_str(), b.clone())));
+        let zip = zip_owned(&entries);
+        let env = env();
+        assert_eq!(
+            run(&env, &f, &zip, "big", LocalPackageLimits::default())
+                .unwrap()
+                .files_written,
+            302
+        );
+        // The same package under the previous defaults is refused before any effect.
+        let old = LocalPackageLimits {
+            max_entries: 256,
+            max_file_bytes: 4 * 1024 * 1024,
+            max_total_bytes: 16 * 1024 * 1024,
+        };
+        let env2 = self::env();
+        assert_eq!(run(&env2, &f, &zip, "d", old), Err(LocalPackageError::LimitExceeded));
+        assert_nothing_created(&env2);
+        // Over the new per-file bound is refused too.
+        let huge = LocalPackageLimits {
+            max_file_bytes: 1024,
+            ..LocalPackageLimits::default()
+        };
+        let env3 = self::env();
+        assert_eq!(run(&env3, &f, &zip, "d", huge), Err(LocalPackageError::LimitExceeded));
+        assert_nothing_created(&env3);
     }
 }
