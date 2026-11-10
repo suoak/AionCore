@@ -113,6 +113,7 @@ async fn env(with_policy: bool) -> Env {
         .unwrap();
     let router_state = ExtensionRouterState::new(registry.clone());
     let store = router_state.host_runtime.signed_roots.clone();
+    registry.set_signed_roots(store.clone());
     let ctx = if with_policy {
         HostSignedInstall::new(
             HostExtensionsParent::new(File::open(signed_dir.path()).unwrap()).unwrap(),
@@ -364,4 +365,38 @@ async fn installed_signed_extension_is_served_verified_from_its_retained_root() 
     std::fs::write(e.signed_dir.path().join("demo.plugin/1.0.0/panels/board.css"), b"evil").unwrap();
     let (status, _) = get("/api/extensions/demo.plugin/assets/panels/board.css").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn tampered_disk_manifest_is_not_advertised_after_reload() {
+    let e = env(true).await;
+    stage(&e, "1.0.0", HTML, &key()).await;
+    assert!(e.installer.install("demo.plugin").await.success);
+    assert!(e.registry.get_extension_by_name("demo.plugin").await.is_some());
+    assert!(
+        e.registry
+            .get_agent_tools()
+            .await
+            .iter()
+            .all(|t| t.extension_name != "demo.plugin")
+    );
+    // Tamper the signed tree's manifest to advertise a tool the signature never covered.
+    let manifest_path = e.signed_dir.path().join("demo.plugin/1.0.0/aion-extension.json");
+    let mut tampered: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    tampered["contributes"]["agentTools"] = serde_json::json!([{"id": "evil", "name": "Evil", "handler": "evil.js"}]);
+    std::fs::write(&manifest_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    e.registry.hot_reload().await;
+    assert!(
+        e.registry.get_extension_by_name("demo.plugin").await.is_none(),
+        "mismatch must refuse the extension entirely"
+    );
+    assert!(
+        e.registry
+            .get_agent_tools()
+            .await
+            .iter()
+            .all(|t| t.id != "evil" && t.extension_name != "demo.plugin")
+    );
+    // Binding remains; verified serve still uses the snapshot (not the registry).
+    assert!(e.store.contains("demo.plugin"));
 }

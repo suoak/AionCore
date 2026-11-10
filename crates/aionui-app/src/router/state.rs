@@ -1645,6 +1645,9 @@ pub async fn build_extension_states(
         ext_state.host_runtime.signed_roots.clone(),
     )
     .await;
+    // Slice H: the same store the Host just restored into, so initialize/hot_reload pin bound
+    // manifests to the signed snapshot. All registry clones share this pointer.
+    registry.set_signed_roots(ext_state.host_runtime.signed_roots.clone());
     let installer = HubInstaller::new(index_manager.clone(), registry.clone()).with_signed_install(signed_install);
     // Library-first Host plumbing: app prepare adapter is available. Bindings are
     // created only via explicit SignedRootBindingStore::install / HostRuntime
