@@ -272,6 +272,41 @@ mod tests {
         assert!(gate.is_empty());
     }
 
+    fn files_only_panel_json() -> String {
+        format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{{"path":"panels/board.html","integrity":"{}"}}],"contributes":{{"panels":[{{"id":"p","title":"P","entryPoint":"panels/board.html"}}]}}}}"#,
+            sri()
+        )
+    }
+
+    #[test]
+    fn integrity_inherited_from_files_gates_exactly_like_declared() {
+        let inherited = parse_manifest(files_only_panel_json().as_bytes()).unwrap();
+        let declared = manifest(&declared_panel());
+        let a = AssetIntegrityGate::new(&inherited, None).unwrap();
+        let b = AssetIntegrityGate::new(&declared, None).unwrap();
+        assert!(!a.is_empty());
+        for p in ["panels/board.html", "panels/board.css", "icon.svg", "other.html"] {
+            assert_eq!(a.check_requested(Path::new(p)), b.check_requested(Path::new(p)), "{p}");
+        }
+        assert_eq!(
+            a.check_requested(Path::new("panels/board.html")),
+            Err(AssetServeGateError::DeclaredIntegrityCannotBeChecked)
+        );
+    }
+
+    #[test]
+    fn files_only_signed_snapshot_refuses_even_if_loaded_manifest_stripped() {
+        let snapshot = checked(files_only_panel_json().as_bytes());
+        let stripped = manifest(r#"{"panels":[{"id":"p","title":"P","entryPoint":"panels/board.html"}]}"#);
+        let gate = AssetIntegrityGate::new(&stripped, Some(&snapshot)).unwrap();
+        assert_eq!(
+            gate.check_requested(Path::new("panels/board.html")),
+            Err(AssetServeGateError::SignedIntegrityCannotBeChecked)
+        );
+        assert_eq!(gate.check_requested(Path::new("other.html")), Ok(()));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn canonical_check_catches_symlink_alias_of_declared_entry() {

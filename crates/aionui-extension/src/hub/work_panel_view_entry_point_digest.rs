@@ -315,4 +315,46 @@ mod tests {
             Err(EntryPointDigestError::PanelNotFound)
         );
     }
+
+    #[test]
+    fn integrity_inherited_from_files_binds_exactly_like_declared() {
+        let sri = sri_sha512(b"inherit body");
+        let head = r#"{"name":"demo.plugin","version":"1.0.0""#;
+        let files_only = format!(
+            r#"{head},"files":[{{"path":"views/side.html","integrity":"{sri}"}}],"contributes":{{"workPanelViews":[{{"id":"side","title":"Side","entryPoint":"views/side.html"}}]}}}}"#
+        );
+        let declared = format!(
+            r#"{head},"contributes":{{"workPanelViews":[{{"id":"side","title":"Side","entryPoint":"views/side.html","entryPointIntegrity":"{sri}"}}]}}}}"#
+        );
+        let a = parse_manifest(files_only.as_bytes()).unwrap();
+        let b = parse_manifest(declared.as_bytes()).unwrap();
+        let ba = expected_work_panel_view_entry_point_integrity(&a, "side").unwrap();
+        let bb = expected_work_panel_view_entry_point_integrity(&b, "side").unwrap();
+        assert_eq!(ba.entry_point(), bb.entry_point());
+        assert_eq!(ba.integrity(), bb.integrity());
+        assert_eq!(ba.integrity(), sri);
+        // The signed-snapshot binder re-parses the same bytes and yields the same binding.
+        let sa = bind_work_panel_view_entry_point_digest_from_signed(&checked(files_only.as_bytes()), "side").unwrap();
+        assert_eq!(sa.integrity(), sri);
+        assert_eq!(sa.entry_point(), "views/side.html");
+        // An entry that is not listed in `files` is refused at parse: no binder can ever see it.
+        let unlisted = files_only.replace(r#""path":"views/side.html""#, r#""path":"other.bin""#);
+        assert!(parse_manifest(unlisted.as_bytes()).is_err());
+        // ...and the signing check itself refuses such a snapshot, so no signed binding can exist.
+        let (integrity, signature) = sign(unlisted.as_bytes(), "demo.plugin", "1.0.0");
+        assert!(
+            check_signed_manifest(
+                &policy(),
+                &SignedManifestEntry {
+                    name: "demo.plugin",
+                    version: "1.0.0",
+                    pubkey_id: Some("fixture"),
+                    integrity: Some(&integrity),
+                    signature: Some(&signature),
+                },
+                unlisted.as_bytes(),
+            )
+            .is_err()
+        );
+    }
 }

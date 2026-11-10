@@ -834,6 +834,64 @@ mod tests {
         assert!(env.store.lookup_clone("demo.plugin").is_some());
     }
 
+    /// Declare-once authoring: same package, but the panel / tool carry **no** per-entry integrity.
+    fn files_only_manifest_json() -> Vec<u8> {
+        let files = [
+            ("panels/board.html", PANEL),
+            ("tools/run.js", HANDLER),
+            ("panels/board.css", CSS),
+        ]
+        .iter()
+        .map(|(p, b)| format!(r#"{{"path":"{p}","integrity":"{}"}}"#, sri_sha512(b)))
+        .collect::<Vec<_>>()
+        .join(",");
+        format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","files":[{files}],"contributes":{{"panels":[{{"id":"p","title":"P","entryPoint":"panels/board.html"}}],"agentTools":[{{"id":"t","name":"T","planSafeActions":true,"handler":"tools/run.js"}}]}}}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn files_only_manifest_installs_and_inherited_entries_are_byte_verified() {
+        let env1 = env();
+        let f = fixture(files_only_manifest_json());
+        let entries = |raw: &[u8]| {
+            vec![
+                ("aion-extension.json", raw.to_vec()),
+                ("panels/board.html", PANEL.to_vec()),
+                ("tools/run.js", HANDLER.to_vec()),
+                ("panels/board.css", CSS.to_vec()),
+            ]
+        };
+        let out = run(
+            &env1,
+            &f,
+            &zip_owned(&entries(&f.raw)),
+            "d",
+            LocalPackageLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(out.files_written, 4);
+        // The retained signed snapshot binds inherited integrity for panel and tool handler.
+        let (snapshot, _root) = env1.store.lookup_clone("demo.plugin").unwrap();
+        let panel = crate::hub::bind_entry_point_digest_from_signed(&snapshot, "p").unwrap();
+        assert_eq!(panel.integrity(), sri_sha512(PANEL));
+        let tool = crate::hub::bind_handler_digest_from_signed(&snapshot, "t").unwrap();
+        assert_eq!(tool.integrity(), sri_sha512(HANDLER));
+        // Tampered inherited entry bytes are refused exactly like declared ones.
+        for i in [1, 2] {
+            let env2 = env();
+            let mut e = entries(&f.raw);
+            e[i].1 = b"tampered".to_vec();
+            assert_eq!(
+                run(&env2, &f, &zip_owned(&e), "d", LocalPackageLimits::default()),
+                Err(LocalPackageError::IntegrityMismatch),
+                "entry {i}"
+            );
+            assert_nothing_created(&env2);
+        }
+    }
+
     #[test]
     fn files_list_rejects_unlisted_extra_file() {
         let env = env();
