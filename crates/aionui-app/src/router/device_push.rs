@@ -179,9 +179,11 @@ mod tests {
 
     const USER: &str = "system_default_user";
 
+    type RecordedSend = (String, String, String, Option<String>);
+
     #[derive(Default)]
     struct RecordingSender {
-        sends: Mutex<Vec<(String, String, String, Option<String>)>>,
+        sends: Mutex<Vec<RecordedSend>>,
     }
 
     #[async_trait]

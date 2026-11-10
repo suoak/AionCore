@@ -1763,6 +1763,97 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
     }
 }
 
+/// Delivers review batches as ordinary user input through the conversation
+/// input queue (same path as the send box's followup / mid-turn steer).
+struct ReviewConversationInputs {
+    conversations: ConversationService,
+}
+
+fn review_input_error(error: aionui_conversation::ConversationError) -> aionui_review::ReviewInputError {
+    use aionui_conversation::ConversationError as E;
+    match error {
+        E::NotFound { .. } | E::NotFoundReason { .. } => aionui_review::ReviewInputError::NotFound,
+        E::CapabilityUnsupported { .. } => aionui_review::ReviewInputError::Unsupported,
+        other => aionui_review::ReviewInputError::Rejected(other.to_string()),
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_review::ReviewInputSink for ReviewConversationInputs {
+    async fn steer_available(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, aionui_review::ReviewInputError> {
+        let capabilities = self
+            .conversations
+            .conversation_capabilities(user_id, conversation_id)
+            .await
+            .map_err(review_input_error)?;
+        if !capabilities.steer {
+            return Ok(false);
+        }
+        Ok(self
+            .conversations
+            .runtime_summary_for(conversation_id)
+            .await
+            .is_processing)
+    }
+
+    async fn submit(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        mode: aionui_review::ReviewDeliveryMode,
+        content: &str,
+        client_key: &str,
+    ) -> Result<aionui_review::ReviewInputAccepted, aionui_review::ReviewInputError> {
+        let mode = match mode {
+            aionui_review::ReviewDeliveryMode::Steer => aionui_api_types::ConversationInputMode::Steer,
+            aionui_review::ReviewDeliveryMode::Followup => aionui_api_types::ConversationInputMode::Followup,
+        };
+        let receipt = self
+            .conversations
+            .submit_input(
+                user_id,
+                conversation_id,
+                aionui_api_types::SubmitConversationInputRequest {
+                    mode,
+                    content: content.to_owned(),
+                    files: Vec::new(),
+                    inject_skills: Vec::new(),
+                    hidden: false,
+                    client_key: client_key.to_owned(),
+                },
+            )
+            .await
+            .map_err(review_input_error)?;
+        Ok(aionui_review::ReviewInputAccepted {
+            input_id: receipt.input.input_id.clone(),
+            receipt: serde_json::to_value(&receipt)
+                .map_err(|error| aionui_review::ReviewInputError::Rejected(error.to_string()))?,
+        })
+    }
+}
+
+/// Resolves review `pe:` scopes through the caller's own project entries.
+struct ReviewProjectDirs {
+    projects: aionui_project::ProjectService,
+}
+
+#[async_trait::async_trait]
+impl aionui_review::ProjectDirResolver for ReviewProjectDirs {
+    async fn resolve_dir(&self, user_id: &str, pe_id: &str, relative_path: &str) -> Option<std::path::PathBuf> {
+        let input = aionui_project::types::ReferenceInput {
+            pe_id: pe_id.to_owned(),
+            relative_path: relative_path.to_owned(),
+            op: aionui_project::types::FileOp::Browse,
+        };
+        let resolved = self.projects.resolve_reference(user_id, input).await.ok()?;
+        resolved.absolute_path.map(std::path::PathBuf::from)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2237,96 +2328,5 @@ mod tests {
         assert_eq!(loaded[0].name, "demo-ext");
 
         services.database.close().await;
-    }
-}
-
-/// Delivers review batches as ordinary user input through the conversation
-/// input queue (same path as the send box's followup / mid-turn steer).
-struct ReviewConversationInputs {
-    conversations: ConversationService,
-}
-
-fn review_input_error(error: aionui_conversation::ConversationError) -> aionui_review::ReviewInputError {
-    use aionui_conversation::ConversationError as E;
-    match error {
-        E::NotFound { .. } | E::NotFoundReason { .. } => aionui_review::ReviewInputError::NotFound,
-        E::CapabilityUnsupported { .. } => aionui_review::ReviewInputError::Unsupported,
-        other => aionui_review::ReviewInputError::Rejected(other.to_string()),
-    }
-}
-
-#[async_trait::async_trait]
-impl aionui_review::ReviewInputSink for ReviewConversationInputs {
-    async fn steer_available(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-    ) -> Result<bool, aionui_review::ReviewInputError> {
-        let capabilities = self
-            .conversations
-            .conversation_capabilities(user_id, conversation_id)
-            .await
-            .map_err(review_input_error)?;
-        if !capabilities.steer {
-            return Ok(false);
-        }
-        Ok(self
-            .conversations
-            .runtime_summary_for(conversation_id)
-            .await
-            .is_processing)
-    }
-
-    async fn submit(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        mode: aionui_review::ReviewDeliveryMode,
-        content: &str,
-        client_key: &str,
-    ) -> Result<aionui_review::ReviewInputAccepted, aionui_review::ReviewInputError> {
-        let mode = match mode {
-            aionui_review::ReviewDeliveryMode::Steer => aionui_api_types::ConversationInputMode::Steer,
-            aionui_review::ReviewDeliveryMode::Followup => aionui_api_types::ConversationInputMode::Followup,
-        };
-        let receipt = self
-            .conversations
-            .submit_input(
-                user_id,
-                conversation_id,
-                aionui_api_types::SubmitConversationInputRequest {
-                    mode,
-                    content: content.to_owned(),
-                    files: Vec::new(),
-                    inject_skills: Vec::new(),
-                    hidden: false,
-                    client_key: client_key.to_owned(),
-                },
-            )
-            .await
-            .map_err(review_input_error)?;
-        Ok(aionui_review::ReviewInputAccepted {
-            input_id: receipt.input.input_id.clone(),
-            receipt: serde_json::to_value(&receipt)
-                .map_err(|error| aionui_review::ReviewInputError::Rejected(error.to_string()))?,
-        })
-    }
-}
-
-/// Resolves review `pe:` scopes through the caller's own project entries.
-struct ReviewProjectDirs {
-    projects: aionui_project::ProjectService,
-}
-
-#[async_trait::async_trait]
-impl aionui_review::ProjectDirResolver for ReviewProjectDirs {
-    async fn resolve_dir(&self, user_id: &str, pe_id: &str, relative_path: &str) -> Option<std::path::PathBuf> {
-        let input = aionui_project::types::ReferenceInput {
-            pe_id: pe_id.to_owned(),
-            relative_path: relative_path.to_owned(),
-            op: aionui_project::types::FileOp::Browse,
-        };
-        let resolved = self.projects.resolve_reference(user_id, input).await.ok()?;
-        resolved.absolute_path.map(std::path::PathBuf::from)
     }
 }
