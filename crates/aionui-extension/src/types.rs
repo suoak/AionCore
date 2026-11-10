@@ -373,6 +373,66 @@ pub struct ExtBackgroundService {
     pub entry_point_integrity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// How the Host may run this service when it is bound to a signed root (M9 E13 S1).
+    ///
+    /// Only [`ServiceRuntime::WorkmateJs`] is ever startable; `node` / `shell` / `native` are
+    /// reserved values that parse but are refused permanently. An unknown value is a parse error
+    /// (never silently treated as "undeclared"). A declared runtime never takes the legacy path
+    /// spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ServiceRuntime>,
+    /// Tick interval in seconds for a periodic `workmate-js` service; the Host clamps it to
+    /// `[10, 86400]` (default 60). Requires `runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "intervalSeconds")]
+    pub interval_seconds: Option<u64>,
+    /// Capability kinds this service intends to use (default none = pure compute). Requires
+    /// `runtime`. Capabilities themselves arrive in later slices; until then a service that lists
+    /// any kind is refused (`bound_service_capabilities_unavailable`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<ServiceCapabilityKind>,
+}
+
+/// Interpreter a background service declares (see [`ExtBackgroundService::runtime`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ServiceRuntime {
+    /// The Host's embedded, restricted QuickJS runner. The only startable runtime.
+    #[serde(rename = "workmate-js")]
+    WorkmateJs,
+    /// Reserved; permanently refused for bound services (deferred).
+    #[serde(rename = "node")]
+    Node,
+    /// Reserved; permanently refused.
+    #[serde(rename = "shell")]
+    Shell,
+    /// Reserved; permanently refused.
+    #[serde(rename = "native")]
+    Native,
+}
+
+/// Capability kinds a service may declare it uses (names only in this slice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceCapabilityKind {
+    Network,
+    Files,
+    Events,
+    Storage,
+    Secrets,
+}
+
+/// Default tick interval of a periodic service, in seconds.
+pub const SERVICE_DEFAULT_INTERVAL_SECONDS: u64 = 60;
+/// Lower / upper clamp of the tick interval, in seconds.
+pub const SERVICE_MIN_INTERVAL_SECONDS: u64 = 10;
+pub const SERVICE_MAX_INTERVAL_SECONDS: u64 = 86_400;
+
+impl ExtBackgroundService {
+    /// Declared interval clamped to `[10, 86400]`; 60 when undeclared.
+    pub fn effective_interval_seconds(&self) -> u64 {
+        self.interval_seconds
+            .unwrap_or(SERVICE_DEFAULT_INTERVAL_SECONDS)
+            .clamp(SERVICE_MIN_INTERVAL_SECONDS, SERVICE_MAX_INTERVAL_SECONDS)
+    }
 }
 
 /// All contributions declared by an extension.

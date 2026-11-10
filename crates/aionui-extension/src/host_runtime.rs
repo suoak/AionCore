@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::background_service_start_gate::gate_background_service_start;
-use crate::bound_background_start::{refuse_verified_without_fd_exec, verify_bound_files_service};
+use crate::bound_background_start::{declares_runtime, refuse_ready_without_runner, verify_bound_files_service};
 use crate::error::ExtensionError;
 use crate::hub::curated::CuratedInstallPolicy;
 use crate::hub::curated_signed_retain::{
@@ -152,7 +152,7 @@ impl BackgroundServiceManager {
     ///
     /// Bound+`files` (a snapshot that declares `files`): the entry is verified through the
     /// retained root (never `LoadedExtension.directory`). This slice then refuses to spawn
-    /// (`bound_service_fd_exec_unavailable`); it never falls back to a path exec. A snapshot
+    /// (`bound_service_runner_unavailable`, until a runner exists); it never falls back to a path exec. A snapshot
     /// with `files` but no root is also refused.
     ///
     /// Otherwise the existing start gate applies: a declared `entryPointIntegrity` (loaded
@@ -169,9 +169,6 @@ impl BackgroundServiceManager {
         if service.extension_name != ext.manifest.name {
             return Err(ExtensionError::NotFound(service.id.clone()));
         }
-        let perms = ext.manifest.permissions.clone().unwrap_or_default();
-        ensure_shell_permission(&perms)?;
-
         if let Some(checked) = signed {
             let checked = checked.clone();
             let root = match root {
@@ -182,7 +179,7 @@ impl BackgroundServiceManager {
             };
             let service = service.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                verify_bound_files_service(&checked, root.as_ref(), &service).and_then(refuse_verified_without_fd_exec)
+                verify_bound_files_service(&checked, root.as_ref(), &service).and_then(refuse_ready_without_runner)
             })
             .await
             .map_err(|err| ExtensionError::HookFailed {
@@ -191,11 +188,25 @@ impl BackgroundServiceManager {
                 reason: err.to_string(),
             })?;
             match outcome {
-                // NotApplicable: snapshot has no `files` — existing gate + possible path spawn.
+                // NotApplicable: snapshot has no `files` and declares no runtime — existing gate
+                // + possible path spawn.
                 Ok(()) => {}
                 Err(err) => return Err(err.into()),
             }
         }
+
+        // A declared runtime never takes the legacy path spawn, whichever manifest says so
+        // (the loaded manifest is checked too; refusing more is always safe).
+        if declares_runtime(
+            &ext.manifest,
+            crate::background_service_start_gate::local_background_service_id(service),
+        ) {
+            return Err(crate::bound_background_start::BoundBackgroundStartError::RuntimeRequiresSignedFiles.into());
+        }
+
+        // Legacy path only: `permissions.shell` gates path spawns and has no role for `workmate-js`.
+        let perms = ext.manifest.permissions.clone().unwrap_or_default();
+        ensure_shell_permission(&perms)?;
 
         gate_background_service_start(&ext.manifest, service, signed).map_err(ExtensionError::from)?;
 

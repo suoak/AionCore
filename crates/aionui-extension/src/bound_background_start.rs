@@ -1,25 +1,37 @@
-//! Bound+`files` background-service start (M9 E13 slice I).
+//! Bound+`files` background-service start policy (M9 E13 slices I → S1).
 //!
 //! When the Host has a retained signed root whose snapshot declares `files`, a service may
-//! **not** be started by a path string (`LoadedExtension.directory`, a canonicalized script
-//! path, or anything else). The honest steps are:
+//! **not** be started by a path string (`LoadedExtension.directory`, a canonicalized script path,
+//! or anything else). The only runtime a bound service can ever use is `workmate-js` — the Host's
+//! embedded, restricted QuickJS runner, fed **verified in-memory bytes** (never a path, never
+//! argv). `node`, `shell` and `native` are reserved runtime names that are refused permanently,
+//! each with its own fixed reason; there is no guessing from the file extension and no fallback.
 //!
-//! 1. require a signed `entryPoint` / `entryPointIntegrity` for this service (inheritance from
-//!    `files` counts; absence is a refusal, not a legacy spawn);
-//! 2. read that exact listed file through the retained root (`openat(O_NOFOLLOW)`, SRI of the
-//!    bytes read — the same reader as verified asset serve);
-//! 3. start the process from those verified bytes via a same-FD `fexecve` / `execveat`.
+//! [`verify_bound_files_service`] is the policy pipeline. Everything it decides comes from the
+//! **signed snapshot** (never from the loaded manifest or the disk copy), in this order:
 //!
-//! Step 3 is **not implemented in this slice**. An honest FD-based exec cannot be done through
-//! the existing `CmdBuilder` / `tokio::process::Command` path-spawn stack; macOS has no `fexecve`;
-//! and `fexecve` of a shebang script (the current `worker.sh` shape) makes the kernel pass a
-//! procfs path to an interpreter (Node/shell), which is neither portable nor a clearly safe
-//! exec policy. This module therefore **verifies and refuses** (`FdExecUnavailable`). It never
-//! falls back to a path spawn. Leftover decisions (later slice): Linux `memfd`+`execveat` of a verified ELF, shebang/Node
-//! policy, a macOS primitive, and child cwd/env that does not use `LoadedExtension.directory`.
+//! 1. no `files` → [`BoundFilesStart::NotApplicable`] (legacy gate + path spawn), **unless** the
+//!    signed service declares a `runtime` — a declared runtime must never take the legacy path
+//!    spawn (`bound_service_runtime_requires_signed_files`);
+//! 2. the retained root must have been supplied (no root → refuse, never a path fallback);
+//! 3. the service must be uniquely present in the snapshot;
+//! 4. `runtime` must be declared (`bound_service_runtime_required`) and be `workmate-js`
+//!    (`node` → `…_runtime_unsupported`, `shell` → `…_shell_script_unsupported`,
+//!    `native` → `…_native_unsupported`);
+//! 5. the entry must be a `.js` / `.mjs` file;
+//! 6. `uses` must be empty for now (capabilities arrive in later slices;
+//!    `bound_service_capabilities_unavailable`);
+//! 7. the entry must be the signed, listed, SRI-declared entry; its bytes are read once through
+//!    the retained root (`openat(O_NOFOLLOW)`, ≤ 8 MiB regular file, SRI of the bytes read — the
+//!    same reader as verified asset serve) and returned as [`BoundServiceReady`].
 //!
-//! Snapshots without `files`, and extensions with no binding, are [`BoundFilesStart::NotApplicable`]:
-//! the existing start gate + path spawn stay as they are today.
+//! `permissions.shell` plays **no role** for a `workmate-js` service: it neither allows nor blocks
+//! it (the legacy path keeps its own `shell` gate).
+//!
+//! # Not in this slice
+//! There is no runner yet. A [`BoundFilesStart::Ready`] outcome is refused by the caller with
+//! `bound_service_runner_unavailable`; nothing is spawned and no path exec happens. Capabilities,
+//! scheduling, sandboxing and consent are later slices.
 //!
 //! Reasons are fixed strings; never include digests, paths or bytes.
 
@@ -33,18 +45,60 @@ use crate::hub::background_service_entry_point_digest::{
 use crate::hub::signed_manifest::SignatureCheckedManifest;
 use crate::hub::{FilesIndex, VerifiedAssetError, read_verified_listed};
 use crate::manifest::parse_manifest;
-use crate::types::{ExtPermissions, ResolvedBackgroundService};
+use crate::types::{
+    ExtBackgroundService, ExtensionManifest, ResolvedBackgroundService, ServiceCapabilityKind, ServiceRuntime,
+};
 
 use super::background_service_start_gate::local_background_service_id;
+
+/// A fully verified `workmate-js` service: the entry bytes (already SRI-checked) plus the
+/// signed scheduling/capability declaration. Holds source bytes; `Debug` prints sizes only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BoundServiceReady {
+    bytes: Vec<u8>,
+    interval_seconds: u64,
+    uses: Vec<ServiceCapabilityKind>,
+}
+
+impl BoundServiceReady {
+    /// Verified entry source bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Tick interval in seconds, already clamped to `[10, 86400]`.
+    pub fn interval_seconds(&self) -> u64 {
+        self.interval_seconds
+    }
+
+    pub fn uses(&self) -> &[ServiceCapabilityKind] {
+        &self.uses
+    }
+}
+
+impl std::fmt::Debug for BoundServiceReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundServiceReady")
+            .field("byte_len", &self.bytes.len())
+            .field("interval_seconds", &self.interval_seconds)
+            .field("uses", &self.uses)
+            .finish()
+    }
+}
 
 /// Outcome of the bound+`files` start check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundFilesStart {
-    /// No `files` in the signed snapshot: the legacy gate + path spawn applies.
+    /// No `files` in the signed snapshot (and no declared runtime): the legacy gate + path spawn
+    /// applies.
     NotApplicable,
-    /// The listed entry was read from the retained root and matched its SRI. FD-exec is not
-    /// available in this slice; the caller must refuse (and must not path-spawn).
-    Verified { byte_len: usize },
+    /// The service passed the whole policy pipeline and its entry bytes were verified. There is
+    /// no runner in this slice, so the caller must refuse (and must not path-spawn).
+    Ready(BoundServiceReady),
 }
 
 /// Fixed refusal categories for the bound+`files` path. Never a path spawn.
@@ -69,10 +123,22 @@ pub enum BoundBackgroundStartError {
     IntegrityMismatch,
     /// Platform cannot read FD-relative (non-unix).
     Unavailable,
-    /// The signed snapshot does not grant `permissions.shell`.
-    ShellPermissionDenied,
-    /// Entry was verified; no honest FD-based exec is available. Not a spawn.
-    FdExecUnavailable,
+    /// A bound service must declare `runtime` explicitly.
+    RuntimeRequired,
+    /// `runtime: node` (deferred; permanently refused for bound services).
+    RuntimeUnsupported,
+    /// `runtime: shell` (permanently refused).
+    ShellScriptUnsupported,
+    /// `runtime: native` (permanently refused).
+    NativeUnsupported,
+    /// The `workmate-js` entry is not a `.js` / `.mjs` file.
+    EntryKindUnsupported,
+    /// The service lists capability kinds in `uses`; capabilities are not available yet.
+    CapabilitiesUnavailable,
+    /// A declared `runtime` without a signed `files` snapshot: never the legacy path spawn.
+    RuntimeRequiresSignedFiles,
+    /// The service is verified and startable in principle, but the Host has no runner yet.
+    RunnerUnavailable,
 }
 
 impl BoundBackgroundStartError {
@@ -87,8 +153,14 @@ impl BoundBackgroundStartError {
             Self::Unreadable => "bound_service_entry_unreadable",
             Self::IntegrityMismatch => "bound_service_integrity_mismatch",
             Self::Unavailable => "bound_service_verified_read_unavailable",
-            Self::ShellPermissionDenied => "bound_service_shell_permission_denied",
-            Self::FdExecUnavailable => "bound_service_fd_exec_unavailable",
+            Self::RuntimeRequired => "bound_service_runtime_required",
+            Self::RuntimeUnsupported => "bound_service_runtime_unsupported",
+            Self::ShellScriptUnsupported => "bound_service_shell_script_unsupported",
+            Self::NativeUnsupported => "bound_service_native_unsupported",
+            Self::EntryKindUnsupported => "bound_service_entry_kind_unsupported",
+            Self::CapabilitiesUnavailable => "bound_service_capabilities_unavailable",
+            Self::RuntimeRequiresSignedFiles => "bound_service_runtime_requires_signed_files",
+            Self::RunnerUnavailable => "bound_service_runner_unavailable",
         }
     }
 }
@@ -133,7 +205,33 @@ pub(crate) fn relative_service_entry_point(entry_point: &str) -> Option<std::pat
     normalize_relative_asset_path(relative)
 }
 
-/// Verify a bound+`files` service against the retained root, or report that the legacy path applies.
+/// The service with local id `local_id` in `manifest`, only when exactly one matches.
+fn unique_service<'a>(manifest: &'a ExtensionManifest, local_id: &str) -> Option<&'a ExtBackgroundService> {
+    let mut matches = manifest
+        .contributes
+        .iter()
+        .flat_map(|c| c.background_services.iter())
+        .filter(|svc| svc.id == local_id);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+/// True when any service with local id `local_id` in `manifest` declares a runtime.
+pub(crate) fn declares_runtime(manifest: &ExtensionManifest, local_id: &str) -> bool {
+    manifest
+        .contributes
+        .iter()
+        .flat_map(|c| c.background_services.iter())
+        .any(|svc| svc.id == local_id && svc.runtime.is_some())
+}
+
+fn is_js_entry(entry_point: &str) -> bool {
+    let lower = entry_point.to_ascii_lowercase();
+    lower.ends_with(".js") || lower.ends_with(".mjs")
+}
+
+/// Run the bound+`files` policy pipeline (module docs) against the retained root, or report that
+/// the legacy path applies.
 ///
 /// Never opens `LoadedExtension.directory`. `root` must be the Host-retained directory `File`.
 pub fn verify_bound_files_service(
@@ -141,7 +239,14 @@ pub fn verify_bound_files_service(
     root: Option<&File>,
     service: &ResolvedBackgroundService,
 ) -> Result<BoundFilesStart, BoundBackgroundStartError> {
+    let local_id = local_background_service_id(service);
     let Some(index) = FilesIndex::from_signed(checked).map_err(|_| BoundBackgroundStartError::InvalidSnapshot)? else {
+        // No `files`: legacy — but a declared runtime may never take the legacy path spawn.
+        let signed_manifest =
+            parse_manifest(checked.raw_bytes()).map_err(|_| BoundBackgroundStartError::InvalidSnapshot)?;
+        if declares_runtime(&signed_manifest, local_id) {
+            return Err(BoundBackgroundStartError::RuntimeRequiresSignedFiles);
+        }
         return Ok(BoundFilesStart::NotApplicable);
     };
     let Some(root) = root else {
@@ -150,15 +255,23 @@ pub fn verify_bound_files_service(
 
     let signed_manifest =
         parse_manifest(checked.raw_bytes()).map_err(|_| BoundBackgroundStartError::InvalidSnapshot)?;
-    let perms = signed_manifest
-        .permissions
-        .clone()
-        .unwrap_or_else(ExtPermissions::default);
-    if perms.shell != Some(true) {
-        return Err(BoundBackgroundStartError::ShellPermissionDenied);
+    let signed_service =
+        unique_service(&signed_manifest, local_id).ok_or(BoundBackgroundStartError::SignedSnapshotInconclusive)?;
+
+    match signed_service.runtime {
+        None => return Err(BoundBackgroundStartError::RuntimeRequired),
+        Some(ServiceRuntime::Node) => return Err(BoundBackgroundStartError::RuntimeUnsupported),
+        Some(ServiceRuntime::Shell) => return Err(BoundBackgroundStartError::ShellScriptUnsupported),
+        Some(ServiceRuntime::Native) => return Err(BoundBackgroundStartError::NativeUnsupported),
+        Some(ServiceRuntime::WorkmateJs) => {}
+    }
+    if !is_js_entry(&signed_service.entry_point) {
+        return Err(BoundBackgroundStartError::EntryKindUnsupported);
+    }
+    if !signed_service.uses.is_empty() {
+        return Err(BoundBackgroundStartError::CapabilitiesUnavailable);
     }
 
-    let local_id = local_background_service_id(service);
     let binding = match bind_background_service_entry_point_digest_from_signed(checked, local_id) {
         Ok(binding) => binding,
         Err(BackgroundServiceEntryPointDigestError::NotPresent) => {
@@ -177,22 +290,20 @@ pub fn verify_bound_files_service(
     }
 
     let asset = read_verified_listed(root, listed, listed_sri)?;
-    Ok(BoundFilesStart::Verified {
-        byte_len: asset.bytes().len(),
-    })
+    Ok(BoundFilesStart::Ready(BoundServiceReady {
+        bytes: asset.into_bytes(),
+        interval_seconds: signed_service.effective_interval_seconds(),
+        uses: signed_service.uses.clone(),
+    }))
 }
 
-/// Refuse after a successful [`BoundFilesStart::Verified`] — no path spawn, no exec.
-pub fn refuse_fd_exec_unavailable() -> BoundBackgroundStartError {
-    BoundBackgroundStartError::FdExecUnavailable
-}
-
-/// Map a verified-or-refused bound start onto an [`ExtensionError`]. `NotApplicable` is not
-/// converted here; the caller continues with the legacy gate.
-pub fn refuse_verified_without_fd_exec(verified: BoundFilesStart) -> Result<(), BoundBackgroundStartError> {
-    match verified {
+/// Map a successful [`BoundFilesStart`] onto the refusal this slice applies: there is no runner,
+/// so a `Ready` service is refused (`bound_service_runner_unavailable`), never spawned.
+/// `NotApplicable` is not converted; the caller continues with the legacy gate.
+pub fn refuse_ready_without_runner(outcome: BoundFilesStart) -> Result<(), BoundBackgroundStartError> {
+    match outcome {
         BoundFilesStart::NotApplicable => Ok(()),
-        BoundFilesStart::Verified { .. } => Err(BoundBackgroundStartError::FdExecUnavailable),
+        BoundFilesStart::Ready(_) => Err(BoundBackgroundStartError::RunnerUnavailable),
     }
 }
 
@@ -202,9 +313,11 @@ mod tests {
     use crate::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
     use crate::hub::signed_manifest::{SignedManifestEntry, check_signed_manifest};
     use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{Value, json};
     use std::collections::{HashMap, HashSet};
 
-    const SCRIPT: &[u8] = b"#!/bin/sh\necho hi\n";
+    const SCRIPT: &[u8] = b"export async function run(input) { return input; }\n";
+    const ENTRY: &str = "services/digest.mjs";
 
     fn policy_key() -> SigningKey {
         SigningKey::from_bytes(&[43; 32])
@@ -236,21 +349,39 @@ mod tests {
         .unwrap()
     }
 
-    fn files_manifest(integrity: Option<&str>, shell: bool, extra_files: &str) -> Vec<u8> {
-        let sri = sri_sha512(SCRIPT);
-        let integ = match integrity {
-            Some("") => String::new(),
-            Some(i) => format!(r#""entryPointIntegrity":"{i}","#),
-            None => String::new(),
-        };
-        format!(
-            r#"{{"name":"demo.plugin","version":"1.0.0","permissions":{{"shell":{shell}}},"files":[{{"path":"services/worker.sh","integrity":"{sri}"}}{extra_files}],"contributes":{{"backgroundServices":[{{"id":"worker","entryPoint":"services/worker.sh",{integ}"description":"w"}}]}}}}"#
-        )
-        .into_bytes()
+    /// Signed manifest with `files` listing `entry` (SCRIPT bytes) and one service.
+    fn manifest_with(entry: &str, service_extra: Value, shell: Option<bool>) -> Vec<u8> {
+        let mut service = json!({"id": "worker", "entryPoint": entry});
+        service
+            .as_object_mut()
+            .unwrap()
+            .extend(service_extra.as_object().unwrap().clone());
+        let mut m = json!({
+            "name": "demo.plugin", "version": "1.0.0",
+            "files": [{"path": entry, "integrity": sri_sha512(SCRIPT)}],
+            "contributes": {"backgroundServices": [service]}
+        });
+        if let Some(shell) = shell {
+            m["permissions"] = json!({"shell": shell});
+        }
+        serde_json::to_vec(&m).unwrap()
     }
 
-    fn no_files_manifest() -> Vec<u8> {
-        br#"{"name":"demo.plugin","version":"1.0.0","permissions":{"shell":true},"contributes":{"backgroundServices":[{"id":"worker","entryPoint":"services/worker.sh"}]}}"#.to_vec()
+    fn js_manifest() -> Vec<u8> {
+        manifest_with(ENTRY, json!({"runtime": "workmate-js"}), None)
+    }
+
+    fn no_files_manifest(extra: Value) -> Vec<u8> {
+        let mut service = json!({"id": "worker", "entryPoint": "services/worker.sh"});
+        service
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::to_vec(&json!({
+            "name": "demo.plugin", "version": "1.0.0", "permissions": {"shell": true},
+            "contributes": {"backgroundServices": [service]}
+        }))
+        .unwrap()
     }
 
     fn resolved(path: &str) -> ResolvedBackgroundService {
@@ -262,96 +393,243 @@ mod tests {
         }
     }
 
-    fn root_with_script(body: &[u8]) -> (tempfile::TempDir, File) {
+    fn root_with(entry: &str, body: &[u8]) -> (tempfile::TempDir, File) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("services")).unwrap();
-        std::fs::write(dir.path().join("services/worker.sh"), body).unwrap();
+        let path = dir.path().join(entry);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
         let root = File::open(dir.path()).unwrap();
         (dir, root)
     }
 
+    fn verify(raw: &[u8], root: Option<&File>, entry: &str) -> Result<BoundFilesStart, BoundBackgroundStartError> {
+        verify_bound_files_service(&checked(raw), root, &resolved(entry))
+    }
+
     #[test]
-    fn snapshot_without_files_is_not_applicable() {
-        let (_d, root) = root_with_script(SCRIPT);
+    fn snapshot_without_files_and_without_runtime_is_not_applicable() {
+        let (_d, root) = root_with("services/worker.sh", b"#!/bin/sh\n");
         assert_eq!(
-            verify_bound_files_service(
-                &checked(&no_files_manifest()),
-                Some(&root),
-                &resolved("services/worker.sh")
-            ),
+            verify(&no_files_manifest(json!({})), Some(&root), "services/worker.sh"),
             Ok(BoundFilesStart::NotApplicable)
         );
     }
 
     #[test]
-    fn inherited_integrity_is_verified_against_the_retained_root() {
-        let (_d, root) = root_with_script(SCRIPT);
-        // No per-entry integrity: inherited from `files`.
-        let c = checked(&files_manifest(None, true, ""));
-        match verify_bound_files_service(&c, Some(&root), &resolved("services/worker.sh")).unwrap() {
-            BoundFilesStart::Verified { byte_len } => assert_eq!(byte_len, SCRIPT.len()),
-            other => panic!("expected Verified, got {other:?}"),
+    fn a_declared_runtime_never_takes_the_legacy_path_without_signed_files() {
+        let (_d, root) = root_with("services/worker.sh", b"#!/bin/sh\n");
+        for runtime in ["workmate-js", "node", "shell", "native"] {
+            assert_eq!(
+                verify(
+                    &no_files_manifest(json!({"runtime": runtime})),
+                    Some(&root),
+                    "services/worker.sh"
+                ),
+                Err(BoundBackgroundStartError::RuntimeRequiresSignedFiles),
+                "{runtime}"
+            );
         }
-        // Asset-URL form of the same entry is accepted and verified.
-        let url = "/api/extensions/demo.plugin/assets/services/worker.sh";
+    }
+
+    #[test]
+    fn workmate_js_is_verified_and_returns_the_exact_bytes_without_any_shell_permission() {
+        let (_d, root) = root_with(ENTRY, SCRIPT);
+        for shell in [None, Some(false), Some(true)] {
+            let raw = manifest_with(ENTRY, json!({"runtime": "workmate-js"}), shell);
+            match verify(&raw, Some(&root), ENTRY).unwrap() {
+                BoundFilesStart::Ready(ready) => {
+                    assert_eq!(ready.bytes(), SCRIPT, "{shell:?}");
+                    assert_eq!(ready.byte_len(), SCRIPT.len());
+                    assert_eq!(ready.interval_seconds(), 60);
+                    assert!(ready.uses().is_empty());
+                }
+                other => panic!("expected Ready, got {other:?}"),
+            }
+        }
+        // Asset-URL form of the same entry.
         assert!(matches!(
-            verify_bound_files_service(&c, Some(&root), &resolved(url)),
-            Ok(BoundFilesStart::Verified { .. })
-        ));
-        assert_eq!(
-            refuse_verified_without_fd_exec(
-                verify_bound_files_service(&c, Some(&root), &resolved("services/worker.sh")).unwrap()
+            verify(
+                &js_manifest(),
+                Some(&root),
+                "/api/extensions/demo.plugin/assets/services/digest.mjs"
             ),
-            Err(BoundBackgroundStartError::FdExecUnavailable)
-        );
+            Ok(BoundFilesStart::Ready(_))
+        ));
+        // `.js` and upper-case extensions are accepted too.
+        for entry in ["services/a.js", "services/B.MJS"] {
+            let (_d, root) = root_with(entry, SCRIPT);
+            let raw = manifest_with(entry, json!({"runtime": "workmate-js"}), None);
+            assert!(
+                matches!(verify(&raw, Some(&root), entry), Ok(BoundFilesStart::Ready(_))),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_is_clamped_and_defaults_to_sixty() {
+        let (_d, root) = root_with(ENTRY, SCRIPT);
+        for (declared, expected) in [
+            (json!({}), 60),
+            (json!({"intervalSeconds": 0}), 10),
+            (json!({"intervalSeconds": 1}), 10),
+            (json!({"intervalSeconds": 10}), 10),
+            (json!({"intervalSeconds": 120}), 120),
+            (json!({"intervalSeconds": 86400}), 86400),
+            (json!({"intervalSeconds": 86401}), 86400),
+            (json!({"intervalSeconds": u64::MAX}), 86400),
+        ] {
+            let mut extra = json!({"runtime": "workmate-js"});
+            extra
+                .as_object_mut()
+                .unwrap()
+                .extend(declared.as_object().unwrap().clone());
+            let raw = manifest_with(ENTRY, extra, None);
+            match verify(&raw, Some(&root), ENTRY).unwrap() {
+                BoundFilesStart::Ready(r) => assert_eq!(r.interval_seconds(), expected, "{declared}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_matrix_refuses_everything_but_workmate_js_without_reading_the_entry() {
+        // Entry bytes are valid and SRI-listed in every case; the refusal is by runtime alone.
+        let cases: [(Option<&str>, &str, BoundBackgroundStartError); 4] = [
+            (None, ENTRY, BoundBackgroundStartError::RuntimeRequired),
+            (Some("node"), ENTRY, BoundBackgroundStartError::RuntimeUnsupported),
+            (
+                Some("shell"),
+                "services/worker.sh",
+                BoundBackgroundStartError::ShellScriptUnsupported,
+            ),
+            (
+                Some("native"),
+                "services/worker",
+                BoundBackgroundStartError::NativeUnsupported,
+            ),
+        ];
+        for (runtime, entry, expected) in cases {
+            let (_d, root) = root_with(entry, SCRIPT);
+            let extra = runtime.map_or(json!({}), |r| json!({"runtime": r}));
+            // permissions.shell = true must not rescue a refused runtime.
+            let raw = manifest_with(entry, extra, Some(true));
+            assert_eq!(verify(&raw, Some(&root), entry), Err(expected), "{runtime:?}");
+            // Same verdict with the entry file absent: nothing was read.
+            let empty = tempfile::tempdir().unwrap();
+            let empty_root = File::open(empty.path()).unwrap();
+            assert_eq!(
+                verify(&raw, Some(&empty_root), entry),
+                Err(expected),
+                "{runtime:?} (no file)"
+            );
+        }
+    }
+
+    #[test]
+    fn workmate_js_entry_must_be_a_js_module() {
+        for entry in [
+            "services/worker.sh",
+            "services/run.py",
+            "services/a.txt",
+            "services/js",
+            "services/mjs.txt",
+            "services/x.cjs",
+        ] {
+            let (_d, root) = root_with(entry, SCRIPT);
+            let raw = manifest_with(entry, json!({"runtime": "workmate-js"}), None);
+            assert_eq!(
+                verify(&raw, Some(&root), entry),
+                Err(BoundBackgroundStartError::EntryKindUnsupported),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_capability_kinds_is_refused_until_capabilities_exist() {
+        let (_d, root) = root_with(ENTRY, SCRIPT);
+        for kind in ["network", "files", "events", "storage", "secrets"] {
+            let raw = manifest_with(ENTRY, json!({"runtime": "workmate-js", "uses": [kind]}), None);
+            assert_eq!(
+                verify(&raw, Some(&root), ENTRY),
+                Err(BoundBackgroundStartError::CapabilitiesUnavailable),
+                "{kind}"
+            );
+        }
     }
 
     #[test]
     fn files_declared_without_a_root_is_refused_not_a_path_fallback() {
-        let c = checked(&files_manifest(None, true, ""));
         assert_eq!(
-            verify_bound_files_service(&c, None, &resolved("services/worker.sh")),
+            verify(&js_manifest(), None, ENTRY),
             Err(BoundBackgroundStartError::RootMissing)
         );
     }
 
     #[test]
-    fn tampered_or_missing_entry_is_refused() {
-        let (d, root) = root_with_script(SCRIPT);
-        let c = checked(&files_manifest(None, true, ""));
-        std::fs::write(d.path().join("services/worker.sh"), b"#!/bin/sh\nevil\n").unwrap();
+    fn tampered_or_missing_or_symlinked_entry_is_refused() {
+        let (d, root) = root_with(ENTRY, SCRIPT);
+        let raw = js_manifest();
+        std::fs::write(d.path().join(ENTRY), b"export const evil = 1;\n").unwrap();
         assert_eq!(
-            verify_bound_files_service(&c, Some(&root), &resolved("services/worker.sh")),
+            verify(&raw, Some(&root), ENTRY),
             Err(BoundBackgroundStartError::IntegrityMismatch)
         );
-        std::fs::remove_file(d.path().join("services/worker.sh")).unwrap();
+        std::fs::remove_file(d.path().join(ENTRY)).unwrap();
         assert_eq!(
-            verify_bound_files_service(&c, Some(&root), &resolved("services/worker.sh")),
+            verify(&raw, Some(&root), ENTRY),
             Err(BoundBackgroundStartError::Missing)
         );
+        // A symlink at the entry (even to the right bytes) is never followed.
+        std::fs::write(d.path().join("real.mjs"), SCRIPT).unwrap();
+        std::os::unix::fs::symlink("../real.mjs", d.path().join(ENTRY)).unwrap();
+        assert!(matches!(
+            verify(&raw, Some(&root), ENTRY),
+            Err(BoundBackgroundStartError::Unreadable | BoundBackgroundStartError::Missing)
+        ));
     }
 
     #[test]
     fn unlisted_or_mismatched_request_path_is_refused() {
-        let (_d, root) = root_with_script(SCRIPT);
-        let c = checked(&files_manifest(None, true, ""));
-        assert_eq!(
-            verify_bound_files_service(&c, Some(&root), &resolved("other.sh")),
-            Err(BoundBackgroundStartError::EntryMismatch)
-        );
-        assert_eq!(
-            verify_bound_files_service(&c, Some(&root), &resolved("../services/worker.sh")),
-            Err(BoundBackgroundStartError::EntryMismatch)
-        );
+        let (_d, root) = root_with(ENTRY, SCRIPT);
+        let raw = js_manifest();
+        for requested in ["other.mjs", "../services/digest.mjs", "services/../services/x.mjs"] {
+            assert_eq!(
+                verify(&raw, Some(&root), requested),
+                Err(BoundBackgroundStartError::EntryMismatch),
+                "{requested}"
+            );
+        }
     }
 
     #[test]
-    fn signed_snapshot_without_shell_permission_is_refused() {
-        let (_d, root) = root_with_script(SCRIPT);
-        let c = checked(&files_manifest(None, false, ""));
+    fn unknown_or_ambiguous_service_in_the_snapshot_is_refused() {
+        let (_d, root) = root_with(ENTRY, SCRIPT);
+        // Different local id in the snapshot.
+        let raw = serde_json::to_vec(&json!({
+            "name": "demo.plugin", "version": "1.0.0",
+            "files": [{"path": ENTRY, "integrity": sri_sha512(SCRIPT)}],
+            "contributes": {"backgroundServices": [{"id": "other", "entryPoint": ENTRY, "runtime": "workmate-js"}]}
+        }))
+        .unwrap();
         assert_eq!(
-            verify_bound_files_service(&c, Some(&root), &resolved("services/worker.sh")),
-            Err(BoundBackgroundStartError::ShellPermissionDenied)
+            verify(&raw, Some(&root), ENTRY),
+            Err(BoundBackgroundStartError::SignedSnapshotInconclusive)
+        );
+        // Two services with the same id.
+        let raw = serde_json::to_vec(&json!({
+            "name": "demo.plugin", "version": "1.0.0",
+            "files": [{"path": ENTRY, "integrity": sri_sha512(SCRIPT)}],
+            "contributes": {"backgroundServices": [
+                {"id": "worker", "entryPoint": ENTRY, "runtime": "workmate-js"},
+                {"id": "worker", "entryPoint": ENTRY, "runtime": "workmate-js"}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            verify(&raw, Some(&root), ENTRY),
+            Err(BoundBackgroundStartError::SignedSnapshotInconclusive)
         );
     }
 
@@ -369,12 +647,43 @@ mod tests {
     }
 
     #[test]
-    fn reasons_are_fixed_and_never_include_digests() {
-        let err: ExtensionError = BoundBackgroundStartError::FdExecUnavailable.into();
-        let text = err.to_string();
-        assert!(text.contains("bound_service_fd_exec_unavailable"));
-        assert!(!text.contains("sha512-"));
-        assert!(!text.contains("worker.sh"));
+    fn reasons_are_fixed_unique_and_never_include_digests_or_paths() {
+        use BoundBackgroundStartError as E;
+        let all = [
+            E::RootMissing,
+            E::InvalidSnapshot,
+            E::SignedSnapshotInconclusive,
+            E::IntegrityRequired,
+            E::EntryMismatch,
+            E::Missing,
+            E::Unreadable,
+            E::IntegrityMismatch,
+            E::Unavailable,
+            E::RuntimeRequired,
+            E::RuntimeUnsupported,
+            E::ShellScriptUnsupported,
+            E::NativeUnsupported,
+            E::EntryKindUnsupported,
+            E::CapabilitiesUnavailable,
+            E::RuntimeRequiresSignedFiles,
+            E::RunnerUnavailable,
+        ];
+        let reasons: HashSet<&str> = all.iter().map(|e| e.reason()).collect();
+        assert_eq!(reasons.len(), all.len());
+        for e in all {
+            assert!(e.reason().starts_with("bound_service_"));
+            let text = ExtensionError::from(e).to_string();
+            assert!(text.contains(e.reason()));
+            assert!(!text.contains("sha512-") && !text.contains(".mjs") && !text.contains("services/"));
+        }
+    }
+
+    #[test]
+    fn ready_debug_never_prints_the_source_bytes() {
+        let (_d, root) = root_with(ENTRY, SCRIPT);
+        let out = verify(&js_manifest(), Some(&root), ENTRY).unwrap();
+        let text = format!("{out:?}");
+        assert!(text.contains("byte_len") && !text.contains("export async"));
     }
 
     fn loaded(raw: &[u8], dir: &std::path::Path) -> crate::types::LoadedExtension {
@@ -395,66 +704,114 @@ mod tests {
     }
 
     fn write_executable(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A decoy executable under a `LoadedExtension.directory` that would run under the legacy
+    /// path spawn. Returns `(dir, marker)`.
+    fn decoy(entry: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        write_executable(
+            &dir.path().join(entry),
+            &format!("#!/bin/sh\necho hi > {}\n", marker.display()),
+        );
+        (dir, marker)
+    }
+
     #[tokio::test]
-    async fn manager_verifies_bound_service_and_refuses_exec_without_path_spawn() {
+    async fn manager_refuses_a_verified_workmate_js_service_without_a_runner_and_never_spawns() {
         use crate::host_runtime::BackgroundServiceManager;
         use crate::signed_root_binding::SignedRootBindingStore;
 
-        let (root_dir, root) = root_with_script(SCRIPT);
-        // A tempting executable in a *different* LoadedExtension.directory would spawn under the
-        // legacy path. The bound path must not touch it.
-        let decoy = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(decoy.path().join("services")).unwrap();
-        let marker = decoy.path().join("spawned");
-        write_executable(
-            &decoy.path().join("services/worker.sh"),
-            &format!(
-                "#!/bin/sh
-echo hi > {}
-",
-                marker.display()
-            ),
-        );
-        // Also place a runnable copy under the retained root (the honest file).
-        write_executable(
-            &root_dir.path().join("services/worker.sh"),
-            std::str::from_utf8(SCRIPT).unwrap(),
-        );
-
-        let raw = files_manifest(None, true, "");
-        let snapshot = checked(&raw);
+        let (_root_dir, root) = root_with(ENTRY, SCRIPT);
+        let (decoy_dir, marker) = decoy(ENTRY);
+        let raw = js_manifest();
         let store = SignedRootBindingStore::new();
-        store.install("demo.plugin", snapshot, root).unwrap();
-        let ext = loaded(&raw, decoy.path());
+        store.install("demo.plugin", checked(&raw), root).unwrap();
+        let ext = loaded(&raw, decoy_dir.path());
         let manager = BackgroundServiceManager::new();
         let err = manager
-            .start_with_binding("alice", &ext, &resolved("services/worker.sh"), &store)
+            .start_with_binding("alice", &ext, &resolved(ENTRY), &store)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("bound_service_fd_exec_unavailable"));
+        let text = err.to_string();
+        assert!(text.contains("bound_service_runner_unavailable"), "{text}");
+        assert!(!text.contains(".mjs") && !text.contains("sha512-"));
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(!marker.exists(), "decoy directory script must not run");
+        assert!(!marker.exists(), "decoy directory entry must not run");
         assert!(
             !manager
                 .is_running("alice", "demo.plugin", "ext-demo.plugin-worker")
                 .await
         );
+    }
 
-        // Tampered root entry: integrity mismatch, still no spawn.
-        std::fs::write(
-            root_dir.path().join("services/worker.sh"),
-            b"#!/bin/sh
-evil
-",
-        )
-        .unwrap();
-        let err = manager
-            .start_with_binding("alice", &ext, &resolved("services/worker.sh"), &store)
+    #[tokio::test]
+    async fn manager_refuses_every_other_bound_shape_without_a_spawn() {
+        use crate::host_runtime::BackgroundServiceManager;
+        use crate::signed_root_binding::SignedRootBindingStore;
+
+        // (entry, extra service fields, expected reason)
+        let cases: [(&str, Value, &str); 6] = [
+            ("services/worker.sh", json!({}), "bound_service_runtime_required"),
+            (
+                "services/worker.sh",
+                json!({"runtime": "shell"}),
+                "bound_service_shell_script_unsupported",
+            ),
+            (
+                "services/worker",
+                json!({"runtime": "native"}),
+                "bound_service_native_unsupported",
+            ),
+            (ENTRY, json!({"runtime": "node"}), "bound_service_runtime_unsupported"),
+            (
+                "services/worker.sh",
+                json!({"runtime": "workmate-js"}),
+                "bound_service_entry_kind_unsupported",
+            ),
+            (
+                ENTRY,
+                json!({"runtime": "workmate-js", "uses": ["network"]}),
+                "bound_service_capabilities_unavailable",
+            ),
+        ];
+        for (entry, extra, reason) in cases {
+            let (_root_dir, root) = root_with(entry, SCRIPT);
+            let (decoy_dir, marker) = decoy(entry);
+            // Old-style loaded permission: shell = true must not matter either way.
+            let raw = manifest_with(entry, extra, Some(true));
+            let store = SignedRootBindingStore::new();
+            store.install("demo.plugin", checked(&raw), root).unwrap();
+            let ext = loaded(&raw, decoy_dir.path());
+            let err = BackgroundServiceManager::new()
+                .start_with_binding("alice", &ext, &resolved(entry), &store)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(reason), "{entry}: {err}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!marker.exists(), "{entry}: nothing may spawn");
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_retained_root_is_refused_before_anything_else_runs() {
+        use crate::host_runtime::BackgroundServiceManager;
+        use crate::signed_root_binding::SignedRootBindingStore;
+
+        let (root_dir, root) = root_with(ENTRY, SCRIPT);
+        let (decoy_dir, marker) = decoy(ENTRY);
+        let raw = js_manifest();
+        let store = SignedRootBindingStore::new();
+        store.install("demo.plugin", checked(&raw), root).unwrap();
+        let ext = loaded(&raw, decoy_dir.path());
+        std::fs::write(root_dir.path().join(ENTRY), b"export const evil = 1;\n").unwrap();
+        let err = BackgroundServiceManager::new()
+            .start_with_binding("alice", &ext, &resolved(ENTRY), &store)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("bound_service_integrity_mismatch"));
@@ -462,23 +819,40 @@ evil
     }
 
     #[tokio::test]
-    async fn unbound_undeclared_service_still_path_spawns() {
+    async fn unbound_extension_declaring_a_runtime_never_path_spawns_but_undeclared_still_does() {
         use crate::host_runtime::BackgroundServiceManager;
         use crate::signed_root_binding::SignedRootBindingStore;
 
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("services")).unwrap();
-        let marker = dir.path().join("spawned");
-        write_executable(
-            &dir.path().join("services/worker.sh"),
-            &format!(
-                "#!/bin/sh
-echo hi > {}
-",
-                marker.display()
-            ),
-        );
-        let raw = no_files_manifest();
+        // Declared runtime, no binding at all: refused, the executable decoy does not run.
+        let (dir, marker) = decoy("services/worker.sh");
+        let raw = no_files_manifest(json!({"runtime": "workmate-js"}));
+        let ext = loaded(&raw, dir.path());
+        let err = BackgroundServiceManager::new()
+            .start_with_binding(
+                "alice",
+                &ext,
+                &resolved("services/worker.sh"),
+                &SignedRootBindingStore::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bound_service_runtime_requires_signed_files"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!marker.exists());
+
+        // Bound snapshot without `files` but with a runtime: same refusal.
+        let (_root_dir, root) = root_with("services/worker.sh", b"x");
+        let store = SignedRootBindingStore::new();
+        store.install("demo.plugin", checked(&raw), root).unwrap();
+        let err = BackgroundServiceManager::new()
+            .start_with_binding("alice", &ext, &resolved("services/worker.sh"), &store)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bound_service_runtime_requires_signed_files"));
+        assert!(!marker.exists());
+
+        // Legacy: no runtime, no binding -> unchanged path spawn (not "verified").
+        let raw = no_files_manifest(json!({}));
         let ext = loaded(&raw, dir.path());
         let manager = BackgroundServiceManager::new();
         let status = manager
@@ -503,23 +877,11 @@ echo hi > {}
     async fn files_snapshot_without_root_does_not_path_spawn() {
         use crate::host_runtime::BackgroundServiceManager;
 
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("services")).unwrap();
-        let marker = dir.path().join("spawned");
-        write_executable(
-            &dir.path().join("services/worker.sh"),
-            &format!("#!/bin/sh\necho hi > {}\n", marker.display()),
-        );
-        let raw = files_manifest(None, true, "");
+        let (dir, marker) = decoy(ENTRY);
+        let raw = js_manifest();
         let ext = loaded(&raw, dir.path());
         let err = BackgroundServiceManager::new()
-            .start_with_signed(
-                "alice",
-                &ext,
-                &resolved("services/worker.sh"),
-                Some(&checked(&raw)),
-                None,
-            )
+            .start_with_signed("alice", &ext, &resolved(ENTRY), Some(&checked(&raw)), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("bound_service_root_missing"));
