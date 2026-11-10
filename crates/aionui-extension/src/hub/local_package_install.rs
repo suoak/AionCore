@@ -102,6 +102,8 @@ pub enum LocalPackageError {
     /// Host auto-install: the `current` marker could not be switched; the change was undone.
     MarkerWriteFailed,
     ParentNotDirectory,
+    /// Host uninstall: the installed tree could not be removed completely.
+    RemoveFailed,
     RootCreateFailed,
     WriteFailed,
     Retain(SignedRootBindingError),
@@ -198,6 +200,42 @@ fn legacy_contribution_declarations(manifest: &crate::types::ExtensionManifest) 
         }
     }
     declared
+}
+
+/// Read the exact `aion-extension.json` entry of a package archive (bounded, in memory).
+///
+/// The bytes are **not trusted**: the Host passes them to `check_signed_manifest` with the signed
+/// entry metadata it already holds, and the installer then requires the archive's own manifest to be
+/// byte-identical. Exactly one entry may carry that name.
+pub fn read_package_manifest(package_zip: &[u8]) -> Result<Vec<u8>, LocalPackageError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(package_zip)).map_err(|_| LocalPackageError::InvalidPackage)?;
+    let mut found: Option<Vec<u8>> = None;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|_| LocalPackageError::InvalidPackage)?;
+        let is_manifest = entry
+            .name()
+            .map(|n| n.as_ref() == EXTENSION_MANIFEST_FILE)
+            .unwrap_or(false);
+        if !is_manifest || entry.is_dir() {
+            continue;
+        }
+        if found.is_some() {
+            return Err(LocalPackageError::DuplicateEntry);
+        }
+        let max = super::signed_manifest::MAX_MANIFEST_BYTES as u64;
+        if entry.size() > max {
+            return Err(LocalPackageError::LimitExceeded);
+        }
+        let mut bytes = Vec::new();
+        Read::take(&mut entry, max + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| LocalPackageError::InvalidPackage)?;
+        if bytes.len() as u64 > max {
+            return Err(LocalPackageError::LimitExceeded);
+        }
+        found = Some(bytes);
+    }
+    found.ok_or(LocalPackageError::CoveredFileMissing)
 }
 
 pub(super) fn validate_package(
@@ -1140,5 +1178,31 @@ mod tests {
         let env3 = self::env();
         assert_eq!(run(&env3, &f, &zip, "d", huge), Err(LocalPackageError::LimitExceeded));
         assert_nothing_created(&env3);
+    }
+
+    #[test]
+    fn read_package_manifest_returns_exact_entry_and_refuses_duplicates_missing_and_oversize() {
+        let ok = zip_owned(&[("aion-extension.json", b"{\"a\":1}".to_vec()), ("x.css", b"x".to_vec())]);
+        assert_eq!(read_package_manifest(&ok).unwrap(), b"{\"a\":1}");
+        // Nested or differently-cased names are not the manifest.
+        let nested = zip_owned(&[("sub/aion-extension.json", b"{}".to_vec())]);
+        assert_eq!(
+            read_package_manifest(&nested),
+            Err(LocalPackageError::CoveredFileMissing)
+        );
+        let missing = zip_owned(&[("x.css", b"x".to_vec())]);
+        assert_eq!(
+            read_package_manifest(&missing),
+            Err(LocalPackageError::CoveredFileMissing)
+        );
+        let big = zip_owned(&[(
+            "aion-extension.json",
+            vec![b' '; super::super::signed_manifest::MAX_MANIFEST_BYTES + 1],
+        )]);
+        assert_eq!(read_package_manifest(&big), Err(LocalPackageError::LimitExceeded));
+        assert_eq!(
+            read_package_manifest(b"not a zip"),
+            Err(LocalPackageError::InvalidPackage)
+        );
     }
 }

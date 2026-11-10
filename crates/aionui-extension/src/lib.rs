@@ -44,7 +44,7 @@ pub use error::ExtensionError;
 pub use lifecycle::{HookKind, execute_hook, needs_install_hook, resolve_hook_path};
 pub use loader::{
     ScanPath, filter_by_engine_compatibility, load_all, resolve_install_target_dir_for_data_dir, resolve_scan_paths,
-    resolve_scan_paths_for_data_dir,
+    resolve_scan_paths_for_data_dir, signed_extensions_scan_path,
 };
 pub use manifest::{parse_manifest, validate_manifest};
 pub use permission::{build_permission_summary, calculate_risk_level};
@@ -59,8 +59,8 @@ pub use watcher::ExtensionWatcher;
 pub use external_paths::ExternalPathsManager;
 pub use host_runtime::{BackgroundServiceManager, CheckedAgentToolPrepare, HostRuntime};
 pub use hub::{
-    CuratedSignedRetainOutcome, HubIndexManager, HubInstaller, retain_checked_signed_root,
-    try_retain_curated_signed_root,
+    CuratedSignedRetainOutcome, HostSignedInstall, HubIndexManager, HubInstaller, retain_checked_signed_root,
+    signature_policy_configured, try_retain_curated_signed_root,
 };
 pub use hub_routes::{HubRouterState, hub_routes};
 pub use routes::{ExtensionRouterState, extension_asset_session_routes, extension_routes};

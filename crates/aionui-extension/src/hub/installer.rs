@@ -14,7 +14,9 @@ use crate::resolvers::resolve_extension_contributions;
 use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
 
 use super::curated::evaluate_install;
-use super::index_manager::HubIndexManager;
+use super::host_package_install::{UninstallOutcome, encode_component};
+use super::host_signed_install::{HostSignedInstall, SignedPackageError};
+use super::index_manager::{HubIndexEntry, HubIndexManager};
 
 // ---------------------------------------------------------------------------
 // Result type
@@ -65,6 +67,8 @@ pub struct HubInstaller {
     index_manager: HubIndexManager,
     registry: ExtensionRegistry,
     broadcaster: Arc<dyn EventBroadcaster>,
+    /// Host signed-package install context; `None` (no signature policy) keeps today's flow exactly.
+    signed: Option<HostSignedInstall>,
 }
 
 impl HubInstaller {
@@ -74,7 +78,20 @@ impl HubInstaller {
             index_manager,
             registry,
             broadcaster,
+            signed: None,
         }
+    }
+
+    /// Enable the signed local-package path (see [`HostSignedInstall`]). Without this call the
+    /// installer behaves exactly as before.
+    pub fn with_signed_install(mut self, signed: Option<HostSignedInstall>) -> Self {
+        self.signed = signed;
+        self
+    }
+
+    /// True when a signed local package for `entry` is installed through the Host layout.
+    pub fn signed_install_enabled(&self) -> bool {
+        self.signed.is_some()
     }
 
     /// Install an extension from the Hub by name.
@@ -93,6 +110,12 @@ impl HubInstaller {
                 return HubResult::err(error);
             }
         };
+
+        // Signed local package (only with a configured signature policy): verified install or a
+        // refusal; a failure never falls back to the unsigned directory flow below.
+        if let Some(result) = self.try_signed_package(&entry, name).await {
+            return result;
+        }
 
         let target_dir = self.index_manager.install_target_dir();
         let ext_dir = target_dir.join(&entry.name);
@@ -158,6 +181,10 @@ impl HubInstaller {
             }
         };
 
+        if let Some(result) = self.try_signed_package(&entry, name).await {
+            return result;
+        }
+
         let target_dir = self.index_manager.install_target_dir();
         let ext_dir = target_dir.join(&entry.name);
 
@@ -198,16 +225,38 @@ impl HubInstaller {
 
         info!(name, "hub: uninstalling extension");
 
+        // Host signed-layout install first (fail closed: marker, binding, then tree).
+        let mut removed_signed = false;
+        if let Some(signed) = self.signed.clone() {
+            let owned = name.to_owned();
+            match tokio::task::spawn_blocking(move || signed.uninstall(&owned)).await {
+                Ok(Ok(UninstallOutcome::Removed)) => removed_signed = true,
+                Ok(Ok(UninstallOutcome::NotInstalled)) => {}
+                Ok(Err(err)) => {
+                    let error = format!("Failed to remove signed extension: {err:?}");
+                    self.broadcast_state_changed(name, "failed", Some(error.clone()));
+                    return HubResult::err(error);
+                }
+                Err(_) => {
+                    let error = "Failed to remove signed extension".to_owned();
+                    self.broadcast_state_changed(name, "failed", Some(error.clone()));
+                    return HubResult::err(error);
+                }
+            }
+        }
+
         let target_dir = self.index_manager.install_target_dir();
         let ext_dir = target_dir.join(name);
 
-        if !ext_dir.exists() {
+        if !ext_dir.exists() && !removed_signed {
             let error = format!("Extension '{name}' is not installed");
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
 
-        if let Err(e) = std::fs::remove_dir_all(&ext_dir) {
+        if ext_dir.exists()
+            && let Err(e) = std::fs::remove_dir_all(&ext_dir)
+        {
             warn!(
                 name,
                 error = %e,
@@ -223,6 +272,59 @@ impl HubInstaller {
 
         info!(name, "hub: extension uninstalled successfully");
         HubResult::ok()
+    }
+
+    /// Signed local-package path. `None` = not applicable (no signed context, unsafe name, or no
+    /// package file for this entry): the caller continues with today's flow. `Some` = decided here.
+    async fn try_signed_package(&self, entry: &HubIndexEntry, name: &str) -> Option<HubResult> {
+        let signed = self.signed.clone()?;
+        // The package file name is `{name}.zip` next to the index; the name must be its own safe
+        // directory component (identity under the Host's encoding), otherwise no package applies.
+        if encode_component(&entry.name).as_deref() != Some(entry.name.as_str()) {
+            return None;
+        }
+        let package_path = self
+            .index_manager
+            .install_target_dir()
+            .join(format!("{}.zip", entry.name));
+        let max = signed.max_package_zip_bytes();
+        let entry_owned = entry.clone();
+        let installed = tokio::task::spawn_blocking(move || {
+            let bytes = match read_local_package(&package_path, max) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return None,
+                Err(()) => {
+                    return Some(Err(SignedPackageError::Package(
+                        super::local_package_install::LocalPackageError::InvalidPackage,
+                    )));
+                }
+            };
+            Some(signed.install_package(&entry_owned, &bytes))
+        })
+        .await;
+        let outcome = match installed {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => return None,
+            Err(_) => {
+                let error = "Signed package install failed".to_owned();
+                self.broadcast_state_changed(name, "failed", Some(error.clone()));
+                return Some(HubResult::err(error));
+            }
+        };
+        match outcome {
+            Ok(report) => {
+                info!(name, kind = ?report.kind, "hub: signed package installed");
+                self.registry.hot_reload().await;
+                self.broadcast_state_changed(name, "installed", None);
+                Some(HubResult::ok())
+            }
+            Err(err) => {
+                let error = format!("Signed package install failed: {err:?}");
+                warn!(name, "hub: signed package install refused");
+                self.broadcast_state_changed(name, "failed", Some(error.clone()));
+                Some(HubResult::err(error))
+            }
+        }
     }
 
     /// Check for available updates across all installed extensions.
@@ -332,6 +434,30 @@ fn is_newer(index_version: &str, installed_version: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+/// Read a locally supplied package archive: a regular file (never a symlink), bounded. `Ok(None)`
+/// when absent. The bytes are untrusted until `check_signed_manifest` and the SRI checks pass.
+fn read_local_package(path: &Path, max: u64) -> Result<Option<Vec<u8>>, ()> {
+    use std::io::Read as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if !meta.is_file() || meta.len() > max {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| ())?
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > max {
+        return Err(());
+    }
+    Ok(Some(bytes))
+}
 
 #[cfg(test)]
 mod tests {

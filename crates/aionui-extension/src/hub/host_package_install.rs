@@ -276,6 +276,79 @@ pub fn install_local_signed_package_auto(
     )
 }
 
+/// What [`uninstall_local_signed_package`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninstallOutcome {
+    /// A live binding and/or a Host-layout directory existed and is now gone.
+    Removed,
+    /// Nothing under the Host layout for that name (a legacy directory install is not touched).
+    NotInstalled,
+}
+
+/// Uninstall an extension that was installed through [`install_local_signed_package_auto`].
+///
+/// Fail closed order: unlink the `current` marker (a restart can no longer re-bind it), drop the live
+/// binding, then delete the name directory FD-relative and no-follow. Only the Host-layout directory
+/// for the encoded signed name under `parent` is touched; legacy directories are never read here.
+pub fn uninstall_local_signed_package(
+    store: &SignedRootBindingStore,
+    parent: &HostExtensionsParent,
+    name: &str,
+) -> Result<UninstallOutcome, LocalPackageError> {
+    let name_component = encode_component(name).ok_or(LocalPackageError::InvalidDirName)?;
+    let _guard = parent.lock.lock().unwrap_or_else(|e| e.into_inner());
+    imp::uninstall(store, &parent.dir, name, &name_component)
+}
+
+/// Loader discovery helper (read-only, path based, **no trust**): for a name directory in the Host
+/// layout return `{name_dir}/{component}` of the installed version named by a well-formed `current`
+/// marker. The marker must be a regular file (not a symlink), the version directory a real directory,
+/// and both identities must encode to exactly the directory names they were found under. The result
+/// only says where to look for a manifest; trust comes solely from restore / install bindings.
+#[cfg(unix)]
+pub(crate) fn resolve_current_version_dir(name_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::Read as _;
+    let marker_path = name_dir.join(MARKER_FILE);
+    let meta = std::fs::symlink_metadata(&marker_path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_MARKER_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&marker_path)
+        .ok()?
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let marker = CurrentMarker::parse(&bytes)?;
+    if encode_component(&marker.name).as_deref() != Some(name_dir.file_name()?.to_str()?)
+        || encode_component(&marker.version).as_deref() != Some(marker.component.as_str())
+    {
+        return None;
+    }
+    let version_dir = name_dir.join(&marker.component);
+    std::fs::symlink_metadata(&version_dir)
+        .ok()?
+        .is_dir()
+        .then_some(version_dir)
+}
+
+/// True iff `name` / `version` encode to exactly the directory names of `name_dir` / `version_dir`.
+pub(crate) fn loaded_identity_matches_layout(
+    name: &str,
+    version: &str,
+    name_dir: &std::path::Path,
+    version_dir: &std::path::Path,
+) -> bool {
+    let leaf = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+    encode_component(name).is_some_and(|c| Some(c) == leaf(name_dir))
+        && encode_component(version).is_some_and(|c| Some(c) == leaf(version_dir))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn resolve_current_version_dir(_name_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Remove leftovers of crashed attempts under the Host parent: `.wip-*` and `.old-*` directories
 /// and stray `.current.tmp-*` files directly inside name directories.
 ///
@@ -299,7 +372,7 @@ mod imp {
     use super::super::signed_manifest::SignatureCheckedManifest;
     use super::{
         AutoInstallOptions, AutoInstallReport, CurrentMarker, InstallKind, MARKER_FILE, MARKER_TMP_PREFIX,
-        MAX_MARKER_BYTES, STAGING_PREFIX, SUPERSEDED_PREFIX, StagingSweepReport, encode_component,
+        MAX_MARKER_BYTES, STAGING_PREFIX, SUPERSEDED_PREFIX, StagingSweepReport, UninstallOutcome, encode_component,
     };
     use crate::signed_root_binding::SignedRootBindingStore;
 
@@ -512,6 +585,49 @@ mod imp {
         Ok(AutoInstallReport { files_written, kind })
     }
 
+    pub(super) fn uninstall(
+        store: &SignedRootBindingStore,
+        parent: &File,
+        name: &str,
+        name_component: &str,
+    ) -> Result<UninstallOutcome, LocalPackageError> {
+        let kind = kind_nofollow(parent, name_component).map_err(|_| LocalPackageError::RemoveFailed)?;
+        match kind {
+            None => Ok(if store.remove(name) {
+                UninstallOutcome::Removed
+            } else {
+                UninstallOutcome::NotInstalled
+            }),
+            Some(Kind::Dir) => {
+                let name_dir = base::openat(parent, name_component, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+                    .map_err(|_| LocalPackageError::RemoveFailed)?;
+                // 1. No restart may re-bind this tree.
+                if matches!(kind_nofollow(&name_dir, MARKER_FILE), Ok(Some(_))) {
+                    let _ = remove_marker_entry(&name_dir);
+                    if matches!(kind_nofollow(&name_dir, MARKER_FILE), Ok(Some(_))) {
+                        return Err(LocalPackageError::RemoveFailed);
+                    }
+                }
+                // 2. No more verified serving / prepare from the old root.
+                store.remove(name);
+                // 3. Delete the tree.
+                drop(name_dir);
+                remove_tree_at(parent, name_component, 0).map_err(|_| LocalPackageError::RemoveFailed)?;
+                Ok(UninstallOutcome::Removed)
+            }
+            // A file / symlink / special entry where the name directory should be: refuse, touch nothing.
+            Some(_) => Err(LocalPackageError::RemoveFailed),
+        }
+    }
+
+    fn remove_marker_entry(name_dir: &File) -> std::io::Result<()> {
+        match kind_nofollow(name_dir, MARKER_FILE)? {
+            Some(Kind::Dir) => remove_tree_at(name_dir, MARKER_FILE, 0),
+            Some(_) => unlinkat(name_dir, MARKER_FILE, 0),
+            None => Ok(()),
+        }
+    }
+
     pub(super) fn sweep(parent: &File) -> StagingSweepReport {
         let mut report = StagingSweepReport::default();
         let Ok(names) = list_dir(parent) else {
@@ -560,8 +676,17 @@ mod imp {
 
     use super::super::local_package_install::{LocalPackageError, ValidatedPackage};
     use super::super::signed_manifest::SignatureCheckedManifest;
-    use super::{AutoInstallOptions, AutoInstallReport, StagingSweepReport};
+    use super::{AutoInstallOptions, AutoInstallReport, StagingSweepReport, UninstallOutcome};
     use crate::signed_root_binding::SignedRootBindingStore;
+
+    pub(super) fn uninstall(
+        _store: &SignedRootBindingStore,
+        _parent: &File,
+        _name: &str,
+        _name_component: &str,
+    ) -> Result<UninstallOutcome, LocalPackageError> {
+        Err(LocalPackageError::Unsupported)
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn install(
@@ -1377,6 +1502,42 @@ mod tests {
                 ("demo.plugin", RestoreRejection::IntegrityMismatch),
                 ("not-an-extension", RestoreRejection::MarkerMissing)
             ]
+        );
+    }
+
+    #[test]
+    fn uninstall_handles_absent_symlinked_and_present_name_directories() {
+        use super::{UninstallOutcome, uninstall_local_signed_package};
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = HostExtensionsParent::new(File::open(tmp.path()).unwrap()).unwrap();
+        let store = SignedRootBindingStore::new();
+        assert_eq!(
+            uninstall_local_signed_package(&store, &parent, "demo.plugin"),
+            Ok(UninstallOutcome::NotInstalled)
+        );
+        // A symlink where the name directory should be is refused and its target untouched.
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("keep"), b"k").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), tmp.path().join("demo.plugin")).unwrap();
+        assert_eq!(
+            uninstall_local_signed_package(&store, &parent, "demo.plugin"),
+            Err(LocalPackageError::RemoveFailed)
+        );
+        assert!(elsewhere.path().join("keep").exists());
+        std::fs::remove_file(tmp.path().join("demo.plugin")).unwrap();
+        // Real directory with marker and a nested tree is removed.
+        std::fs::create_dir_all(tmp.path().join("demo.plugin/1.0.0/sub")).unwrap();
+        std::fs::write(tmp.path().join("demo.plugin/1.0.0/sub/f"), b"f").unwrap();
+        std::fs::write(tmp.path().join("demo.plugin/current"), b"{}").unwrap();
+        assert_eq!(
+            uninstall_local_signed_package(&store, &parent, "demo.plugin"),
+            Ok(UninstallOutcome::Removed)
+        );
+        assert!(!tmp.path().join("demo.plugin").exists());
+        // Names that cannot be a component are refused before touching anything.
+        assert_eq!(
+            uninstall_local_signed_package(&store, &parent, ""),
+            Err(LocalPackageError::InvalidDirName)
         );
     }
 }
