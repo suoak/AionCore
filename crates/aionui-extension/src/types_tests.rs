@@ -286,6 +286,10 @@ fn test_manifest_full_roundtrip() {
             locales: vec!["en".into(), "zh-CN".into()],
             directory: "i18n".into(),
         }),
+        files: vec![ManifestFile {
+            path: "panels/a.css".into(),
+            integrity: "sha512-x".into(),
+        }],
     };
     let json_str = serde_json::to_string(&manifest).unwrap();
     let parsed: ExtensionManifest = serde_json::from_str(&json_str).unwrap();
@@ -311,6 +315,7 @@ fn test_manifest_snake_case_keys() {
         contributes: None,
         lifecycle: None,
         i18n: None,
+        files: Vec::new(),
     };
     let json = serde_json::to_value(&manifest).unwrap();
     assert!(json.get("display_name").is_some());
@@ -514,6 +519,7 @@ fn test_loaded_extension_roundtrip() {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         },
         directory: "/path/to/ext".into(),
         source: ExtensionSource::Env,

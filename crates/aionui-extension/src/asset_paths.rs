@@ -28,6 +28,19 @@ pub(crate) fn normalize_relative_asset_path(path: &str) -> Option<PathBuf> {
     Some(normalized)
 }
 
+/// Exact canonical relative form (`a/b.txt`) used for signed package paths.
+///
+/// Returns `Some` only when the input already is its own normalization: no `..`,
+/// absolute or drive prefix, backslash, NUL, empty string, `./a`, `a//b` or `a/./b`.
+pub(crate) fn canonical_relative_path(name: &str) -> Option<String> {
+    if name.is_empty() || name.contains('\0') || name.contains('\\') {
+        return None;
+    }
+    let normalized = normalize_relative_asset_path(name)?;
+    let joined = normalized.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
+    (joined == name).then_some(joined)
+}
+
 /// Convert a normalized relative path into a URL path with forward slashes.
 pub(crate) fn normalized_asset_url_path(path: &str) -> Option<String> {
     let normalized = normalize_relative_asset_path(path)?;
@@ -56,6 +69,16 @@ pub(crate) fn resolve_extension_asset_url(extension_name: &str, raw: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_relative_path_accepts_only_exact_canonical_form() {
+        assert_eq!(canonical_relative_path("a/b.txt").as_deref(), Some("a/b.txt"));
+        for bad in [
+            "", "./a", "a//b", "a/./b", "../a", "/a", "a/", "a\\b", "a\0b", "a/../b", "C:\\x",
+        ] {
+            assert!(canonical_relative_path(bad).is_none(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn remote_asset_url_detects_http_and_https() {

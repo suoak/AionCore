@@ -37,7 +37,7 @@ use super::curated::{CuratedInstallPolicy, sri_sha512};
 use super::signed_manifest::{
     SignatureCheckedManifest, SignedManifestEntry, SignedManifestError, check_signed_manifest,
 };
-use crate::asset_paths::normalize_relative_asset_path;
+use crate::asset_paths::canonical_relative_path;
 use crate::constants::EXTENSION_MANIFEST_FILE;
 use crate::manifest::parse_manifest;
 use crate::signed_root_binding::{SignedRootBindingError, SignedRootBindingStore};
@@ -104,13 +104,7 @@ struct ValidatedPackage {
 }
 
 fn canonical_relative(name: &str) -> Option<String> {
-    if name.is_empty() || name.contains('\0') || name.contains('\\') {
-        return None;
-    }
-    let normalized = normalize_relative_asset_path(name)?;
-    let joined = normalized.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
-    // Exact canonical form only (rejects "./a", "a//b", "a/./b").
-    (joined == name).then_some(joined)
+    canonical_relative_path(name)
 }
 
 /// Integrity-covered files declared by the signed manifest: path -> expected SRI.

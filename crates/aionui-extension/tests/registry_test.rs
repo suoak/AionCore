@@ -41,6 +41,7 @@ fn make_ext(name: &str, version: &str, enabled: bool) -> LoadedExtension {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            files: Vec::new(),
         },
         directory: format!("/tmp/test-ext/{name}"),
         source: ExtensionSource::Local,
