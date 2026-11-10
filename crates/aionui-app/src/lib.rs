@@ -6,6 +6,8 @@
 //! submodules. All logic lives in the modules below.
 
 mod config;
+/// Host composition: signed backgroundService binding → checked entry-point source (no service-start auth).
+pub mod extension_js_background_service_source;
 pub mod extension_js_checked_source;
 /// Experimental internal fixed-executable JS client; not connected to extension routes.
 pub mod extension_js_client;

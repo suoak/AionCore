@@ -82,13 +82,15 @@ Host directory `File` from path strings (HostRuntime path containment stays as-i
 
 ## Host composition (app)
 
-`aionui_app::extension_js_panel_source::load_checked_panel_source_from_signed`
-and `extension_js_work_panel_view_source::load_checked_work_panel_view_source_from_signed`
-compose the panels / workPanelViews binders with `read_checked_source` against a
+`aionui_app::extension_js_panel_source::load_checked_panel_source_from_signed`,
+`extension_js_work_panel_view_source::load_checked_work_panel_view_source_from_signed`
+and `extension_js_background_service_source::load_checked_background_service_source_from_signed`
+compose the panels / workPanelViews / backgroundServices binders with `read_checked_source` against a
 Host-supplied trusted root. Missing integrity remains `NotPresent` (no unchecked
 fallback). Success returns the same owned verified source `String`. Still not
-panel/view-load/iframe auth, curation/owner/root proof, or M9/E13 completion.
+panel/view-load/iframe auth, service start/spawn auth (HostRuntime start is not wired to this),
+curation/owner/root proof, or M9/E13 completion.
 
-**No backgroundServices app compose / HostRuntime start-path change in this sibling
-knife** — extension-crate field + validate + binder only until a deliberate Host
-call site exists that already holds a trusted root (not path-string invention).
+**No HostRuntime start-path change**: backgroundServices app compose exists, but
+service start/spawn is not routed through it until a deliberate Host call site
+exists that already holds a trusted root (not path-string invention).
