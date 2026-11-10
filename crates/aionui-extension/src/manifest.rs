@@ -1,4 +1,4 @@
-use crate::asset_paths::canonical_relative_path;
+use crate::asset_paths::{canonical_relative_path, is_remote_asset_url};
 use crate::constants::{EXTENSION_MANIFEST_FILE, RESERVED_NAME_PREFIXES};
 use crate::error::ExtensionError;
 use crate::hub::is_canonical_sha512_sri;
@@ -37,6 +37,13 @@ pub const MAX_MANIFEST_FILES: usize = 1024;
 /// binder and gate reads inherited integrity from the very same field as declared integrity. A typed
 /// manifest that was not inherited (field still `None`) is refused here rather than treated as
 /// undeclared. Manifests without `files` keep the existing per-entry behaviour unchanged.
+///
+/// Served-asset rules (M9 E13 slice J): when `files` is non-empty, every local path a contribution
+/// resolver later turns into `/api/extensions/{name}/assets/…` (settingsTabs `url`/`icon`, panel
+/// and workPanelView `icon`, theme `cover_image`, assistant/agent/channel-plugin `icon`, ACP
+/// `avatar`) must also be a canonical path listed in `files`. Remote `http(s)` URLs are not
+/// package files. Paths that are not actually asset-served today (theme `css_file`, webui
+/// directory/handlers, skills, i18n, hooks, manifest-level `icon`) are not forced into the list.
 /// Declaration consistency only: it reads no file, proves no bytes, and an omitted list never
 /// means unlisted extras are verified.
 fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
@@ -66,6 +73,20 @@ fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), Extension
                     "contribution integrity was not inherited from the files list".into(),
                 ));
             }
+        }
+    }
+    // Slice J: every local path the Host later turns into `/assets/...` must be listed, so a
+    // bound serve (slice F) can verify it and an unlisted referenced asset cannot be advertised.
+    for path in served_contribution_assets(manifest) {
+        let canonical = canonical_relative_path(path).ok_or_else(|| {
+            ExtensionError::ManifestValidation(
+                "served contribution asset must be a canonical relative path when files is declared".into(),
+            )
+        })?;
+        if !declared.contains_key(canonical.as_str()) {
+            return Err(ExtensionError::ManifestValidation(
+                "served contribution asset is missing from the files list".into(),
+            ));
         }
     }
     Ok(())
@@ -148,6 +169,52 @@ fn contribution_file_entries(manifest: &ExtensionManifest) -> Vec<(&str, Option<
         if let Some(handler) = t.handler.as_deref().filter(|h| !h.is_empty()) {
             out.push((handler, t.handler_integrity.as_deref()));
         }
+    }
+    out
+}
+
+/// Local (non-`http(s)`) paths that contribution resolvers turn into `/api/extensions/{name}/assets/…`
+/// URLs and that `serve_extension_asset` therefore serves. Remote URLs are skipped. This is only the
+/// set that is actually asset-served today; theme CSS, webui directories, skills, i18n and hooks are
+/// not included (they are read or resolved some other way — see the slice J design note).
+fn push_local_served_asset<'a>(out: &mut Vec<&'a str>, value: Option<&'a str>) {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return;
+    };
+    if !is_remote_asset_url(value) {
+        out.push(value);
+    }
+}
+
+fn served_contribution_assets(manifest: &ExtensionManifest) -> Vec<&str> {
+    let mut out = Vec::new();
+    let Some(c) = manifest.contributes.as_ref() else {
+        return out;
+    };
+    for tab in &c.settings_tabs {
+        push_local_served_asset(&mut out, Some(tab.url.as_str()));
+        push_local_served_asset(&mut out, tab.icon.as_deref());
+    }
+    for theme in &c.themes {
+        push_local_served_asset(&mut out, theme.cover_image.as_deref());
+    }
+    for panel in &c.panels {
+        push_local_served_asset(&mut out, panel.icon.as_deref());
+    }
+    for view in &c.work_panel_views {
+        push_local_served_asset(&mut out, view.icon.as_deref());
+    }
+    for assistant in &c.assistants {
+        push_local_served_asset(&mut out, assistant.icon.as_deref());
+    }
+    for agent in &c.agents {
+        push_local_served_asset(&mut out, agent.icon.as_deref());
+    }
+    for plugin in &c.channel_plugins {
+        push_local_served_asset(&mut out, plugin.icon.as_deref());
+    }
+    for adapter in &c.acp_adapters {
+        push_local_served_asset(&mut out, adapter.avatar.as_deref());
     }
     out
 }
@@ -1384,6 +1451,134 @@ mod tests {
         let tool = json!({"agentTools": [{"id": "t", "name": "T"}]});
         let m = parse_manifest(&files_manifest(json!([{"path": "a.css", "integrity": i}]), tool)).unwrap();
         assert!(m.contributes.unwrap().agent_tools[0].handler_integrity.is_none());
+    }
+
+    fn served_kind(kind: &str, path: &str) -> serde_json::Value {
+        match kind {
+            "settingsTabs" => json!({"settingsTabs": [{"id": "t", "label": "T", "url": path}]}),
+            "settingsTabIcon" => {
+                json!({"settingsTabs": [{"id": "t", "label": "T", "url": "https://example.com/tab", "icon": path}]})
+            }
+            "themes" => {
+                json!({"themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css", "cover_image": path}]})
+            }
+            "panelIcon" => json!({"panels": [{"id": "p", "title": "P", "entryPoint": "p.html", "icon": path}]}),
+            "viewIcon" => {
+                json!({"workPanelViews": [{"id": "v", "title": "V", "entryPoint": "v.html", "icon": path}]})
+            }
+            "assistants" => json!({"assistants": [{"id": "a", "name": "A", "icon": path}]}),
+            "agents" => json!({"agents": [{"id": "g", "name": "G", "icon": path}]}),
+            "channelPlugins" => json!({"channelPlugins": [{"id": "c", "name": "C", "icon": path}]}),
+            "acpAdapters" => json!({"acpAdapters": [{"id": "acp", "name": "ACP", "avatar": path}]}),
+            _ => panic!("unknown served kind {kind}"),
+        }
+    }
+
+    /// Paths the Host later advertises as `/assets/...` must be listed when `files` is declared.
+    #[test]
+    fn files_must_list_every_local_served_contribution_asset() {
+        let i = sri(b"asset");
+        let entry = sri(b"entry");
+        for kind in [
+            "settingsTabs",
+            "settingsTabIcon",
+            "themes",
+            "panelIcon",
+            "viewIcon",
+            "assistants",
+            "agents",
+            "channelPlugins",
+            "acpAdapters",
+        ] {
+            let asset = "icons/logo.svg";
+            let mut list = vec![json!({"path": asset, "integrity": i})];
+            // Icon kinds that ride on a panel / view also need the already-required entryPoint listed.
+            if kind == "panelIcon" {
+                list.push(json!({"path": "p.html", "integrity": entry}));
+            }
+            if kind == "viewIcon" {
+                list.push(json!({"path": "v.html", "integrity": entry}));
+            }
+            assert!(
+                parse_manifest(&files_manifest(json!(list), served_kind(kind, asset))).is_ok(),
+                "{kind} listed"
+            );
+            // Unlisted local path is refused.
+            let placeholder = json!([{"path": "other.css", "integrity": i}]);
+            let mut missing = placeholder.as_array().unwrap().clone();
+            if kind == "panelIcon" {
+                missing.push(json!({"path": "p.html", "integrity": entry}));
+            }
+            if kind == "viewIcon" {
+                missing.push(json!({"path": "v.html", "integrity": entry}));
+            }
+            assert!(
+                is_validation_err(parse_manifest(&files_manifest(
+                    json!(missing),
+                    served_kind(kind, asset)
+                ))),
+                "{kind} unlisted"
+            );
+            // Non-canonical local path cannot be listed.
+            let mut noncanon = vec![json!({"path": asset, "integrity": i})];
+            if kind == "panelIcon" {
+                noncanon.push(json!({"path": "p.html", "integrity": entry}));
+            }
+            if kind == "viewIcon" {
+                noncanon.push(json!({"path": "v.html", "integrity": entry}));
+            }
+            assert!(
+                is_validation_err(parse_manifest(&files_manifest(
+                    json!(noncanon),
+                    served_kind(kind, &format!("./{asset}")),
+                ))),
+                "{kind} noncanonical"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_served_assets_do_not_need_a_files_entry() {
+        let i = sri(b"x");
+        for (kind, url) in [
+            ("settingsTabs", "https://example.com/tab"),
+            ("settingsTabIcon", "https://cdn.example/icon.svg"),
+            ("themes", "https://cdn.example/cover.png"),
+            ("assistants", "http://example.com/a.png"),
+            ("agents", "https://example.com/g.png"),
+            ("channelPlugins", "https://example.com/c.png"),
+            ("acpAdapters", "https://example.com/a.png"),
+        ] {
+            let raw = files_manifest(json!([{"path": "a.css", "integrity": i}]), served_kind(kind, url));
+            assert!(parse_manifest(&raw).is_ok(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn theme_css_and_webui_paths_are_not_forced_into_files() {
+        // Honest scope: these are not served through `serve_extension_asset` today.
+        let i = sri(b"x");
+        let theme = json!({"themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css"}]});
+        assert!(parse_manifest(&files_manifest(json!([{"path": "a.css", "integrity": i}]), theme)).is_ok());
+        let webui = json!({"webui": [{"id": "ui", "directory": "ui", "routes": [{"path": "/x", "method": "GET", "handler": "ui/h.js"}]}]});
+        assert!(parse_manifest(&files_manifest(json!([{"path": "a.css", "integrity": i}]), webui)).is_ok());
+    }
+
+    #[test]
+    fn legacy_manifest_without_files_does_not_require_served_assets() {
+        for kind in ["settingsTabs", "themes", "assistants", "acpAdapters"] {
+            for files in [None, Some(json!([]))] {
+                let mut raw = json!({
+                    "name": "demo.plugin",
+                    "version": "1.0.0",
+                    "contributes": served_kind(kind, "icons/logo.svg"),
+                });
+                if let Some(f) = files {
+                    raw["files"] = f;
+                }
+                assert!(parse_manifest(&serde_json::to_vec(&raw).unwrap()).is_ok(), "{kind}");
+            }
+        }
     }
 
     #[test]
