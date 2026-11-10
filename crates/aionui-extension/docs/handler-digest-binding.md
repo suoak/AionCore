@@ -84,6 +84,9 @@ existing planSafeActions gate:
 Curated HubInstaller still does **not** auto-install bindings. Not execution
 auth / Node-shell unlock / M9/E13 complete.
 
-## Related: panel entryPointIntegrity
+## Related: entryPointIntegrity (panels / workPanelViews / backgroundServices)
 
-See `entry-point-digest-binding.md` for the parallel optional field on `ExtPanel` (declaration only; choice B after Host retain map).
+See `entry-point-digest-binding.md` for the parallel optional fields on
+`ExtPanel`, `ExtWorkPanelView`, and `ExtBackgroundService` (declaration + sibling
+binders; choice B after Host retain map). BackgroundServices knife does not
+change HostRuntime service start.

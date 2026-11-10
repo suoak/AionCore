@@ -1,3 +1,4 @@
+pub mod background_service_entry_point_digest;
 pub mod curated;
 pub mod curated_signed_retain;
 pub mod entry_point_digest;
@@ -8,6 +9,10 @@ pub mod signed_manifest;
 pub mod sri_format;
 pub mod work_panel_view_entry_point_digest;
 
+pub use background_service_entry_point_digest::{
+    BackgroundServiceEntryPointDigestError, bind_background_service_entry_point_digest_from_signed,
+    expected_background_service_entry_point_integrity,
+};
 pub use curated::{
     ALLOWLIST_ENV, CuratedGateError, CuratedInstallPolicy, REQUIRE_SIGNATURE_ENV, SIGNING_PUBKEYS_ENV,
     signature_payload, sri_sha512,

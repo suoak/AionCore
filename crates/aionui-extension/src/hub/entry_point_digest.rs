@@ -6,7 +6,7 @@
 //! can form a host-mediated binding; this module alone does not authorize panel
 //! load/execution, prove curation/owner/root or read entry-point files.
 //!
-//! Scoped to standalone `contributes.panels` (not workPanelViews / background).
+//! Scoped to standalone `contributes.panels` (workPanelViews / backgroundServices have siblings).
 use super::signed_manifest::SignatureCheckedManifest;
 use super::sri_format::is_canonical_sha512_sri;
 use crate::manifest::parse_manifest;
@@ -42,7 +42,7 @@ impl std::fmt::Debug for EntryPointDigestBinding {
 impl EntryPointDigestBinding {
     /// Construct a binding from already-validated non-empty entry path + canonical SRI.
     ///
-    /// `pub(crate)` so sibling contribute binders (e.g. workPanelViews) can reuse the
+    /// `pub(crate)` so sibling contribute binders (workPanelViews / backgroundServices) can reuse the
     /// same opaque type without exposing a public invent-digest API.
     pub(crate) fn new(entry_point: String, integrity: String) -> Self {
         Self { entry_point, integrity }

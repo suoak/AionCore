@@ -13,6 +13,7 @@ pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionEr
     validate_agent_tool_handler_digests(manifest)?;
     validate_panel_entry_point_digests(manifest)?;
     validate_work_panel_view_entry_point_digests(manifest)?;
+    validate_background_service_entry_point_digests(manifest)?;
     Ok(())
 }
 
@@ -87,6 +88,32 @@ fn validate_work_panel_view_entry_point_digests(manifest: &ExtensionManifest) ->
         if view.entry_point.is_empty() {
             return Err(ExtensionError::ManifestValidation(
                 "workPanelView entryPointIntegrity requires a non-empty entryPoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fail closed when an optional backgroundService entry-point digest is present but malformed.
+///
+/// Missing/None remains allowed for back-compat and does **not** mean verified.
+/// Scoped to `contributes.backgroundServices` only (panels / workPanelViews have sibling validators).
+fn validate_background_service_entry_point_digests(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
+    let Some(contributes) = manifest.contributes.as_ref() else {
+        return Ok(());
+    };
+    for service in &contributes.background_services {
+        let Some(integrity) = service.entry_point_integrity.as_deref() else {
+            continue;
+        };
+        if !is_canonical_sha512_sri(integrity) {
+            return Err(ExtensionError::ManifestValidation(
+                "backgroundService entryPointIntegrity must be a canonical sha512 SRI".into(),
+            ));
+        }
+        if service.entry_point.is_empty() {
+            return Err(ExtensionError::ManifestValidation(
+                "backgroundService entryPointIntegrity requires a non-empty entryPoint".into(),
             ));
         }
     }
@@ -334,6 +361,8 @@ fn normalize_background_service(value: &mut Value) {
         return;
     };
     move_key(obj, "entryPoint", "entry_point");
+    // ExtBackgroundService integrity field (panels / workPanelViews use separate normalizers).
+    move_key(obj, "entryPointIntegrity", "entry_point_integrity");
 }
 
 fn normalize_array_entries(value: Option<&mut Value>, normalize_item: fn(&mut Value)) {
