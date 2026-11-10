@@ -8,4 +8,15 @@
 # which aws-sigv4 1.x does not accept, so it cannot be patched from this
 # workspace's lockfile; drop this entry once the aionrs pin moves to an
 # aws-sigv4 built on crypto-bigint >= 0.7.6.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
+# RUSTSEC-2026-0462 (rmcp: unbounded buffering in Streamable HTTP *clients*):
+# the advisory is limited to features `transport-streamable-http-client-reqwest`
+# and `transport-streamable-http-client-unix-socket`. aionui-app pins
+# `rmcp = { version = "1.5", features = ["server", "transport-io", "schemars"] }`.
+# `cargo metadata` on this lockfile shows rmcp 1.8.0 enabled features
+# `base64`, `default`, `macros`, `schemars`, `server`, `transport-async-rw`,
+# and `transport-io` only; `cargo tree -i rmcp` reaches only aionui-app, and
+# the locked rmcp 1.8.0 dependency list has no reqwest / HTTP-client crates.
+# A 1.8 → 3.9 major bump is not taken. Drop this ignore if those client
+# features are enabled, or once rmcp is on a line that includes them with
+# the 3.9+ body-size fix.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0462"]
