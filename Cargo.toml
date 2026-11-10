@@ -33,6 +33,9 @@ members = [
     "crates/aionui-batch",
     "crates/aionui-app",
 ]
+# Vendored third-party crate (see [patch.crates-io] below); not a workspace member,
+# so it is not fmt/clippy/test-linted as first-party code.
+exclude = ["vendor/sqlx-sqlite"]
 
 [workspace.package]
 version = "0.4.0"
@@ -114,7 +117,7 @@ rpassword = "7"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Auth / Crypto
 jsonwebtoken = "9"
@@ -238,3 +241,12 @@ incremental = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = false
+
+# RUSTSEC-2026-0459: libsqlite3-sys < 0.39 bundles SQLite < 3.54.0. sqlx-sqlite 0.8.6
+# hard-pins libsqlite3-sys 0.30.1 and rusqlite 0.41 needs ^0.39 (one `links = "sqlite3"`
+# per graph), and no released sqlx accepts 0.39. Use the unmodified published
+# sqlx-sqlite 0.8.6 sources with only that version range widened (vendor/README.md).
+# Drop this patch once the workspace moves to a released sqlx whose sqlx-sqlite accepts
+# libsqlite3-sys >= 0.39.
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
