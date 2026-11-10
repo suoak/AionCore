@@ -1505,6 +1505,79 @@ mod tests {
         assert_eq!((status, body.as_str()), (StatusCode::OK, "EVIL-CSS"));
     }
 
+    const V_TAB: &[u8] = b"<h1>settings</h1>";
+    const V_ICON: &[u8] = b"<svg></svg>";
+    const V_COVER: &[u8] = b"PNGCOVER";
+
+    /// Bound+files serve of settings-tab, icon and theme-cover paths (the kinds slice J now
+    /// requires to be listed). Same retained-root / O_NOFOLLOW / SRI path as slice F; unlisted 403.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_serve_covers_listed_settings_icon_and_theme_cover() {
+        use crate::hub::curated::sri_sha512;
+        let loaded = serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "contributes": {
+                "settingsTabs": [{"id": "t", "label": "T", "url": "settings/index.html", "icon": "icons/gear.svg"}],
+                "themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css", "cover_image": "themes/cover.png"}]
+            }
+        });
+        let (state, tmp, ext_dir) = make_state_with_manifest(loaded).await;
+        std::fs::create_dir_all(ext_dir.join("settings")).unwrap();
+        std::fs::create_dir_all(ext_dir.join("icons")).unwrap();
+        std::fs::create_dir_all(ext_dir.join("themes")).unwrap();
+        std::fs::write(ext_dir.join("settings/index.html"), "EVIL-TAB").unwrap();
+        std::fs::write(ext_dir.join("icons/gear.svg"), "EVIL-ICON").unwrap();
+        std::fs::write(ext_dir.join("themes/cover.png"), "EVIL-COVER").unwrap();
+        let host_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_root.path().join("settings")).unwrap();
+        std::fs::create_dir_all(host_root.path().join("icons")).unwrap();
+        std::fs::create_dir_all(host_root.path().join("themes")).unwrap();
+        std::fs::write(host_root.path().join("settings/index.html"), V_TAB).unwrap();
+        std::fs::write(host_root.path().join("icons/gear.svg"), V_ICON).unwrap();
+        std::fs::write(host_root.path().join("themes/cover.png"), V_COVER).unwrap();
+        std::fs::write(host_root.path().join("unlisted.css"), "x").unwrap();
+        let signed = serde_json::to_vec(&serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "files": [
+                {"path": "settings/index.html", "integrity": sri_sha512(V_TAB)},
+                {"path": "icons/gear.svg", "integrity": sri_sha512(V_ICON)},
+                {"path": "themes/cover.png", "integrity": sri_sha512(V_COVER)},
+            ],
+            "contributes": {
+                "settingsTabs": [{"id": "t", "label": "T", "url": "settings/index.html", "icon": "icons/gear.svg"}],
+                "themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css", "cover_image": "themes/cover.png"}]
+            }
+        }))
+        .unwrap();
+        state
+            .host_runtime
+            .signed_roots
+            .install(
+                "hello",
+                check_for_hello(&signed),
+                std::fs::File::open(host_root.path()).unwrap(),
+            )
+            .unwrap();
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        let _ = tmp;
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/settings/index.html").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "<h1>settings</h1>"));
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/icons/gear.svg").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "<svg></svg>"));
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/themes/cover.png").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "PNGCOVER"));
+        // css_file is not asset-served; an unlisted path is refused even if present on the root.
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/themes/dark.css").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            asset_status(&router, "/api/extensions/hello/assets/unlisted.css").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
     #[tokio::test]
     async fn asset_token_serves_only_its_extension_without_auth() {
         let (state, _tmp, _ext_dir) = make_state_with_extension().await;
