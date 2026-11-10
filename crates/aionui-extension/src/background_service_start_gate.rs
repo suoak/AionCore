@@ -6,7 +6,11 @@
 //! be a TOCTOU, and there is no honest Host directory `File` at this call site
 //! (`LoadedExtension.directory` is a `String`, which must never be reopened as a trust root).
 //!
-//! So the honest slice is a **refusal gate**: if a service declares `entryPointIntegrity`
+//! Bound extensions whose signed snapshot declares `files` are handled by
+//! [`crate::bound_background_start`] (verify through the retained root, then refuse FD-exec in
+//! this slice) and never reach the path spawn below.
+//!
+//! So the honest slice for the **legacy / no-files** path is a **refusal gate**: if a service declares `entryPointIntegrity`
 //! (in the loaded manifest, or in a Host-retained signature-checked snapshot), the
 //! integrity claim cannot be honoured by the path spawn → refuse; never fall back to an
 //! unchecked spawn. A service that declares nothing keeps the legacy path-spawn behaviour

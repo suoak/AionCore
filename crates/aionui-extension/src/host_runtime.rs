@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::background_service_start_gate::gate_background_service_start;
+use crate::bound_background_start::{refuse_verified_without_fd_exec, verify_bound_files_service};
 use crate::error::ExtensionError;
 use crate::hub::curated::CuratedInstallPolicy;
 use crate::hub::curated_signed_retain::{
@@ -126,26 +127,76 @@ impl BackgroundServiceManager {
         ext: &LoadedExtension,
         service: &ResolvedBackgroundService,
     ) -> Result<BackgroundServiceStatus, ExtensionError> {
-        self.start_with_signed(user_id, ext, service, None).await
+        self.start_with_signed(user_id, ext, service, None, None).await
     }
 
-    /// Like [`Self::start`], with an optional Host-retained signature-checked snapshot.
+    /// Look up a Host-retained binding (snapshot + root FD) and start via [`Self::start_with_signed`].
+    pub async fn start_with_binding(
+        &self,
+        user_id: &str,
+        ext: &LoadedExtension,
+        service: &ResolvedBackgroundService,
+        store: &SignedRootBindingStore,
+    ) -> Result<BackgroundServiceStatus, ExtensionError> {
+        let bound = store.lookup_clone(&service.extension_name);
+        match &bound {
+            Some((checked, root)) => {
+                self.start_with_signed(user_id, ext, service, Some(checked), Some(root))
+                    .await
+            }
+            None => self.start_with_signed(user_id, ext, service, None, None).await,
+        }
+    }
+
+    /// Like [`Self::start`], with an optional Host-retained signed snapshot and root FD.
     ///
-    /// M9 E13 fail-closed gate: a path spawn cannot enforce `entryPointIntegrity`, so a
-    /// service that declares it (loaded manifest or signed snapshot) is refused before any
-    /// path resolution or spawn. Undeclared services keep the legacy path spawn (not "verified").
+    /// Bound+`files` (a snapshot that declares `files`): the entry is verified through the
+    /// retained root (never `LoadedExtension.directory`). This slice then refuses to spawn
+    /// (`bound_service_fd_exec_unavailable`); it never falls back to a path exec. A snapshot
+    /// with `files` but no root is also refused.
+    ///
+    /// Otherwise the existing start gate applies: a declared `entryPointIntegrity` (loaded
+    /// manifest or snapshot) cannot be enforced by a path spawn → refuse. Undeclared services
+    /// keep the legacy path spawn (not "verified").
     pub async fn start_with_signed(
         &self,
         user_id: &str,
         ext: &LoadedExtension,
         service: &ResolvedBackgroundService,
         signed: Option<&SignatureCheckedManifest>,
+        root: Option<&File>,
     ) -> Result<BackgroundServiceStatus, ExtensionError> {
         if service.extension_name != ext.manifest.name {
             return Err(ExtensionError::NotFound(service.id.clone()));
         }
         let perms = ext.manifest.permissions.clone().unwrap_or_default();
         ensure_shell_permission(&perms)?;
+
+        if let Some(checked) = signed {
+            let checked = checked.clone();
+            let root = match root {
+                Some(file) => Some(file.try_clone().map_err(|_| {
+                    ExtensionError::from(crate::bound_background_start::BoundBackgroundStartError::RootMissing)
+                })?),
+                None => None,
+            };
+            let service = service.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                verify_bound_files_service(&checked, root.as_ref(), &service).and_then(refuse_verified_without_fd_exec)
+            })
+            .await
+            .map_err(|err| ExtensionError::HookFailed {
+                extension_name: ext.manifest.name.clone(),
+                hook: "backgroundService".into(),
+                reason: err.to_string(),
+            })?;
+            match outcome {
+                // NotApplicable: snapshot has no `files` — existing gate + possible path spawn.
+                Ok(()) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
         gate_background_service_start(&ext.manifest, service, signed).map_err(ExtensionError::from)?;
 
         let script = resolve_service_script(&ext.directory, &service.entry_point)?;
