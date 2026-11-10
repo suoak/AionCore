@@ -18,8 +18,11 @@ pub mod skill;
 pub mod theme;
 pub mod webui;
 
+use std::fs::File;
 use std::path::Path;
 
+use crate::hub::signed_manifest::SignatureCheckedManifest;
+use crate::signed_root_binding::SignedRootBindingStore;
 use crate::types::{LoadedExtension, ResolvedContributions};
 
 /// Resolve all contributions from a single extension.
@@ -27,6 +30,13 @@ use crate::types::{LoadedExtension, ResolvedContributions};
 /// Failures in individual contribution types are logged and skipped —
 /// one broken theme does not block ACP adapter resolution.
 pub fn resolve_extension_contributions(ext: &LoadedExtension) -> ResolvedContributions {
+    resolve_extension_contributions_bound(ext, None)
+}
+
+fn resolve_extension_contributions_bound(
+    ext: &LoadedExtension,
+    verified: Option<(&SignatureCheckedManifest, &File)>,
+) -> ResolvedContributions {
     let ext_name = &ext.manifest.name;
     let ext_dir = Path::new(&ext.directory);
 
@@ -41,7 +51,7 @@ pub fn resolve_extension_contributions(ext: &LoadedExtension) -> ResolvedContrib
         assistants: assistant::resolve_assistants(&contributes.assistants, ext_name, ext_dir),
         agents: agent::resolve_agents(&contributes.agents, ext_name, ext_dir),
         skills: skill::resolve_skills(&contributes.skills, ext_name, ext_dir),
-        themes: theme::resolve_themes(&contributes.themes, ext_name, ext_dir),
+        themes: theme::resolve_themes_from(&contributes.themes, ext_name, ext_dir, verified),
         channel_plugins: channel_plugin::resolve_channel_plugins(&contributes.channel_plugins, ext_name, ext_dir),
         webui: webui::resolve_webui_contributions(&contributes.webui, ext_name, ext_dir),
         settings_tabs: settings_tab::resolve_settings_tabs(&contributes.settings_tabs, ext_name, ext_dir),
@@ -61,6 +71,16 @@ pub fn resolve_extension_contributions(ext: &LoadedExtension) -> ResolvedContrib
 ///
 /// Extensions that are disabled (`state.enabled == false`) are skipped.
 pub fn resolve_all_contributions(extensions: &[LoadedExtension]) -> ResolvedContributions {
+    resolve_all_contributions_with_roots(extensions, None)
+}
+
+/// Like [`resolve_all_contributions`], but a bound extension whose snapshot declares `files`
+/// has its theme CSS read through the retained root (slice K). Other contribution kinds are
+/// unchanged.
+pub(crate) fn resolve_all_contributions_with_roots(
+    extensions: &[LoadedExtension],
+    signed_roots: Option<&SignedRootBindingStore>,
+) -> ResolvedContributions {
     let mut merged = ResolvedContributions::default();
 
     for ext in extensions {
@@ -69,7 +89,9 @@ pub fn resolve_all_contributions(extensions: &[LoadedExtension]) -> ResolvedCont
             continue;
         }
 
-        let resolved = resolve_extension_contributions(ext);
+        let binding = signed_roots.and_then(|store| store.lookup_clone(&ext.manifest.name));
+        let resolved =
+            resolve_extension_contributions_bound(ext, binding.as_ref().map(|(checked, root)| (checked, root)));
         merge_contributions(&mut merged, resolved, &ext.manifest.name);
     }
 

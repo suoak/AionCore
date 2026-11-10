@@ -42,8 +42,10 @@ pub const MAX_MANIFEST_FILES: usize = 1024;
 /// resolver later turns into `/api/extensions/{name}/assets/…` (settingsTabs `url`/`icon`, panel
 /// and workPanelView `icon`, theme `cover_image`, assistant/agent/channel-plugin `icon`, ACP
 /// `avatar`) must also be a canonical path listed in `files`. Remote `http(s)` URLs are not
-/// package files. Paths that are not actually asset-served today (theme `css_file`, webui
-/// directory/handlers, skills, i18n, hooks, manifest-level `icon`) are not forced into the list.
+/// package files. Theme `css_file` is also required (inlined at resolve, not asset-served, but
+/// read through the same retained-root verifier when bound+`files`). Paths that are not actually
+/// asset-served or verified today (webui directory/handlers, skills, i18n, hooks, manifest-level
+/// `icon`) are not forced into the list.
 /// Declaration consistency only: it reads no file, proves no bytes, and an omitted list never
 /// means unlisted extras are verified.
 fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
@@ -86,6 +88,20 @@ fn validate_manifest_files(manifest: &ExtensionManifest) -> Result<(), Extension
         if !declared.contains_key(canonical.as_str()) {
             return Err(ExtensionError::ManifestValidation(
                 "served contribution asset is missing from the files list".into(),
+            ));
+        }
+    }
+    // Slice K: theme CSS is inlined at resolve, not asset-served, but a bound read uses the
+    // same files list + retained-root verifier. Unlisted css_file cannot be advertised.
+    for path in theme_css_file_paths(manifest) {
+        let canonical = canonical_relative_path(path).ok_or_else(|| {
+            ExtensionError::ManifestValidation(
+                "theme css_file must be a canonical relative path when files is declared".into(),
+            )
+        })?;
+        if !declared.contains_key(canonical.as_str()) {
+            return Err(ExtensionError::ManifestValidation(
+                "theme css_file is missing from the files list".into(),
             ));
         }
     }
@@ -215,6 +231,20 @@ fn served_contribution_assets(manifest: &ExtensionManifest) -> Vec<&str> {
     }
     for adapter in &c.acp_adapters {
         push_local_served_asset(&mut out, adapter.avatar.as_deref());
+    }
+    out
+}
+
+/// Local theme `css_file` paths. These are not advertised as `/assets/…` (the CSS is inlined
+/// into the themes API), but when `files` is declared they must be listed so a bound resolve
+/// can read them through the retained-root verifier.
+fn theme_css_file_paths(manifest: &ExtensionManifest) -> Vec<&str> {
+    let mut out = Vec::new();
+    let Some(c) = manifest.contributes.as_ref() else {
+        return out;
+    };
+    for theme in &c.themes {
+        push_local_served_asset(&mut out, Some(theme.css_file.as_str()));
     }
     out
 }
@@ -1499,6 +1529,9 @@ mod tests {
             if kind == "viewIcon" {
                 list.push(json!({"path": "v.html", "integrity": entry}));
             }
+            if kind == "themes" {
+                list.push(json!({"path": "themes/dark.css", "integrity": i}));
+            }
             assert!(
                 parse_manifest(&files_manifest(json!(list), served_kind(kind, asset))).is_ok(),
                 "{kind} listed"
@@ -1511,6 +1544,9 @@ mod tests {
             }
             if kind == "viewIcon" {
                 missing.push(json!({"path": "v.html", "integrity": entry}));
+            }
+            if kind == "themes" {
+                missing.push(json!({"path": "themes/dark.css", "integrity": i}));
             }
             assert!(
                 is_validation_err(parse_manifest(&files_manifest(
@@ -1526,6 +1562,9 @@ mod tests {
             }
             if kind == "viewIcon" {
                 noncanon.push(json!({"path": "v.html", "integrity": entry}));
+            }
+            if kind == "themes" {
+                noncanon.push(json!({"path": "themes/dark.css", "integrity": i}));
             }
             assert!(
                 is_validation_err(parse_manifest(&files_manifest(
@@ -1549,17 +1588,47 @@ mod tests {
             ("channelPlugins", "https://example.com/c.png"),
             ("acpAdapters", "https://example.com/a.png"),
         ] {
-            let raw = files_manifest(json!([{"path": "a.css", "integrity": i}]), served_kind(kind, url));
+            let mut list = vec![json!({"path": "a.css", "integrity": i})];
+            if kind == "themes" {
+                list.push(json!({"path": "themes/dark.css", "integrity": i}));
+            }
+            let raw = files_manifest(json!(list), served_kind(kind, url));
             assert!(parse_manifest(&raw).is_ok(), "{kind}");
         }
     }
 
     #[test]
-    fn theme_css_and_webui_paths_are_not_forced_into_files() {
-        // Honest scope: these are not served through `serve_extension_asset` today.
+    fn theme_css_file_must_be_listed_when_files_is_declared() {
         let i = sri(b"x");
         let theme = json!({"themes": [{"id": "th", "name": "Th", "css_file": "themes/dark.css"}]});
-        assert!(parse_manifest(&files_manifest(json!([{"path": "a.css", "integrity": i}]), theme)).is_ok());
+        assert!(is_validation_err(parse_manifest(&files_manifest(
+            json!([{"path": "a.css", "integrity": i}]),
+            theme.clone()
+        ))));
+        assert!(
+            parse_manifest(&files_manifest(
+                json!([{"path": "themes/dark.css", "integrity": i}]),
+                theme
+            ))
+            .is_ok()
+        );
+        for bad in ["./themes/dark.css", "themes/../themes/dark.css"] {
+            let t = json!({"themes": [{"id": "th", "name": "Th", "css_file": bad}]});
+            assert!(
+                is_validation_err(parse_manifest(&files_manifest(
+                    json!([{"path": "themes/dark.css", "integrity": i}]),
+                    t
+                ))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn webui_paths_are_not_forced_into_files() {
+        // Honest scope: webui directory/handlers are not served through `serve_extension_asset`
+        // and are not verified in this slice.
+        let i = sri(b"x");
         let webui = json!({"webui": [{"id": "ui", "directory": "ui", "routes": [{"path": "/x", "method": "GET", "handler": "ui/h.js"}]}]});
         assert!(parse_manifest(&files_manifest(json!([{"path": "a.css", "integrity": i}]), webui)).is_ok());
     }
