@@ -4,6 +4,7 @@
 
 mod asset_paths;
 pub mod asset_tokens;
+pub mod background_service_start_gate;
 pub mod classifier;
 pub mod constants;
 pub mod dependency;

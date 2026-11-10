@@ -99,6 +99,12 @@ impl SignedRootBindingStore {
         Some((binding.checked.clone(), root))
     }
 
+    /// Clone only the signature-checked snapshot (no root FD dup) for read-only gates.
+    pub fn lookup_checked(&self, extension_key: &str) -> Option<SignatureCheckedManifest> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(extension_key).map(|b| b.checked.clone())
+    }
+
     pub fn contains(&self, extension_key: &str) -> bool {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.contains_key(extension_key)
@@ -204,6 +210,7 @@ mod tests {
         let (snap, root2) = store.lookup_clone("demo.plugin").unwrap();
         assert_eq!(snap.name(), "demo.plugin");
         assert!(root2.metadata().unwrap().is_dir());
+        assert_eq!(store.lookup_checked("demo.plugin").unwrap().name(), "demo.plugin");
         // Original binding remains after clone lookup.
         assert!(store.contains("demo.plugin"));
         assert!(store.remove("demo.plugin"));
@@ -215,6 +222,7 @@ mod tests {
     fn never_invents_binding_from_empty_store() {
         let store = SignedRootBindingStore::new();
         assert!(store.lookup_clone("anything").is_none());
+        assert!(store.lookup_checked("anything").is_none());
         assert!(!store.contains("anything"));
     }
 }

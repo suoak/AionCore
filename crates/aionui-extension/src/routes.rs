@@ -665,10 +665,13 @@ async fn start_background_service(
             service.extension_name
         )));
     }
+    // E13: Host-retained signed snapshot (if any) lets the start gate refuse a declared
+    // entryPointIntegrity even when the loaded manifest was stripped. No root FD is used.
+    let signed = state.host_runtime.signed_roots.lookup_checked(&service.extension_name);
     let status = state
         .host_runtime
         .background
-        .start(&user.id, &ext, &service)
+        .start_with_signed(&user.id, &ext, &service, signed.as_ref())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(serde_json::to_value(&status).unwrap_or_default())))

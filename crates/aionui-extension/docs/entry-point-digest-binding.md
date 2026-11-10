@@ -91,6 +91,11 @@ fallback). Success returns the same owned verified source `String`. Still not
 panel/view-load/iframe auth, service start/spawn auth (HostRuntime start is not wired to this),
 curation/owner/root proof, or M9/E13 completion.
 
-**No HostRuntime start-path change**: backgroundServices app compose exists, but
-service start/spawn is not routed through it until a deliberate Host call site
-exists that already holds a trusted root (not path-string invention).
+**HostRuntime start gate (fail-closed refusal)**: `BackgroundServiceManager::start` spawns a
+file *path*, which cannot consume the verified bytes from the app compose (re-reading would be
+a TOCTOU) and has no honest Host directory `File` (`LoadedExtension.directory` is a `String`).
+`background_service_start_gate::gate_background_service_start` therefore **refuses** start when a
+service declares `entryPointIntegrity` in the loaded manifest, or in a Host-retained signed
+snapshot (`SignedRootBindingStore::lookup_checked`); an inconclusive signed snapshot also
+refuses. Undeclared services keep the legacy path spawn (undeclared, never "verified").
+Actually spawning *from* checked source remains unwired.
