@@ -12,6 +12,7 @@ pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionEr
     validate_name(&manifest.name)?;
     validate_version(&manifest.version)?;
     validate_agent_tool_handler_digests(manifest)?;
+    validate_background_service_runtime(manifest)?;
     validate_panel_entry_point_digests(manifest)?;
     validate_work_panel_view_entry_point_digests(manifest)?;
     validate_background_service_entry_point_digests(manifest)?;
@@ -424,6 +425,40 @@ fn validate_background_service_entry_point_digests(manifest: &ExtensionManifest)
     Ok(())
 }
 
+/// Fail closed on inconsistent background-service runtime declarations (M9 E13 S1).
+///
+/// `intervalSeconds` and `uses` mean nothing without a `runtime`, so declaring them alone is an
+/// error rather than a silently ignored field; a declared runtime needs an entry point; `uses`
+/// may not repeat a kind. Reserved runtimes (`node` / `shell` / `native`) still parse here — they
+/// are refused when a start is attempted, with their own fixed reason.
+fn validate_background_service_runtime(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
+    let Some(contributes) = manifest.contributes.as_ref() else {
+        return Ok(());
+    };
+    for service in &contributes.background_services {
+        if service.runtime.is_none() {
+            if service.interval_seconds.is_some() || !service.uses.is_empty() {
+                return Err(ExtensionError::ManifestValidation(
+                    "backgroundService intervalSeconds/uses require a runtime".into(),
+                ));
+            }
+            continue;
+        }
+        if service.entry_point.is_empty() {
+            return Err(ExtensionError::ManifestValidation(
+                "backgroundService runtime requires a non-empty entryPoint".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !service.uses.iter().all(|kind| seen.insert(*kind)) {
+            return Err(ExtensionError::ManifestValidation(
+                "backgroundService uses must not repeat a capability kind".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reject extension names that use reserved prefixes.
 fn validate_name(name: &str) -> Result<(), ExtensionError> {
     if name.is_empty() {
@@ -670,6 +705,7 @@ fn normalize_background_service(value: &mut Value) {
     move_key(obj, "entryPoint", "entry_point");
     // ExtBackgroundService integrity field (panels / workPanelViews use separate normalizers).
     move_key(obj, "entryPointIntegrity", "entry_point_integrity");
+    move_key(obj, "intervalSeconds", "interval_seconds");
 }
 
 fn normalize_array_entries(value: Option<&mut Value>, normalize_item: fn(&mut Value)) {
@@ -1759,5 +1795,132 @@ mod tests {
             let missing = files_manifest(json!([{"path": "z.css", "integrity": i}]), contributes(kind));
             assert!(is_validation_err(parse_manifest(&missing)), "{kind}");
         }
+    }
+}
+
+#[cfg(test)]
+mod background_runtime_tests {
+    use super::*;
+    use crate::types::{ServiceCapabilityKind, ServiceRuntime};
+    use serde_json::json;
+
+    fn with_service(service: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "name": "demo.plugin", "version": "1.0.0",
+            "contributes": {"backgroundServices": [service]}
+        }))
+        .unwrap()
+    }
+
+    fn service_of(raw: &[u8]) -> crate::types::ExtBackgroundService {
+        parse_manifest(raw)
+            .unwrap()
+            .contributes
+            .unwrap()
+            .background_services
+            .remove(0)
+    }
+
+    #[test]
+    fn runtime_interval_and_uses_parse_in_camel_and_snake_case() {
+        let camel = service_of(&with_service(json!({
+            "id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js",
+            "intervalSeconds": 30, "uses": ["network", "storage"]
+        })));
+        assert_eq!(camel.runtime, Some(ServiceRuntime::WorkmateJs));
+        assert_eq!(camel.interval_seconds, Some(30));
+        assert_eq!(
+            camel.uses,
+            [ServiceCapabilityKind::Network, ServiceCapabilityKind::Storage]
+        );
+        let snake = service_of(&with_service(json!({
+            "id": "w", "entry_point": "s/a.mjs", "runtime": "workmate-js", "interval_seconds": 30
+        })));
+        assert_eq!(snake.interval_seconds, Some(30));
+    }
+
+    #[test]
+    fn reserved_runtimes_parse_but_unknown_ones_are_a_parse_error() {
+        for (name, expected) in [
+            ("node", ServiceRuntime::Node),
+            ("shell", ServiceRuntime::Shell),
+            ("native", ServiceRuntime::Native),
+        ] {
+            let svc = service_of(&with_service(json!({"id": "w", "entryPoint": "s/a", "runtime": name})));
+            assert_eq!(svc.runtime, Some(expected));
+        }
+        for bad in ["python", "sh", "WORKMATE-JS", "workmate_js", "", "bun"] {
+            assert!(
+                parse_manifest(&with_service(json!({"id": "w", "entryPoint": "s/a", "runtime": bad}))).is_err(),
+                "{bad:?}"
+            );
+        }
+        // Unknown capability kind names are refused as well.
+        assert!(
+            parse_manifest(&with_service(json!({
+                "id": "w", "entryPoint": "s/a", "runtime": "workmate-js", "uses": ["camera"]
+            })))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inconsistent_declarations_are_refused() {
+        for bad in [
+            json!({"id": "w", "entryPoint": "s/a.mjs", "intervalSeconds": 30}),
+            json!({"id": "w", "entryPoint": "s/a.mjs", "uses": ["network"]}),
+            json!({"id": "w", "entryPoint": "", "runtime": "workmate-js"}),
+            json!({"id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js", "uses": ["network", "network"]}),
+            json!({"id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js", "intervalSeconds": -1}),
+            json!({"id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js", "intervalSeconds": "60"}),
+        ] {
+            assert!(parse_manifest(&with_service(bad.clone())).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn legacy_services_are_unchanged_and_serialize_without_the_new_fields() {
+        let svc = service_of(&with_service(json!({"id": "w", "entryPoint": "s/worker.sh"})));
+        assert_eq!((svc.runtime, svc.interval_seconds), (None, None));
+        assert!(svc.uses.is_empty());
+        let text = serde_json::to_string(&svc).unwrap();
+        assert!(
+            !text.contains("runtime") && !text.contains("interval") && !text.contains("uses"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn effective_interval_is_clamped() {
+        let mut svc = service_of(&with_service(
+            json!({"id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js"}),
+        ));
+        assert_eq!(svc.effective_interval_seconds(), 60);
+        for (declared, expected) in [
+            (0, 10),
+            (9, 10),
+            (10, 10),
+            (61, 61),
+            (86_400, 86_400),
+            (u64::MAX, 86_400),
+        ] {
+            svc.interval_seconds = Some(declared);
+            assert_eq!(svc.effective_interval_seconds(), expected, "{declared}");
+        }
+    }
+
+    #[test]
+    fn resolved_background_service_response_shape_is_unchanged() {
+        let raw = with_service(json!({
+            "id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js",
+            "intervalSeconds": 30, "uses": ["network"]
+        }));
+        let resolved = crate::resolvers::contract_v1::resolve_background_services(
+            &parse_manifest(&raw).unwrap().contributes.unwrap().background_services,
+            "demo.plugin",
+        );
+        let value = serde_json::to_value(&resolved).unwrap();
+        let keys: std::collections::BTreeSet<&str> = value[0].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["entryPoint", "extensionName", "id"].into_iter().collect());
     }
 }
