@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Plan checklist</title>
+<link rel="stylesheet" href="checklist.css">
+<script src="checklist.js" defer></script>
+</head>
+<body>
+  <main class="app">
+    <header class="head">
+      <img class="logo" src="../assets/icon.svg" alt="" width="36" height="36">
+      <div class="head-text">
+        <h1 data-i18n="title">Plan checklist</h1>
+        <p class="sub" data-i18n="subtitle">Break the work into steps and tick them off as you go.</p>
+      </div>
+    </header>
+
+    <section class="progress" aria-labelledby="progress-label">
+      <div class="progress-top">
+        <span id="progress-label" class="progress-label" data-i18n="progress">Progress</span>
+        <span id="progress-count" class="progress-count" aria-live="polite">0 / 0</span>
+      </div>
+      <div id="progress-bar" class="bar" role="progressbar" aria-labelledby="progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="progress-fill" class="fill"></div>
+      </div>
+    </section>
+
+    <div id="add-form" class="add" role="group" aria-label="New step" data-i18n-aria-label="addLabel">
+      <label class="sr-only" for="add-input" data-i18n="addLabel">New step</label>
+      <input id="add-input" class="add-input" type="text" maxlength="200" autocomplete="off" placeholder="Add a step and press Enter" data-i18n-placeholder="addPlaceholder">
+      <button id="add-button" class="btn primary" type="button" data-i18n="add">Add</button>
+    </div>
+
+    <div id="empty" class="empty" hidden>
+      <p class="empty-title" data-i18n="emptyTitle">No steps yet</p>
+      <p class="empty-text" data-i18n="emptyText">Write your own, or start from a simple plan and edit it.</p>
+      <button id="starter" class="btn" type="button" data-i18n="starter">Add a starter plan</button>
+    </div>
+
+    <ul id="list" class="list" aria-label="Steps" data-i18n-aria-label="listLabel"></ul>
+
+    <footer id="toolbar" class="toolbar" hidden>
+      <div class="filters" role="group" aria-label="Show" data-i18n-aria-label="filterLabel">
+        <button class="chip" type="button" data-filter="all" aria-pressed="true" data-i18n="filterAll">All</button>
+        <button class="chip" type="button" data-filter="open" aria-pressed="false" data-i18n="filterOpen">To do</button>
+        <button class="chip" type="button" data-filter="done" aria-pressed="false" data-i18n="filterDone">Done</button>
+      </div>
+      <button id="clear-done" class="btn quiet" type="button" data-i18n="clearDone">Clear done</button>
+    </footer>
+
+    <p class="note" data-i18n="memoryNote">Steps live only in this panel and are cleared when it reloads. Nothing is saved or sent anywhere.</p>
+    <p id="status" class="sr-only" role="status" aria-live="polite"></p>
+  </main>
+</body>
+</html>

@@ -512,4 +512,193 @@ mod tests {
         assert!(ctx.is_none() && store.is_empty());
         assert_eq!(std::fs::read_dir(data_dir.path()).unwrap().count(), 0);
     }
+
+    // ---- slice B5: the committed sample packs, installed through the Host path -------------------
+
+    /// A test-local set built from the committed `builtin/index.json` + zips (test/dev key only;
+    /// the production `builtins()` stays empty).
+    fn committed_test_signed_set() -> (&'static aionui_extension::hub::BuiltinSet<'static>, std::path::PathBuf) {
+        use aionui_extension::hub::{BuiltinKey, BuiltinPack, BuiltinSet};
+
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(repo.join("builtin/index.json")).unwrap()).unwrap();
+        let leak = |s: &str| -> &'static str { Box::leak(s.to_owned().into_boxed_str()) };
+        let mut public_key = [0u8; 32];
+        hex::decode_to_slice(index["publicKeyHex"].as_str().unwrap(), &mut public_key).unwrap();
+        let key_id = leak(index["pubkeyId"].as_str().unwrap());
+        assert_eq!(key_id, "workmate-test-dev");
+        let keys: &'static [BuiltinKey<'static>] = Box::leak(Box::new([BuiltinKey { id: key_id, public_key }]));
+        let packs: Vec<BuiltinPack<'static>> = index["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| BuiltinPack {
+                name: leak(e["name"].as_str().unwrap()),
+                version: leak(e["version"].as_str().unwrap()),
+                pubkey_id: leak(e["pubkeyId"].as_str().unwrap()),
+                integrity: leak(e["integrity"].as_str().unwrap()),
+                signature: leak(e["signature"].as_str().unwrap()),
+                package_zip: Box::leak(
+                    std::fs::read(repo.join("builtin").join(e["zip"].as_str().unwrap()))
+                        .unwrap()
+                        .into_boxed_slice(),
+                ),
+            })
+            .collect();
+        let packs: &'static [BuiltinPack<'static>] = Box::leak(packs.into_boxed_slice());
+        (Box::leak(Box::new(BuiltinSet { keys, packs })), repo)
+    }
+
+    /// The two B5 sample packs install from their committed test-signed zips, survive a restart,
+    /// are listed by the B3 listing rule (signed `files` authorise the entry points) and are served
+    /// verified: every listed file byte-identical to its source, the manifest never, a tampered
+    /// file never.
+    #[tokio::test]
+    async fn committed_sample_packs_install_list_and_serve_verified_end_to_end() {
+        use aionui_extension::loader::ScanPath;
+        use aionui_extension::registry::ExtensionRegistry;
+        use aionui_extension::routes::{ExtensionRouterState, extension_routes};
+        use aionui_extension::state::ExtensionStateStore;
+        use aionui_extension::types::ExtensionSource;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (builtins, repo) = committed_test_signed_set();
+        assert!(!builtins.is_empty());
+        assert!(
+            crate::builtin_extensions::builtins().is_empty(),
+            "the production set stays empty"
+        );
+        let data_dir = tempfile::tempdir().unwrap();
+        // First start installs; second start (fresh in-memory state) restores from disk.
+        for pass in 0..2 {
+            let state_dir = tempfile::tempdir().unwrap();
+            let registry = ExtensionRegistry::new(
+                ExtensionStateStore::new(state_dir.path().join("states.json")),
+                Arc::new(aionui_realtime::BroadcastEventBus::new(64)),
+                "1.0.0".into(),
+            );
+            let router_state = ExtensionRouterState::new(registry.clone());
+            let store = router_state.host_runtime.signed_roots.clone();
+            let ctx = build_host_signed_install(data_dir.path(), Ok(no_policy()), store.clone(), builtins).await;
+            assert!(ctx.is_some());
+            for name in [
+                "workmate.theme-dusk-ember",
+                "workmate.sample-shortcuts",
+                "workmate.sample-checklist",
+            ] {
+                assert_eq!(store.lookup_checked(name).unwrap().version(), "1.0.0", "{name}");
+            }
+            registry.set_signed_roots(store.clone());
+            registry
+                .initialize_with_scan_paths(vec![ScanPath {
+                    path: data_dir.path().join(aionui_extension::SIGNED_EXTENSIONS_DIR_NAME),
+                    source: ExtensionSource::Local,
+                }])
+                .await
+                .unwrap();
+            let router = extension_routes(router_state)
+                .layer(axum::extract::Extension(aionui_auth::CurrentUser::local_default()));
+            let get = |uri: String| {
+                let router = router.clone();
+                async move {
+                    let response = router
+                        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let content_type = response
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    (
+                        status,
+                        content_type,
+                        response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+                    )
+                }
+            };
+            let listing = |body: Vec<u8>| -> Vec<serde_json::Value> {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                v["data"].as_array().cloned().unwrap_or_default()
+            };
+
+            // -- B3 listing: only the two samples contribute, with the declared ids --
+            let (status, _, body) = get("/api/extensions/panels".into()).await;
+            assert_eq!(status, StatusCode::OK);
+            let panels = listing(body);
+            let shortcuts: Vec<_> = panels
+                .iter()
+                .filter(|p| p["extensionName"] == "workmate.sample-shortcuts")
+                .collect();
+            assert_eq!(shortcuts.len(), 1, "{panels:?}");
+            assert_eq!(shortcuts[0]["id"], "ext-workmate.sample-shortcuts-shortcuts");
+            assert_eq!(
+                shortcuts[0]["entryPoint"],
+                "/api/extensions/workmate.sample-shortcuts/assets/panels/shortcuts.html"
+            );
+            assert!(
+                panels.iter().all(|p| p["extensionName"] != "workmate.sample-checklist"),
+                "the checklist is a work-panel view, not a panel"
+            );
+            let (status, _, body) = get("/api/extensions/work-panel-views".into()).await;
+            assert_eq!(status, StatusCode::OK);
+            let views = listing(body);
+            let checklist: Vec<_> = views
+                .iter()
+                .filter(|v| v["extensionName"] == "workmate.sample-checklist")
+                .collect();
+            assert_eq!(checklist.len(), 1, "{views:?}");
+            assert_eq!(checklist[0]["id"], "ext-workmate.sample-checklist-checklist");
+            assert_eq!(
+                checklist[0]["entryPoint"],
+                "/api/extensions/workmate.sample-checklist/assets/views/checklist.html"
+            );
+            assert_eq!(checklist[0]["placement"], "secondary");
+            assert!(views.iter().all(|v| v["extensionName"] != "workmate.sample-shortcuts"));
+
+            // -- verified serve: every file is byte-identical to its source and typed --
+            for (name, rel, content_type) in [
+                ("workmate.sample-shortcuts", "panels/shortcuts.html", "text/html"),
+                ("workmate.sample-shortcuts", "panels/shortcuts.css", "text/css"),
+                ("workmate.sample-shortcuts", "assets/icon.svg", "image/svg+xml"),
+                ("workmate.sample-checklist", "views/checklist.html", "text/html"),
+                ("workmate.sample-checklist", "views/checklist.css", "text/css"),
+                ("workmate.sample-checklist", "views/checklist.js", "javascript"),
+                ("workmate.sample-checklist", "assets/icon.svg", "image/svg+xml"),
+            ] {
+                let (status, ct, body) = get(format!("/api/extensions/{name}/assets/{rel}")).await;
+                assert_eq!(status, StatusCode::OK, "{name}/{rel}");
+                assert!(ct.contains(content_type), "{name}/{rel}: {ct}");
+                assert_eq!(
+                    body,
+                    std::fs::read(repo.join("extensions").join(name).join(rel)).unwrap()
+                );
+            }
+            for name in ["workmate.sample-shortcuts", "workmate.sample-checklist"] {
+                let (status, _, _) = get(format!("/api/extensions/{name}/assets/aion-extension.json")).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{name}: the manifest is not an asset");
+                let (status, _, _) = get(format!("/api/extensions/{name}/assets/i18n/fr.json")).await;
+                assert_ne!(status, StatusCode::OK, "{name}: an unlisted file is never served");
+            }
+
+            // -- tamper after install (last pass): verified serve refuses the changed file --
+            if pass == 1 {
+                let root = data_dir
+                    .path()
+                    .join(aionui_extension::SIGNED_EXTENSIONS_DIR_NAME)
+                    .join("workmate.sample-checklist")
+                    .join("1.0.0");
+                std::fs::write(root.join("views/checklist.js"), b"evil()").unwrap();
+                let (status, _, _) =
+                    get("/api/extensions/workmate.sample-checklist/assets/views/checklist.js".into()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            }
+        }
+    }
 }

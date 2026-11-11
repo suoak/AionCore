@@ -1,0 +1,5 @@
+{
+  "displayName": "计划清单（CSBU WorkMate）",
+  "description": "与会话并排的小型计划清单。所有内容只保存在面板内存中：不写入存储，也不联网。",
+  "views.checklist.title": "计划清单"
+}

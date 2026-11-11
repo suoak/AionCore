@@ -1,0 +1,59 @@
+{
+  "author": "CSBU WorkMate contributors",
+  "contributes": {
+    "workPanelViews": [
+      {
+        "entryPoint": "views/checklist.html",
+        "entryPointIntegrity": "sha512-SGssmKTSkWMo4OTglO0JavfJ+BicPK/uJY5AfAaNDlxF7SIg3Rw2IRs8UHhSRLnZeHfE4LLqq8gJvtSdIUbb/A==",
+        "icon": "assets/icon.svg",
+        "id": "checklist",
+        "placement": "secondary",
+        "title": "Plan checklist"
+      }
+    ]
+  },
+  "description": "A small plan checklist that lives next to your session. Everything stays in memory inside the panel: no storage, no network.",
+  "displayName": "Plan checklist (CSBU WorkMate)",
+  "files": [
+    {
+      "integrity": "sha512-KDTW2HBBneyTCkR+M1znvLYErXH81JqGJuQ2zDRECPziimOpULch5EXwdSc3rxlgFo9q3+nHwhOlBK6OPU9hGg==",
+      "path": "assets/icon.svg"
+    },
+    {
+      "integrity": "sha512-Xd7GKKuAdN0Kh5pTgas2e/Ll8u06cra8GvbQcnXnIWnP/yapKvrPPJ+X9QJygI1idmlSAPHutszOeU6kyJ1QEA==",
+      "path": "i18n/en.json"
+    },
+    {
+      "integrity": "sha512-DhPlbHWhgx5oewIDk00ILDNoM4CrWlXz1xo1IQqjZSR0ohVKdd3GyItKfRMVdc3ji0OhYAQuH/zqwMBmS4v7pQ==",
+      "path": "i18n/zh-CN.json"
+    },
+    {
+      "integrity": "sha512-OupvZbkM4Ic7plhDNqq6VhcmHEUznJapM0lTx9E1dquRG+fIrJu6esSzaN+bqfMjK1N5vcAP+GJhk47bomJe8w==",
+      "path": "views/checklist.css"
+    },
+    {
+      "integrity": "sha512-SGssmKTSkWMo4OTglO0JavfJ+BicPK/uJY5AfAaNDlxF7SIg3Rw2IRs8UHhSRLnZeHfE4LLqq8gJvtSdIUbb/A==",
+      "path": "views/checklist.html"
+    },
+    {
+      "integrity": "sha512-DjKzESqeVwtuvXaBu2PReHRDaMNF7RMDMXaVxy9inrudAHvq2Dk3ihHOUjYgxnBaEVwM440gbQsMn73DI9BDbg==",
+      "path": "views/checklist.js"
+    }
+  ],
+  "i18n": {
+    "directory": "i18n",
+    "locales": [
+      "en",
+      "zh-CN"
+    ]
+  },
+  "icon": "assets/icon.svg",
+  "license": "Apache-2.0",
+  "name": "workmate.sample-checklist",
+  "permissions": {
+    "network": false,
+    "shell": false,
+    "storage": false
+  },
+  "version": "1.0.0"
+}

@@ -7,6 +7,22 @@
       "signature": "00c4f7086230201f112ffc8ad90026a7c847d0f310e3368c78890851cc3c9f2404b63c3fe2ee23e4c4808c1a06c1b2c0202a13b46dc672d04ae3315ccb4ee90d",
       "version": "1.0.0",
       "zip": "workmate.theme-dusk-ember.zip"
+    },
+    {
+      "integrity": "sha512-TOaM4dfAmKrZ5O5VmhgzYw22w6YZt2C509etgf22W2bRmEYC2c2nfvhgGFrwojxLHgif5+fkhyaik7/hy19p/A==",
+      "name": "workmate.sample-shortcuts",
+      "pubkeyId": "workmate-test-dev",
+      "signature": "bb9297002ae54b7cdfce9fc9c04e46e987da7932ffbbd0d27ecb8b828d22d15c6b5d008e9b76f0b3f960bde39c6cdc78848eed70aa69daf62fa0c1d683118709",
+      "version": "1.0.0",
+      "zip": "workmate.sample-shortcuts.zip"
+    },
+    {
+      "integrity": "sha512-+X0o6KB7eTf7wol0I4SN3q6C+CMTzz0knRGEkMYpPOyXNju915+YlhaEcK9ko92YBcy4o+Gt/RlP8mSuyshhQQ==",
+      "name": "workmate.sample-checklist",
+      "pubkeyId": "workmate-test-dev",
+      "signature": "31885c49e0a17b85142767246e02d14318b5c7cd552fe40648f7204466a3a289ea453f8dae529bbfb506e574ab93d70cff95f27e82338e06553cf7537b9ed90a",
+      "version": "1.0.0",
+      "zip": "workmate.sample-checklist.zip"
     }
   ],
   "pubkeyId": "workmate-test-dev",

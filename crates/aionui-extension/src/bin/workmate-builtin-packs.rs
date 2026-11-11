@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use aionui_extension::hub::curated::signature_payload;
+use aionui_extension::hub::curated::{signature_payload, sri_sha512};
 use aionui_extension::pack::{PackOptions, pack_extension_dir};
 use aionui_extension::theme_import::{convert_vendored, css_matches, default_paths, verify_upstream_blobs};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -30,12 +30,26 @@ struct PackDef {
     zip_rel: &'static str,
 }
 
-const PACKS: &[PackDef] = &[PackDef {
-    name: "workmate.theme-dusk-ember",
-    version: "1.0.0",
-    source_rel: "extensions/workmate.theme-dusk-ember",
-    zip_rel: "builtin/workmate.theme-dusk-ember.zip",
-}];
+const PACKS: &[PackDef] = &[
+    PackDef {
+        name: "workmate.theme-dusk-ember",
+        version: "1.0.0",
+        source_rel: "extensions/workmate.theme-dusk-ember",
+        zip_rel: "builtin/workmate.theme-dusk-ember.zip",
+    },
+    PackDef {
+        name: "workmate.sample-shortcuts",
+        version: "1.0.0",
+        source_rel: "extensions/workmate.sample-shortcuts",
+        zip_rel: "builtin/workmate.sample-shortcuts.zip",
+    },
+    PackDef {
+        name: "workmate.sample-checklist",
+        version: "1.0.0",
+        source_rel: "extensions/workmate.sample-checklist",
+        zip_rel: "builtin/workmate.sample-checklist.zip",
+    },
+];
 
 struct Args {
     repo_root: PathBuf,
@@ -131,6 +145,42 @@ fn write_theme_css(repo_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Contribution arrays whose `entryPoint` file the pipeline pins with an explicit
+/// `entryPointIntegrity` (the manifest parser would also inherit it from `files`; the built-in
+/// samples declare it so the signed manifest states it literally).
+const ENTRY_POINT_ARRAYS: &[&str] = &["panels", "workPanelViews"];
+
+/// Return the source manifest with every local panel / workPanelView `entryPointIntegrity` set to
+/// the SRI of the entry file's current bytes, and whether that changed anything. Reads only
+/// regular files below `source`; a missing entry file is an error.
+fn pinned_entry_point_manifest(source: &Path) -> Result<(Vec<u8>, bool), String> {
+    let manifest_path = source.join("aion-extension.json");
+    let original = read(&manifest_path)?;
+    let mut manifest: Value =
+        serde_json::from_slice(&original).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    if let Some(contributes) = manifest.get_mut("contributes").and_then(Value::as_object_mut) {
+        for array in ENTRY_POINT_ARRAYS {
+            let Some(entries) = contributes.get_mut(*array).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for entry in entries {
+                let Some(object) = entry.as_object_mut() else { continue };
+                let Some(entry_point) = object.get("entryPoint").and_then(Value::as_str).map(str::to_owned) else {
+                    continue;
+                };
+                if entry_point.is_empty() {
+                    continue;
+                }
+                let bytes = read(&source.join(&entry_point))?;
+                object.insert("entryPointIntegrity".into(), Value::String(sri_sha512(&bytes)));
+            }
+        }
+    }
+    let bytes = pretty(&manifest);
+    let changed = bytes != original;
+    Ok((bytes, changed))
+}
+
 struct Built {
     name: String,
     version: String,
@@ -220,6 +270,25 @@ fn main() -> ExitCode {
             eprintln!("workmate-builtin-packs: {e}");
             return ExitCode::from(code);
         }
+        for def in PACKS {
+            // A panel / workPanelView `entryPointIntegrity` that is missing or stale (or a source
+            // manifest that is not in canonical form) is a stale artefact: write mode re-pins it
+            // from the entry file's bytes.
+            match pinned_entry_point_manifest(&args.repo_root.join(def.source_rel)) {
+                Ok((_, false)) => {}
+                Ok((_, true)) => {
+                    eprintln!(
+                        "workmate-builtin-packs: {} entryPointIntegrity is out of date",
+                        def.source_rel
+                    );
+                    return ExitCode::from(3);
+                }
+                Err(e) => {
+                    eprintln!("workmate-builtin-packs: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
         let built = match build_all(&args.repo_root, &key) {
             Ok(b) => b,
             Err(e) => {
@@ -272,6 +341,22 @@ fn main() -> ExitCode {
     if let Err(e) = write_theme_css(&args.repo_root) {
         eprintln!("workmate-builtin-packs: {e}");
         return ExitCode::from(1);
+    }
+    for def in PACKS {
+        let source = args.repo_root.join(def.source_rel);
+        match pinned_entry_point_manifest(&source) {
+            Ok((bytes, true)) => {
+                if let Err(e) = std::fs::write(source.join("aion-extension.json"), bytes) {
+                    eprintln!("workmate-builtin-packs: {}: {e}", def.source_rel);
+                    return ExitCode::from(1);
+                }
+            }
+            Ok((_, false)) => {}
+            Err(e) => {
+                eprintln!("workmate-builtin-packs: {e}");
+                return ExitCode::from(1);
+            }
+        }
     }
     let built = match build_all(&args.repo_root, &key) {
         Ok(b) => b,

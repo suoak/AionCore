@@ -3,3 +3,8 @@
 
 # Vendored upstream bytes are pinned by git blob SHA; never convert EOLs.
 tools/theme-import/upstream/** -text
+
+# Built-in packs: the signed zips and the source trees they are built from are pinned byte for
+# byte (SRI over the file contents), so never convert EOLs on any platform.
+extensions/** -text
+builtin/** -text

@@ -1,0 +1,5 @@
+{
+  "displayName": "Shortcuts & tips (CSBU WorkMate)",
+  "description": "A built-in cheat-sheet of CSBU WorkMate keyboard shortcuts and quick tips. Static page, no scripts, no network.",
+  "panels.shortcuts.title": "Shortcuts & tips"
+}

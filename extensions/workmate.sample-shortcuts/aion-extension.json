@@ -1,0 +1,54 @@
+{
+  "author": "CSBU WorkMate contributors",
+  "contributes": {
+    "panels": [
+      {
+        "entryPoint": "panels/shortcuts.html",
+        "entryPointIntegrity": "sha512-EkJURV6LIbTR17uZNPxkKwBVa7D5M9WPGq5ALyG0TmAiiRpP2k+Kepy8m+bS2D2D5b8UJoqwoa+u0KROzoYEog==",
+        "icon": "assets/icon.svg",
+        "id": "shortcuts",
+        "title": "Shortcuts & tips"
+      }
+    ]
+  },
+  "description": "A built-in cheat-sheet of CSBU WorkMate keyboard shortcuts and quick tips. Static page, no scripts, no network.",
+  "displayName": "Shortcuts & tips (CSBU WorkMate)",
+  "files": [
+    {
+      "integrity": "sha512-DUBofjjpFEFBxSd0SBzQS1/WTZ7fQVOaZcQfdV/IshtbgNOv0CwQCZHPHMWcWCL96Fkb4oL++Iyh3hdtKQQFcg==",
+      "path": "assets/icon.svg"
+    },
+    {
+      "integrity": "sha512-DcDDXG2b4kCULuibdMY17diHXgrzDRQut93CvzSuZ4siI7GTcOj/teF9SdqF1NEizhd345Pzr4tgClNppYnBFw==",
+      "path": "i18n/en.json"
+    },
+    {
+      "integrity": "sha512-SkDpwjb3dnOExhrc4Htvok1vfUZrX5fTegtx4LXTnmsbkkQb+7ZctP03yFmUW3oUhY4MWSJfV3+pgDHrUvqm6w==",
+      "path": "i18n/zh-CN.json"
+    },
+    {
+      "integrity": "sha512-Se4BJ7NvVTOVcSXrowkLFY82jmXjH1OM2itQIQLG1qETIOPHrdH87PnMYNm151+BEst1HjjCGzZNruOVk7eiEw==",
+      "path": "panels/shortcuts.css"
+    },
+    {
+      "integrity": "sha512-EkJURV6LIbTR17uZNPxkKwBVa7D5M9WPGq5ALyG0TmAiiRpP2k+Kepy8m+bS2D2D5b8UJoqwoa+u0KROzoYEog==",
+      "path": "panels/shortcuts.html"
+    }
+  ],
+  "i18n": {
+    "directory": "i18n",
+    "locales": [
+      "en",
+      "zh-CN"
+    ]
+  },
+  "icon": "assets/icon.svg",
+  "license": "Apache-2.0",
+  "name": "workmate.sample-shortcuts",
+  "permissions": {
+    "network": false,
+    "shell": false,
+    "storage": false
+  },
+  "version": "1.0.0"
+}
