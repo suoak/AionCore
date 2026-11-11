@@ -1643,6 +1643,7 @@ pub async fn build_extension_states(
         &skill_data_dir,
         aionui_extension::hub::curated::CuratedInstallPolicy::from_env(),
         ext_state.host_runtime.signed_roots.clone(),
+        crate::builtin_extensions::builtins(),
     )
     .await;
     // Slice H: the same store the Host just restored into, so initialize/hot_reload pin bound
