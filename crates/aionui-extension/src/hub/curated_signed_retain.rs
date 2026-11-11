@@ -127,7 +127,7 @@ mod tests {
         let raw = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
         let (integrity, signature) = signed_raw(raw, "demo.plugin", "1.0.0");
         let temp = tempfile::tempdir().unwrap();
-        let root = File::open(temp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(temp.path());
         let outcome = try_retain_curated_signed_root(
             &store,
             &policy(),
@@ -152,7 +152,7 @@ mod tests {
         sig_bytes[0] = if sig_bytes[0] == b'0' { b'1' } else { b'0' };
         let signature = String::from_utf8(sig_bytes).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let root = File::open(temp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(temp.path());
         let outcome = try_retain_curated_signed_root(
             &store,
             &policy(),
@@ -211,7 +211,7 @@ mod tests {
         let (integrity, signature) = signed_raw(raw, "demo.plugin", "1.0.0");
         let other = br#"{"name":"demo.plugin","version":"1.0.0","x":1}"#;
         let temp = tempfile::tempdir().unwrap();
-        let root = File::open(temp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(temp.path());
         let outcome = try_retain_curated_signed_root(
             &store,
             &policy(),

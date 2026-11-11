@@ -203,7 +203,7 @@ mod tests {
         let store = SignedRootBindingStore::new();
         let raw = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
         let temp = tempfile::tempdir().unwrap();
-        let root = File::open(temp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(temp.path());
         let err = store
             .install("other.plugin", checked(raw, "demo.plugin", "1.0.0"), root)
             .unwrap_err();
@@ -228,7 +228,7 @@ mod tests {
         let store = SignedRootBindingStore::new();
         let raw = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
         let temp = tempfile::tempdir().unwrap();
-        let root = File::open(temp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(temp.path());
         store
             .install("demo.plugin", checked(raw, "demo.plugin", "1.0.0"), root)
             .unwrap();

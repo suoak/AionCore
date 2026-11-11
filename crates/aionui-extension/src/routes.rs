@@ -1289,7 +1289,7 @@ mod tests {
         )
         .unwrap();
         // Honest Host-created root for the test: the tempdir the test itself created.
-        let root = std::fs::File::open(tmp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(tmp.path());
         state.host_runtime.signed_roots.install("hello", checked, root).unwrap();
         let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
         assert_eq!(

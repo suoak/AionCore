@@ -388,7 +388,7 @@ mod tests {
         // Snapshot without files: not applicable, legacy read (missing file stays an empty map).
         let checked = checked_with_files(serde_json::json!([]));
         let root_dir = tempfile::tempdir().unwrap();
-        let root = std::fs::File::open(root_dir.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(root_dir.path());
         assert_eq!(
             load_extension_i18n_from(&config, "en", "hello", ext_dir.path(), Some((&checked, &root))).unwrap()["k"],
             "dir"

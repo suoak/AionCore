@@ -5,7 +5,9 @@
 //! version change, activate/deactivate execution, timeout behaviour,
 //! and graceful handling of missing scripts.
 
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::path::Path;
 
 use aionui_extension::{HookKind, LifecycleHooks, execute_hook, needs_install_hook, resolve_hook_path};
@@ -15,6 +17,7 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 /// Create a shell script at `dir/path` with the given body and make it executable.
 fn write_script(dir: &Path, rel_path: &str, body: &str) {
     let full = dir.join(rel_path);
@@ -38,6 +41,7 @@ fn setup_ext_dir() -> TempDir {
 // LH-1: First install executes onInstall
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)] // POSIX `#!/bin/sh` hook scripts; hooks do not run on Windows
 #[tokio::test]
 async fn lh1_first_install_executes_on_install() {
     let dir = setup_ext_dir();
@@ -66,6 +70,7 @@ async fn lh1_first_install_executes_on_install() {
 // LH-2: Version change executes onInstall
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)] // POSIX `#!/bin/sh` hook scripts; hooks do not run on Windows
 #[tokio::test]
 async fn lh2_version_change_executes_on_install() {
     let dir = setup_ext_dir();
@@ -103,6 +108,7 @@ fn lh2_same_version_skips_install() {
 // LH-3: Each activation executes onActivate
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)] // POSIX `#!/bin/sh` hook scripts; hooks do not run on Windows
 #[tokio::test]
 async fn lh3_activate_executes_on_activate() {
     let dir = setup_ext_dir();
@@ -138,6 +144,7 @@ async fn lh3_activate_executes_on_activate() {
 // LH-4: Deactivation executes onDeactivate
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)] // POSIX `#!/bin/sh` hook scripts; hooks do not run on Windows
 #[tokio::test]
 async fn lh4_deactivate_executes_on_deactivate() {
     let dir = setup_ext_dir();
@@ -163,6 +170,7 @@ async fn lh4_deactivate_executes_on_deactivate() {
 // LH-5: Hook timeout
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)] // POSIX `#!/bin/sh` hook scripts; hooks do not run on Windows
 #[tokio::test]
 async fn lh5_hook_timeout() {
     let dir = setup_ext_dir();
@@ -229,6 +237,7 @@ fn resolve_hook_path_none_when_not_declared() {
 // Additional: Hook script exits with non-zero status
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)] // POSIX `#!/bin/sh` hook scripts; hooks do not run on Windows
 #[tokio::test]
 async fn hook_nonzero_exit_returns_hook_failed() {
     let dir = setup_ext_dir();
@@ -256,6 +265,7 @@ async fn hook_nonzero_exit_returns_hook_failed() {
 // Additional: Hook uses working directory correctly
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)] // POSIX `#!/bin/sh` hook scripts; hooks do not run on Windows
 #[tokio::test]
 async fn hook_working_directory_is_ext_dir() {
     let dir = setup_ext_dir();

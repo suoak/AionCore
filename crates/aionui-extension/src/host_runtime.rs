@@ -674,7 +674,7 @@ mod tests {
         )
         .unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let root = File::open(temp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(temp.path());
 
         let host = HostRuntime::new().with_checked_prepare(Arc::new(StubPrepare));
         host.signed_roots.install("demo.plugin", checked, root).unwrap();
@@ -739,7 +739,7 @@ mod tests {
         };
         let host = HostRuntime::new();
         let temp = tempfile::tempdir().unwrap();
-        let root = File::open(temp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(temp.path());
         assert_eq!(
             host.try_retain_curated_signed_root(&policy, &entry, raw, Some(root)),
             CuratedSignedRetainOutcome::Retained
