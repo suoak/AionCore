@@ -58,6 +58,21 @@ jobs:
           prefix-key: v1-rust
       - run: cargo check --workspace
 
+
+  builtin-pack-sync:
+    name: Builtin pack sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+      - name: Theme CSS and test-signed packs match sources
+        run: cargo run -p aionui-extension --bin workmate-builtin-packs -- --check
+
   test:
     name: Test
     runs-on: ubuntu-latest

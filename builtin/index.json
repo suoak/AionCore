@@ -1,0 +1,15 @@
+{
+  "packs": [
+    {
+      "integrity": "sha512-DOyvouLAJB3J/PD9fSlu7/0eGVfz45vKL4XcETWxYhzV9L0DWtyJv62FQXRTFUJZQ0qqBZyL1zJHeySbkzO5ow==",
+      "name": "workmate.theme-dusk-ember",
+      "pubkeyId": "workmate-test-dev",
+      "signature": "00c4f7086230201f112ffc8ad90026a7c847d0f310e3368c78890851cc3c9f2404b63c3fe2ee23e4c4808c1a06c1b2c0202a13b46dc672d04ae3315ccb4ee90d",
+      "version": "1.0.0",
+      "zip": "workmate.theme-dusk-ember.zip"
+    }
+  ],
+  "pubkeyId": "workmate-test-dev",
+  "publicKeyHex": "ad969e192a88fe6c45e26ed15d0a5eb264ad0f94e855ee7850ccf51f6440e8b8",
+  "warning": "Test/dev signatures only. The production curator key is not in this repository and is not used by this pipeline."
+}

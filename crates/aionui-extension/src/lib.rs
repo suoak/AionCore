@@ -36,6 +36,7 @@ pub mod skill_view;
 pub mod startup_materialize;
 pub mod state;
 pub mod template;
+pub mod theme_import;
 pub mod types;
 pub mod watcher;
 
