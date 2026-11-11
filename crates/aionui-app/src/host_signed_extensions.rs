@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aionui_extension::hub::curated::{CuratedGateError, CuratedInstallPolicy};
+use aionui_extension::hub::{BuiltinSet, merge_builtin_policy};
 use aionui_extension::{HostSignedInstall, SignedRootBindingStore, signature_policy_configured};
 
 /// Open the Host's signed-install parent directory handle (creating the directory if needed).
@@ -84,7 +85,8 @@ pub(crate) fn open_signed_extensions_parent(
     aionui_extension::hub::HostExtensionsParent::new(handle).map_err(|_| refuse("not a directory"))
 }
 
-/// Build the signed-install context, then sweep abandoned staging and restore bindings.
+/// Build the signed-install context, then sweep abandoned staging, restore bindings and ensure the
+/// app's built-in signed packs (`builtins`; the production set is empty, see `builtin_extensions`).
 ///
 /// `None` (and no filesystem effect) when no signature policy is configured, when the policy
 /// configuration is broken, or when the Host directory cannot be opened — the app then behaves
@@ -94,6 +96,7 @@ pub(crate) async fn build_host_signed_install(
     data_dir: &Path,
     policy: Result<CuratedInstallPolicy, CuratedGateError>,
     store: Arc<SignedRootBindingStore>,
+    builtins: &'static BuiltinSet<'static>,
 ) -> Option<HostSignedInstall> {
     let policy = match policy {
         Ok(policy) => policy,
@@ -102,6 +105,15 @@ pub(crate) async fn build_host_signed_install(
             return None;
         }
     };
+    // Built-in keys are merged in (never overriding a Host key of the same id). With no built-ins
+    // this is the identity, so an unconfigured Host stays unconfigured and touches no directory.
+    let (policy, merged) = merge_builtin_policy(policy, builtins);
+    for id in &merged.conflicting_key_ids {
+        tracing::warn!(key_id = %id, "signed extensions: built-in key id collides with a Host key; its packs are skipped");
+    }
+    for id in &merged.invalid_key_ids {
+        tracing::warn!(key_id = %id, "signed extensions: built-in key is not a valid public key; dropped");
+    }
     if !signature_policy_configured(&policy) {
         return None;
     }
@@ -118,6 +130,7 @@ pub(crate) async fn build_host_signed_install(
             };
             let ctx = HostSignedInstall::new(parent, policy, store)?;
             ctx.startup_sweep_and_restore();
+            ctx.ensure_builtin_packs(builtins);
             Some(ctx)
         })
         .await;
@@ -131,7 +144,7 @@ pub(crate) async fn build_host_signed_install(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (data_dir, policy, store);
+        let _ = (data_dir, policy, store, builtins);
         tracing::warn!("signed extensions: not supported on this platform; signed install disabled");
         None
     }
@@ -173,7 +186,13 @@ mod tests {
     async fn no_policy_means_no_directory_no_context() {
         let tmp = tempfile::tempdir().unwrap();
         let none = CuratedInstallPolicy::new(HashSet::new(), false, HashMap::new());
-        let ctx = build_host_signed_install(tmp.path(), Ok(none), Arc::new(SignedRootBindingStore::new())).await;
+        let ctx = build_host_signed_install(
+            tmp.path(),
+            Ok(none),
+            Arc::new(SignedRootBindingStore::new()),
+            crate::builtin_extensions::builtins(),
+        )
+        .await;
         assert!(ctx.is_none());
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
@@ -182,7 +201,13 @@ mod tests {
     async fn broken_policy_config_disables_signed_install_without_touching_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let broken = Err(CuratedGateError::PubkeyConfig("bad".into()));
-        let ctx = build_host_signed_install(tmp.path(), broken, Arc::new(SignedRootBindingStore::new())).await;
+        let ctx = build_host_signed_install(
+            tmp.path(),
+            broken,
+            Arc::new(SignedRootBindingStore::new()),
+            crate::builtin_extensions::builtins(),
+        )
+        .await;
         assert!(ctx.is_none());
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
@@ -194,6 +219,7 @@ mod tests {
             tmp.path(),
             Ok(verifying_policy()),
             Arc::new(SignedRootBindingStore::new()),
+            crate::builtin_extensions::builtins(),
         )
         .await;
         assert!(ctx.is_some());
@@ -209,6 +235,7 @@ mod tests {
             tmp.path(),
             Ok(verifying_policy()),
             Arc::new(SignedRootBindingStore::new()),
+            crate::builtin_extensions::builtins(),
         )
         .await;
         assert!(ctx.is_none());
@@ -223,7 +250,13 @@ mod tests {
         std::fs::write(dir.join("broken/current"), b"not json").unwrap();
         std::fs::create_dir_all(dir.join("demo/.wip-abc")).unwrap();
         let store = Arc::new(SignedRootBindingStore::new());
-        let ctx = build_host_signed_install(tmp.path(), Ok(verifying_policy()), store.clone()).await;
+        let ctx = build_host_signed_install(
+            tmp.path(),
+            Ok(verifying_policy()),
+            store.clone(),
+            crate::builtin_extensions::builtins(),
+        )
+        .await;
         assert!(ctx.is_some());
         assert!(store.is_empty());
         assert!(!dir.join("demo/.wip-abc").exists());
@@ -318,7 +351,13 @@ mod tests {
         let router_state = ExtensionRouterState::new(registry.clone());
         let store = router_state.host_runtime.signed_roots.clone();
         assert!(store.is_empty());
-        let ctx = build_host_signed_install(data_dir.path(), Ok(verifying_policy()), store.clone()).await;
+        let ctx = build_host_signed_install(
+            data_dir.path(),
+            Ok(verifying_policy()),
+            store.clone(),
+            crate::builtin_extensions::builtins(),
+        )
+        .await;
         assert!(ctx.is_some());
         assert!(store.contains("demo.plugin"), "startup restore re-bound the install");
         assert_eq!(store.lookup_checked("demo.plugin").unwrap().version(), "1.0.0");
@@ -370,5 +409,107 @@ mod tests {
         std::fs::write(root.join("panels/board.css"), b"evil").unwrap();
         let (status, _) = get("/api/extensions/demo.plugin/assets/panels/board.css").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ---- slice B1: built-in packs through the app's startup path ----------------------------------
+
+    /// A leaked (`'static`) built-in set with one signed pack; the production set is empty.
+    fn leaked_builtins(version: &str) -> &'static aionui_extension::hub::BuiltinSet<'static> {
+        use aionui_extension::hub::curated::signature_payload;
+        use aionui_extension::hub::{BuiltinKey, BuiltinPack, BuiltinSet};
+        use aionui_extension::pack::{PackOptions, pack_extension_dir};
+        use ed25519_dalek::Signer;
+
+        let author = tempfile::tempdir().unwrap();
+        let write = |rel: &str, bytes: &[u8]| {
+            let path = author.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        write(
+            "aion-extension.json",
+            &serde_json::to_vec(&serde_json::json!({
+                "name": "demo.builtin", "version": version,
+                "contributes": {"panels": [{"id": "board", "title": "Board", "entryPoint": "panels/board.html"}]}
+            }))
+            .unwrap(),
+        );
+        write("panels/board.html", b"<p>builtin</p>");
+        let packed = pack_extension_dir(author.path(), &PackOptions::default()).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[61; 32]);
+        let signature = hex::encode(
+            key.sign(signature_payload("demo.builtin", version, &packed.manifest_integrity).as_bytes())
+                .to_bytes(),
+        );
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        let keys: &'static [BuiltinKey<'static>] = Box::leak(Box::new([BuiltinKey {
+            id: "app-builtin-test",
+            public_key: key.verifying_key().to_bytes(),
+        }]));
+        let packs: &'static [BuiltinPack<'static>] = Box::leak(Box::new([BuiltinPack {
+            name: "demo.builtin",
+            version: leak(version.to_owned()),
+            pubkey_id: "app-builtin-test",
+            integrity: leak(packed.manifest_integrity),
+            signature: leak(signature),
+            package_zip: Box::leak(packed.zip.into_boxed_slice()),
+        }]));
+        Box::leak(Box::new(BuiltinSet { keys, packs }))
+    }
+
+    fn no_policy() -> CuratedInstallPolicy {
+        CuratedInstallPolicy::new(HashSet::new(), false, HashMap::new())
+    }
+
+    #[tokio::test]
+    async fn builtin_pack_installs_at_startup_without_any_env_policy_and_is_restored_next_start() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let builtins = leaked_builtins("1.0.0");
+        let store = Arc::new(SignedRootBindingStore::new());
+        let ctx = build_host_signed_install(data_dir.path(), Ok(no_policy()), store.clone(), builtins).await;
+        assert!(ctx.is_some());
+        assert_eq!(store.lookup_checked("demo.builtin").unwrap().version(), "1.0.0");
+        assert!(
+            data_dir
+                .path()
+                .join("extensions-signed")
+                .join("demo.builtin")
+                .join("1.0.0")
+                .join("panels")
+                .join("board.html")
+                .is_file()
+        );
+        drop((ctx, store));
+
+        // Restart: restored from disk, ensure is a no-op.
+        let store = Arc::new(SignedRootBindingStore::new());
+        let ctx = build_host_signed_install(data_dir.path(), Ok(no_policy()), store.clone(), builtins).await;
+        assert!(ctx.is_some());
+        assert_eq!(store.lookup_checked("demo.builtin").unwrap().version(), "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn builtin_key_colliding_with_a_host_key_installs_nothing() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let builtins = leaked_builtins("1.0.0");
+        let mut host = no_policy();
+        host.pubkeys.insert(
+            "app-builtin-test".into(),
+            ed25519_dalek::SigningKey::from_bytes(&[62; 32]).verifying_key(),
+        );
+        let store = Arc::new(SignedRootBindingStore::new());
+        let ctx = build_host_signed_install(data_dir.path(), Ok(host), store.clone(), builtins).await;
+        assert!(ctx.is_some());
+        assert!(store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_config_installs_no_builtins() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SignedRootBindingStore::new());
+        let broken = Err(CuratedGateError::PubkeyConfig("bad".into()));
+        let ctx = build_host_signed_install(data_dir.path(), broken, store.clone(), leaked_builtins("1.0.0")).await;
+        assert!(ctx.is_none() && store.is_empty());
+        assert_eq!(std::fs::read_dir(data_dir.path()).unwrap().count(), 0);
     }
 }
