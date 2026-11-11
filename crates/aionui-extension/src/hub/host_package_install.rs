@@ -1741,6 +1741,10 @@ mod tests {
         std::fs::create_dir(name_dir(&env).join("9.9.9")).unwrap();
         let root = name_dir(&env).join("1.0.0");
 
+        // Drop the live binding first: Windows refuses to rename a directory while a handle to a
+        // directory *inside* it is open (the test moves the name directory itself).
+        env.store.clear();
+
         // Name directory renamed so the marker's signed name no longer encodes to it.
         let moved = env.parent_path.join("moved.plugin");
         std::fs::rename(name_dir(&env), &moved).unwrap();
