@@ -40,7 +40,8 @@
 //! execution authorization, not root/owner/curation proof beyond Host possession of `parent`.
 //! The caller supplies `parent`: a Host-opened directory handle. On an I/O failure after
 //! creation the partially written root is left in place (no deletion in this slice) and is
-//! never retained. Unix only; other targets return `Unsupported`.
+//! never retained. Unix and Windows (handle-relative `NtCreateFile`, slice W2a); other targets return
+//! `Unsupported`.
 //! Fixed error categories: never digests, paths or manifest text.
 
 use std::collections::{BTreeMap, HashSet};
@@ -131,7 +132,12 @@ pub(super) struct ValidatedPackage {
 }
 
 fn canonical_relative(name: &str) -> Option<String> {
-    canonical_relative_path(name)
+    let rel = canonical_relative_path(name)?;
+    // Windows cannot hold every name a canonical path allows (ADS colon, DOS device names,
+    // trailing dot/space, …): such a package is refused there rather than written under another name.
+    #[cfg(windows)]
+    super::verified_reader::windows_portable_components(&rel).ok()?;
+    Some(rel)
 }
 
 /// Allow-listed non-manifest files declared by the signed manifest: path -> expected SRI.
@@ -316,6 +322,10 @@ pub(super) fn validate_package(
 }
 
 fn valid_root_dir_name(name: &str) -> bool {
+    #[cfg(windows)]
+    if super::verified_reader::windows_portable_components(name).is_err() {
+        return false;
+    }
     !name.is_empty()
         && name.len() <= 128
         && name != "."
@@ -395,6 +405,27 @@ pub(super) fn write_file_under(root: &File, rel: &str, bytes: &[u8]) -> Result<(
     file.sync_all().map_err(|_| LocalPackageError::WriteFailed)
 }
 
+#[cfg(windows)]
+fn create_root(parent: &File, dir_name: &str) -> Result<File, LocalPackageError> {
+    // Exclusive: a collision (including a symlink, junction or file of that name) is a failure.
+    super::host_fs_windows::create_dir_exclusive(parent, dir_name).map_err(|_| LocalPackageError::RootCreateFailed)
+}
+
+/// Write `bytes` at the canonical relative path `rel` below `root`: each parent directory is
+/// opened (or created) handle-relative with link refusal, the file is created exclusively.
+#[cfg(windows)]
+pub(super) fn write_file_under(root: &File, rel: &str, bytes: &[u8]) -> Result<(), LocalPackageError> {
+    use super::host_fs_windows::{create_file_exclusive, open_or_create_dir};
+    let parts =
+        super::verified_reader::windows_portable_components(rel).map_err(|()| LocalPackageError::WriteFailed)?;
+    let (last, dirs) = parts.split_last().ok_or(LocalPackageError::WriteFailed)?;
+    let mut current = root.try_clone().map_err(|_| LocalPackageError::WriteFailed)?;
+    for dir in dirs {
+        current = open_or_create_dir(&current, dir).map_err(|_| LocalPackageError::WriteFailed)?;
+    }
+    create_file_exclusive(&current, last, bytes).map_err(|_| LocalPackageError::WriteFailed)
+}
+
 /// Check the signature, validate the whole archive, create a fresh Host-owned root under
 /// `parent`, write the verified files and retain the root in `store`.
 ///
@@ -425,7 +456,7 @@ pub fn install_local_signed_package(
     install_validated(store, checked, package, parent, root_dir_name)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn install_validated(
     store: &SignedRootBindingStore,
     checked: SignatureCheckedManifest,
@@ -444,7 +475,7 @@ fn install_validated(
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn install_validated(
     _store: &SignedRootBindingStore,
     _checked: SignatureCheckedManifest,
@@ -455,13 +486,14 @@ fn install_validated(
     Err(LocalPackageError::Unsupported)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hub::curated::signature_payload;
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::HashMap;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use zip::write::SimpleFileOptions;
 
@@ -564,7 +596,7 @@ mod tests {
     fn env() -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let parent_path = tmp.path().to_path_buf();
-        let parent = File::open(&parent_path).unwrap();
+        let parent = crate::hub::test_support::open_dir(&parent_path);
         Env {
             _tmp: tmp,
             parent_path,
@@ -599,13 +631,25 @@ mod tests {
         assert_eq!(std::fs::read(root_path.join("panels/board.html")).unwrap(), PANEL);
         assert_eq!(std::fs::read(root_path.join("tools/run.js")).unwrap(), HANDLER);
         assert_eq!(std::fs::read(root_path.join("aion-extension.json")).unwrap(), f.raw);
-        assert_eq!(std::fs::metadata(&root_path).unwrap().mode() & 0o777, 0o700);
-        // Retained root is the very directory the Host created (same dev/ino), not a reopened string.
         let (snap, root) = env.store.lookup_clone("demo.plugin").unwrap();
         assert_eq!(snap.name(), "demo.plugin");
-        let a = root.metadata().unwrap();
-        let b = std::fs::metadata(&root_path).unwrap();
-        assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+        #[cfg(unix)]
+        {
+            assert_eq!(std::fs::metadata(&root_path).unwrap().mode() & 0o777, 0o700);
+            // Retained root is the very directory the Host created (same dev/ino), not a reopened string.
+            let a = root.metadata().unwrap();
+            let b = std::fs::metadata(&root_path).unwrap();
+            assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
+        }
+        // On every platform the retained handle reads the installed bytes through the verified reader.
+        assert_eq!(
+            crate::hub::verified_reader::read_file_under(&root, "panels/board.html", 1 << 20).unwrap(),
+            PANEL
+        );
+        assert_eq!(
+            crate::hub::verified_reader::read_file_under(&root, "aion-extension.json", 1 << 20).unwrap(),
+            f.raw
+        );
     }
 
     #[test]
@@ -794,7 +838,7 @@ mod tests {
         let f = fixture(manifest_json());
         let zip = zip_owned(&good_entries(&f.raw));
         let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), env.parent_path.join("link")).unwrap();
+        crate::hub::test_support::link_dir(outside.path(), &env.parent_path.join("link"));
         assert_eq!(
             run(&env, &f, &zip, "link", LocalPackageLimits::default()),
             Err(LocalPackageError::RootCreateFailed)
@@ -1204,5 +1248,37 @@ mod tests {
             read_package_manifest(b"not a zip"),
             Err(LocalPackageError::InvalidPackage)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_names_it_cannot_hold_before_creating_anything() {
+        let env = env();
+        // A root directory name that is a DOS device / has a trailing dot.
+        let f = fixture(manifest_json());
+        let zip = zip_owned(&good_entries(&f.raw));
+        for bad in ["con", "NUL", "demo.", "COM1.d"] {
+            assert_eq!(
+                run(&env, &f, &zip, bad, LocalPackageLimits::default()),
+                Err(LocalPackageError::InvalidDirName),
+                "{bad}"
+            );
+        }
+        // A covered file whose name Windows would silently rewrite (`aux.html` is a device name).
+        let manifest = format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","contributes":{{"panels":[{{"id":"p","title":"P","entryPoint":"panels/aux.html","entryPointIntegrity":"{}"}}]}}}}"#,
+            sri_sha512(PANEL)
+        )
+        .into_bytes();
+        let f = fixture(manifest);
+        let zip = zip_owned(&[
+            ("aion-extension.json", f.raw.clone()),
+            ("panels/aux.html", PANEL.to_vec()),
+        ]);
+        assert!(matches!(
+            run(&env, &f, &zip, "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::UnsafeEntryName | LocalPackageError::InvalidCoveredPath)
+        ));
+        assert_nothing_created(&env);
     }
 }

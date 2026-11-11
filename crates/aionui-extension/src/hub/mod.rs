@@ -16,6 +16,8 @@ pub mod installer;
 pub mod local_package_install;
 pub mod signed_manifest;
 pub mod sri_format;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod verified_asset;
 pub(crate) mod verified_reader;
 pub mod work_panel_view_entry_point_digest;

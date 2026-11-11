@@ -29,7 +29,8 @@ Usage:
 
 Without any output option nothing is written; a JSON report is printed to stdout.
 Outputs must not be inside <dir>. Symlinks, special files, non-canonical or case-colliding
-names and anything over the install limits are refused.
+names, names that cannot exist on Windows (con, aux, nul, com1, trailing dot, ':' ...) and
+anything over the install limits are refused.
 ";
 
 #[derive(Default)]

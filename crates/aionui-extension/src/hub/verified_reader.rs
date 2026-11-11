@@ -51,7 +51,6 @@ pub(crate) const MAX_COMPONENT_UTF16: usize = 255;
 /// `CONIN$`, `CONOUT$`, with or without an extension), components over 255 UTF-16 units and
 /// paths deeper than [`MAX_COMPONENTS`]. Pure and platform independent so it is unit-tested
 /// everywhere; only the Windows backend applies it.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn windows_portable_components(rel: &str) -> Result<Vec<&str>, ()> {
     if rel.is_empty() {
         return Err(());
@@ -212,20 +211,7 @@ mod tests {
     const MAX: u64 = 1024;
 
     fn open_root(path: &Path) -> File {
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // FILE_FLAG_BACKUP_SEMANTICS is required to open a directory handle.
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(0x0200_0000)
-                .open(path)
-                .unwrap()
-        }
-        #[cfg(not(windows))]
-        {
-            File::open(path).unwrap()
-        }
+        crate::hub::test_support::open_dir(path)
     }
 
     fn fixture() -> (tempfile::TempDir, File) {
@@ -244,34 +230,7 @@ mod tests {
         r.expect_err("must be refused").kind()
     }
 
-    /// Create a directory link `link -> target`: a junction on Windows (no privilege needed),
-    /// a symlink elsewhere.
-    fn link_dir(target: &Path, link: &Path) {
-        #[cfg(windows)]
-        junction::create(target, link).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(target, link).unwrap();
-    }
-
-    /// Create a file symlink; `false` when the OS refuses for lack of privilege (Windows).
-    fn link_file(target: &Path, link: &Path) -> bool {
-        #[cfg(windows)]
-        {
-            match std::os::windows::fs::symlink_file(target, link) {
-                Ok(()) => true,
-                Err(e) if e.raw_os_error() == Some(1314) => {
-                    eprintln!("SKIPPED: SeCreateSymbolicLinkPrivilege not held");
-                    false
-                }
-                Err(e) => panic!("symlink_file: {e}"),
-            }
-        }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, link).unwrap();
-            true
-        }
-    }
+    use crate::hub::test_support::{link_dir, link_file};
 
     #[test]
     fn reads_top_level_nested_empty_and_binary_files_exactly() {

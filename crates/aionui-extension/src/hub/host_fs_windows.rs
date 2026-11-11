@@ -23,17 +23,19 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-    NtCreateFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
 };
 use windows_sys::Win32::Foundation::{
     HANDLE, NTSTATUS, OBJ_DONT_REPARSE, STATUS_ACCESS_DENIED, STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK, FileAttributeTagInfo, FileStandardInfo,
-    GetFileInformationByHandleEx, GetFileType, SYNCHRONIZE,
+    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_DATA,
+    FileAttributeTagInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFileType, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -85,11 +87,8 @@ pub(super) fn read_file_under(root: &File, rel: &str, max: u64) -> io::Result<Ve
     Ok(bytes)
 }
 
-/// Open the single component `name` below `parent`, never traversing a reparse point.
+/// Open the single component `name` below `parent` for reading, never traversing a reparse point.
 fn open_relative(parent: &File, name: &str, want: Want) -> io::Result<File> {
-    let wide: Vec<u16> = name.encode_utf16().collect();
-    let byte_len = u16::try_from(wide.len() * 2).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-
     let (access, extra_options) = match want {
         Want::Directory => (
             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -100,9 +99,35 @@ fn open_relative(parent: &File, name: &str, want: Want) -> io::Result<File> {
             FILE_NON_DIRECTORY_FILE,
         ),
     };
-    let options = extra_options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
+    nt_open(
+        parent,
+        name,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,
+        extra_options,
+        0,
+    )
+}
 
-    // Prefer OBJ_DONT_REPARSE; retry once without it only when the OS rejects the flag itself.
+/// Handle-relative `NtCreateFile` of the single component `name` below `parent`.
+///
+/// `options` get `FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT` added, so an existing
+/// link is opened as the link itself; the opened handle is then refused when it is a reparse
+/// point. `OBJ_DONT_REPARSE` is preferred and dropped only if the OS rejects the flag itself.
+fn nt_open(
+    parent: &File,
+    name: &str,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    file_attributes: u32,
+) -> io::Result<File> {
+    let wide: Vec<u16> = name.encode_utf16().collect();
+    let byte_len = u16::try_from(wide.len() * 2).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let options = options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
+
     let mut status: NTSTATUS = STATUS_INVALID_PARAMETER;
     let mut handle: HANDLE = std::ptr::null_mut();
     for attributes in [OBJ_DONT_REPARSE, 0] {
@@ -130,9 +155,9 @@ fn open_relative(parent: &File, name: &str, want: Want) -> io::Result<File> {
                 &object,
                 &mut io_status,
                 std::ptr::null(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_OPEN,
+                file_attributes,
+                share,
+                disposition,
                 options,
                 std::ptr::null::<c_void>(),
                 0,
@@ -149,6 +174,65 @@ fn open_relative(parent: &File, name: &str, want: Want) -> io::Result<File> {
     let file = File::from(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) });
     refuse_reparse(file.as_raw_handle())?;
     Ok(file)
+}
+
+/// Access of a Host-owned directory handle: list, add entries, delete/rename itself.
+const HOST_DIR_ACCESS: u32 = FILE_LIST_DIRECTORY
+    | FILE_ADD_FILE
+    | FILE_ADD_SUBDIRECTORY
+    | FILE_TRAVERSE
+    | FILE_READ_ATTRIBUTES
+    | DELETE
+    | SYNCHRONIZE;
+const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+/// Exclusively create the directory `name` below `parent` and return the handle of **that very
+/// creation** (the analogue of `mkdirat` + `openat`): `STATUS_OBJECT_NAME_COLLISION` when anything
+/// of that name exists, including a link. The handle carries `DELETE` so the Host can later
+/// rename or remove the directory through it; it is Host-internal and never used to write
+/// anything but verified bytes.
+pub(super) fn create_dir_exclusive(parent: &File, name: &str) -> io::Result<File> {
+    nt_open(
+        parent,
+        name,
+        HOST_DIR_ACCESS,
+        SHARE_ALL,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+        FILE_ATTRIBUTE_NORMAL,
+    )
+}
+
+/// Open the directory `name` below `parent`, creating it when absent. An existing file or link of
+/// that name is refused (the analogue of `mkdirat(exist_ok)` + `openat(O_DIRECTORY|O_NOFOLLOW)`).
+pub(super) fn open_or_create_dir(parent: &File, name: &str) -> io::Result<File> {
+    nt_open(
+        parent,
+        name,
+        HOST_DIR_ACCESS,
+        SHARE_ALL,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE,
+        FILE_ATTRIBUTE_NORMAL,
+    )
+}
+
+/// Exclusively create the regular file `name` below `parent`, write `bytes` and flush them. The
+/// file is never shared while it is written; an existing entry of that name (including a link)
+/// fails instead of being written through.
+pub(super) fn create_file_exclusive(parent: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut file = nt_open(
+        parent,
+        name,
+        FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+        FILE_ATTRIBUTE_NORMAL,
+    )?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Refuse a handle that is itself a reparse point (symlink, junction, mount point, …).
@@ -182,6 +266,7 @@ fn status_to_error(status: NTSTATUS) -> io::Error {
     let kind = match status {
         STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => io::ErrorKind::NotFound,
         STATUS_ACCESS_DENIED => io::ErrorKind::PermissionDenied,
+        STATUS_OBJECT_NAME_COLLISION => io::ErrorKind::AlreadyExists,
         STATUS_NOT_A_DIRECTORY | STATUS_FILE_IS_A_DIRECTORY => io::ErrorKind::InvalidData,
         _ => io::ErrorKind::Other,
     };

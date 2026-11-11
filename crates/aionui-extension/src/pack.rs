@@ -24,7 +24,9 @@
 //!
 //! # Fail closed
 //! Symlinks and every non-regular, non-directory entry; names that are not UTF-8, not canonical
-//! (`\`, `..`, empty components, …) or that contain control characters; case-fold collisions
+//! (`\`, `..`, empty components, …) or that contain control characters; names that cannot exist on
+//! Windows (DOS device names, trailing dot/space, `:` and other reserved characters, over 255
+//! UTF-16 units — Windows is a required platform); case-fold collisions
 //! (including with the manifest name); `$file:` references in the manifest (the Host never
 //! resolves them on a signed manifest); and anything over the install limits
 //! ([`LocalPackageLimits`], the manifest size cap) are all refused with a message that names the
@@ -122,6 +124,10 @@ pub enum PackError {
     NonUtf8(String),
     #[error("{0}: not a canonical package path (or contains control characters)")]
     NonCanonical(String),
+    #[error(
+        "{0}: this name cannot exist on Windows (DOS device name such as con/aux/nul/com1, trailing dot or space, or one of : * ? \" < > | \\, or over 255 characters); rename it so the package installs on Windows"
+    )]
+    WindowsInvalidName(String),
     #[error("{0} and {1} collide when case-folded")]
     CaseFoldCollision(String, String),
     #[error("{0}: exceeds the per-file size limit")]
@@ -329,6 +335,14 @@ pub fn pack_extension_dir(dir: &Path, options: &PackOptions) -> Result<PackOutpu
         mut files, excluded, ..
     } = walk;
     files.sort();
+
+    // 2b. Every packaged path must also be a valid Windows name: Windows is a required platform
+    // and a package that only fails there at install time is refused at pack time instead.
+    for rel in &files {
+        if crate::hub::verified_reader::windows_portable_components(rel).is_err() {
+            return Err(PackError::WindowsInvalidName(rel.clone()));
+        }
+    }
 
     // 3. Case-fold collisions (also against the manifest name).
     let mut folded: BTreeMap<String, String> = BTreeMap::new();
@@ -678,8 +692,62 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn names_that_cannot_exist_on_windows_are_refused_at_pack_time() {
+        for name in [
+            "docs/aux.md",
+            "CON.txt",
+            "panels/nul",
+            "a:b.txt",
+            "trailing.",
+            "dir./x.txt",
+            "q?.txt",
+            "star*.txt",
+            "lt<.txt",
+            "com1.log",
+        ] {
+            let tmp = sample();
+            write(tmp.path(), name, b"x");
+            assert!(
+                matches!(
+                    pack_extension_dir(tmp.path(), &PackOptions::default()),
+                    Err(PackError::WindowsInvalidName(p)) if p == name
+                ),
+                "{name:?}"
+            );
+        }
+        // Look-alikes that are fine on Windows still pack.
+        let tmp = sample();
+        for name in [
+            "docs/console.md",
+            "auxiliary.txt",
+            "com10.txt",
+            "lpt.txt",
+            "a b/c d.txt",
+        ] {
+            write(tmp.path(), name, b"x");
+        }
+        assert!(pack_extension_dir(tmp.path(), &PackOptions::default()).is_ok());
+        // An excluded offender is not inspected, so it does not block packing.
+        let tmp = sample();
+        write(tmp.path(), "scratch/aux.md", b"x");
+        let opts = PackOptions {
+            extra_excludes: vec!["scratch".into()],
+            ..PackOptions::default()
+        };
+        assert!(pack_extension_dir(tmp.path(), &opts).is_ok());
+    }
+
     #[test]
     fn case_fold_collisions_are_refused_including_with_the_manifest() {
+        // On a case-insensitive filesystem (Windows, default macOS) the aliasing writes below may
+        // legitimately fail or overwrite; the helper must not panic there.
+        fn write(root: &Path, rel: &str, bytes: &[u8]) {
+            let p = root.join(rel);
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            let _ = std::fs::write(p, bytes);
+        }
         let tmp = sample();
         write(tmp.path(), "Panels/Board.html", b"x");
         // On a case-insensitive filesystem the write above aliases; only assert when distinct.
@@ -705,7 +773,7 @@ mod tests {
         let tmp = sample();
         write(tmp.path(), "a", b"x");
         write(tmp.path(), "A/b", b"y");
-        if tmp.path().join("a").is_file() {
+        if tmp.path().join("a").is_file() && tmp.path().join("A").join("b").is_file() {
             assert!(matches!(
                 pack_extension_dir(tmp.path(), &PackOptions::default()),
                 Err(PackError::CaseFoldCollision(_, _))
@@ -819,6 +887,9 @@ mod tests {
         assert_eq!(zip_names(&out.zip), [EXTENSION_MANIFEST_FILE]);
         let mut a = zip::ZipArchive::new(std::io::Cursor::new(&out.zip)).unwrap();
         let mut e = a.by_index(0).unwrap();
+        // The zip crate records unix mode bits differently when built for Windows; the Host
+        // installer only looks at the file-type bits, so only unix pins the exact mode.
+        #[cfg(unix)]
         assert_eq!(e.unix_mode().map(|m| m & 0o777), Some(0o644));
         let mut buf = Vec::new();
         e.read_to_end(&mut buf).unwrap();
