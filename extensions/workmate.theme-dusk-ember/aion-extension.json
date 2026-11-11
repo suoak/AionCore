@@ -1,0 +1,57 @@
+{
+  "author": "CSBU WorkMate contributors",
+  "contributes": {
+    "themes": [
+      {
+        "cover": "assets/cover.svg",
+        "file": "themes/dusk-ember.css",
+        "id": "dusk-ember",
+        "name": "Dusk & Ember"
+      }
+    ]
+  },
+  "description": "A violet dark theme (Dusk) and a warm light theme (Ember) for CSBU WorkMate. Colour values derived from the MIT-licensed Orca Dusk & Ember themes; see NOTICE.md.",
+  "displayName": "Dusk & Ember (CSBU WorkMate)",
+  "files": [
+    {
+      "integrity": "sha512-aPkQ7KBAznLtdJBxe5gI7aGE1k2OqfBadd+HeSpFlGnuRL9z69HKxgd05eODeMDPyEvxwTwHXEu6RdgHa+0YiA==",
+      "path": "LICENSE"
+    },
+    {
+      "integrity": "sha512-Lrr1Uts3xP7p3FC5hPCV876Dvwia3fgKNXK2XyzvRL6iesFgE3764w1AbWqHQbAa6H0Tr2Gyk5xGviPjGqWnuQ==",
+      "path": "NOTICE.md"
+    },
+    {
+      "integrity": "sha512-+4/EUoADomdC93d4u3bQRObChXwZxBpAF/uVEJWky++Jif+82k9l9m51TKyVgRzteIXE8CuSzmrF8yk9jIq33w==",
+      "path": "assets/cover.svg"
+    },
+    {
+      "integrity": "sha512-kLuXk8vCwBgScNEqOKhFw4iYNtKd0R7IHqZcKkwsXkM9XcEyPOn3F+jhDZArVjQ37shptEtOrKvJY5oqnH6CJg==",
+      "path": "i18n/en.json"
+    },
+    {
+      "integrity": "sha512-LtEUYXVWHIUf0HkXciBLTWCOH5hj+3gpKUSnJvLo1dVVJ+ScIZMeKuwHi9R60Elm8znT4Ik5Qe1qwAinz6cuiA==",
+      "path": "i18n/zh-CN.json"
+    },
+    {
+      "integrity": "sha512-3TwyJHb4ZSCdmz8fICAlc0l8u8kWa3zN06IQVMFB5Mc+nzldDU/z5pGfPcR/O07mLsx6L2qn2Q1FAQhOI/NSYg==",
+      "path": "themes/dusk-ember.css"
+    }
+  ],
+  "i18n": {
+    "directory": "i18n",
+    "locales": [
+      "en",
+      "zh-CN"
+    ]
+  },
+  "icon": "assets/cover.svg",
+  "license": "MIT",
+  "name": "workmate.theme-dusk-ember",
+  "permissions": {
+    "network": false,
+    "shell": false,
+    "storage": false
+  },
+  "version": "1.0.0"
+}

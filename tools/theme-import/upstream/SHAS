@@ -1,0 +1,5 @@
+commit 4589eb93e28d8a4e4fdd3a77670297da804e7abe
+source https://github.com/stablyai/orca-plugins plugins/dusk-ember
+LICENSE fbf46fc17dacb1f65e03e2b6290eb53ba94b149d
+dusk.json 99b70bf0ec0313b27ac6e5be5c7233b45dcbd9ae
+ember.json 099b9cd51a00d43f0dac8828af69207bd8015739
