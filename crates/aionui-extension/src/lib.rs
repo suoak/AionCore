@@ -43,7 +43,7 @@ pub use classifier::{AssistantClassifier, AssistantRuleDispatcher, DefaultUserCl
 pub use constants::*;
 pub use dependency::{DependencyIssue, DependencyValidationResult, topological_sort, validate_dependencies};
 pub use error::ExtensionError;
-pub use lifecycle::{HookKind, execute_hook, needs_install_hook, resolve_hook_path};
+pub use lifecycle::{HookKind, execute_hook, execute_hook_with_timeout, needs_install_hook, resolve_hook_path};
 pub use loader::{
     ScanPath, filter_by_engine_compatibility, load_all, resolve_install_target_dir_for_data_dir, resolve_scan_paths,
     resolve_scan_paths_for_data_dir, signed_extensions_scan_path,

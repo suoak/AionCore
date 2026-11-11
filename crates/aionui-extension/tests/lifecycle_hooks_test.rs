@@ -10,6 +10,8 @@ use std::fs;
 #[cfg(unix)]
 use std::path::Path;
 
+#[cfg(unix)]
+use aionui_extension::execute_hook_with_timeout;
 use aionui_extension::{HookKind, LifecycleHooks, execute_hook, needs_install_hook, resolve_hook_path};
 use tempfile::TempDir;
 
@@ -174,22 +176,28 @@ async fn lh4_deactivate_executes_on_deactivate() {
 #[tokio::test]
 async fn lh5_hook_timeout() {
     let dir = setup_ext_dir();
-    // Script that sleeps for a long time
-    write_script(dir.path(), "scripts/slow.sh", "sleep 120");
+    // `exec` so the timeout kills the sleeper itself, not only its parent shell.
+    write_script(dir.path(), "scripts/slow.sh", "exec sleep 120");
+    assert!(dir.path().join("scripts/slow.sh").exists());
 
-    // We can't easily override the built-in timeout constants in the public API,
-    // so we test the timeout mechanism by using tokio::time::timeout directly
-    // to simulate what execute_hook does internally with a very short deadline.
-    let script_path = dir.path().join("scripts/slow.sh");
-    assert!(script_path.exists());
-
-    let child_future = tokio::process::Command::new(&script_path)
-        .current_dir(dir.path())
-        .kill_on_drop(true)
-        .output();
-
-    let result = tokio::time::timeout(std::time::Duration::from_millis(200), child_future).await;
-    assert!(result.is_err(), "should time out before script completes");
+    // Through the real runner with a short deadline (the per-kind defaults are 30-120 s).
+    let result = execute_hook_with_timeout(
+        dir.path(),
+        "scripts/slow.sh",
+        HookKind::OnInstall,
+        "slow-ext",
+        std::time::Duration::from_millis(300),
+    )
+    .await;
+    match result {
+        Err(aionui_extension::ExtensionError::HookTimeout {
+            extension_name, hook, ..
+        }) => {
+            assert_eq!(extension_name, "slow-ext");
+            assert_eq!(hook, "onInstall");
+        }
+        other => panic!("expected HookTimeout, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

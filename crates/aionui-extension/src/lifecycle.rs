@@ -67,6 +67,25 @@ pub async fn execute_hook(
     kind: HookKind,
     extension_name: &str,
 ) -> Result<(), ExtensionError> {
+    execute_hook_with_timeout(
+        ext_dir,
+        hook_path,
+        kind,
+        extension_name,
+        std::time::Duration::from_secs(kind.timeout_secs()),
+    )
+    .await
+}
+
+/// [`execute_hook`] with an explicit deadline (the production callers always pass the per-kind
+/// default). Exists so the timeout path is testable through the real runner instead of a copy of it.
+pub async fn execute_hook_with_timeout(
+    ext_dir: &Path,
+    hook_path: &str,
+    kind: HookKind,
+    extension_name: &str,
+    timeout: std::time::Duration,
+) -> Result<(), ExtensionError> {
     let script = ext_dir.join(hook_path);
 
     if !script.exists() {
@@ -79,7 +98,7 @@ pub async fn execute_hook(
         return Err(ExtensionError::HookNotFound(script.display().to_string()));
     }
 
-    let timeout_secs = kind.timeout_secs();
+    let timeout_secs = timeout.as_secs();
     let label = kind.label();
 
     info!(
@@ -90,11 +109,8 @@ pub async fn execute_hook(
         "executing lifecycle hook"
     );
 
-    let mut builder = CmdBuilder::clean_cli(&script);
-    builder.current_dir(ext_dir);
-    let child_future = builder.output();
-
-    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child_future).await;
+    // The retry for a busy executable lives inside the deadline: it never extends the timeout.
+    let result = tokio::time::timeout(timeout, run_script_retrying_busy(&script, ext_dir)).await;
 
     match result {
         Err(_elapsed) => {
@@ -154,6 +170,43 @@ pub async fn execute_hook(
     }
 }
 
+/// How often a spawn that failed with `ETXTBSY` is retried, and the pause between attempts
+/// (`step * attempt`, capped). The worst case adds about two seconds, inside the hook deadline.
+const BUSY_RETRIES: u32 = 20;
+const BUSY_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+const BUSY_MAX_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `execve` refused the script because some process still has it open for writing (`ETXTBSY`).
+fn is_executable_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ExecutableFileBusy
+}
+
+/// Run the hook script, retrying **only** a spawn that failed with `ETXTBSY`.
+///
+/// Why this is a real race and not a flaky test: Unix `fork` duplicates every open file descriptor
+/// into the child until it reaches `exec` (the `O_CLOEXEC` flag only closes them there). A thread
+/// that has just written the script — installing or extracting an extension — holds a writable
+/// descriptor for a moment; if any other thread of the process forks (any other spawn: another hook,
+/// a CLI probe) in that moment, the forked child keeps a copy open for writing until its own exec,
+/// and `exec` of the script fails with "Text file busy" even though the writer already closed it.
+/// Nothing was executed on that failure, so retrying is safe, and the window is microseconds to
+/// milliseconds. Every other error (not found, permission, exit status, timeout) is reported
+/// exactly as before and never retried.
+async fn run_script_retrying_busy(script: &Path, ext_dir: &Path) -> std::io::Result<std::process::Output> {
+    let mut attempt: u32 = 0;
+    loop {
+        let mut builder = CmdBuilder::clean_cli(script);
+        builder.current_dir(ext_dir);
+        match builder.output().await {
+            Err(error) if is_executable_busy(&error) && attempt < BUSY_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep((BUSY_STEP * attempt).min(BUSY_MAX_PAUSE)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Determine whether the `onInstall` hook should run.
 ///
 /// Returns `true` when:
@@ -169,8 +222,12 @@ pub fn needs_install_hook(current_version: &str, persisted_version: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(unix)]
-    use tokio::process::Command;
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     // -----------------------------------------------------------------------
     // needs_install_hook
@@ -324,27 +381,82 @@ mod tests {
     async fn test_execute_hook_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("slow.sh");
-        // Script that sleeps longer than we allow
-        std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").unwrap();
+        // `exec` so the timeout kills the sleeper itself, not just its parent shell.
+        std::fs::write(&script_path, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        make_executable(&script_path);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        // Use a very short timeout override via a direct timeout wrapper
-        let ext_dir = dir.path().to_owned();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            Command::new(ext_dir.join("slow.sh"))
-                .current_dir(&ext_dir)
-                .kill_on_drop(true)
-                .output(),
+        let result = execute_hook_with_timeout(
+            dir.path(),
+            "slow.sh",
+            HookKind::OnActivate,
+            "test-ext",
+            std::time::Duration::from_millis(300),
         )
         .await;
 
-        assert!(result.is_err(), "should have timed out");
+        assert!(
+            matches!(result, Err(ExtensionError::HookTimeout { .. })),
+            "expected HookTimeout, got {result:?}"
+        );
+    }
+
+    /// Deterministic reproduction of the fork/exec race: a writable descriptor on the script makes
+    /// `exec` fail with ETXTBSY exactly like a forked sibling holding a copy. The runner must wait
+    /// it out (the descriptor is released after a short pause) and then run the hook.
+    // Linux enforces ETXTBSY on exec of a file open for writing; the premise assert guards that.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_execute_hook_waits_out_a_busy_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("busy.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&script_path);
+        let writer = std::fs::OpenOptions::new().write(true).open(&script_path).unwrap();
+        // Prove the premise: while the writer is open the script cannot be executed.
+        let direct = std::process::Command::new(&script_path).output();
+        assert!(
+            matches!(&direct, Err(e) if is_executable_busy(e)),
+            "premise: exec must fail with ETXTBSY, got {direct:?}"
+        );
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(writer);
+        });
+
+        let result = execute_hook(dir.path(), "busy.sh", HookKind::OnActivate, "test-ext").await;
+        releaser.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// Only ETXTBSY is retried: any other spawn error is reported at once, and the retry never
+    /// outlives the hook deadline.
+    // Linux enforces ETXTBSY on exec of a file open for writing; the premise assert guards that.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_execute_hook_busy_retry_respects_the_deadline_and_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not executable: PermissionDenied, reported immediately as HookFailed.
+        let plain = dir.path().join("plain.sh");
+        std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        let started = std::time::Instant::now();
+        let result = execute_hook(dir.path(), "plain.sh", HookKind::OnActivate, "test-ext").await;
+        assert!(matches!(result, Err(ExtensionError::HookFailed { .. })), "{result:?}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+        // Permanently busy: gives up by the deadline with a timeout, never hangs.
+        let busy = dir.path().join("busy.sh");
+        std::fs::write(&busy, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&busy);
+        let _writer = std::fs::OpenOptions::new().write(true).open(&busy).unwrap();
+        let result = execute_hook_with_timeout(
+            dir.path(),
+            "busy.sh",
+            HookKind::OnActivate,
+            "test-ext",
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(matches!(result, Err(ExtensionError::HookTimeout { .. })), "{result:?}");
     }
 
     // Hook scripts are POSIX `#!/bin/sh` files run directly; hooks do not run on Windows (not part of
