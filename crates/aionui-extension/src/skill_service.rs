@@ -1077,13 +1077,27 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
         Err(e) => return Err(e.into()),
     };
 
-    if metadata.file_type().is_symlink() || metadata.is_file() {
+    if metadata.file_type().is_symlink() {
+        remove_link_entry(path).await?;
+    } else if metadata.is_file() {
         tokio::fs::remove_file(path).await?;
     } else {
         tokio::fs::remove_dir_all(path).await?;
     }
 
     Ok(())
+}
+
+/// Remove a symlink / junction itself, never its target, and whether or not it dangles.
+///
+/// On unix `remove_file` removes any symlink. On Windows a *directory* link (an NTFS junction, which
+/// is what [`create_symlink`] makes for directory skills, or a directory symlink) can only be removed
+/// with `remove_dir`; `remove_file` fails with "access denied". Neither call follows the link.
+async fn remove_link_entry(path: &Path) -> io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(file_err) => tokio::fs::remove_dir(path).await.map_err(|_| file_err),
+    }
 }
 
 pub(crate) fn user_skill_root_for_user(paths: &SkillPaths, user_id: &str) -> PathBuf {
@@ -1195,14 +1209,9 @@ pub async fn export_skill_with_symlink(skill_path: &Path, target_dir: &Path) -> 
     let target_link = target_dir.join(&skill_name);
     tokio::fs::create_dir_all(target_dir).await?;
 
-    // Remove existing link if present
-    if target_link.exists() {
-        if target_link.is_symlink() || target_link.is_file() {
-            tokio::fs::remove_file(&target_link).await?;
-        } else {
-            tokio::fs::remove_dir_all(&target_link).await?;
-        }
-    }
+    // Remove existing entry if present. `symlink_metadata` (not `exists`) so a dangling link is
+    // replaced too instead of making the new link fail with AlreadyExists.
+    replace_existing_path(&target_link).await?;
 
     create_symlink(skill_path, &target_link).await?;
 
@@ -2843,9 +2852,8 @@ mod tests {
         assert!(!has_import_staging_dirs(&user_root));
     }
 
-    // Windows follow-up (not part of E13): replacing a dangling directory junction on import is not
-    // yet covered; this was never run on Windows before W2b widened the Windows CI job.
-    #[cfg(unix)]
+    // Runs on unix (dangling symlink) and Windows (dangling NTFS junction, which `remove_file` cannot
+    // delete). A real Windows bug before W3: the import failed instead of replacing the stale link.
     #[tokio::test]
     async fn import_skills_replaces_dangling_link_with_copy() {
         let tmp = TempDir::new().unwrap();
@@ -3287,6 +3295,23 @@ mod tests {
     async fn make_test_skill_repo() -> SqliteSkillRepository {
         let db = init_database_memory().await.unwrap();
         SqliteSkillRepository::new(db.pool().clone())
+    }
+
+    #[tokio::test]
+    async fn export_skill_with_symlink_replaces_a_dangling_link() {
+        let tmp = TempDir::new().unwrap();
+        let stale = tmp.path().join("stale/skill-a");
+        std::fs::create_dir_all(&stale).unwrap();
+        let target_dir = tmp.path().join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        create_symlink(&stale, &target_dir.join("skill-a")).await.unwrap();
+        std::fs::remove_dir_all(tmp.path().join("stale")).unwrap();
+
+        let fresh = tmp.path().join("fresh/skill-a");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("marker"), b"fresh").unwrap();
+        export_skill_with_symlink(&fresh, &target_dir).await.unwrap();
+        assert_eq!(std::fs::read(target_dir.join("skill-a/marker")).unwrap(), b"fresh");
     }
 
     fn create_skill_in_dir(base: &Path, name: &str, description: &str) {

@@ -1,7 +1,8 @@
 //! M9 E13 packing helper: pack -> sign (test key) -> `install_local_signed_package_auto` ->
-//! restore -> verified serve, plus end-to-end checks of the `workmate-pack` binary. Unix only
-//! (FD-relative Host layout).
-#![cfg(unix)]
+//! restore -> verified serve, plus end-to-end checks of the `workmate-pack` binary. Runs on unix
+//! (FD-relative Host layout) and on Windows (handle-relative layout, slice W3) — the Windows CI job
+//! runs it for real, so the whole signed-install chain is exercised on NTFS.
+#![cfg(any(unix, windows))]
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -34,6 +35,26 @@ use tower::ServiceExt;
 
 const HTML: &[u8] = b"<html>packed board</html>";
 const LOGO: &[u8] = &[0, 1, 2, 3, 254, 255];
+
+/// Open the Host-held parent directory handle: a plain `File::open` on unix, the same access mask
+/// the Host app uses (`open_signed_extensions_parent`) on Windows.
+fn open_host_dir(path: &Path) -> File {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // list | add file | add subdir | traverse | read attrs | DELETE | SYNCHRONIZE, opened with
+        // FILE_FLAG_BACKUP_SEMANTICS so a directory can be opened at all.
+        std::fs::OpenOptions::new()
+            .access_mode(0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x1_0000 | 0x10_0000)
+            .custom_flags(0x0200_0000)
+            .open(path)
+            .unwrap()
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path).unwrap()
+    }
+}
 
 fn key() -> SigningKey {
     SigningKey::from_bytes(&[52; 32])
@@ -132,7 +153,7 @@ async fn packed_package_installs_restores_and_is_served_verified() {
 
     // Sign (curator step) + install through the Host's auto installer.
     let signed_dir = TempDir::new().unwrap();
-    let parent = HostExtensionsParent::new(File::open(signed_dir.path()).unwrap()).unwrap();
+    let parent = HostExtensionsParent::new(open_host_dir(signed_dir.path())).unwrap();
     let store = SignedRootBindingStore::new();
     install(
         &store,
@@ -169,7 +190,7 @@ async fn packed_package_installs_restores_and_is_served_verified() {
     let store2 = router_state.host_runtime.signed_roots.clone();
     registry.set_signed_roots(store2.clone());
     let ctx = HostSignedInstall::new(
-        HostExtensionsParent::new(File::open(signed_dir.path()).unwrap()).unwrap(),
+        HostExtensionsParent::new(open_host_dir(signed_dir.path())).unwrap(),
         policy(),
         store2.clone(),
     )
@@ -231,7 +252,7 @@ fn packer_output_is_rejected_by_the_installer_when_swapped_or_unsigned() {
     let src = author_dir();
     let packed = pack_extension_dir(src.path(), &PackOptions::default()).unwrap();
     let signed_dir = TempDir::new().unwrap();
-    let parent = HostExtensionsParent::new(File::open(signed_dir.path()).unwrap()).unwrap();
+    let parent = HostExtensionsParent::new(open_host_dir(signed_dir.path())).unwrap();
     let store = SignedRootBindingStore::new();
 
     // A zip packed from edited sources does not match the signed manifest's SRIs.
@@ -348,6 +369,8 @@ fn cli_writes_zip_and_manifest_and_update_then_check_is_clean() {
     assert!(names.iter().all(|n| !n.contains(".tmp-")), "{names:?}");
 }
 
+// Uses unix symlinks directly; Windows link refusal is covered by the pack and reader tests.
+#[cfg(unix)]
 #[test]
 fn cli_refuses_outputs_inside_source_symlink_outputs_bad_sources_and_misuse() {
     let src = author_dir();

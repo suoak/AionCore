@@ -83,6 +83,8 @@ jobs:
     env:
       # Whole-crate `-D warnings` on Windows (slice W2b ported the last unix-only paths).
       RUSTFLAGS: "-D warnings"
+      # A runner that cannot create file symlinks must FAIL the link-refusal tests, not skip them.
+      AIONCORE_REQUIRE_LINK_PRIVILEGE: "1"
     defaults:
       run:
         shell: bash
@@ -111,16 +113,28 @@ jobs:
                    sweep_removes_only_leftovers_and_never_follows_symlinks \
                    uninstall_handles_absent_symlinked_and_present_name_directories \
                    windows_refuses_identities_that_encode_to_device_names \
-                   crash_between_the_two_renames_fails_closed_and_a_reinstall_recovers; do
+                   crash_between_the_two_renames_fails_closed_and_a_reinstall_recovers \
+                   windows_refuses_identities_that_differ_only_by_case \
+                   case_alias_is_ascii_case_folding_of_a_different_entry; do
             grep -E "$t \.\.\. ok" test.log
           done
-          if grep -q "SKIPPED" test.log; then echo "::warning::some symlink cases were skipped (no SeCreateSymbolicLinkPrivilege)"; fi
+          if grep -q "SKIPPED" test.log; then echo "::error::some Windows cases were SKIPPED (skipped is not passed)"; exit 1; fi
       - name: Full aionui-extension suite on Windows
-        run: cargo test -p aionui-extension --no-fail-fast 2>&1 | tee full.log
+        run: |
+          cargo test -p aionui-extension --no-fail-fast 2>&1 | tee full.log
+          # A failing test makes `tee` hide cargo's exit code, so assert the outcome explicitly.
+          if grep -E "^test result: FAILED|\.\.\. FAILED" full.log; then echo "::error::failures in the full aionui-extension suite"; exit 1; fi
+          for t in import_skills_replaces_dangling_link_with_copy export_skill_with_symlink_replaces_a_dangling_link \
+                   packed_package_installs_restores_and_is_served_verified; do
+            grep -E "$t \.\.\. ok" full.log
+          done
+          if grep -q "SKIPPED" full.log; then echo "::error::SKIPPED in the full suite"; exit 1; fi
       - name: Host app wiring (open_signed_extensions_parent) on Windows
         run: |
           cargo test -p aionui-app --lib host_signed_extensions -- --nocapture --test-threads=1 2>&1 | tee app.log
           grep -E "test result: ok\. [1-9][0-9]* passed; 0 failed" app.log
+          grep -E "pack_install_restart_restore_and_verified_serve_end_to_end \.\.\. ok" app.log
+          if grep -q "SKIPPED" app.log; then echo "::error::SKIPPED in the app wiring tests"; exit 1; fi
 
   changes:
     name: Detect dependency changes

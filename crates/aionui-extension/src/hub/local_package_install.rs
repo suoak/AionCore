@@ -94,6 +94,10 @@ pub enum LocalPackageError {
     ManifestMismatch,
     IntegrityMismatch,
     InvalidDirName,
+    /// Windows (case-insensitive filesystem): a *different* signed identity or version already
+    /// occupies the directory this install / uninstall would use (names differing only by ASCII
+    /// case). Refused instead of overwriting or deleting the other extension; never lower-cased.
+    CaseCollision,
     /// Host auto-install: placing the finished staging directory failed.
     PlaceFailed,
     /// Host auto-install: the version slot holds something that is not a real directory.

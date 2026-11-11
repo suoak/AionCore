@@ -228,4 +228,147 @@ mod tests {
         assert!(store.is_empty());
         assert!(!dir.join("demo/.wip-abc").exists());
     }
+
+    // ---- slice W3: the whole chain end to end (runs for real on windows-latest CI) ----------------
+
+    /// Curator packs and signs an author directory; the Host installs it through the same parent
+    /// opener the app uses, "restarts" (everything dropped, fresh binding store), and
+    /// `build_host_signed_install` sweeps and restores it; the routes then serve it verified from
+    /// the retained root, and refuse a file that was tampered with after install.
+    #[tokio::test]
+    async fn pack_install_restart_restore_and_verified_serve_end_to_end() {
+        use aionui_extension::hub::curated::{signature_payload, sri_sha512};
+        use aionui_extension::hub::signed_manifest::SignedManifestEntry;
+        use aionui_extension::hub::{
+            AutoInstallOptions, LocalPackageLimits, LocalPackageSource, install_local_signed_package_auto,
+        };
+        use aionui_extension::loader::ScanPath;
+        use aionui_extension::pack::{PackOptions, pack_extension_dir};
+        use aionui_extension::registry::ExtensionRegistry;
+        use aionui_extension::routes::{ExtensionRouterState, extension_routes};
+        use aionui_extension::state::ExtensionStateStore;
+        use aionui_extension::types::ExtensionSource;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use ed25519_dalek::Signer;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        const HTML: &[u8] = b"<html>w3 board</html>";
+
+        // -- curator: author directory -> pack -> sign --
+        let author = tempfile::tempdir().unwrap();
+        let write = |rel: &str, bytes: &[u8]| {
+            let path = author.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        write(
+            "aion-extension.json",
+            &serde_json::to_vec(&serde_json::json!({
+                "name": "demo.plugin", "version": "1.0.0",
+                "contributes": {"panels": [{"id": "board", "title": "Board", "entryPoint": "panels/board.html"}]}
+            }))
+            .unwrap(),
+        );
+        write("panels/board.html", HTML);
+        write("panels/board.css", b"p{color:red}");
+        let packed = pack_extension_dir(author.path(), &PackOptions::default()).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let signature = hex::encode(
+            key.sign(signature_payload("demo.plugin", "1.0.0", &packed.manifest_integrity).as_bytes())
+                .to_bytes(),
+        );
+
+        // -- Host, first run: install through the app's own parent opener --
+        let data_dir = tempfile::tempdir().unwrap();
+        {
+            let parent = open_signed_extensions_parent(data_dir.path()).unwrap();
+            let store = SignedRootBindingStore::new();
+            let report = install_local_signed_package_auto(
+                &store,
+                &verifying_policy(),
+                &LocalPackageSource {
+                    entry: SignedManifestEntry {
+                        name: "demo.plugin",
+                        version: "1.0.0",
+                        pubkey_id: Some("fixture"),
+                        integrity: Some(&packed.manifest_integrity),
+                        signature: Some(&signature),
+                    },
+                    raw_manifest: &packed.manifest,
+                    package_zip: &packed.zip,
+                },
+                &parent,
+                LocalPackageLimits::default(),
+                AutoInstallOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(report.files_written, packed.files.len() + 1);
+            assert!(store.contains("demo.plugin"));
+        } // parent + store dropped: the "process" ends.
+
+        // -- Host, restart: fresh state, then build_host_signed_install --
+        let state_dir = tempfile::tempdir().unwrap();
+        let registry = ExtensionRegistry::new(
+            ExtensionStateStore::new(state_dir.path().join("states.json")),
+            Arc::new(aionui_realtime::BroadcastEventBus::new(64)),
+            "1.0.0".into(),
+        );
+        let router_state = ExtensionRouterState::new(registry.clone());
+        let store = router_state.host_runtime.signed_roots.clone();
+        assert!(store.is_empty());
+        let ctx = build_host_signed_install(data_dir.path(), Ok(verifying_policy()), store.clone()).await;
+        assert!(ctx.is_some());
+        assert!(store.contains("demo.plugin"), "startup restore re-bound the install");
+        assert_eq!(store.lookup_checked("demo.plugin").unwrap().version(), "1.0.0");
+        registry.set_signed_roots(store.clone());
+        registry
+            .initialize_with_scan_paths(vec![ScanPath {
+                path: data_dir.path().join(aionui_extension::SIGNED_EXTENSIONS_DIR_NAME),
+                source: ExtensionSource::Local,
+            }])
+            .await
+            .unwrap();
+        let router =
+            extension_routes(router_state).layer(axum::extract::Extension(aionui_auth::CurrentUser::local_default()));
+        let get = |uri: &'static str| {
+            let router = router.clone();
+            async move {
+                let response = router
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                (
+                    response.status(),
+                    response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+                )
+            }
+        };
+
+        // -- verified serve from the retained root --
+        let (status, body) = get("/api/extensions/demo.plugin/assets/panels/board.html").await;
+        assert_eq!((status, &body[..]), (StatusCode::OK, HTML));
+        let (status, _) = get("/api/extensions/demo.plugin/assets/aion-extension.json").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the manifest itself is not an asset");
+
+        // -- tamper on disk after install: verified serve refuses the changed file --
+        let root = data_dir
+            .path()
+            .join(aionui_extension::SIGNED_EXTENSIONS_DIR_NAME)
+            .join("demo.plugin")
+            .join("1.0.0");
+        assert_eq!(
+            sri_sha512(&std::fs::read(root.join("panels/board.css")).unwrap()),
+            packed
+                .files
+                .iter()
+                .find(|f| f.path == "panels/board.css")
+                .unwrap()
+                .integrity
+        );
+        std::fs::write(root.join("panels/board.css"), b"evil").unwrap();
+        let (status, _) = get("/api/extensions/demo.plugin/assets/panels/board.css").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
 }
