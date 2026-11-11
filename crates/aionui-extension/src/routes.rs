@@ -1289,7 +1289,7 @@ mod tests {
         )
         .unwrap();
         // Honest Host-created root for the test: the tempdir the test itself created.
-        let root = std::fs::File::open(tmp.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(tmp.path());
         state.host_runtime.signed_roots.install("hello", checked, root).unwrap();
         let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
         assert_eq!(
@@ -1304,9 +1304,12 @@ mod tests {
 
     // -- slice F: verified serve from the retained signed root --
 
+    #[cfg(unix)]
     const V_HTML: &[u8] = b"<p>verified board</p>";
+    #[cfg(unix)]
     const V_CSS: &[u8] = b"p{color:green}";
 
+    #[cfg(unix)]
     fn signed_files_manifest() -> Vec<u8> {
         use crate::hub::curated::sri_sha512;
         serde_json::to_vec(&serde_json::json!({
@@ -1320,6 +1323,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
     fn check_for_hello(raw: &[u8]) -> crate::hub::signed_manifest::SignatureCheckedManifest {
         use crate::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
         use crate::hub::signed_manifest::{SignedManifestEntry, check_signed_manifest};
@@ -1351,6 +1355,7 @@ mod tests {
     }
 
     /// Router whose on-disk extension dir holds DIFFERENT (evil) bytes than the retained root.
+    #[cfg(unix)]
     async fn verified_fixture() -> (Router, ExtensionRouterState, tempfile::TempDir, tempfile::TempDir) {
         let (state, tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(false)).await;
         std::fs::create_dir_all(ext_dir.join("panels")).unwrap();
@@ -1368,6 +1373,7 @@ mod tests {
         (router, state, tmp, host_root)
     }
 
+    #[cfg(unix)]
     async fn asset_body(router: &Router, uri: &str) -> (StatusCode, String, Option<String>) {
         let response = router
             .clone()
@@ -1508,9 +1514,13 @@ mod tests {
         assert_eq!((status, body.as_str()), (StatusCode::OK, "EVIL-CSS"));
     }
 
+    #[cfg(unix)]
     const V_TAB: &[u8] = b"<h1>settings</h1>";
+    #[cfg(unix)]
     const V_ICON: &[u8] = b"<svg></svg>";
+    #[cfg(unix)]
     const V_COVER: &[u8] = b"PNGCOVER";
+    #[cfg(unix)]
     const V_THEME_CSS: &[u8] = b":root{--bg:#000}";
 
     /// Bound+files serve of settings-tab, icon and theme-cover paths (the kinds slice J now

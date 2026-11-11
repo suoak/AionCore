@@ -2843,6 +2843,9 @@ mod tests {
         assert!(!has_import_staging_dirs(&user_root));
     }
 
+    // Windows follow-up (not part of E13): replacing a dangling directory junction on import is not
+    // yet covered; this was never run on Windows before W2b widened the Windows CI job.
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_skills_replaces_dangling_link_with_copy() {
         let tmp = TempDir::new().unwrap();

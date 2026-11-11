@@ -380,7 +380,7 @@ mod tests {
         // empty files list: from_signed returns None only when files is empty; parse of empty
         // files is allowed (legacy). Need a valid empty list? files: [] is empty → Ok(None).
         let root_dir = tempfile::tempdir().unwrap();
-        let root = std::fs::File::open(root_dir.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(root_dir.path());
         let result =
             resolve_theme_from(&theme("legacy.css"), "hello", ext_dir.path(), Some((&checked, &root))).unwrap();
         assert_eq!(result.css_content, "body { color: #333; }");

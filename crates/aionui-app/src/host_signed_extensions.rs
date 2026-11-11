@@ -6,8 +6,11 @@
 //! that already holds the database, the extension state file and the key material); the leaf name is
 //! a fixed constant. No component of the path comes from a manifest, a package, a hub index entry,
 //! `LoadedExtension.directory`, `AIONUI_EXTENSIONS_PATH` or any other extension-controlled string.
-//! The handle is opened `O_DIRECTORY | O_NOFOLLOW` (a symlinked leaf is refused), after which the
-//! install / restore / uninstall code in `aionui-extension` only ever works relative to it.
+//! The handle is opened `O_DIRECTORY | O_NOFOLLOW` on unix; on Windows it is opened with
+//! `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` and refused when the opened object is
+//! a reparse point (symlink / junction / mount point) or not a directory. A linked leaf is refused
+//! either way, after which the install / restore / uninstall code in `aionui-extension` only ever
+//! works relative to the handle.
 //! The trust assumption is the one the Host already makes for its database and key files: its own
 //! data directory is not writable by untrusted parties.
 //!
@@ -44,6 +47,43 @@ pub(crate) fn open_signed_extensions_parent(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a directory"))
 }
 
+/// Windows counterpart of the unix opener above (slice W2b): same fixed leaf under the Host data
+/// directory, a linked or non-directory leaf is refused, and the handle itself is checked to be a
+/// real (non-reparse) directory so a leaf swapped for a junction between the check and the open is
+/// caught too.
+#[cfg(windows)]
+pub(crate) fn open_signed_extensions_parent(
+    data_dir: &Path,
+) -> std::io::Result<aionui_extension::hub::HostExtensionsParent> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    // FILE_FLAG_BACKUP_SEMANTICS (open a directory) | FILE_FLAG_OPEN_REPARSE_POINT (never traverse).
+    const OPEN_FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
+    // FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE |
+    // FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE: what the handle-relative install code needs from
+    // its parent (the same mask `aionui-extension` gives the directories it creates itself).
+    const PARENT_ACCESS: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x1_0000 | 0x10_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let refuse = |why: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+
+    let dir = data_dir.join(aionui_extension::SIGNED_EXTENSIONS_DIR_NAME);
+    std::fs::create_dir_all(&dir)?;
+    // `symlink_metadata` reports a symlink or junction leaf as a link, never as a directory.
+    if !std::fs::symlink_metadata(&dir)?.is_dir() {
+        return Err(refuse("signed extensions directory is not a real directory"));
+    }
+    let handle = std::fs::OpenOptions::new()
+        .access_mode(PARENT_ACCESS)
+        .custom_flags(OPEN_FLAGS)
+        .open(&dir)?;
+    let attributes = handle.metadata()?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(refuse("signed extensions directory is not a real directory"));
+    }
+    aionui_extension::hub::HostExtensionsParent::new(handle).map_err(|_| refuse("not a directory"))
+}
+
 /// Build the signed-install context, then sweep abandoned staging and restore bindings.
 ///
 /// `None` (and no filesystem effect) when no signature policy is configured, when the policy
@@ -65,7 +105,7 @@ pub(crate) async fn build_host_signed_install(
     if !signature_policy_configured(&policy) {
         return None;
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let data_dir = data_dir.to_path_buf();
         let joined = tokio::task::spawn_blocking(move || {
@@ -89,7 +129,7 @@ pub(crate) async fn build_host_signed_install(
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (data_dir, policy, store);
         tracing::warn!("signed extensions: not supported on this platform; signed install disabled");
@@ -97,10 +137,28 @@ pub(crate) async fn build_host_signed_install(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    /// Directory link `link -> target`: a symlink on unix, a junction (no privilege needed) on Windows.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "mklink /J failed");
+        }
+    }
 
     fn verifying_policy() -> CuratedInstallPolicy {
         let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
@@ -143,10 +201,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn symlinked_host_directory_leaf_is_refused() {
+    async fn linked_host_directory_leaf_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), tmp.path().join("extensions-signed")).unwrap();
+        link_dir(elsewhere.path(), &tmp.path().join("extensions-signed"));
         let ctx = build_host_signed_install(
             tmp.path(),
             Ok(verifying_policy()),

@@ -6,8 +6,9 @@
 //! opened with `FILE_OPEN_REPARSE_POINT` (so a symlink / junction / mount point is opened as the
 //! link itself, never traversed) plus `OBJ_DONT_REPARSE` where the OS knows it, and the opened
 //! handle is then checked: a reparse point is refused. The final file must additionally be a
-//! `FILE_TYPE_DISK` regular file with exactly one link and at most `max` bytes. Shares never
-//! include `FILE_SHARE_DELETE`, so an opened directory cannot be renamed away mid-walk.
+//! `FILE_TYPE_DISK` regular file with exactly one link and at most `max` bytes. Handles share
+//! read, write and delete so a concurrent install/upgrade can rename or delete the tree; a walk
+//! is handle-relative, so a rename of an ancestor cannot redirect it.
 //!
 //! The listed names are first filtered by [`super::verified_reader::windows_portable_components`]
 //! (no ADS colon, no DOS device names, no trailing dot/space, bounded length/depth).
@@ -24,18 +25,21 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    HANDLE, NTSTATUS, OBJ_DONT_REPARSE, STATUS_ACCESS_DENIED, STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    UNICODE_STRING,
+    ERROR_NO_MORE_FILES, HANDLE, NTSTATUS, OBJ_DONT_REPARSE, STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY,
+    STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_DATA,
-    FileAttributeTagInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFileType, SYNCHRONIZE,
+    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_DATA, FileAttributeTagInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
+    FileFullDirectoryRestartInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFileType, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -99,15 +103,7 @@ fn open_relative(parent: &File, name: &str, want: Want) -> io::Result<File> {
             FILE_NON_DIRECTORY_FILE,
         ),
     };
-    nt_open(
-        parent,
-        name,
-        access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        FILE_OPEN,
-        extra_options,
-        0,
-    )
+    nt_open(parent, name, access, SHARE_ALL, FILE_OPEN, extra_options, 0, true)
 }
 
 /// Handle-relative `NtCreateFile` of the single component `name` below `parent`.
@@ -115,6 +111,7 @@ fn open_relative(parent: &File, name: &str, want: Want) -> io::Result<File> {
 /// `options` get `FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT` added, so an existing
 /// link is opened as the link itself; the opened handle is then refused when it is a reparse
 /// point. `OBJ_DONT_REPARSE` is preferred and dropped only if the OS rejects the flag itself.
+#[allow(clippy::too_many_arguments)]
 fn nt_open(
     parent: &File,
     name: &str,
@@ -123,6 +120,7 @@ fn nt_open(
     disposition: u32,
     options: u32,
     file_attributes: u32,
+    refuse_links: bool,
 ) -> io::Result<File> {
     let wide: Vec<u16> = name.encode_utf16().collect();
     let byte_len = u16::try_from(wide.len() * 2).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -172,7 +170,9 @@ fn nt_open(
     }
     // SAFETY: NtCreateFile succeeded, so `handle` is a valid handle that nothing else owns.
     let file = File::from(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) });
-    refuse_reparse(file.as_raw_handle())?;
+    if refuse_links {
+        refuse_reparse(file.as_raw_handle())?;
+    }
     Ok(file)
 }
 
@@ -200,6 +200,7 @@ pub(super) fn create_dir_exclusive(parent: &File, name: &str) -> io::Result<File
         FILE_CREATE,
         FILE_DIRECTORY_FILE,
         FILE_ATTRIBUTE_NORMAL,
+        true,
     )
 }
 
@@ -214,6 +215,7 @@ pub(super) fn open_or_create_dir(parent: &File, name: &str) -> io::Result<File> 
         FILE_OPEN_IF,
         FILE_DIRECTORY_FILE,
         FILE_ATTRIBUTE_NORMAL,
+        true,
     )
 }
 
@@ -230,6 +232,7 @@ pub(super) fn create_file_exclusive(parent: &File, name: &str, bytes: &[u8]) -> 
         FILE_CREATE,
         FILE_NON_DIRECTORY_FILE,
         FILE_ATTRIBUTE_NORMAL,
+        true,
     )?;
     file.write_all(bytes)?;
     file.sync_all()
@@ -267,8 +270,268 @@ fn status_to_error(status: NTSTATUS) -> io::Error {
         STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => io::ErrorKind::NotFound,
         STATUS_ACCESS_DENIED => io::ErrorKind::PermissionDenied,
         STATUS_OBJECT_NAME_COLLISION => io::ErrorKind::AlreadyExists,
+        STATUS_DIRECTORY_NOT_EMPTY => io::ErrorKind::DirectoryNotEmpty,
         STATUS_NOT_A_DIRECTORY | STATUS_FILE_IS_A_DIRECTORY => io::ErrorKind::InvalidData,
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, format!("NTSTATUS {:#010x}", status as u32))
+}
+
+// ---- install / restore / sweep side (slice W2b): mirrors `host_fs` for unix ----
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Kind {
+    Dir,
+    Regular,
+    Other,
+}
+
+/// Our own trees are shallow (zip names are bounded); anything deeper is refused, not followed.
+pub(super) const MAX_REMOVE_DEPTH: u32 = 64;
+
+/// Classify the entry `name` of `dir` without following a link: `Ok(None)` when absent. Anything
+/// that is a reparse point (symlink, junction, mount point, …) is [`Kind::Other`].
+pub(super) fn kind_nofollow(dir: &File, name: &str) -> io::Result<Option<Kind>> {
+    let file = match nt_open(
+        dir,
+        name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        SHARE_ALL,
+        FILE_OPEN,
+        0,
+        0,
+        false,
+    ) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let tag: FILE_ATTRIBUTE_TAG_INFO = file_info(file.as_raw_handle(), FileAttributeTagInfo)?;
+    Ok(Some(if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        Kind::Other
+    } else if tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        Kind::Dir
+    } else {
+        Kind::Regular
+    }))
+}
+
+/// Open the existing real directory `name` below `parent` for listing / reading (no write or
+/// delete access); a link of that name is refused. Used for name directories and for the root
+/// handle a restart re-retains.
+pub(super) fn open_dir_existing(parent: &File, name: &str) -> io::Result<File> {
+    nt_open(
+        parent,
+        name,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+        0,
+        true,
+    )
+}
+
+/// Open the existing real directory `name` with the Host-directory access (list, add entries,
+/// rename/delete) used for the per-extension name directory during an install.
+pub(super) fn open_host_dir_existing(parent: &File, name: &str) -> io::Result<File> {
+    nt_open(
+        parent,
+        name,
+        HOST_DIR_ACCESS,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+        0,
+        true,
+    )
+}
+
+/// UTF-8 entry names of an open directory (non-UTF-16-clean names are skipped; `.`/`..`
+/// excluded). Always lists from the beginning.
+pub(super) fn list_dir(dir: &File) -> io::Result<Vec<String>> {
+    // 8-byte aligned scratch buffer (32 KiB); records are 8-byte aligned inside it.
+    let mut buf = vec![0u64; 4096];
+    let mut names = Vec::new();
+    let mut class = FileFullDirectoryRestartInfo;
+    loop {
+        // SAFETY: `buf` is a valid writable buffer of the stated size for the whole call.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                dir.as_raw_handle() as HANDLE,
+                class,
+                buf.as_mut_ptr().cast::<c_void>(),
+                (buf.len() * std::mem::size_of::<u64>()) as u32,
+            )
+        };
+        if ok == 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                return Ok(names);
+            }
+            return Err(err);
+        }
+        class = FileFullDirectoryInfo;
+        let base = buf.as_ptr().cast::<u8>();
+        let mut offset = 0usize;
+        loop {
+            // SAFETY: the kernel filled a chain of `FILE_FULL_DIR_INFO` records inside `buf`;
+            // `NextEntryOffset` stays within it and the file name lies within `FileNameLength`.
+            let (next, name) = unsafe {
+                let entry = base.add(offset).cast::<FILE_FULL_DIR_INFO>();
+                let next = std::ptr::addr_of!((*entry).NextEntryOffset).read_unaligned() as usize;
+                let len = std::ptr::addr_of!((*entry).FileNameLength).read_unaligned() as usize / 2;
+                let name_ptr = base
+                    .add(offset + std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName))
+                    .cast::<u16>();
+                let units: Vec<u16> = (0..len).map(|i| name_ptr.add(i).read_unaligned()).collect();
+                (next, String::from_utf16(&units).ok())
+            };
+            if let Some(name) = name
+                && name != "."
+                && name != ".."
+            {
+                names.push(name);
+            }
+            if next == 0 {
+                break;
+            }
+            offset += next;
+        }
+    }
+}
+
+/// Mark the object behind `handle` for deletion with POSIX semantics (the name disappears at
+/// once even while other handles are open). A non-empty directory fails.
+fn mark_delete(handle: RawHandle) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: `info` is a valid, properly sized buffer for `FileDispositionInfoEx`.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle as HANDLE,
+            FileDispositionInfoEx,
+            (&info as *const FILE_DISPOSITION_INFO_EX).cast::<c_void>(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Open `name` (file, directory or link — never traversed) with delete access.
+fn open_for_delete(parent: &File, name: &str, options: u32, refuse_links: bool) -> io::Result<File> {
+    nt_open(
+        parent,
+        name,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        SHARE_ALL,
+        FILE_OPEN,
+        options,
+        0,
+        refuse_links,
+    )
+}
+
+/// Delete the non-directory entry `name` (regular file, or a link/junction **itself**).
+pub(super) fn unlink_at(parent: &File, name: &str) -> io::Result<()> {
+    let file = open_for_delete(parent, name, 0, false)?;
+    mark_delete(file.as_raw_handle())
+}
+
+/// Delete the real directory `name`; fails unless it is empty.
+pub(super) fn remove_empty_dir_at(parent: &File, name: &str) -> io::Result<()> {
+    let dir = open_for_delete(parent, name, FILE_DIRECTORY_FILE, true)?;
+    mark_delete(dir.as_raw_handle())
+}
+
+/// Delete the directory tree `name` under `parent`, handle-relative, never following a link: a
+/// link or junction inside is deleted as a link and never entered.
+pub(super) fn remove_tree_at(parent: &File, name: &str, depth: u32) -> io::Result<()> {
+    if depth > MAX_REMOVE_DEPTH {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    let dir = nt_open(
+        parent,
+        name,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+        0,
+        true,
+    )?;
+    for entry in list_dir(&dir)? {
+        match kind_nofollow(&dir, &entry)? {
+            Some(Kind::Dir) => remove_tree_at(&dir, &entry, depth + 1)?,
+            Some(_) => unlink_at(&dir, &entry)?,
+            None => {}
+        }
+    }
+    mark_delete(dir.as_raw_handle())
+}
+
+/// Rename the entry `from` to `to` inside `dir` (both single components). `replace` lets a
+/// regular file replace an existing regular file; without it an existing destination of any
+/// kind fails (`AlreadyExists`) and nothing changes. The source is never a link.
+fn rename_in_dir(dir: &File, from: &str, to: &str, replace: bool) -> io::Result<()> {
+    let source = open_for_delete(dir, from, 0, true)?;
+    let wide: Vec<u16> = to.encode_utf16().collect();
+    let name_bytes = wide.len() * 2;
+    let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let total = header + name_bytes;
+    // 8-byte aligned buffer for the variable-length record.
+    let mut buf = vec![0u64; total.div_ceil(8)];
+    // SAFETY: `buf` is large enough for the header plus the name and 8-byte aligned; the record
+    // is fully initialised before it is passed to the kernel.
+    unsafe {
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        (*info).Anonymous.ReplaceIfExists = replace;
+        (*info).RootDirectory = dir.as_raw_handle() as HANDLE;
+        (*info).FileNameLength = name_bytes as u32;
+        let name_ptr = buf.as_mut_ptr().cast::<u8>().add(header).cast::<u16>();
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), name_ptr, wide.len());
+    }
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: valid handle, valid initialised record of `total` bytes, valid status block.
+    let status = unsafe {
+        NtSetInformationFile(
+            source.as_raw_handle() as HANDLE,
+            &mut io_status,
+            buf.as_ptr().cast::<c_void>(),
+            total as u32,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        Err(status_to_error(status))
+    } else {
+        Ok(())
+    }
+}
+
+/// Rename `from` to `to` inside `dir`; an existing destination of any kind makes it fail.
+pub(super) fn rename_noreplace(dir: &File, from: &str, to: &str) -> io::Result<()> {
+    rename_in_dir(dir, from, to, false)
+}
+
+/// Rename the regular file `from` over the regular file (or absent) `to` inside `dir`.
+pub(super) fn rename_replace(dir: &File, from: &str, to: &str) -> io::Result<()> {
+    rename_in_dir(dir, from, to, true)
+}
+
+/// Atomically (re)write the small regular file `final_name` in `dir`: exclusive temp file,
+/// flush, rename-over. Never writes through an existing path in place and never creates a link.
+/// Returns without touching `final_name` on any failure.
+pub(super) fn write_file_atomic(dir: &File, tmp_name: &str, final_name: &str, bytes: &[u8]) -> io::Result<()> {
+    create_file_exclusive(dir, tmp_name, bytes).inspect_err(|_| {
+        let _ = unlink_at(dir, tmp_name);
+    })?;
+    rename_replace(dir, tmp_name, final_name).inspect_err(|_| {
+        let _ = unlink_at(dir, tmp_name);
+    })
 }
