@@ -5,6 +5,7 @@
 //! This file is a public façade — it only re-exports symbols defined in
 //! submodules. All logic lives in the modules below.
 
+mod builtin_extensions;
 mod config;
 /// Host composition: signed backgroundService binding → checked entry-point source (no service-start auth).
 pub mod extension_js_background_service_source;

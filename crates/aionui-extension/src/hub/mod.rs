@@ -1,5 +1,6 @@
 pub mod background_service_entry_point_digest;
 pub(crate) mod bound_manifest;
+pub mod builtin_packs;
 pub mod curated;
 pub mod curated_signed_retain;
 pub mod entry_point_digest;
@@ -26,6 +27,9 @@ pub mod work_panel_view_entry_point_digest;
 pub use background_service_entry_point_digest::{
     BackgroundServiceEntryPointDigestError, bind_background_service_entry_point_digest_from_signed,
     expected_background_service_entry_point_integrity,
+};
+pub use builtin_packs::{
+    BuiltinKey, BuiltinOutcome, BuiltinPack, BuiltinReport, BuiltinSet, BuiltinSkip, MergeReport, merge_builtin_policy,
 };
 pub use curated::{
     ALLOWLIST_ENV, CuratedGateError, CuratedInstallPolicy, REQUIRE_SIGNATURE_ENV, SIGNING_PUBKEYS_ENV,

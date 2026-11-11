@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use super::builtin_packs::{BuiltinOutcome, BuiltinPack, BuiltinReport, BuiltinSet, BuiltinSkip, usable_key_ids};
 use super::curated::{CuratedInstallPolicy, evaluate_install_with};
 use super::host_package_install::{
     AutoInstallOptions, AutoInstallReport, HostExtensionsParent, UninstallOutcome, install_local_signed_package_auto,
@@ -105,6 +106,89 @@ impl HostSignedInstall {
             "signed extensions: startup restore finished"
         );
         report
+    }
+
+    /// Ensure the app's built-in signed packs are installed (blocking; run after
+    /// [`Self::startup_sweep_and_restore`]). See `hub::builtin_packs` for the policy: forward-only,
+    /// self-healing, key collisions fail closed. Never fails or panics the caller; each pack's
+    /// outcome is reported and logged.
+    pub fn ensure_builtin_packs(&self, set: &BuiltinSet<'_>) -> BuiltinReport {
+        let usable = usable_key_ids(&self.policy, set);
+        let mut report = BuiltinReport::default();
+        for pack in set.packs {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !usable.contains(pack.pubkey_id) {
+                    return BuiltinOutcome::Skipped(BuiltinSkip::KeyUnavailable);
+                }
+                self.ensure_one_builtin(pack)
+            }));
+            let outcome = run.unwrap_or_else(|_| {
+                tracing::error!(pack = %pack.name, "signed extensions: built-in install panicked");
+                BuiltinOutcome::Failed(LocalPackageError::PlaceFailed)
+            });
+            match outcome {
+                BuiltinOutcome::Installed(kind) => {
+                    tracing::info!(pack = %pack.name, version = %pack.version, ?kind, "signed extensions: built-in installed");
+                }
+                BuiltinOutcome::AlreadyCurrent | BuiltinOutcome::KeptNewer => {
+                    tracing::debug!(pack = %pack.name, ?outcome, "signed extensions: built-in left as is");
+                }
+                BuiltinOutcome::Skipped(why) => {
+                    tracing::warn!(pack = %pack.name, ?why, "signed extensions: built-in skipped");
+                }
+                BuiltinOutcome::Failed(why) => {
+                    tracing::warn!(pack = %pack.name, reason = ?why, "signed extensions: built-in install refused");
+                }
+            }
+            report.outcomes.push((pack.name.to_owned(), outcome));
+        }
+        report
+    }
+
+    fn ensure_one_builtin(&self, pack: &BuiltinPack<'_>) -> BuiltinOutcome {
+        // Cheap skip from the live binding. Anything unparsable falls through to the install chain,
+        // which makes the authoritative decision from the binding / marker.
+        if let Some(bound) = self.store.lookup_checked(pack.name)
+            && let (Ok(have), Ok(want)) = (
+                semver::Version::parse(bound.version()),
+                semver::Version::parse(pack.version),
+            )
+        {
+            match have.cmp(&want) {
+                std::cmp::Ordering::Equal => return BuiltinOutcome::AlreadyCurrent,
+                std::cmp::Ordering::Greater => return BuiltinOutcome::KeptNewer,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        let raw = match read_package_manifest(pack.package_zip) {
+            Ok(raw) => raw,
+            Err(why) => return BuiltinOutcome::Failed(why),
+        };
+        // The built-in installs under the built-in signature alone: the soft allowlist is not applied.
+        let policy = CuratedInstallPolicy::new(Default::default(), true, self.policy.pubkeys.clone());
+        let source = LocalPackageSource {
+            entry: SignedManifestEntry {
+                name: pack.name,
+                version: pack.version,
+                pubkey_id: Some(pack.pubkey_id),
+                integrity: Some(pack.integrity),
+                signature: Some(pack.signature),
+            },
+            raw_manifest: &raw,
+            package_zip: pack.package_zip,
+        };
+        match install_local_signed_package_auto(
+            &self.store,
+            &policy,
+            &source,
+            &self.parent,
+            LocalPackageLimits::default(),
+            AutoInstallOptions::default(),
+        ) {
+            Ok(report) => BuiltinOutcome::Installed(report.kind),
+            Err(LocalPackageError::DowngradeRefused) => BuiltinOutcome::KeptNewer,
+            Err(why) => BuiltinOutcome::Failed(why),
+        }
     }
 
     /// Verify and install one locally supplied package for `entry` (blocking).
