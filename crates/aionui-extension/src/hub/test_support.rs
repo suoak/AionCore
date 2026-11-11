@@ -37,6 +37,12 @@ pub(crate) fn link_file(target: &Path, link: &Path) -> bool {
         match std::os::windows::fs::symlink_file(target, link) {
             Ok(()) => true,
             Err(e) if e.raw_os_error() == Some(1314) => {
+                // CI sets this so a runner without the privilege FAILS instead of silently
+                // skipping the link-refusal cases (skipped is not passed).
+                assert!(
+                    std::env::var_os("AIONCORE_REQUIRE_LINK_PRIVILEGE").is_none_or(|v| v.is_empty()),
+                    "SeCreateSymbolicLinkPrivilege not held but AIONCORE_REQUIRE_LINK_PRIVILEGE is set"
+                );
                 eprintln!("SKIPPED: SeCreateSymbolicLinkPrivilege not held");
                 false
             }

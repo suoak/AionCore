@@ -212,6 +212,17 @@ pub(crate) fn host_component(value: &str) -> Option<String> {
     Some(component)
 }
 
+/// True iff `entries` holds a name that equals `component` ignoring ASCII case but is not exactly
+/// `component`. [`encode_component`] output is ASCII only (everything else is `~XX` with upper-case
+/// hex), so ASCII case folding is exactly what a case-insensitive filesystem merges. Pure so it is
+/// tested on every platform; only the Windows `imp` applies it to real directory listings.
+#[cfg(any(windows, test))]
+pub(crate) fn has_case_alias<S: AsRef<str>>(entries: &[S], component: &str) -> bool {
+    entries
+        .iter()
+        .any(|e| e.as_ref() != component && e.as_ref().eq_ignore_ascii_case(component))
+}
+
 /// True iff `value` has exactly the shape `encode_component` produces.
 pub(super) fn is_encoded_component(value: &str) -> bool {
     let b = value.as_bytes();
@@ -722,6 +733,13 @@ mod imp {
     };
     use crate::signed_root_binding::SignedRootBindingStore;
 
+    /// Whether another entry of `dir` differs from `component` only by ASCII case. A Windows
+    /// directory lookup is case-insensitive, so such an entry would be silently reused (a second
+    /// signed identity overwriting or deleting the first).
+    fn case_alias(dir: &File, component: &str) -> std::io::Result<bool> {
+        Ok(super::has_case_alias(&list_dir(dir)?, component))
+    }
+
     /// Where the new tree went, so a later failure can put things back.
     enum Placement {
         /// The version slot was free; the staging directory was renamed into it.
@@ -764,6 +782,11 @@ mod imp {
         marker: &[u8],
         options: AutoInstallOptions,
     ) -> Result<AutoInstallReport, LocalPackageError> {
+        match case_alias(parent, name_component) {
+            Ok(false) => {}
+            Ok(true) => return Err(LocalPackageError::CaseCollision),
+            Err(_) => return Err(LocalPackageError::RootCreateFailed),
+        }
         // Exclusive create tells us whether this call made the name directory (for tidy cleanup).
         let (name_dir, created_name) = match create_dir_exclusive(parent, name_component) {
             Ok(dir) => (dir, true),
@@ -790,6 +813,11 @@ mod imp {
         marker: &[u8],
         options: AutoInstallOptions,
     ) -> Result<AutoInstallReport, LocalPackageError> {
+        match case_alias(name_dir, version_component) {
+            Ok(false) => {}
+            Ok(true) => return Err(LocalPackageError::CaseCollision),
+            Err(_) => return Err(LocalPackageError::RootCreateFailed),
+        }
         // --- policy: what is installed now? -------------------------------------------------
         let bound_version = store.lookup_checked(checked.name()).map(|c| c.version().to_owned());
         let old_marker = read_file_under(name_dir, MARKER_FILE, MAX_MARKER_BYTES)
@@ -915,6 +943,9 @@ mod imp {
         name: &str,
         name_component: &str,
     ) -> Result<UninstallOutcome, LocalPackageError> {
+        if case_alias(parent, name_component).map_err(|_| LocalPackageError::RemoveFailed)? {
+            return Err(LocalPackageError::CaseCollision);
+        }
         let kind = kind_nofollow(parent, name_component).map_err(|_| LocalPackageError::RemoveFailed)?;
         match kind {
             None => Ok(if store.remove(name) {
@@ -1829,6 +1860,55 @@ mod tests {
                 ("not-an-extension", RestoreRejection::MarkerMissing)
             ]
         );
+    }
+
+    #[test]
+    fn case_alias_is_ascii_case_folding_of_a_different_entry() {
+        assert!(has_case_alias(&["Demo.Plugin", "other"], "demo.plugin"));
+        assert!(
+            !has_case_alias(&["demo.plugin", "other"], "demo.plugin"),
+            "exact match is no alias"
+        );
+        assert!(!has_case_alias(&["demo.plugin2"], "demo.plugin"));
+        // Encoded non-ASCII is upper-case hex only, so folding never merges distinct identities.
+        assert!(!has_case_alias(&["~C3~89"], "~C3~A9"));
+        assert!(!has_case_alias::<&str>(&[], "x"));
+    }
+
+    /// Windows lookups are case-insensitive: a second identity differing only by case would reuse
+    /// (overwrite / delete) the first one's directory. Both install and uninstall must refuse.
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_identities_that_differ_only_by_case() {
+        let env = env();
+        let first = pkg_full("demo.plugin", "1.0.0", "a", &[], false);
+        install(&env, &first).unwrap();
+        let clash = pkg_full("Demo.Plugin", "1.0.0", "b", &[], false);
+        assert_eq!(install(&env, &clash), Err(LocalPackageError::CaseCollision));
+        assert_eq!(
+            uninstall_local_signed_package(&env.store, &env.parent, "DEMO.PLUGIN"),
+            Err(LocalPackageError::CaseCollision)
+        );
+        // Nothing of the original changed.
+        assert_eq!(names(&env.parent_path), vec!["demo.plugin"]);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+        assert_eq!(marker_version(&env), "1.0.0");
+        assert_eq!(
+            std::fs::read(name_dir(&env).join("1.0.0/panels/board.html")).unwrap(),
+            first.panel
+        );
+        assert_eq!(bound_version(&env), "1.0.0");
+        // Same for a version that differs only by case from an installed one.
+        let rc = pkg_with("demo.plugin", "2.0.0-RC1", &[], false);
+        install(&env, &rc).unwrap();
+        let rc_lower = pkg_with("demo.plugin", "2.0.0-rc1", &[], false);
+        assert_eq!(
+            install_opts(&env, &rc_lower, true),
+            Err(LocalPackageError::CaseCollision)
+        );
+        assert_eq!(marker_version(&env), "2.0.0-RC1");
+        // The exact identity still works.
+        assert!(uninstall_local_signed_package(&env.store, &env.parent, "demo.plugin").is_ok());
     }
 
     #[cfg(windows)]

@@ -36,3 +36,24 @@ not packaged. File modes are normalized to `0644` and timestamps to 1980-01-01 i
 Signing stays a curator step: sign `signature_payload(name, version, manifestIntegrity)` with the
 curator key and ship `(pubkey_id, integrity, signature)` in the index entry. The zip is not signed;
 the signature covers the manifest and the manifest covers each file's SRI.
+
+## Windows hosts (required platform)
+Signed packages install on Windows with the same guarantees as on unix (handle-relative, never
+following links, signature and per-file SRI re-verified on every restart). What differs:
+
+* **Lifecycle hooks are not supported on Windows.** `lifecycle.onInstall` / `onActivate` /
+  `onDeactivate` are executed as the script file itself (a POSIX `#!/bin/sh` script), which Windows
+  cannot do. A pack that relies on hooks works on macOS / Linux hosts only; do not depend on hooks
+  for a pack that must run on Windows. (Hooks are not part of the signed-install guarantees.)
+* **Identities that Windows cannot hold are refused at install** with `InvalidDirName`: a signed
+  `name` or `version` whose encoded directory name is a DOS device name (`con`, `nul`, `aux`,
+  `com1`, …, also `con.txt`) or ends in a dot or space. Pick other identifiers.
+* **Names that differ only by ASCII case collide on NTFS** (`Demo.Plugin` vs `demo.plugin`, or the
+  versions `1.0.0-RC1` vs `1.0.0-rc1`). The Host refuses to install or uninstall such an identity
+  with `CaseCollision` instead of reusing (overwriting / deleting) the other one's directory. It
+  never lower-cases an identity: the signed name must keep equal to the directory it is stored in
+  (restore checks that), and lower-casing would also change the layout of existing unix installs.
+  Use lower-case identifiers (the curated packs all do) so the question never comes up.
+* A same-version *replace* is a two-step rename on Windows (no atomic directory exchange). A crash
+  between the two steps leaves that extension unbound after restart (fail closed); reinstall it.
+  A first install or a version change has no such window.
