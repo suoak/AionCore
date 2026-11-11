@@ -489,7 +489,7 @@ mod install_artifacts {
     #[test]
     fn committed_theme_pack_verifies_with_the_test_key_and_ensure_installs_it() {
         let root = repo_root();
-        let seed_hex: String = std::fs::read_to_string(root.join("tools/builtin-sign/workmate-test-dev.seed"))
+        let seed_hex: String = std::fs::read_to_string(root.join("tools/builtin-sign/workmate-test-dev.hex"))
             .unwrap()
             .chars()
             .filter(|c| c.is_ascii_hexdigit())

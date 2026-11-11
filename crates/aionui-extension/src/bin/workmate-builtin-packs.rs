@@ -4,7 +4,7 @@
 //! workmate-builtin-packs [--repo-root <dir>] [--check]
 //! ```
 //!
-//! Always uses the throwaway test/dev curator key in `tools/builtin-sign/workmate-test-dev.seed`
+//! Always uses the throwaway test/dev curator key in `tools/builtin-sign/workmate-test-dev.hex`
 //! (id `workmate-test-dev`). This tool will not read, embed, or write a production key.
 //! Without `--check`, it updates each source manifest's `files` list, writes `builtin/*.zip`
 //! and `builtin/index.json`. `--check` writes nothing and exits 3 when any committed artefact
@@ -20,7 +20,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde_json::{Value, json};
 
 const TEST_KEY_ID: &str = "workmate-test-dev";
-const TEST_KEY_REL: &str = "tools/builtin-sign/workmate-test-dev.seed";
+const TEST_KEY_REL: &str = "tools/builtin-sign/workmate-test-dev.hex";
 const INDEX_REL: &str = "builtin/index.json";
 
 struct PackDef {
