@@ -516,8 +516,29 @@ async fn get_panels(
     State(state): State<ExtensionRouterState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let items = state.registry.get_panels_for_user(&user.id).await;
+    let items = authorized_panels(&state, &user.id).await;
     Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
+}
+
+/// Panels the Host-retained signed snapshot vouches for (bound, entry listed in the signed
+/// `files`); see `hub::listing_auth`. Same item type and JSON shape as before, fewer items.
+async fn authorized_panels(state: &ExtensionRouterState, user_id: &str) -> Vec<crate::types::ResolvedPanel> {
+    let store = &state.host_runtime.signed_roots;
+    state
+        .registry
+        .get_panels_for_user(user_id)
+        .await
+        .into_iter()
+        .filter(|p| {
+            crate::hub::listing_authorized(
+                store,
+                crate::hub::ContributionKind::Panel,
+                &p.extension_name,
+                &p.id,
+                &p.entry_point,
+            )
+        })
+        .collect()
 }
 
 /// `GET /api/extensions/work-panel-views` — Plugin Contract v1 work-panel views.
@@ -525,7 +546,22 @@ async fn get_work_panel_views(
     State(state): State<ExtensionRouterState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let items = state.registry.get_work_panel_views_for_user(&user.id).await;
+    let store = &state.host_runtime.signed_roots;
+    let items: Vec<_> = state
+        .registry
+        .get_work_panel_views_for_user(&user.id)
+        .await
+        .into_iter()
+        .filter(|v| {
+            crate::hub::listing_authorized(
+                store,
+                crate::hub::ContributionKind::WorkPanelView,
+                &v.extension_name,
+                &v.id,
+                &v.entry_point,
+            )
+        })
+        .collect();
     Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
 }
 
@@ -587,7 +623,8 @@ async fn invoke_command(
     let command = host_runtime::find_command(&commands, &req.id, req.extension_name.as_deref())
         .cloned()
         .ok_or_else(|| ApiError::NotFound(format!("Command not found: {}", req.id)))?;
-    let panels = state.registry.get_panels_for_user(&user.id).await;
+    // Only a panel the signed snapshot vouches for may be hinted to the UI.
+    let panels = authorized_panels(&state, &user.id).await;
     let open_panel = host_runtime::panel_hint_for_command(&panels, &command).cloned();
     tracing::info!(
         user_id = %user.id,
@@ -1302,6 +1339,131 @@ mod tests {
         );
     }
 
+    // -- slice B3: panel / work-panel-view listing needs a bound, signed-`files`-listed entry --
+
+    const LISTED: &[u8] = b"<p>listed</p>";
+
+    fn listing_manifest(with_files: bool) -> serde_json::Value {
+        use crate::hub::curated::sri_sha512;
+        let mut m = serde_json::json!({
+            "name": "hello", "version": "1.0.0",
+            "contributes": {
+                "commands": [{"id": "board", "title": "Board"}],
+                "panels": [{"id": "board", "title": "Board", "entryPoint": "panels/board.html"}],
+                "workPanelViews": [{"id": "view", "title": "View", "entryPoint": "views/view.html"}],
+            }
+        });
+        if with_files {
+            m["files"] = serde_json::json!([
+                {"path": "panels/board.html", "integrity": sri_sha512(LISTED)},
+                {"path": "views/view.html", "integrity": sri_sha512(LISTED)},
+            ]);
+        }
+        m
+    }
+
+    /// State whose registry lists `listing_manifest`; optionally bound to its signed snapshot.
+    async fn listing_state(with_files: bool, bind: bool) -> (Router, tempfile::TempDir) {
+        let manifest = listing_manifest(with_files);
+        let (state, tmp, _ext_dir) = make_state_with_manifest(manifest.clone()).await;
+        if bind {
+            let checked = check_for_hello(&serde_json::to_vec_pretty(&manifest).unwrap());
+            let root = crate::hub::test_support::open_dir(tmp.path());
+            state.host_runtime.signed_roots.install("hello", checked, root).unwrap();
+        }
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        (router, tmp)
+    }
+
+    async fn get_json_data(router: &Router, uri: &str) -> serde_json::Value {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"].clone()
+    }
+
+    async fn invoke_board(router: &Router) -> serde_json::Value {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extensions/commands/invoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"id":"board","extensionName":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn bound_signed_entries_listed_in_files_are_listed_with_unchanged_shape() {
+        let (router, _tmp) = listing_state(true, true).await;
+        let panels = get_json_data(&router, "/api/extensions/panels").await;
+        assert_eq!(
+            panels,
+            serde_json::json!([{
+                "extensionName": "hello",
+                "id": "ext-hello-board",
+                "title": "Board",
+                "entryPoint": "/api/extensions/hello/assets/panels/board.html",
+            }])
+        );
+        let views = get_json_data(&router, "/api/extensions/work-panel-views").await;
+        assert_eq!(
+            views,
+            serde_json::json!([{
+                "extensionName": "hello",
+                "id": "ext-hello-view",
+                "title": "View",
+                "entryPoint": "/api/extensions/hello/assets/views/view.html",
+            }])
+        );
+        let invoked = invoke_board(&router).await;
+        assert_eq!(invoked["openPanel"]["id"], "ext-hello-board");
+    }
+
+    #[tokio::test]
+    async fn unbound_extensions_list_no_panels_or_views_and_give_no_panel_hint() {
+        for with_files in [true, false] {
+            let (router, _tmp) = listing_state(with_files, false).await;
+            assert_eq!(
+                get_json_data(&router, "/api/extensions/panels").await,
+                serde_json::json!([])
+            );
+            assert_eq!(
+                get_json_data(&router, "/api/extensions/work-panel-views").await,
+                serde_json::json!([])
+            );
+            let invoked = invoke_board(&router).await;
+            assert_eq!(invoked["status"], "accepted");
+            assert!(invoked.get("openPanel").is_none_or(|v| v.is_null()), "{invoked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_snapshot_without_files_lists_nothing() {
+        let (router, _tmp) = listing_state(false, true).await;
+        assert_eq!(
+            get_json_data(&router, "/api/extensions/panels").await,
+            serde_json::json!([])
+        );
+        assert_eq!(
+            get_json_data(&router, "/api/extensions/work-panel-views").await,
+            serde_json::json!([])
+        );
+        let invoked = invoke_board(&router).await;
+        assert!(invoked.get("openPanel").is_none_or(|v| v.is_null()), "{invoked}");
+    }
+
     // -- slice F: verified serve from the retained signed root --
 
     #[cfg(unix)]
@@ -1323,7 +1485,6 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(unix)]
     fn check_for_hello(raw: &[u8]) -> crate::hub::signed_manifest::SignatureCheckedManifest {
         use crate::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
         use crate::hub::signed_manifest::{SignedManifestEntry, check_signed_manifest};

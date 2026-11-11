@@ -13,6 +13,7 @@ pub mod host_package_restore;
 pub mod host_signed_install;
 pub mod index_manager;
 pub mod installer;
+pub mod listing_auth;
 pub mod local_package_install;
 pub mod signed_manifest;
 pub mod sri_format;
@@ -47,6 +48,7 @@ pub use host_package_restore::{RestoreRejection, RestoreReport, restore_installe
 pub use host_signed_install::{HostSignedInstall, StartupReport, signature_policy_configured};
 pub use index_manager::HubIndexManager;
 pub use installer::HubInstaller;
+pub use listing_auth::{ContributionKind, listing_authorized, listing_authorized_by_snapshot};
 pub use local_package_install::{
     LocalPackageError, LocalPackageInstalled, LocalPackageLimits, LocalPackageSource, install_local_signed_package,
     read_package_manifest,
