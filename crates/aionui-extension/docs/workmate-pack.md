@@ -60,10 +60,11 @@ following links, signature and per-file SRI re-verified on every restart). What 
 
 ## Panel / work-panel-view listing
 
-`GET /api/extensions/panels` and `/work-panel-views` (and the panel hint of `commands/invoke`) list a
-contribution only when the Host-retained signed snapshot vouches for it: the extension is bound, the
-signed manifest declares a `files` list that contains the entry point (exact, case-sensitive), the
-contribution id is unique, and the resolved entry URL equals the one derived from the signed entry
-point. So a pack that ships panels must declare `files` (`workmate-pack` always does); an extension
-that is unsigned/unbound, or signed without `files`, simply does not appear. The response shape is
-unchanged.
+`GET /api/extensions/panels` and `/work-panel-views` (and the panel hint of `commands/invoke`) use a
+split rule. Unsigned / unbound local extensions keep today's listing behaviour (their panels and
+work-panel views still appear, with the same JSON). A **bound / signed** extension is listed only
+when the Host-retained signed snapshot vouches for the entry: the signed manifest declares a
+`files` list that contains the entry point (exact, case-sensitive), the contribution id is unique,
+and the resolved entry URL equals the one derived from the signed entry point. A bound extension
+signed without `files` does not appear. So a pack that ships panels must declare `files`
+(`workmate-pack` always does). The response shape is unchanged.

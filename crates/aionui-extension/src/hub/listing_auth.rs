@@ -1,20 +1,25 @@
 //! Listing authorization for panel / work-panel-view contributions (M9 E13 slice B3).
 //!
 //! `GET /api/extensions/panels` and `/work-panel-views` (and the panel hint of a command invoke)
-//! only list an entry when the **Host-retained signed snapshot** vouches for it:
+//! apply a split rule:
 //!
-//! 1. the extension is *bound* (it has a signature-checked snapshot in the binding store),
-//! 2. that snapshot declares `files` and lists the entry-point path **exactly** (the same
-//!    case-sensitive lookup the verified asset serve uses, so the page the UI would load is
-//!    served from the retained root with a per-file SRI check),
-//! 3. the contribution `id` is unique in the signed manifest,
-//! 4. the entry point is a local canonical relative path (never a remote URL), and
-//! 5. the URL the registry resolved for the entry equals the one derived from the signed entry
-//!    point, so a divergent loaded manifest cannot point the UI somewhere else.
+//! * **Unsigned / unbound** extensions keep today's listing behaviour: the registry's resolved
+//!   items are listed as they are (same JSON). A local unsigned plugin stays usable.
+//! * **Bound / signed** extensions are listed only when the Host-retained signed snapshot
+//!   vouches for the entry:
+//!   1. that snapshot declares `files` and lists the entry-point path **exactly** (the same
+//!      case-sensitive lookup the verified asset serve uses, so the page the UI would load is
+//!      served from the retained root with a per-file SRI check),
+//!   2. the contribution `id` is unique in the signed manifest,
+//!   3. the entry point is a local canonical relative path (never a remote URL), and
+//!   4. the URL the registry resolved for the entry equals the one derived from the signed
+//!      entry point, so a divergent loaded manifest cannot point the UI somewhere else.
 //!
-//! Everything else is not listed (fail closed). This is a pure function of signed bytes and the
-//! resolved item: no filesystem access, no response-shape change, not a load or execution
-//! permit by itself.
+//!   A bound extension whose snapshot has no `files` (or whose entry fails any of the checks)
+//!   is not listed (fail closed for the signed path).
+//!
+//! This is a pure function of the binding store and signed bytes: no filesystem access, no
+//! response-shape change, not a load or execution permit by itself.
 use super::signed_manifest::SignatureCheckedManifest;
 use super::verified_asset::FilesIndex;
 use crate::asset_paths::{canonical_relative_path, is_remote_asset_url, resolve_extension_asset_url};
@@ -87,7 +92,10 @@ pub fn listing_authorized_by_snapshot(
     resolve_extension_asset_url(extension_name, &canonical).as_deref() == Some(resolved_entry_url)
 }
 
-/// Store-backed form used by the routes: unbound extensions are never listed.
+/// Store-backed form used by the routes.
+///
+/// Unbound (typically unsigned local) extensions keep today's listing behaviour. Bound
+/// extensions go through [`listing_authorized_by_snapshot`].
 pub fn listing_authorized(
     store: &SignedRootBindingStore,
     kind: ContributionKind,
@@ -95,9 +103,12 @@ pub fn listing_authorized(
     resolved_id: &str,
     resolved_entry_url: &str,
 ) -> bool {
-    store.lookup_checked(extension_name).is_some_and(|checked| {
-        listing_authorized_by_snapshot(&checked, kind, extension_name, resolved_id, resolved_entry_url)
-    })
+    match store.lookup_checked(extension_name) {
+        None => true,
+        Some(checked) => {
+            listing_authorized_by_snapshot(&checked, kind, extension_name, resolved_id, resolved_entry_url)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -286,13 +297,20 @@ mod tests {
     }
 
     #[test]
-    fn unbound_store_lists_nothing() {
+    fn unbound_store_keeps_todays_listing() {
         let store = SignedRootBindingStore::default();
-        assert!(!listing_authorized(
+        assert!(listing_authorized(
             &store,
             ContributionKind::Panel,
             "hello",
             "ext-hello-board",
+            URL
+        ));
+        assert!(listing_authorized(
+            &store,
+            ContributionKind::WorkPanelView,
+            "hello",
+            "ext-hello-view",
             URL
         ));
     }

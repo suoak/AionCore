@@ -520,8 +520,9 @@ async fn get_panels(
     Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
 }
 
-/// Panels the Host-retained signed snapshot vouches for (bound, entry listed in the signed
-/// `files`); see `hub::listing_auth`. Same item type and JSON shape as before, fewer items.
+/// Panels the listing rule allows: unbound (unsigned local) extensions keep today's items;
+/// bound / signed ones must have the entry in the signed `files` list. See `hub::listing_auth`.
+/// Same item type and JSON shape as before.
 async fn authorized_panels(state: &ExtensionRouterState, user_id: &str) -> Vec<crate::types::ResolvedPanel> {
     let store = &state.host_runtime.signed_roots;
     state
@@ -623,7 +624,7 @@ async fn invoke_command(
     let command = host_runtime::find_command(&commands, &req.id, req.extension_name.as_deref())
         .cloned()
         .ok_or_else(|| ApiError::NotFound(format!("Command not found: {}", req.id)))?;
-    // Only a panel the signed snapshot vouches for may be hinted to the UI.
+    // Same listing rule as GET /panels: unsigned locals stay usable; signed ones must be vouched for.
     let panels = authorized_panels(&state, &user.id).await;
     let open_panel = host_runtime::panel_hint_for_command(&panels, &command).cloned();
     tracing::info!(
@@ -1432,20 +1433,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_extensions_list_no_panels_or_views_and_give_no_panel_hint() {
+    async fn unbound_extensions_keep_todays_listing_and_panel_hint() {
+        // Unsigned / unbound local plugins stay listed, whether or not the on-disk manifest
+        // happens to declare `files`. Shape is the same JSON as before this slice.
+        let expected_panels = serde_json::json!([{
+            "extensionName": "hello",
+            "id": "ext-hello-board",
+            "title": "Board",
+            "entryPoint": "/api/extensions/hello/assets/panels/board.html",
+        }]);
+        let expected_views = serde_json::json!([{
+            "extensionName": "hello",
+            "id": "ext-hello-view",
+            "title": "View",
+            "entryPoint": "/api/extensions/hello/assets/views/view.html",
+        }]);
         for with_files in [true, false] {
             let (router, _tmp) = listing_state(with_files, false).await;
             assert_eq!(
                 get_json_data(&router, "/api/extensions/panels").await,
-                serde_json::json!([])
+                expected_panels,
+                "with_files={with_files}"
             );
             assert_eq!(
                 get_json_data(&router, "/api/extensions/work-panel-views").await,
-                serde_json::json!([])
+                expected_views,
+                "with_files={with_files}"
             );
             let invoked = invoke_board(&router).await;
             assert_eq!(invoked["status"], "accepted");
-            assert!(invoked.get("openPanel").is_none_or(|v| v.is_null()), "{invoked}");
+            assert_eq!(invoked["openPanel"]["id"], "ext-hello-board");
         }
     }
 
