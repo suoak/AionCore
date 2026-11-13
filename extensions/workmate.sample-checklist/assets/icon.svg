@@ -1,0 +1,19 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Plan checklist">
+  <title>Plan checklist</title>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#26b58a"/>
+      <stop offset="100%" stop-color="#14805f"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#g)"/>
+  <rect x="16" y="13" width="32" height="38" rx="6" fill="#ffffff" fill-opacity="0.18" stroke="#ffffff" stroke-opacity="0.92" stroke-width="2"/>
+  <g fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21.5 24.5l2.6 2.6 4.6-5"/>
+    <path d="M21.5 36.5l2.6 2.6 4.6-5"/>
+  </g>
+  <g stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-opacity="0.9">
+    <path d="M33 24.5h9"/>
+    <path d="M33 36.5h9"/>
+  </g>
+</svg>

@@ -1,0 +1,5 @@
+{
+  "displayName": "Plan checklist (CSBU WorkMate)",
+  "description": "A small plan checklist that lives next to your session. Everything stays in memory inside the panel: no storage, no network.",
+  "views.checklist.title": "Plan checklist"
+}

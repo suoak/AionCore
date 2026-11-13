@@ -1,0 +1,22 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Shortcuts &amp; tips">
+  <title>Shortcuts &amp; tips</title>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5b7cfa"/>
+      <stop offset="100%" stop-color="#3a52c4"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#g)"/>
+  <rect x="13" y="18" width="38" height="28" rx="6" fill="#ffffff" fill-opacity="0.16" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2"/>
+  <g fill="#ffffff">
+    <rect x="18" y="23" width="6" height="5" rx="1.4"/>
+    <rect x="26" y="23" width="6" height="5" rx="1.4"/>
+    <rect x="34" y="23" width="6" height="5" rx="1.4"/>
+    <rect x="42" y="23" width="4" height="5" rx="1.4"/>
+    <rect x="18" y="31" width="4" height="5" rx="1.4"/>
+    <rect x="24" y="31" width="6" height="5" rx="1.4"/>
+    <rect x="32" y="31" width="6" height="5" rx="1.4"/>
+    <rect x="40" y="31" width="6" height="5" rx="1.4"/>
+    <rect x="21" y="39" width="22" height="4" rx="1.4"/>
+  </g>
+</svg>
