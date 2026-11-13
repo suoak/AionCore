@@ -144,11 +144,14 @@ jobs:
             grep -E "$t \.\.\. ok" full.log
           done
           if grep -q "SKIPPED" full.log; then echo "::error::SKIPPED in the full suite"; exit 1; fi
-      - name: Host app wiring (open_signed_extensions_parent) on Windows
+      - name: Host app wiring (open_signed_extensions_parent, production built-ins) on Windows
         run: |
-          cargo test -p aionui-app --lib host_signed_extensions -- --nocapture --test-threads=1 2>&1 | tee app.log
+          cargo test -p aionui-app --lib -- host_signed_extensions builtin_extensions --nocapture --test-threads=1 2>&1 | tee app.log
           grep -E "test result: ok\. [1-9][0-9]* passed; 0 failed" app.log
           grep -E "pack_install_restart_restore_and_verified_serve_end_to_end \.\.\. ok" app.log
+          grep -E "production_builtins_install_list_and_serve_verified_without_env_policy \.\.\. ok" app.log
+          grep -E "production_builtins_configure_the_host_without_env_and_restore_on_restart \.\.\. ok" app.log
+          grep -E "every_pack_signature_verifies_strictly_under_the_embedded_key \.\.\. ok" app.log
           if grep -q "SKIPPED" app.log; then echo "::error::SKIPPED in the app wiring tests"; exit 1; fi
 
   changes:

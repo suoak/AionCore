@@ -86,10 +86,14 @@ pub(crate) fn open_signed_extensions_parent(
 }
 
 /// Build the signed-install context, then sweep abandoned staging, restore bindings and ensure the
-/// app's built-in signed packs (`builtins`; the production set is empty, see `builtin_extensions`).
+/// app's built-in signed packs (`builtins`; production: the curator key + three curated packs, see
+/// `builtin_extensions`).
 ///
-/// `None` (and no filesystem effect) when no signature policy is configured, when the policy
-/// configuration is broken, or when the Host directory cannot be opened — the app then behaves
+/// The production built-in key alone makes the policy configured, so a Host with no
+/// `WORKMATE_HUB_SIGNING_PUBKEYS` still opens its directory and installs the built-ins.
+/// `None` (and no filesystem effect) when no signature policy is configured (no env key and an
+/// empty built-in set), when the policy configuration is broken, or when the Host directory cannot
+/// be opened — the app then behaves
 /// exactly as before. A restore rejection never fails startup: it is logged and the extension is
 /// left unbound.
 pub(crate) async fn build_host_signed_install(
@@ -155,6 +159,10 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
+    /// No built-ins: the "unconfigured / env-only Host" behaviour, kept separate from the
+    /// production set (which configures the policy on its own).
+    static NO_BUILTINS: BuiltinSet<'static> = BuiltinSet::EMPTY;
+
     /// Directory link `link -> target`: a symlink on unix, a junction (no privilege needed) on Windows.
     fn link_dir(target: &Path, link: &Path) {
         #[cfg(unix)]
@@ -190,7 +198,7 @@ mod tests {
             tmp.path(),
             Ok(none),
             Arc::new(SignedRootBindingStore::new()),
-            crate::builtin_extensions::builtins(),
+            &NO_BUILTINS,
         )
         .await;
         assert!(ctx.is_none());
@@ -205,7 +213,7 @@ mod tests {
             tmp.path(),
             broken,
             Arc::new(SignedRootBindingStore::new()),
-            crate::builtin_extensions::builtins(),
+            &NO_BUILTINS,
         )
         .await;
         assert!(ctx.is_none());
@@ -219,7 +227,7 @@ mod tests {
             tmp.path(),
             Ok(verifying_policy()),
             Arc::new(SignedRootBindingStore::new()),
-            crate::builtin_extensions::builtins(),
+            &NO_BUILTINS,
         )
         .await;
         assert!(ctx.is_some());
@@ -235,7 +243,7 @@ mod tests {
             tmp.path(),
             Ok(verifying_policy()),
             Arc::new(SignedRootBindingStore::new()),
-            crate::builtin_extensions::builtins(),
+            &NO_BUILTINS,
         )
         .await;
         assert!(ctx.is_none());
@@ -250,13 +258,7 @@ mod tests {
         std::fs::write(dir.join("broken/current"), b"not json").unwrap();
         std::fs::create_dir_all(dir.join("demo/.wip-abc")).unwrap();
         let store = Arc::new(SignedRootBindingStore::new());
-        let ctx = build_host_signed_install(
-            tmp.path(),
-            Ok(verifying_policy()),
-            store.clone(),
-            crate::builtin_extensions::builtins(),
-        )
-        .await;
+        let ctx = build_host_signed_install(tmp.path(), Ok(verifying_policy()), store.clone(), &NO_BUILTINS).await;
         assert!(ctx.is_some());
         assert!(store.is_empty());
         assert!(!dir.join("demo/.wip-abc").exists());
@@ -351,13 +353,7 @@ mod tests {
         let router_state = ExtensionRouterState::new(registry.clone());
         let store = router_state.host_runtime.signed_roots.clone();
         assert!(store.is_empty());
-        let ctx = build_host_signed_install(
-            data_dir.path(),
-            Ok(verifying_policy()),
-            store.clone(),
-            crate::builtin_extensions::builtins(),
-        )
-        .await;
+        let ctx = build_host_signed_install(data_dir.path(), Ok(verifying_policy()), store.clone(), &NO_BUILTINS).await;
         assert!(ctx.is_some());
         assert!(store.contains("demo.plugin"), "startup restore re-bound the install");
         assert_eq!(store.lookup_checked("demo.plugin").unwrap().version(), "1.0.0");
@@ -413,7 +409,7 @@ mod tests {
 
     // ---- slice B1: built-in packs through the app's startup path ----------------------------------
 
-    /// A leaked (`'static`) built-in set with one signed pack; the production set is empty.
+    /// A leaked (`'static`) built-in set with one signed pack (test key; independent of the production set).
     fn leaked_builtins(version: &str) -> &'static aionui_extension::hub::BuiltinSet<'static> {
         use aionui_extension::hub::curated::signature_payload;
         use aionui_extension::hub::{BuiltinKey, BuiltinPack, BuiltinSet};
@@ -515,8 +511,8 @@ mod tests {
 
     // ---- slice B5: the committed sample packs, installed through the Host path -------------------
 
-    /// A test-local set built from the committed `builtin/index.json` + zips (test/dev key only;
-    /// the production `builtins()` stays empty).
+    /// A test-local set built from the committed `builtin/index.json` + zips (CI test/dev key only;
+    /// production signatures live in `builtin_extensions`).
     fn committed_test_signed_set() -> (&'static aionui_extension::hub::BuiltinSet<'static>, std::path::PathBuf) {
         use aionui_extension::hub::{BuiltinKey, BuiltinPack, BuiltinSet};
 
@@ -550,12 +546,38 @@ mod tests {
         (Box::leak(Box::new(BuiltinSet { keys, packs })), repo)
     }
 
-    /// The two B5 sample packs install from their committed test-signed zips, survive a restart,
-    /// are listed by the B3 listing rule (signed `files` authorise the entry points) and are served
-    /// verified: every listed file byte-identical to its source, the manifest never, a tampered
-    /// file never.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// The committed test-signed set (CI pipeline key) — exercises the same zips as production.
     #[tokio::test]
-    async fn committed_sample_packs_install_list_and_serve_verified_end_to_end() {
+    async fn committed_test_signed_packs_install_list_and_serve_verified_end_to_end() {
+        let (builtins, _) = committed_test_signed_set();
+        curated_packs_install_list_and_serve_verified(builtins, no_policy).await;
+    }
+
+    /// Production: the real `builtins()` (curator public key + curator-signed packs) with NO
+    /// `WORKMATE_HUB_SIGNING_PUBKEYS`: startup installs and binds all three packs, and the theme,
+    /// panel, work-panel view and every verified asset are served.
+    #[tokio::test]
+    async fn production_builtins_install_list_and_serve_verified_without_env_policy() {
+        curated_packs_install_list_and_serve_verified(crate::builtin_extensions::builtins(), no_policy).await;
+    }
+
+    /// Production built-ins alongside an operator-configured env key: merged, still installed.
+    #[tokio::test]
+    async fn production_builtins_install_alongside_an_env_configured_host_key() {
+        curated_packs_install_list_and_serve_verified(crate::builtin_extensions::builtins(), verifying_policy).await;
+    }
+
+    /// The three B5 packs install from their committed zips, survive a restart, are listed by the
+    /// B3 listing rule (signed `files` authorise the entry points) and are served verified: every
+    /// listed file byte-identical to its source, the manifest never, a tampered file never.
+    async fn curated_packs_install_list_and_serve_verified(
+        builtins: &'static BuiltinSet<'static>,
+        policy: fn() -> CuratedInstallPolicy,
+    ) {
         use aionui_extension::loader::ScanPath;
         use aionui_extension::registry::ExtensionRegistry;
         use aionui_extension::routes::{ExtensionRouterState, extension_routes};
@@ -566,12 +588,8 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let (builtins, repo) = committed_test_signed_set();
+        let repo = repo_root();
         assert!(!builtins.is_empty());
-        assert!(
-            crate::builtin_extensions::builtins().is_empty(),
-            "the production set stays empty"
-        );
         let data_dir = tempfile::tempdir().unwrap();
         // First start installs; second start (fresh in-memory state) restores from disk.
         for pass in 0..2 {
@@ -583,7 +601,7 @@ mod tests {
             );
             let router_state = ExtensionRouterState::new(registry.clone());
             let store = router_state.host_runtime.signed_roots.clone();
-            let ctx = build_host_signed_install(data_dir.path(), Ok(no_policy()), store.clone(), builtins).await;
+            let ctx = build_host_signed_install(data_dir.path(), Ok(policy()), store.clone(), builtins).await;
             assert!(ctx.is_some());
             for name in [
                 "workmate.theme-dusk-ember",
@@ -638,6 +656,7 @@ mod tests {
                 .collect();
             assert_eq!(shortcuts.len(), 1, "{panels:?}");
             assert_eq!(shortcuts[0]["id"], "ext-workmate.sample-shortcuts-shortcuts");
+            assert_eq!(shortcuts[0]["title"], "Shortcuts & tips");
             assert_eq!(
                 shortcuts[0]["entryPoint"],
                 "/api/extensions/workmate.sample-shortcuts/assets/panels/shortcuts.html"
@@ -655,6 +674,7 @@ mod tests {
                 .collect();
             assert_eq!(checklist.len(), 1, "{views:?}");
             assert_eq!(checklist[0]["id"], "ext-workmate.sample-checklist-checklist");
+            assert_eq!(checklist[0]["title"], "Plan checklist");
             assert_eq!(
                 checklist[0]["entryPoint"],
                 "/api/extensions/workmate.sample-checklist/assets/views/checklist.html"
@@ -662,8 +682,35 @@ mod tests {
             assert_eq!(checklist[0]["placement"], "secondary");
             assert!(views.iter().all(|v| v["extensionName"] != "workmate.sample-shortcuts"));
 
+            // -- theme: Dusk & Ember is listed with its CSS loaded from the verified root --
+            let (status, _, body) = get("/api/extensions/themes".into()).await;
+            assert_eq!(status, StatusCode::OK);
+            let themes = listing(body);
+            let dusk: Vec<_> = themes
+                .iter()
+                .filter(|t| {
+                    t["id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("ext-workmate.theme-dusk-ember-")
+                })
+                .collect();
+            assert_eq!(dusk.len(), 1, "{themes:?}");
+            assert!(
+                dusk[0]["name"].as_str().unwrap().starts_with("Dusk & Ember"),
+                "{:?}",
+                dusk[0]
+            );
+            let css = dusk[0]["css"].as_str().unwrap();
+            let committed_css =
+                std::fs::read_to_string(repo.join("extensions/workmate.theme-dusk-ember/themes/dusk-ember.css"))
+                    .unwrap();
+            assert_eq!(css.trim(), committed_css.trim());
+
             // -- verified serve: every file is byte-identical to its source and typed --
             for (name, rel, content_type) in [
+                ("workmate.theme-dusk-ember", "themes/dusk-ember.css", "text/css"),
+                ("workmate.theme-dusk-ember", "assets/cover.svg", "image/svg+xml"),
                 ("workmate.sample-shortcuts", "panels/shortcuts.html", "text/html"),
                 ("workmate.sample-shortcuts", "panels/shortcuts.css", "text/css"),
                 ("workmate.sample-shortcuts", "assets/icon.svg", "image/svg+xml"),
@@ -700,5 +747,82 @@ mod tests {
                 assert_eq!(status, StatusCode::FORBIDDEN);
             }
         }
+    }
+
+    // ---- production built-ins: startup behaviour without any env configuration ---------------
+
+    #[tokio::test]
+    async fn production_builtins_configure_the_host_without_env_and_restore_on_restart() {
+        let data_dir = tempfile::tempdir().unwrap();
+        for _pass in 0..2 {
+            let store = Arc::new(SignedRootBindingStore::new());
+            let ctx = build_host_signed_install(
+                data_dir.path(),
+                Ok(no_policy()),
+                store.clone(),
+                crate::builtin_extensions::builtins(),
+            )
+            .await;
+            assert!(ctx.is_some(), "the curator key alone configures the policy");
+            for pack in crate::builtin_extensions::builtins().packs {
+                assert_eq!(store.lookup_checked(pack.name).unwrap().version(), pack.version);
+                assert!(
+                    data_dir
+                        .path()
+                        .join(aionui_extension::SIGNED_EXTENSIONS_DIR_NAME)
+                        .join(pack.name)
+                        .join(pack.version)
+                        .join("aion-extension.json")
+                        .is_file()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_builtin_set_without_env_stays_an_unconfigured_host() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SignedRootBindingStore::new());
+        let ctx = build_host_signed_install(data_dir.path(), Ok(no_policy()), store.clone(), &NO_BUILTINS).await;
+        assert!(ctx.is_none() && store.is_empty());
+        assert_eq!(std::fs::read_dir(data_dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn host_key_colliding_with_the_curator_key_id_installs_no_production_pack() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut host = no_policy();
+        host.pubkeys.insert(
+            crate::builtin_extensions::CURATOR_KEY_ID.into(),
+            ed25519_dalek::SigningKey::from_bytes(&[63; 32]).verifying_key(),
+        );
+        let store = Arc::new(SignedRootBindingStore::new());
+        let ctx = build_host_signed_install(
+            data_dir.path(),
+            Ok(host),
+            store.clone(),
+            crate::builtin_extensions::builtins(),
+        )
+        .await;
+        assert!(ctx.is_some());
+        assert!(
+            store.is_empty(),
+            "a colliding Host key never lets the curator packs through"
+        );
+    }
+
+    #[tokio::test]
+    async fn broken_policy_config_installs_no_production_builtins() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SignedRootBindingStore::new());
+        let ctx = build_host_signed_install(
+            data_dir.path(),
+            Err(CuratedGateError::PubkeyConfig("bad".into())),
+            store.clone(),
+            crate::builtin_extensions::builtins(),
+        )
+        .await;
+        assert!(ctx.is_none() && store.is_empty());
+        assert_eq!(std::fs::read_dir(data_dir.path()).unwrap().count(), 0);
     }
 }
