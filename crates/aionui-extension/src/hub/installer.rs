@@ -111,6 +111,10 @@ impl HubInstaller {
             }
         };
 
+        if let Some(result) = self.refuse_builtin_name(&entry, name) {
+            return result;
+        }
+
         // Signed local package (only with a configured signature policy): verified install or a
         // refusal; a failure never falls back to the unsigned directory flow below.
         if let Some(result) = self.try_signed_package(&entry, name).await {
@@ -180,6 +184,10 @@ impl HubInstaller {
                 return HubResult::err(error);
             }
         };
+
+        if let Some(result) = self.refuse_builtin_name(&entry, name) {
+            return result;
+        }
 
         if let Some(result) = self.try_signed_package(&entry, name).await {
             return result;
@@ -272,6 +280,20 @@ impl HubInstaller {
 
         info!(name, "hub: extension uninstalled successfully");
         HubResult::ok()
+    }
+
+    /// A built-in name (design §T.8) is provisioned and updated by the app itself: hub install and
+    /// update refuse it before either the signed or the unsigned directory flow runs, whatever the
+    /// index entry says (`bundled`, `curated`, signer). `None` = not a built-in name.
+    fn refuse_builtin_name(&self, entry: &HubIndexEntry, name: &str) -> Option<HubResult> {
+        let signed = self.signed.as_ref()?;
+        if !signed.is_builtin_name(name) && !signed.is_builtin_name(&entry.name) {
+            return None;
+        }
+        let error = format!("Extension '{name}' is built into CSBU WorkMate and is updated with the app");
+        warn!(name, "hub: refused install/update of a built-in name");
+        self.broadcast_state_changed(name, "failed", Some(error.clone()));
+        Some(HubResult::err(error))
     }
 
     /// Signed local-package path. `None` = not applicable (no signed context, unsafe name, or no

@@ -547,7 +547,9 @@ mod install_artifacts {
         let (policy, report) =
             merge_builtin_policy(CuratedInstallPolicy::new(HashSet::new(), false, HashMap::new()), &set);
         assert!(report.conflicting_key_ids.is_empty() && report.invalid_key_ids.is_empty());
-        let ctx = HostSignedInstall::new(parent, policy, store.clone()).unwrap();
+        let ctx = HostSignedInstall::new(parent, policy, store.clone())
+            .unwrap()
+            .with_builtin_pins(&set);
         assert_eq!(
             ctx.ensure_builtin_packs(&set).outcomes[0].1,
             BuiltinOutcome::Installed(InstallKind::Fresh)

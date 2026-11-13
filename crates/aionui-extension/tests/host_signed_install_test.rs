@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use aionui_extension::hub::curated::{CuratedInstallPolicy, signature_payload, sri_sha512};
 use aionui_extension::hub::{
-    HostExtensionsParent, HostSignedInstall, HubIndexManager, HubInstaller, RestoreRejection,
-    signature_policy_configured,
+    BuiltinKey, BuiltinPack, BuiltinSet, HostExtensionsParent, HostSignedInstall, HubIndexManager, HubInstaller,
+    RestoreRejection, signature_policy_configured,
 };
 use aionui_extension::loader::ScanPath;
 use aionui_extension::registry::ExtensionRegistry;
@@ -90,6 +90,11 @@ struct Env {
 }
 
 async fn env(with_policy: bool) -> Env {
+    env_pinned(with_policy, None).await
+}
+
+/// [`env`] whose signed-install context reserves the names in `builtins`.
+async fn env_pinned(with_policy: bool, builtins: Option<&BuiltinSet<'_>>) -> Env {
     let hub = TempDir::new().unwrap();
     let signed_dir = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
@@ -120,6 +125,10 @@ async fn env(with_policy: bool) -> Env {
             policy(),
             store.clone(),
         )
+        .map(|ctx| match builtins {
+            Some(set) => ctx.with_builtin_pins(set),
+            None => ctx,
+        })
     } else {
         None
     };
@@ -399,4 +408,67 @@ async fn tampered_disk_manifest_is_not_advertised_after_reload() {
     );
     // Binding remains; verified serve still uses the snapshot (not the registry).
     assert!(e.store.contains("demo.plugin"));
+}
+
+#[tokio::test]
+async fn hub_install_and_update_of_a_builtin_name_are_refused_before_any_flow() {
+    // The app pins `demo.plugin` 1.0.0 (signed with the fixture key) as a built-in.
+    let raw = manifest("1.0.0", HTML);
+    let zip = package(&raw, HTML);
+    let integrity = sri_sha512(&raw);
+    let signature = hex::encode(
+        key()
+            .sign(signature_payload("demo.plugin", "1.0.0", &integrity).as_bytes())
+            .to_bytes(),
+    );
+    let keys = [BuiltinKey {
+        id: "fixture",
+        public_key: key().verifying_key().to_bytes(),
+    }];
+    let packs = [BuiltinPack {
+        name: "demo.plugin",
+        version: "1.0.0",
+        pubkey_id: "fixture",
+        integrity: &integrity,
+        signature: &signature,
+        package_zip: &zip,
+    }];
+    let set = BuiltinSet {
+        keys: &keys,
+        packs: &packs,
+    };
+    let e = env_pinned(true, Some(&set)).await;
+    let refused = |r: &aionui_extension::hub::installer::HubResult| {
+        !r.success && r.msg.as_deref().is_some_and(|m| m.contains("built into CSBU WorkMate"))
+    };
+
+    // A validly signed, curated, newer package of the built-in name (signed path).
+    stage(&e, "1.1.0", b"<html>v2</html>", &key()).await;
+    let r = e.installer.install("demo.plugin").await;
+    assert!(refused(&r), "{r:?}");
+    let r = e.installer.update("demo.plugin").await;
+    assert!(refused(&r), "{r:?}");
+    assert!(e.store.is_empty());
+    assert_eq!(std::fs::read_dir(e.signed_dir.path()).unwrap().count(), 0);
+
+    // The unsigned directory flow is refused too (no package file, loadable legacy directory).
+    std::fs::remove_file(e.hub.path().join("demo.plugin.zip")).unwrap();
+    let legacy = e.hub.path().join("demo.plugin");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("aion-extension.json"),
+        manifest("1.1.0", b"<html>v2</html>"),
+    )
+    .unwrap();
+    let r = e.installer.install("demo.plugin").await;
+    assert!(refused(&r), "{r:?}");
+
+    // A case variant of the built-in name, even flagged `bundled` in the (writable) index.
+    write_index(
+        e.hub.path(),
+        &[json!({"name": "Demo.Plugin", "version": "1.0.0", "curated": true, "bundled": true})],
+    );
+    let r = e.installer.install("Demo.Plugin").await;
+    assert!(refused(&r), "{r:?}");
+    assert!(e.store.is_empty());
 }

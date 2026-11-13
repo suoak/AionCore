@@ -8,6 +8,9 @@
 //!    regular file only, `O_NOFOLLOW`);
 //! 2. the marker must parse strictly, its signed name must encode to the directory's own name and
 //!    its version to the recorded component (no guessing a version);
+//!    A built-in name (see `hub::builtin_packs::BuiltinPins`) must in addition carry exactly the
+//!    identity the app binary pins (version, key id + embedded key bytes, integrity), otherwise it
+//!    is rejected here (`BuiltinPinMismatch`) and the built-in provisioner replaces it;
 //! 3. `openat(O_DIRECTORY|O_NOFOLLOW)` that version directory — this handle becomes the root;
 //! 4. read `aion-extension.json` through the root and run `check_signed_manifest` again with the
 //!    Host policy and the signed entry metadata from the marker (signature, integrity and key id are
@@ -24,6 +27,7 @@
 //!
 //! Unix and Windows (slice W2b); other targets restore nothing.
 
+use super::builtin_packs::BuiltinPins;
 use super::curated::CuratedInstallPolicy;
 use super::host_package_install::HostExtensionsParent;
 use super::local_package_install::LocalPackageLimits;
@@ -45,6 +49,9 @@ pub enum RestoreRejection {
     IntegrityMismatch,
     AlreadyBound,
     Unsupported,
+    /// A built-in name whose installed identity is not exactly the one the app binary pins
+    /// (other signer, other version, other integrity, or a case variant of a built-in name).
+    BuiltinPinMismatch,
 }
 
 /// Counts plus the (encoded, charset-safe) name-directory components that were rejected.
@@ -54,15 +61,28 @@ pub struct RestoreReport {
     pub rejected: Vec<(String, RestoreRejection)>,
 }
 
-/// Re-bind every installed extension under `parent` that verifies; see the module docs.
+/// Re-bind every installed extension under `parent` that verifies; see the module docs. No
+/// built-in names are reserved (see [`restore_installed_extensions_pinned`]).
 pub fn restore_installed_extensions(
     store: &SignedRootBindingStore,
     policy: &CuratedInstallPolicy,
     parent: &HostExtensionsParent,
     limits: LocalPackageLimits,
 ) -> RestoreReport {
+    restore_installed_extensions_pinned(store, policy, &BuiltinPins::default(), parent, limits)
+}
+
+/// [`restore_installed_extensions`] with the app's built-in pins: a built-in name is only re-bound
+/// when its marker is exactly the pinned identity (the signature and every file are still checked).
+pub fn restore_installed_extensions_pinned(
+    store: &SignedRootBindingStore,
+    policy: &CuratedInstallPolicy,
+    pins: &BuiltinPins,
+    parent: &HostExtensionsParent,
+    limits: LocalPackageLimits,
+) -> RestoreReport {
     let _guard = parent.lock.lock().unwrap_or_else(|e| e.into_inner());
-    imp::restore(store, policy, &parent.dir, limits)
+    imp::restore(store, policy, pins, &parent.dir, limits)
 }
 
 #[cfg(unix)]
@@ -74,13 +94,17 @@ mod imp {
     use super::super::host_package_install::{CurrentMarker, MARKER_FILE, MAX_MARKER_BYTES, encode_component};
     use super::super::local_package_install::{covered_files, sys as base};
     use super::super::signed_manifest::{MAX_MANIFEST_BYTES, SignedManifestEntry, check_signed_manifest};
-    use super::{CuratedInstallPolicy, LocalPackageLimits, RestoreRejection, RestoreReport, SignedRootBindingStore};
+    use super::{
+        BuiltinPins, CuratedInstallPolicy, LocalPackageLimits, RestoreRejection, RestoreReport, SignedRootBindingStore,
+    };
     use crate::constants::EXTENSION_MANIFEST_FILE;
+    use crate::hub::builtin_packs::PinVerdict;
     use crate::signed_root_binding::SignedRootBindingError;
 
     pub(super) fn restore(
         store: &SignedRootBindingStore,
         policy: &CuratedInstallPolicy,
+        pins: &BuiltinPins,
         parent: &File,
         limits: LocalPackageLimits,
     ) -> RestoreReport {
@@ -93,7 +117,7 @@ mod imp {
             if name.starts_with('.') || !matches!(kind_nofollow(parent, &name), Ok(Some(Kind::Dir))) {
                 continue;
             }
-            match restore_one(store, policy, parent, &name, limits) {
+            match restore_one(store, policy, pins, parent, &name, limits) {
                 Ok(()) => report.restored += 1,
                 Err(why) => report.rejected.push((name, why)),
             }
@@ -104,6 +128,7 @@ mod imp {
     fn restore_one(
         store: &SignedRootBindingStore,
         policy: &CuratedInstallPolicy,
+        pins: &BuiltinPins,
         parent: &File,
         dir_name: &str,
         limits: LocalPackageLimits,
@@ -123,6 +148,18 @@ mod imp {
             || encode_component(&marker.version).as_deref() != Some(marker.component.as_str())
         {
             return Err(RestoreRejection::IdentityMismatch);
+        }
+        // Built-in names: the binary's pin decides before anything else is opened. The signature
+        // and every covered file are still verified below (double pin).
+        let verdict = pins.verdict(
+            policy,
+            &marker.name,
+            &marker.version,
+            &marker.pubkey_id,
+            &marker.integrity,
+        );
+        if verdict == PinVerdict::Mismatch {
+            return Err(RestoreRejection::BuiltinPinMismatch);
         }
         let root = base::openat(&name_dir, &marker.component, libc::O_RDONLY | libc::O_DIRECTORY, 0)
             .map_err(|_| RestoreRejection::VersionDirMissing)?;
@@ -168,13 +205,17 @@ mod imp {
     use super::super::local_package_install::covered_files;
     use super::super::signed_manifest::{MAX_MANIFEST_BYTES, SignedManifestEntry, check_signed_manifest};
     use super::super::verified_reader::read_file_under;
-    use super::{CuratedInstallPolicy, LocalPackageLimits, RestoreRejection, RestoreReport, SignedRootBindingStore};
+    use super::{
+        BuiltinPins, CuratedInstallPolicy, LocalPackageLimits, RestoreRejection, RestoreReport, SignedRootBindingStore,
+    };
     use crate::constants::EXTENSION_MANIFEST_FILE;
+    use crate::hub::builtin_packs::PinVerdict;
     use crate::signed_root_binding::SignedRootBindingError;
 
     pub(super) fn restore(
         store: &SignedRootBindingStore,
         policy: &CuratedInstallPolicy,
+        pins: &BuiltinPins,
         parent: &File,
         limits: LocalPackageLimits,
     ) -> RestoreReport {
@@ -187,7 +228,7 @@ mod imp {
             if name.starts_with('.') || !matches!(kind_nofollow(parent, &name), Ok(Some(Kind::Dir))) {
                 continue;
             }
-            match restore_one(store, policy, parent, &name, limits) {
+            match restore_one(store, policy, pins, parent, &name, limits) {
                 Ok(()) => report.restored += 1,
                 Err(why) => report.rejected.push((name, why)),
             }
@@ -198,6 +239,7 @@ mod imp {
     fn restore_one(
         store: &SignedRootBindingStore,
         policy: &CuratedInstallPolicy,
+        pins: &BuiltinPins,
         parent: &File,
         dir_name: &str,
         limits: LocalPackageLimits,
@@ -216,6 +258,18 @@ mod imp {
             || encode_component(&marker.version).as_deref() != Some(marker.component.as_str())
         {
             return Err(RestoreRejection::IdentityMismatch);
+        }
+        // Built-in names: the binary's pin decides before anything else is opened. The signature
+        // and every covered file are still verified below (double pin).
+        let verdict = pins.verdict(
+            policy,
+            &marker.name,
+            &marker.version,
+            &marker.pubkey_id,
+            &marker.integrity,
+        );
+        if verdict == PinVerdict::Mismatch {
+            return Err(RestoreRejection::BuiltinPinMismatch);
         }
         let root = open_dir_existing(&name_dir, &marker.component).map_err(|_| RestoreRejection::VersionDirMissing)?;
         let raw = read_file_under(&root, EXTENSION_MANIFEST_FILE, MAX_MANIFEST_BYTES as u64)
@@ -253,11 +307,12 @@ mod imp {
 mod imp {
     use std::fs::File;
 
-    use super::{CuratedInstallPolicy, LocalPackageLimits, RestoreReport, SignedRootBindingStore};
+    use super::{BuiltinPins, CuratedInstallPolicy, LocalPackageLimits, RestoreReport, SignedRootBindingStore};
 
     pub(super) fn restore(
         _store: &SignedRootBindingStore,
         _policy: &CuratedInstallPolicy,
+        _pins: &BuiltinPins,
         _parent: &File,
         _limits: LocalPackageLimits,
     ) -> RestoreReport {

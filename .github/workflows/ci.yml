@@ -140,7 +140,9 @@ jobs:
           # A failing test makes `tee` hide cargo's exit code, so assert the outcome explicitly.
           if grep -E "^test result: FAILED|\.\.\. FAILED" full.log; then echo "::error::failures in the full aionui-extension suite"; exit 1; fi
           for t in import_skills_replaces_dangling_link_with_copy export_skill_with_symlink_replaces_a_dangling_link \
-                   packed_package_installs_restores_and_is_served_verified; do
+                   packed_package_installs_restores_and_is_served_verified \
+                   a_third_party_package_under_a_builtin_name_is_not_restored_and_is_replaced_by_the_pin \
+                   app_update_upgrades_and_app_rollback_downgrades_to_the_pinned_version; do
             grep -E "$t \.\.\. ok" full.log
           done
           if grep -q "SKIPPED" full.log; then echo "::error::SKIPPED in the full suite"; exit 1; fi
@@ -152,6 +154,8 @@ jobs:
           grep -E "production_builtins_install_list_and_serve_verified_without_env_policy \.\.\. ok" app.log
           grep -E "production_builtins_configure_the_host_without_env_and_restore_on_restart \.\.\. ok" app.log
           grep -E "every_pack_signature_verifies_strictly_under_the_embedded_key \.\.\. ok" app.log
+          grep -E "a_squatted_production_builtin_name_is_replaced_by_the_pinned_pack_at_startup \.\.\. ok" app.log
+          grep -E "builtin_follows_the_app_binary_on_update_and_on_rollback \.\.\. ok" app.log
           if grep -q "SKIPPED" app.log; then echo "::error::SKIPPED in the app wiring tests"; exit 1; fi
 
   changes:
