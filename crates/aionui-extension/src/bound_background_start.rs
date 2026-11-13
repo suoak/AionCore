@@ -19,8 +19,8 @@
 //!    (`node` → `…_runtime_unsupported`, `shell` → `…_shell_script_unsupported`,
 //!    `native` → `…_native_unsupported`);
 //! 5. the entry must be a `.js` / `.mjs` file;
-//! 6. `uses` must be empty for now (capabilities arrive in later slices;
-//!    `bound_service_capabilities_unavailable`);
+//! 6. `uses` must be empty for now (capability *authorization* arrives in S3;
+//!    a valid S2 `capabilities` schema still yields `bound_service_capabilities_unavailable`);
 //! 7. the entry must be the signed, listed, SRI-declared entry; its bytes are read once through
 //!    the retained root (`openat(O_NOFOLLOW)`, ≤ 8 MiB regular file, SRI of the bytes read — the
 //!    same reader as verified asset serve) and returned as [`BoundServiceReady`].
@@ -133,7 +133,7 @@ pub enum BoundBackgroundStartError {
     NativeUnsupported,
     /// The `workmate-js` entry is not a `.js` / `.mjs` file.
     EntryKindUnsupported,
-    /// The service lists capability kinds in `uses`; capabilities are not available yet.
+    /// The service lists capability kinds in `uses`; capability authorization is not available yet (S3).
     CapabilitiesUnavailable,
     /// A declared `runtime` without a signed `files` snapshot: never the legacy path spawn.
     RuntimeRequiresSignedFiles,
@@ -371,6 +371,44 @@ mod tests {
         manifest_with(ENTRY, json!({"runtime": "workmate-js"}), None)
     }
 
+    /// A signed manifest whose service lists `uses`, plus a valid S2 capabilities block.
+    /// Start is still refused with `bound_service_capabilities_unavailable` (consent is S3).
+    fn manifest_with_uses(entry: &str, kinds: &[&str], shell: Option<bool>) -> Vec<u8> {
+        use crate::capabilities::{capability_fingerprint, minimal_capabilities_for, permissions_covering};
+        let rust_kinds: Vec<ServiceCapabilityKind> = kinds
+            .iter()
+            .map(|kind| match *kind {
+                "network" => ServiceCapabilityKind::Network,
+                "files" => ServiceCapabilityKind::Files,
+                "events" => ServiceCapabilityKind::Events,
+                "storage" => ServiceCapabilityKind::Storage,
+                "secrets" => ServiceCapabilityKind::Secrets,
+                other => panic!("unknown kind {other}"),
+            })
+            .collect();
+        let caps = minimal_capabilities_for(&rust_kinds);
+        let fp = capability_fingerprint(&caps).unwrap();
+        let perms = permissions_covering(&caps).unwrap();
+        let mut manifest: Value = serde_json::from_slice(&manifest_with(
+            entry,
+            json!({"runtime": "workmate-js", "uses": kinds}),
+            shell,
+        ))
+        .unwrap();
+        manifest["capabilities"] = serde_json::to_value(&caps).unwrap();
+        manifest["capabilityFingerprint"] = json!(fp);
+        let mut perms_json = serde_json::to_value(&perms).unwrap();
+        if let Some(existing) = manifest.get("permissions").and_then(Value::as_object)
+            && let Some(obj) = perms_json.as_object_mut()
+        {
+            for (key, value) in existing {
+                obj.entry(key.clone()).or_insert(value.clone());
+            }
+        }
+        manifest["permissions"] = perms_json;
+        serde_json::to_vec(&manifest).unwrap()
+    }
+
     fn no_files_manifest(extra: Value) -> Vec<u8> {
         let mut service = json!({"id": "worker", "entryPoint": "services/worker.sh"});
         service
@@ -550,7 +588,7 @@ mod tests {
     fn listing_capability_kinds_is_refused_until_capabilities_exist() {
         let (_d, root) = root_with(ENTRY, SCRIPT);
         for kind in ["network", "files", "events", "storage", "secrets"] {
-            let raw = manifest_with(ENTRY, json!({"runtime": "workmate-js", "uses": [kind]}), None);
+            let raw = manifest_with_uses(ENTRY, &[kind], None);
             assert_eq!(
                 verify(&raw, Some(&root), ENTRY),
                 Err(BoundBackgroundStartError::CapabilitiesUnavailable),
@@ -784,7 +822,11 @@ mod tests {
             let (_root_dir, root) = root_with(entry, SCRIPT);
             let (decoy_dir, marker) = decoy(entry);
             // Old-style loaded permission: shell = true must not matter either way.
-            let raw = manifest_with(entry, extra, Some(true));
+            let raw = if extra.get("uses").is_some() {
+                manifest_with_uses(entry, &["network"], Some(true))
+            } else {
+                manifest_with(entry, extra, Some(true))
+            };
             let store = SignedRootBindingStore::new();
             store.install("demo.plugin", checked(&raw), root).unwrap();
             let ext = loaded(&raw, decoy_dir.path());

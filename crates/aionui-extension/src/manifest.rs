@@ -17,6 +17,7 @@ pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionEr
     validate_work_panel_view_entry_point_digests(manifest)?;
     validate_background_service_entry_point_digests(manifest)?;
     validate_manifest_files(manifest)?;
+    crate::capabilities::validate_manifest_capabilities(manifest)?;
     Ok(())
 }
 
@@ -512,6 +513,13 @@ fn parse_manifest_inner(json_bytes: &[u8], extension_dir: Option<&Path>) -> Resu
         manifest_json = resolve_file_refs(manifest_json, dir, &mut visited)?;
     }
     normalize_manifest_json(&mut manifest_json);
+    // Fail closed on `capabilities` with ManifestValidation (unknown fields/types included)
+    // before the rest of the manifest is deserialized as JsonParse.
+    if let Some(value) = manifest_json.get("capabilities")
+        && !value.is_null()
+    {
+        crate::capabilities::parse_capabilities(value)?;
+    }
     let mut manifest: ExtensionManifest = serde_json::from_value(manifest_json)?;
     // Well-formed `files` first (clear errors), then declare-once inheritance, then full validation.
     validate_files_list(&manifest)?;
@@ -583,7 +591,7 @@ fn resolve_file_ref_value(
     Ok(resolved)
 }
 
-fn normalize_manifest_json(value: &mut Value) {
+pub(crate) fn normalize_manifest_json(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
         return;
     };
@@ -591,6 +599,7 @@ fn normalize_manifest_json(value: &mut Value) {
     move_key(root, "displayName", "display_name");
     move_key(root, "apiVersion", "api_version");
     move_key(root, "entryPoint", "entry_point");
+    move_key(root, "capabilityFingerprint", "capability_fingerprint");
 
     if let Some(i18n) = root.get_mut("i18n") {
         normalize_i18n(i18n);
@@ -600,8 +609,27 @@ fn normalize_manifest_json(value: &mut Value) {
         normalize_lifecycle(lifecycle);
     }
 
+    if let Some(capabilities) = root.get_mut("capabilities") {
+        normalize_capabilities(capabilities);
+    }
+
     if let Some(contributes) = root.get_mut("contributes") {
         normalize_contributes(contributes);
+    }
+}
+
+fn normalize_capabilities(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::Object(storage)) = obj.get_mut("storage") {
+        move_key(storage, "quotaBytes", "quota_bytes");
+        move_key(storage, "maxKeys", "max_keys");
+    }
+    if let Some(Value::Object(files)) = obj.get_mut("files")
+        && let Some(Value::Object(data)) = files.get_mut("data")
+    {
+        move_key(data, "quotaBytes", "quota_bytes");
     }
 }
 
@@ -928,6 +956,8 @@ mod tests {
             lifecycle: None,
             i18n: None,
             files: Vec::new(),
+            capabilities: None,
+            capability_fingerprint: None,
         };
         assert!(validate_manifest(&manifest).is_ok());
     }
@@ -952,6 +982,8 @@ mod tests {
             lifecycle: None,
             i18n: None,
             files: Vec::new(),
+            capabilities: None,
+            capability_fingerprint: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::ManifestValidation(_)));
@@ -977,6 +1009,8 @@ mod tests {
             lifecycle: None,
             i18n: None,
             files: Vec::new(),
+            capabilities: None,
+            capability_fingerprint: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(
@@ -1007,6 +1041,8 @@ mod tests {
                 lifecycle: None,
                 i18n: None,
                 files: Vec::new(),
+                capabilities: None,
+                capability_fingerprint: None,
             };
             assert!(
                 validate_manifest(&manifest).is_err(),
@@ -1035,6 +1071,8 @@ mod tests {
             lifecycle: None,
             i18n: None,
             files: Vec::new(),
+            capabilities: None,
+            capability_fingerprint: None,
         };
         assert!(validate_manifest(&manifest).is_err());
     }
@@ -1059,6 +1097,8 @@ mod tests {
             lifecycle: None,
             i18n: None,
             files: Vec::new(),
+            capabilities: None,
+            capability_fingerprint: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::ManifestValidation(_)));
@@ -1084,6 +1124,8 @@ mod tests {
             lifecycle: None,
             i18n: None,
             files: Vec::new(),
+            capabilities: None,
+            capability_fingerprint: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::InvalidVersion { .. }));
@@ -1110,6 +1152,8 @@ mod tests {
                 lifecycle: None,
                 i18n: None,
                 files: Vec::new(),
+                capabilities: None,
+                capability_fingerprint: None,
             };
             assert!(
                 validate_manifest(&manifest).is_ok(),
@@ -1821,12 +1865,29 @@ mod background_runtime_tests {
             .remove(0)
     }
 
+    fn with_service_caps(service: serde_json::Value, kinds: &[ServiceCapabilityKind]) -> Vec<u8> {
+        let caps = crate::capabilities::minimal_capabilities_for(kinds);
+        let fp = crate::capabilities::capability_fingerprint(&caps).unwrap();
+        let perms = crate::capabilities::permissions_covering(&caps).unwrap();
+        serde_json::to_vec(&json!({
+            "name": "demo.plugin", "version": "1.0.0",
+            "capabilities": caps,
+            "capabilityFingerprint": fp,
+            "permissions": perms,
+            "contributes": {"backgroundServices": [service]}
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn runtime_interval_and_uses_parse_in_camel_and_snake_case() {
-        let camel = service_of(&with_service(json!({
-            "id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js",
-            "intervalSeconds": 30, "uses": ["network", "storage"]
-        })));
+        let camel = service_of(&with_service_caps(
+            json!({
+                "id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js",
+                "intervalSeconds": 30, "uses": ["network", "storage"]
+            }),
+            &[ServiceCapabilityKind::Network, ServiceCapabilityKind::Storage],
+        ));
         assert_eq!(camel.runtime, Some(ServiceRuntime::WorkmateJs));
         assert_eq!(camel.interval_seconds, Some(30));
         assert_eq!(
@@ -1911,10 +1972,13 @@ mod background_runtime_tests {
 
     #[test]
     fn resolved_background_service_response_shape_is_unchanged() {
-        let raw = with_service(json!({
-            "id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js",
-            "intervalSeconds": 30, "uses": ["network"]
-        }));
+        let raw = with_service_caps(
+            json!({
+                "id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js",
+                "intervalSeconds": 30, "uses": ["network"]
+            }),
+            &[ServiceCapabilityKind::Network],
+        );
         let resolved = crate::resolvers::contract_v1::resolve_background_services(
             &parse_manifest(&raw).unwrap().contributes.unwrap().background_services,
             "demo.plugin",
@@ -1922,5 +1986,17 @@ mod background_runtime_tests {
         let value = serde_json::to_value(&resolved).unwrap();
         let keys: std::collections::BTreeSet<&str> = value[0].as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, ["entryPoint", "extensionName", "id"].into_iter().collect());
+    }
+
+    #[test]
+    fn uses_without_declared_capabilities_is_refused() {
+        let raw = with_service(json!({
+            "id": "w", "entryPoint": "s/a.mjs", "runtime": "workmate-js",
+            "uses": ["network"]
+        }));
+        assert!(matches!(
+            parse_manifest(&raw),
+            Err(ExtensionError::ManifestValidation(msg)) if msg.contains("uses")
+        ));
     }
 }

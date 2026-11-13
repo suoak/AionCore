@@ -188,6 +188,8 @@ mod tests {
                 lifecycle: None,
                 i18n: None,
                 files: Vec::new(),
+                capabilities: None,
+                capability_fingerprint: None,
             },
             directory: "/tmp/ext".to_owned(),
             source: ExtensionSource::Local,

@@ -7,6 +7,7 @@ mod asset_paths;
 pub mod asset_tokens;
 pub mod background_service_start_gate;
 pub mod bound_background_start;
+pub mod capabilities;
 pub mod classifier;
 pub mod constants;
 pub mod dependency;
@@ -40,6 +41,12 @@ pub mod theme_import;
 pub mod types;
 pub mod watcher;
 
+pub use capabilities::{
+    EventsCapabilities, ExtensionCapabilities, FileRoot, FileRootAccess, FilesCapabilities, FilesDataQuota,
+    NetworkCapabilities, SecretCapability, SecretInject, StorageCapabilities, apply_pack_capability_metadata,
+    capability_fingerprint, minimal_capabilities_for, parse_capabilities, permissions_covering,
+    validate_manifest_capabilities,
+};
 pub use classifier::{AssistantClassifier, AssistantRuleDispatcher, DefaultUserClassifier};
 pub use constants::*;
 pub use dependency::{DependencyIssue, DependencyValidationResult, topological_sort, validate_dependencies};

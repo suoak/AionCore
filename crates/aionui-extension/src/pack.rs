@@ -106,6 +106,8 @@ pub struct PackOutput {
     pub excluded: Vec<String>,
     /// Difference between the source manifest's `files` list and the computed one.
     pub diff: FilesDiff,
+    /// True when `capabilityFingerprint` or covering `permissions` were written or updated.
+    pub metadata_changed: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -386,19 +388,23 @@ pub fn pack_extension_dir(dir: &Path, options: &PackOptions) -> Result<PackOutpu
         contents.push(bytes);
     }
 
-    // 5. Manifest with the recomputed `files` list.
-    let root = manifest_json
-        .as_object_mut()
-        .ok_or_else(|| PackError::ManifestInvalid("manifest must be a JSON object".into()))?;
-    if packed.is_empty() {
-        root.remove("files");
-    } else {
-        let list: Vec<Value> = packed
-            .iter()
-            .map(|f| serde_json::json!({"path": f.path, "integrity": f.integrity}))
-            .collect();
-        root.insert("files".into(), Value::Array(list));
+    // 5. Manifest with the recomputed `files` list, plus capability fingerprint / permissions.
+    {
+        let root = manifest_json
+            .as_object_mut()
+            .ok_or_else(|| PackError::ManifestInvalid("manifest must be a JSON object".into()))?;
+        if packed.is_empty() {
+            root.remove("files");
+        } else {
+            let list: Vec<Value> = packed
+                .iter()
+                .map(|f| serde_json::json!({"path": f.path, "integrity": f.integrity}))
+                .collect();
+            root.insert("files".into(), Value::Array(list));
+        }
     }
+    let metadata_changed = crate::capabilities::apply_pack_capability_metadata(&mut manifest_json)
+        .map_err(|e| PackError::ManifestInvalid(e.to_string()))?;
     let mut manifest =
         serde_json::to_vec_pretty(&manifest_json).map_err(|e| PackError::ManifestInvalid(e.to_string()))?;
     manifest.push(b'\n');
@@ -446,6 +452,7 @@ pub fn pack_extension_dir(dir: &Path, options: &PackOptions) -> Result<PackOutpu
         files: packed,
         excluded,
         diff,
+        metadata_changed,
     })
 }
 
@@ -903,5 +910,34 @@ mod tests {
         assert!(is_inside(tmp.path(), &tmp.path().join("panels")));
         let other = tempfile::tempdir().unwrap();
         assert!(!is_inside(tmp.path(), other.path()));
+    }
+
+    #[test]
+    fn capabilities_fingerprint_and_permissions_are_written_and_idempotent() {
+        let tmp = sample();
+        let mut m: Value = serde_json::from_slice(&base_manifest()).unwrap();
+        m["capabilities"] =
+            serde_json::json!({"schema": 1, "storage": true, "events": {"subscribe": ["extension.activated"]}});
+        write(tmp.path(), EXTENSION_MANIFEST_FILE, &serde_json::to_vec(&m).unwrap());
+        let a = pack_extension_dir(tmp.path(), &PackOptions::default()).unwrap();
+        assert!(a.metadata_changed);
+        let parsed = parse_manifest(&a.manifest).unwrap();
+        assert!(parsed.capability_fingerprint.as_deref().unwrap().starts_with("cap1:"));
+        assert_eq!(parsed.permissions.as_ref().unwrap().storage, Some(true));
+        assert_eq!(parsed.permissions.as_ref().unwrap().events, Some(true));
+        write(tmp.path(), EXTENSION_MANIFEST_FILE, &a.manifest);
+        let b = pack_extension_dir(tmp.path(), &PackOptions::default()).unwrap();
+        assert_eq!(a.manifest, b.manifest);
+        assert!(!b.metadata_changed);
+        assert!(b.diff.is_empty());
+    }
+
+    #[test]
+    fn packs_without_capabilities_are_unchanged() {
+        let tmp = sample();
+        let a = pack_extension_dir(tmp.path(), &PackOptions::default()).unwrap();
+        assert!(!a.metadata_changed);
+        let text = String::from_utf8(a.manifest.clone()).unwrap();
+        assert!(!text.contains("capabilityFingerprint") && !text.contains("capabilities"));
     }
 }

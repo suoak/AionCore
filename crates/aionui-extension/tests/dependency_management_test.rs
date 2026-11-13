@@ -36,6 +36,8 @@ fn ext(name: &str, version: &str, deps: &[(&str, &str)]) -> LoadedExtension {
             lifecycle: None,
             i18n: None,
             files: Vec::new(),
+            capabilities: None,
+            capability_fingerprint: None,
         },
         directory: format!("/extensions/{name}"),
         source: ExtensionSource::Local,

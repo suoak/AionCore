@@ -25,7 +25,7 @@ Usage:
   --exclude <path>    leave out an exact relative file or directory (repeatable);
                       .git, node_modules and .DS_Store are always left out
   --force             overwrite existing output files
-  --check             write nothing; exit 3 when the manifest `files` list is out of date
+  --check             write nothing; exit 3 when the manifest `files` list, fingerprint, or permissions are out of date
 
 Without any output option nothing is written; a JSON report is printed to stdout.
 Outputs must not be inside <dir>. Symlinks, special files, non-canonical or case-colliding
@@ -169,8 +169,8 @@ fn run() -> Result<ExitCode, String> {
         "{}",
         serde_json::to_string_pretty(&report(&packed, &written)).map_err(|e| e.to_string())?
     );
-    if args.check && !packed.diff.is_empty() {
-        eprintln!("workmate-pack: the manifest `files` list is out of date");
+    if args.check && (!packed.diff.is_empty() || packed.metadata_changed) {
+        eprintln!("workmate-pack: the manifest files list, capability fingerprint, or permissions are out of date");
         return Ok(ExitCode::from(3));
     }
     Ok(ExitCode::SUCCESS)
