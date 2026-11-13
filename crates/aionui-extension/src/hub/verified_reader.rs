@@ -48,8 +48,9 @@ pub(crate) const MAX_COMPONENT_UTF16: usize = 255;
 /// colons, the wildcard/reserved characters `* ? " < > |`, control characters, trailing dot or
 /// space (Win32 silently strips them, so the opened name would differ from the listed one),
 /// DOS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, `COM¹²³`, `LPT¹²³`,
-/// `CONIN$`, `CONOUT$`, with or without an extension), components over 255 UTF-16 units and
-/// paths deeper than [`MAX_COMPONENTS`]. Pure and platform independent so it is unit-tested
+/// `CONIN$`, `CONOUT$`, with or without an extension), names shaped like an 8.3 short-name alias
+/// (`PROGRA~1`, `BOARD~12.HTM`: see [`looks_like_short_name`]), components over 255 UTF-16 units
+/// and paths deeper than [`MAX_COMPONENTS`]. Pure and platform independent so it is unit-tested
 /// everywhere; only the Windows backend applies it.
 pub(crate) fn windows_portable_components(rel: &str) -> Result<Vec<&str>, ()> {
     if rel.is_empty() {
@@ -83,7 +84,33 @@ fn windows_portable_component(part: &str) -> bool {
     if part.ends_with('.') || part.ends_with(' ') {
         return false;
     }
-    !is_dos_device_name(part)
+    !is_dos_device_name(part) && !looks_like_short_name(part)
+}
+
+/// True iff `part` has the shape of a generated 8.3 short name (design §W.5): at most one `.`, a
+/// stem of at most 8 characters that contains exactly one `~` followed only by (at least one)
+/// ASCII digit, and an extension of at most 3 characters. On a volume with short-name generation a
+/// name of that shape can open **another** entry (the long name it is the alias of), so it is
+/// refused everywhere a listed name is checked (pack, Windows install, Windows verified read).
+/// Hex-encoded identity components (`~XX`) only match when both hex digits are decimal *and* the
+/// component has a single `~` and a short stem; the Host then fails closed (`InvalidDirName`).
+pub(crate) fn looks_like_short_name(part: &str) -> bool {
+    let (stem, ext) = match part.split_once('.') {
+        Some((stem, ext)) => (stem, Some(ext)),
+        None => (part, None),
+    };
+    if let Some(ext) = ext
+        && (ext.contains('.') || ext.chars().count() > 3)
+    {
+        return false;
+    }
+    if stem.chars().count() > 8 {
+        return false;
+    }
+    let Some((_prefix, digits)) = stem.split_once('~') else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// DOS device name check: the stem before the first `.` (trailing spaces ignored), any case.
@@ -104,6 +131,39 @@ fn is_dos_device_name(part: &str) -> bool {
         }
     }
     false
+}
+
+/// Defence-in-depth check of the Windows verified reader (design §W.3), pure so it is tested on
+/// every platform: `file_final` (the normalized final path of the opened file handle) must be
+/// exactly `root_final` (the same for the retained root handle) followed by the listed components
+/// `parts`, one `\\`-separated name each. Names compare exactly, or equal after Unicode
+/// upper-casing (NTFS is case-insensitive); anything else — an 8.3 alias that resolved to a long
+/// name, a different directory, an extra or missing component — is a mismatch. This is never the
+/// only criterion: the handle-relative, reparse-refusing walk is what makes the read safe.
+#[cfg(any(windows, test))]
+pub(crate) fn final_path_is_listed_under(root_final: &str, file_final: &str, parts: &[&str]) -> bool {
+    if root_final.is_empty() {
+        return false;
+    }
+    let Some(rest) = file_final.strip_prefix(root_final) else {
+        return false;
+    };
+    let rest = if root_final.ends_with('\\') {
+        rest
+    } else {
+        match rest.strip_prefix('\\') {
+            Some(rest) => rest,
+            None => return false,
+        }
+    };
+    let mut got = rest.split('\\');
+    for want in parts {
+        match got.next() {
+            Some(name) if name == *want || name.to_uppercase() == want.to_uppercase() => {}
+            _ => return false,
+        }
+    }
+    got.next().is_none()
 }
 
 #[cfg(test)]
@@ -195,6 +255,66 @@ mod tests {
         ] {
             assert!(windows_portable_components(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn short_name_aliases_are_refused_and_lookalikes_are_not() {
+        for alias in [
+            "PROGRA~1",
+            "progra~1",
+            "BOARD~1.HTM",
+            "board~12.htm",
+            "AB12~1.JS",
+            "A~123456",
+            "~1",
+            "x~1.",
+            "panels/BOARD~1.HTM",
+            "BOARD~1/index.html",
+        ] {
+            assert!(windows_portable_components(alias).is_err(), "{alias}");
+        }
+        for ok in [
+            "board~x.htm",      // non-digit after ~
+            "board~1a.htm",     // trailing non-digit
+            "longername~1.htm", // stem over 8 characters
+            "board~1.html",     // extension over 3 characters
+            "board~1.min.js",   // more than one dot
+            "a~1~2",            // two tildes
+            "~",                // no digits
+            "a~7Eb",            // encoded component, hex letters
+            "1.0.0~2Bbuild.5",  // encoded version
+            "panels/board.html",
+        ] {
+            assert!(windows_portable_components(ok).is_ok(), "{ok}");
+        }
+        assert!(looks_like_short_name("a~21") && !looks_like_short_name("a~2F"));
+    }
+
+    #[test]
+    fn final_path_must_be_the_root_followed_by_exactly_the_listed_names() {
+        let root = r"\Device\HarddiskVolume3\data\extensions-signed\demo\1.0.0";
+        let ok = |file: &str, rel: &str| final_path_is_listed_under(root, file, &rel.split('/').collect::<Vec<_>>());
+        assert!(ok(&format!(r"{root}\panels\board.html"), "panels/board.html"));
+        assert!(ok(&format!(r"{root}\Panels\Board.HTML"), "panels/board.html"));
+        assert!(ok(&format!(r"{root}\i18n\ÉTÉ.json"), "i18n/été.json"));
+        // An 8.3 alias that resolved to its long name.
+        assert!(!ok(&format!(r"{root}\panels\board-long.html"), "panels/BOARD~1.HTM"));
+        // Outside the root, sibling with a shared prefix, extra / missing components.
+        assert!(!ok(
+            r"\Device\HarddiskVolume3\elsewhere\panels\board.html",
+            "panels/board.html"
+        ));
+        assert!(!ok(&format!(r"{root}0\panels\board.html"), "panels/board.html"));
+        assert!(!ok(&format!(r"{root}\x\panels\board.html"), "panels/board.html"));
+        assert!(!ok(&format!(r"{root}\board.html"), "panels/board.html"));
+        assert!(!ok(root, "panels/board.html"));
+        // A root at the volume root ends in a separator.
+        assert!(final_path_is_listed_under(
+            r"\Device\HarddiskVolume3\",
+            r"\Device\HarddiskVolume3\a.txt",
+            &["a.txt"]
+        ));
+        assert!(!final_path_is_listed_under("", r"\a.txt", &["a.txt"]));
     }
 
     #[test]

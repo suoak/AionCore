@@ -25,7 +25,7 @@ workmate-pack <dir> [--zip-out <file>] [--manifest-out <file>] [--update-manifes
 
 ## Rules (all refuse, none silently skip)
 Symlinks and non-regular files; non-UTF-8, non-canonical (`\`, `..`, empty components) or
-control-character names; names that cannot exist on Windows (DOS device names such as `con`/`aux`/`nul`/`com1`, trailing dot or space, `: * ? " < > |`, over 255 UTF-16 units — Windows is a required platform, so such a package is refused at pack time); case-fold collisions (also with `aion-extension.json`); `$file:` references
+control-character names; names that cannot exist on Windows (DOS device names such as `con`/`aux`/`nul`/`com1`, trailing dot or space, `: * ? " < > |`, names shaped like an 8.3 short-name alias such as `PROGRA~1` or `BOARD~1.HTM`, over 255 UTF-16 units — Windows is a required platform, so such a package is refused at pack time); case-fold collisions (also with `aion-extension.json`); `$file:` references
 in the manifest; more than 512 entries (files + manifest), a file over 8 MiB, more than 32 MiB in
 total, a manifest over 256 KiB; and any manifest the Host would refuse (`parse_manifest` runs on the
 result, so e.g. a referenced asset that is not in the directory, or a declared
@@ -57,7 +57,15 @@ following links, signature and per-file SRI re-verified on every restart). What 
   for a pack that must run on Windows. (Hooks are not part of the signed-install guarantees.)
 * **Identities that Windows cannot hold are refused at install** with `InvalidDirName`: a signed
   `name` or `version` whose encoded directory name is a DOS device name (`con`, `nul`, `aux`,
-  `com1`, …, also `con.txt`) or ends in a dot or space. Pick other identifiers.
+  `com1`, …, also `con.txt`), ends in a dot or space, or has the shape of an 8.3 short name
+  (e.g. the name `ab!` encodes to `ab~21`). Pick other identifiers.
+* **8.3 short-name aliases are never a listed name.** A component with at most one dot, a stem of
+  at most 8 characters holding a single `~` followed only by digits, and an extension of at most 3
+  characters (`PROGRA~1`, `BOARD~1.HTM`) can open a *different* long-named entry on a volume that
+  generates short names, so it is refused at pack time, at install and by the verified reader.
+  As defence in depth the Windows verified reader also compares the normalized final path of every
+  file it opens (`GetFinalPathNameByHandleW`) with the retained root plus exactly the listed
+  names, and refuses the read on any difference.
 * **Names that differ only by ASCII case collide on NTFS** (`Demo.Plugin` vs `demo.plugin`, or the
   versions `1.0.0-RC1` vs `1.0.0-rc1`). The Host refuses to install or uninstall such an identity
   with `CaseCollision` instead of reusing (overwriting / deleting) the other one's directory. It

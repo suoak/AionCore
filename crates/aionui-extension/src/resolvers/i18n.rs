@@ -303,7 +303,6 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(unix)]
     #[test]
     fn bound_files_i18n_reads_retained_root_not_ext_dir() {
         use crate::hub::curated::sri_sha512;
@@ -319,7 +318,7 @@ mod tests {
             {"path": "i18n/en.json", "integrity": sri_sha512(good)},
             {"path": "i18n/zh.json", "integrity": sri_sha512(good)},
         ]));
-        let root = std::fs::File::open(root_dir.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(root_dir.path());
         let config = make_i18n_config(vec!["en", "zh"]);
         let out = load_extension_i18n_from(&config, "en", "hello", ext_dir.path(), Some((&checked, &root))).unwrap();
         assert_eq!(out["k"], "good");
@@ -328,7 +327,6 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn bound_files_i18n_refuses_unlisted_missing_mismatched_symlink_and_bad_json() {
         use crate::hub::curated::sri_sha512;
@@ -345,7 +343,7 @@ mod tests {
         let checked = checked_with_files(serde_json::json!([
             {"path": "i18n/en.json", "integrity": sri_sha512(good)},
         ]));
-        let root = std::fs::File::open(root_dir.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(root_dir.path());
         let config = make_i18n_config(vec!["en", "zh", "fr"]);
         let load = |l: &str| load_extension_i18n_from(&config, l, "hello", ext_dir.path(), Some((&checked, &root)));
 
@@ -360,7 +358,10 @@ mod tests {
         assert!(matches!(load("en"), Err(ExtensionError::ResolutionFailed { .. })));
         // Symlink with matching bytes.
         std::fs::write(root_dir.path().join("real.json"), good).unwrap();
-        std::os::unix::fs::symlink(root_dir.path().join("real.json"), root_dir.path().join("i18n/en.json")).unwrap();
+        assert!(crate::hub::test_support::link_file(
+            &root_dir.path().join("real.json"),
+            &root_dir.path().join("i18n/en.json")
+        ));
         assert!(matches!(load("en"), Err(ExtensionError::ResolutionFailed { .. })));
         // Listed + verified but not a string map.
         let bad = b"[1,2]";
