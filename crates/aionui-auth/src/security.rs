@@ -18,6 +18,20 @@ fn allows_embedding(path: &str) -> bool {
     )
 }
 
+/// Response CSP for extension-served assets (`/api/extensions/{name}/assets/...`
+/// and `/api/extensions/{name}/asset-session/...`).
+///
+/// Everything except same-origin scripts/styles/images/fonts is denied: no
+/// network (`connect-src 'none'`), no plugins, no `<base>` rewrites, no form
+/// posts. `'unsafe-inline'` is kept for `script-src` / `style-src` only because
+/// existing settings-tab pages ship inline `<style>` / `<script>`. Pages that
+/// carry their own stricter `<meta http-equiv="Content-Security-Policy">`
+/// (the built-in samples) still block inline code, since browsers enforce every
+/// policy present (header ∩ meta).
+pub const EXTENSION_ASSET_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; \
+style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'none'; \
+object-src 'none'; base-uri 'none'; form-action 'none'";
+
 /// Office preview proxies serve content loaded in same-origin iframes by
 /// the web UI; `DENY` here blanks the preview (iOfficeAI/AionUi#3177).
 fn allows_same_origin_embedding(path: &str) -> bool {
@@ -29,6 +43,7 @@ fn allows_same_origin_embedding(path: &str) -> bool {
 /// Headers set:
 /// - `X-Frame-Options: DENY` — prevent clickjacking on non-embeddable routes
 ///   (`SAMEORIGIN` + `frame-ancestors 'self'` on office preview proxies)
+/// - `Content-Security-Policy: EXTENSION_ASSET_CSP` on extension asset routes
 /// - `X-Content-Type-Options: nosniff` — prevent MIME sniffing
 /// - `X-XSS-Protection: 1; mode=block` — enable XSS filter
 /// - `Referrer-Policy: strict-origin-when-cross-origin` — limit referrer leakage
@@ -45,7 +60,11 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("frame-ancestors 'self'"),
         );
-    } else if !allows_embedding(&path) {
+    } else if allows_embedding(&path) {
+        // Extension assets stay frameable (no X-Frame-Options) but are locked
+        // down by CSP. Append so a handler-set policy is never dropped.
+        headers.append(CONTENT_SECURITY_POLICY, HeaderValue::from_static(EXTENSION_ASSET_CSP));
+    } else {
         headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     }
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
@@ -162,5 +181,97 @@ mod tests {
 
         assert!(response.headers().get("x-frame-options").is_none());
         assert_eq!(response.headers().get("x-content-type-options").unwrap(), "nosniff");
+    }
+
+    async fn get_headers(app: Router, uri: &str) -> axum::http::HeaderMap {
+        app.oneshot(axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .headers()
+            .clone()
+    }
+
+    #[test]
+    fn extension_asset_csp_locks_down_everything_but_same_origin_inline_ui() {
+        let directives: Vec<&str> = EXTENSION_ASSET_CSP.split("; ").collect();
+        assert_eq!(
+            directives,
+            vec![
+                "default-src 'none'",
+                "script-src 'self' 'unsafe-inline'",
+                "style-src 'self' 'unsafe-inline'",
+                "img-src 'self' data:",
+                "font-src 'self' data:",
+                "connect-src 'none'",
+                "object-src 'none'",
+                "base-uri 'none'",
+                "form-action 'none'",
+            ]
+        );
+        assert!(HeaderValue::from_str(EXTENSION_ASSET_CSP).is_ok());
+    }
+
+    #[tokio::test]
+    async fn extension_asset_and_asset_session_routes_carry_csp() {
+        let app = Router::new()
+            .route("/api/extensions/{name}/assets/{*path}", get(|| async { "ok" }))
+            .route(
+                "/api/extensions/{name}/asset-session/{token}/{*path}",
+                get(|| async { "ok" }),
+            )
+            .layer(middleware::from_fn(security_headers_middleware));
+
+        for uri in [
+            "/api/extensions/hello/assets/settings/index.html",
+            "/api/extensions/workmate.sample-shortcuts/assets/panels/shortcuts.html",
+            "/api/extensions/hello/asset-session/tok123/settings/index.html",
+        ] {
+            let headers = get_headers(app.clone(), uri).await;
+            let csp: Vec<_> = headers.get_all("content-security-policy").iter().collect();
+            assert_eq!(csp.len(), 1, "{uri} should carry exactly one CSP");
+            assert_eq!(csp[0], EXTENSION_ASSET_CSP, "{uri}");
+            assert!(headers.get("x-frame-options").is_none(), "{uri} must stay frameable");
+            assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_asset_csp_is_appended_not_replacing_a_handler_policy() {
+        let app = Router::new()
+            .route(
+                "/api/extensions/{name}/assets/{*path}",
+                get(|| async { ([("content-security-policy", "sandbox allow-scripts")], "ok") }),
+            )
+            .layer(middleware::from_fn(security_headers_middleware));
+
+        let headers = get_headers(app, "/api/extensions/hello/assets/a.html").await;
+        let csp: Vec<_> = headers
+            .get_all("content-security-policy")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            csp,
+            vec!["sandbox allow-scripts".to_string(), EXTENSION_ASSET_CSP.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_asset_extension_routes_get_no_asset_csp_and_stay_deny() {
+        let app = Router::new()
+            .route("/api/extensions/{name}/asset-token", get(|| async { "ok" }))
+            .route("/api/extensions/panels", get(|| async { "ok" }))
+            .route("/api/extensions/{name}/settings", get(|| async { "ok" }))
+            .layer(middleware::from_fn(security_headers_middleware));
+
+        for uri in [
+            "/api/extensions/hello/asset-token",
+            "/api/extensions/panels",
+            "/api/extensions/hello/settings",
+        ] {
+            let headers = get_headers(app.clone(), uri).await;
+            assert!(headers.get("content-security-policy").is_none(), "{uri}");
+            assert_eq!(headers.get("x-frame-options").unwrap(), "DENY", "{uri}");
+        }
     }
 }

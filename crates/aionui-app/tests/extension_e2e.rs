@@ -906,6 +906,14 @@ async fn extension_enablement_and_contributions_are_isolated_by_user() {
         .unwrap();
     assert_eq!(asset_a.status(), StatusCode::NOT_FOUND);
     assert_eq!(asset_b.status(), StatusCode::OK);
+    // E13: extension assets are frameable but locked down by the asset CSP.
+    assert_eq!(
+        asset_b.headers().get("content-security-policy").unwrap(),
+        "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+img-src 'self' data:; font-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; \
+form-action 'none'"
+    );
+    assert!(asset_b.headers().get("x-frame-options").is_none());
 
     let response = app
         .clone()
