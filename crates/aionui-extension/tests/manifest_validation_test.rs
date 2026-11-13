@@ -142,6 +142,8 @@ fn validate_manifest_directly() {
         lifecycle: None,
         i18n: None,
         files: Vec::new(),
+        capabilities: None,
+        capability_fingerprint: None,
     };
     assert!(validate_manifest(&manifest).is_ok());
 }

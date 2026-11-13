@@ -629,6 +629,8 @@ mod tests {
                 lifecycle: None,
                 i18n: None,
                 files: Vec::new(),
+                capabilities: None,
+                capability_fingerprint: None,
             },
             directory: format!("/test/{name}"),
             source: ExtensionSource::Local,

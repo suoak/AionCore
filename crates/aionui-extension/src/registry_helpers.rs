@@ -186,6 +186,8 @@ mod tests {
                 lifecycle: None,
                 i18n: None,
                 files: Vec::new(),
+                capabilities: None,
+                capability_fingerprint: None,
             },
             directory: format!("/tmp/ext/{name}"),
             source: ExtensionSource::Local,

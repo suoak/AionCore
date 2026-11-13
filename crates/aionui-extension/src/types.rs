@@ -386,8 +386,9 @@ pub struct ExtBackgroundService {
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "intervalSeconds")]
     pub interval_seconds: Option<u64>,
     /// Capability kinds this service intends to use (default none = pure compute). Requires
-    /// `runtime`. Capabilities themselves arrive in later slices; until then a service that lists
-    /// any kind is refused (`bound_service_capabilities_unavailable`).
+    /// `runtime`. Each kind must be declared in the top-level `capabilities` block. Authorization
+    /// of those kinds is a later slice; until then a service that lists any kind is refused
+    /// (`bound_service_capabilities_unavailable`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uses: Vec<ServiceCapabilityKind>,
 }
@@ -560,6 +561,12 @@ pub struct ExtensionManifest {
     /// it never means unlisted extras are acceptable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<ManifestFile>,
+    /// Optional Host-proxy capability declaration (M9 E13 S2). Absent = legacy / pure-compute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::capabilities::ExtensionCapabilities>,
+    /// Overall `cap1:` fingerprint of [`Self::capabilities`]; required when that field is present.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "capabilityFingerprint")]
+    pub capability_fingerprint: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
