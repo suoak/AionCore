@@ -37,6 +37,16 @@ Signing stays a curator step: sign `signature_payload(name, version, manifestInt
 curator key and ship `(pubkey_id, integrity, signature)` in the index entry. The zip is not signed;
 the signature covers the manifest and the manifest covers each file's SRI.
 
+## Built-in names are reserved
+The packs CSBU WorkMate ships with the app (today `workmate.theme-dusk-ember`,
+`workmate.sample-shortcuts`, `workmate.sample-checklist`) are pinned by the app binary: name,
+version, key id + key bytes and manifest integrity. Such a name — compared ASCII
+case-insensitively — can only hold that exact pinned pack. A package under a built-in name is
+refused by hub install/update whatever its signer, version or `bundled`/`curated` flags ("built
+into CSBU WorkMate and is updated with the app"), and a copy found on disk that is not the pin is
+not restored (`BuiltinPinMismatch`) and is replaced by the app's own copy at startup. Built-ins
+change only with an app update, and an app rollback rolls them back too. Pick another name.
+
 ## Windows hosts (required platform)
 Signed packages install on Windows with the same guarantees as on unix (handle-relative, never
 following links, signature and per-file SRI re-verified on every restart). What differs:

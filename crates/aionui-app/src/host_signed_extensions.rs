@@ -132,7 +132,8 @@ pub(crate) async fn build_host_signed_install(
                     return None;
                 }
             };
-            let ctx = HostSignedInstall::new(parent, policy, store)?;
+            // Built-in names are pinned before restore, so a non-pinned copy of one is never re-bound.
+            let ctx = HostSignedInstall::new(parent, policy, store)?.with_builtin_pins(builtins);
             ctx.startup_sweep_and_restore();
             ctx.ensure_builtin_packs(builtins);
             Some(ctx)
@@ -775,6 +776,109 @@ mod tests {
                         .join("aion-extension.json")
                         .is_file()
                 );
+            }
+        }
+    }
+
+    // ---- slice S3b-1: built-in names are reserved and pinned by the app binary -------------------
+
+    #[tokio::test]
+    async fn builtin_follows_the_app_binary_on_update_and_on_rollback() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (old, new) = (leaked_builtins("1.0.0"), leaked_builtins("1.1.0"));
+        for (set, want) in [(old, "1.0.0"), (new, "1.1.0"), (old, "1.0.0"), (old, "1.0.0")] {
+            let store = Arc::new(SignedRootBindingStore::new());
+            let ctx = build_host_signed_install(data_dir.path(), Ok(no_policy()), store.clone(), set).await;
+            assert!(ctx.is_some());
+            assert_eq!(store.lookup_checked("demo.builtin").unwrap().version(), want);
+        }
+    }
+
+    /// A validly signed package under a production built-in name from another signer the Host
+    /// trusts (env key) is on disk, newer than the built-in: startup does not re-bind it and puts
+    /// the curator-signed built-in back; the hub path cannot bring it back either.
+    #[tokio::test]
+    async fn a_squatted_production_builtin_name_is_replaced_by_the_pinned_pack_at_startup() {
+        use aionui_extension::hub::curated::signature_payload;
+        use aionui_extension::hub::signed_manifest::SignedManifestEntry;
+        use aionui_extension::hub::{
+            AutoInstallOptions, LocalPackageLimits, LocalPackageSource, install_local_signed_package_auto,
+        };
+        use aionui_extension::pack::{PackOptions, pack_extension_dir};
+        use ed25519_dalek::Signer;
+
+        let pinned = &crate::builtin_extensions::builtins().packs[1];
+        let third = ed25519_dalek::SigningKey::from_bytes(&[64; 32]);
+        let host = || {
+            let mut p = no_policy();
+            p.pubkeys.insert("third".into(), third.verifying_key());
+            p
+        };
+
+        let author = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(author.path().join("panels")).unwrap();
+        std::fs::write(
+            author.path().join("aion-extension.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": pinned.name, "version": "9.9.9",
+                "contributes": {"panels": [{"id": "board", "title": "Board", "entryPoint": "panels/board.html"}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(author.path().join("panels/board.html"), b"<p>squatter</p>").unwrap();
+        let packed = pack_extension_dir(author.path(), &PackOptions::default()).unwrap();
+        let signature = hex::encode(
+            third
+                .sign(signature_payload(pinned.name, "9.9.9", &packed.manifest_integrity).as_bytes())
+                .to_bytes(),
+        );
+        let data_dir = tempfile::tempdir().unwrap();
+        {
+            // Installed before this app version reserved the name (no pins in play here).
+            let parent = open_signed_extensions_parent(data_dir.path()).unwrap();
+            let raw = aionui_extension::hub::read_package_manifest(&packed.zip).unwrap();
+            install_local_signed_package_auto(
+                &SignedRootBindingStore::new(),
+                &host(),
+                &LocalPackageSource {
+                    entry: SignedManifestEntry {
+                        name: pinned.name,
+                        version: "9.9.9",
+                        pubkey_id: Some("third"),
+                        integrity: Some(&packed.manifest_integrity),
+                        signature: Some(&signature),
+                    },
+                    raw_manifest: &raw,
+                    package_zip: &packed.zip,
+                },
+                &parent,
+                LocalPackageLimits::default(),
+                AutoInstallOptions::default(),
+            )
+            .unwrap();
+        }
+        for _restart in 0..2 {
+            let store = Arc::new(SignedRootBindingStore::new());
+            let ctx = build_host_signed_install(
+                data_dir.path(),
+                Ok(host()),
+                store.clone(),
+                crate::builtin_extensions::builtins(),
+            )
+            .await
+            .expect("configured");
+            let bound = store.lookup_checked(pinned.name).unwrap();
+            assert_eq!(
+                (bound.version(), bound.key_id()),
+                (pinned.version, crate::builtin_extensions::CURATOR_KEY_ID)
+            );
+            assert_eq!(
+                aionui_extension::hub::curated::sri_sha512(bound.raw_bytes()),
+                pinned.integrity
+            );
+            for pack in crate::builtin_extensions::builtins().packs {
+                assert!(ctx.is_builtin_name(pack.name));
             }
         }
     }

@@ -29,7 +29,8 @@ pub use background_service_entry_point_digest::{
     expected_background_service_entry_point_integrity,
 };
 pub use builtin_packs::{
-    BuiltinKey, BuiltinOutcome, BuiltinPack, BuiltinReport, BuiltinSet, BuiltinSkip, MergeReport, merge_builtin_policy,
+    BuiltinKey, BuiltinOutcome, BuiltinPack, BuiltinPins, BuiltinReport, BuiltinSet, BuiltinSkip, MergeReport,
+    PinVerdict, merge_builtin_policy,
 };
 pub use curated::{
     ALLOWLIST_ENV, CuratedGateError, CuratedInstallPolicy, REQUIRE_SIGNATURE_ENV, SIGNING_PUBKEYS_ENV,
@@ -48,7 +49,9 @@ pub use host_package_install::{
     AutoInstallOptions, AutoInstallReport, HostExtensionsParent, InstallKind, StagingSweepReport, UninstallOutcome,
     install_local_signed_package_auto, sweep_abandoned_staging, uninstall_local_signed_package,
 };
-pub use host_package_restore::{RestoreRejection, RestoreReport, restore_installed_extensions};
+pub use host_package_restore::{
+    RestoreRejection, RestoreReport, restore_installed_extensions, restore_installed_extensions_pinned,
+};
 pub use host_signed_install::{HostSignedInstall, StartupReport, signature_policy_configured};
 pub use index_manager::HubIndexManager;
 pub use installer::HubInstaller;
