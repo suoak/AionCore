@@ -36,15 +36,20 @@ impl From<ExtensionError> for ApiError {
             ExtensionError::UndefinedEnvVariable(var) => {
                 ApiError::BadRequest(format!("Undefined environment variable: {var}"))
             }
+            // F7: never put a local path in a public message (the detail stays in the Host log).
             ExtensionError::FileReferenceNotFound(path) => {
-                ApiError::NotFound(format!("File reference not found: {path}"))
+                tracing::debug!(%path, "file reference not found");
+                ApiError::NotFound("File reference not found".into())
             }
             ExtensionError::PathTraversal(path) => ApiError::BadRequest(format!("Path traversal detected: {path}")),
             ExtensionError::EngineIncompatible { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::ApiVersionIncompatible { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::InvalidWebuiRouteNamespace { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::ReservedWebuiRoute { .. } => ApiError::BadRequest(err.to_string()),
-            ExtensionError::ThemeCssNotFound(path) => ApiError::NotFound(format!("Theme CSS not found: {path}")),
+            ExtensionError::ThemeCssNotFound(path) => {
+                tracing::debug!(%path, "theme css not found");
+                ApiError::NotFound("Theme CSS not found".into())
+            }
             ExtensionError::ThemeCssUnverified(reason) => match crate::reason_catalogue::find_code(reason) {
                 Some(code) => coded_refusal(
                     StatusCode::FORBIDDEN,
@@ -56,7 +61,10 @@ impl From<ExtensionError> for ApiError {
             },
             ExtensionError::HookTimeout { .. } => ApiError::Internal(err.to_string()),
             ExtensionError::HookFailed { .. } => ApiError::Internal(err.to_string()),
-            ExtensionError::HookNotFound(path) => ApiError::NotFound(format!("Hook script not found: {path}")),
+            ExtensionError::HookNotFound(path) => {
+                tracing::debug!(%path, "hook script not found");
+                ApiError::NotFound("Hook script not found".into())
+            }
             ExtensionError::ResolutionFailed { .. } => ApiError::Internal(err.to_string()),
             ExtensionError::NotFound(name) => ApiError::NotFound(format!("Extension not found: {name}")),
             ExtensionError::StatePersistence(msg) => ApiError::Internal(msg),
@@ -661,8 +669,15 @@ async fn invoke_agent_tool(
         .ok_or_else(|| ApiError::NotFound(format!("Agent tool not found: {}", req.id)))?;
     // No authoritative session/run context is bound to this endpoint yet.
     // Fail closed regardless of the client hint, including false or omission.
-    if let Err(err) = host_runtime::gate_plan_safe(&tool, true) {
-        return Err(ApiError::Forbidden(err.to_string()));
+    if host_runtime::gate_plan_safe(&tool, true).is_err() {
+        // Fixed code + hint in the public message (S16; review F3): a bare `Forbidden` collapses to
+        // the generic `Forbidden.` and the UI could not explain the refusal.
+        return Err(coded_refusal(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Agent tool refused",
+            host_runtime::PLAN_MODE_REFUSED_REASON,
+        ));
     }
     // Host may retain an explicit signed-root binding on host_runtime.signed_roots
     // and an app prepare hook. Missing either → integrity_binding_unavailable.
@@ -1226,6 +1241,23 @@ mod tests {
                     assert_eq!(body["data"]["dispatched"], false);
                     assert_eq!(body["data"]["reason"], "integrity_binding_unavailable");
                     assert_ne!(body["data"]["reason"], "handler_stub");
+                } else {
+                    // The refusal body carries the fixed code and hint (S16), not the generic `Forbidden.`,
+                    // and never the tool id.
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+                    assert_eq!(body["code"], "FORBIDDEN");
+                    let message = body["error"].as_str().unwrap();
+                    assert_eq!(
+                        crate::reason_catalogue::find_code(message),
+                        Some(host_runtime::PLAN_MODE_REFUSED_REASON),
+                        "{message}"
+                    );
+                    assert!(
+                        message
+                            .ends_with(crate::reason_catalogue::hint(host_runtime::PLAN_MODE_REFUSED_REASON).unwrap())
+                    );
+                    assert!(!message.contains("demo"), "{message}");
                 }
             }
         }
@@ -1758,6 +1790,20 @@ mod tests {
             let status = response.status();
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert_refusal_body(status, &String::from_utf8_lossy(&body), StatusCode::FORBIDDEN, code);
+        }
+    }
+
+    #[test]
+    fn not_found_messages_never_carry_local_paths() {
+        for err in [
+            ExtensionError::HookNotFound("/home/alice/.aionui/extensions/x/run.sh".into()),
+            ExtensionError::ThemeCssNotFound("/home/alice/.aionui/extensions/x/theme.css".into()),
+            ExtensionError::FileReferenceNotFound("/home/alice/.aionui/extensions/x/p.md".into()),
+        ] {
+            let api = ApiError::from(err);
+            let message = api.public_message();
+            assert!(!message.contains('/') && !message.contains("alice"), "{message}");
+            assert_eq!(api.status_code(), StatusCode::NOT_FOUND);
         }
     }
 

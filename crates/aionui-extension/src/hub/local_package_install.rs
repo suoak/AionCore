@@ -113,6 +113,9 @@ pub enum LocalPackageError {
     WriteFailed,
     Retain(SignedRootBindingError),
     Unsupported,
+    /// The signed manifest declares `lifecycle` hooks: shell / native programs run by path, which a
+    /// signed extension never gets (E13 design §3; internal security review F2).
+    LifecycleHooksRefused,
 }
 
 impl LocalPackageError {
@@ -144,6 +147,7 @@ impl LocalPackageError {
             Self::WriteFailed => "package_write_failed",
             Self::Retain(_) => "package_retain_failed",
             Self::Unsupported => "package_unsupported_platform",
+            Self::LifecycleHooksRefused => "package_lifecycle_hooks_refused",
         }
     }
 }
@@ -183,6 +187,13 @@ fn canonical_relative(name: &str) -> Option<String> {
 pub(super) fn covered_files(checked: &SignatureCheckedManifest) -> Result<BTreeMap<String, String>, LocalPackageError> {
     let manifest = parse_manifest(checked.raw_bytes())
         .map_err(|_| LocalPackageError::Signature(SignedManifestError::InvalidManifest))?;
+    if manifest
+        .lifecycle
+        .as_ref()
+        .is_some_and(crate::lifecycle::declares_any_hook)
+    {
+        return Err(LocalPackageError::LifecycleHooksRefused);
+    }
     let declared: Vec<(String, String)> = if manifest.files.is_empty() {
         legacy_contribution_declarations(&manifest)
     } else {
@@ -713,6 +724,43 @@ mod tests {
             Err(LocalPackageError::ManifestMismatch)
         );
         assert_nothing_created(&env);
+    }
+
+    #[test]
+    fn signed_manifest_declaring_lifecycle_hooks_is_refused_without_effects() {
+        for hook in ["onInstall", "onActivate", "onDeactivate", "onUninstall"] {
+            let env = env();
+            let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_json()).unwrap();
+            manifest["lifecycle"] = serde_json::json!({ hook: "tools/run.js" });
+            let f = fixture(serde_json::to_vec(&manifest).unwrap());
+            assert_eq!(
+                run(
+                    &env,
+                    &f,
+                    &zip_owned(&good_entries(&f.raw)),
+                    "d",
+                    LocalPackageLimits::default()
+                ),
+                Err(LocalPackageError::LifecycleHooksRefused),
+                "{hook}"
+            );
+            assert_nothing_created(&env);
+        }
+        // An empty lifecycle block declares nothing and stays installable.
+        let env = env();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_json()).unwrap();
+        manifest["lifecycle"] = serde_json::json!({});
+        let f = fixture(serde_json::to_vec(&manifest).unwrap());
+        assert!(
+            run(
+                &env,
+                &f,
+                &zip_owned(&good_entries(&f.raw)),
+                "d",
+                LocalPackageLimits::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

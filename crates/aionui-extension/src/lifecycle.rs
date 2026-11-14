@@ -42,6 +42,10 @@ impl HookKind {
 }
 
 /// Resolve the hook script path from the manifest for a given hook kind.
+///
+/// Only a plain relative path inside the extension directory is accepted (no absolute path, drive
+/// prefix, `..` or `.` component, backslash or empty segment); anything else is treated as "no
+/// hook" so the runner never executes a program outside the extension's own tree.
 pub fn resolve_hook_path(hooks: &LifecycleHooks, kind: HookKind) -> Option<&str> {
     let value = match kind {
         HookKind::OnInstall => hooks.on_install.as_deref(),
@@ -49,7 +53,46 @@ pub fn resolve_hook_path(hooks: &LifecycleHooks, kind: HookKind) -> Option<&str>
         HookKind::OnActivate => hooks.on_activate.as_deref(),
         HookKind::OnDeactivate => hooks.on_deactivate.as_deref(),
     };
-    value.filter(|s| !s.is_empty())
+    value.filter(|s| is_contained_hook_path(s))
+}
+
+fn is_contained_hook_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path.contains(':')
+        && !path.starts_with('/')
+        && path.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// The lifecycle hooks the Host may run for `manifest`, or `None`.
+///
+/// Hooks are shell / native programs started **by path**. A signed-layout manifest (one with a
+/// top-level `files` list) never gets them: signed extensions are only ever read through their
+/// retained root and verified bytes, and a bound spawn of shell / native code is permanently refused
+/// (E13 design §3; internal security review F2). Signed installs already refuse manifests that
+/// declare hooks (`package_lifecycle_hooks_refused`); this is the runtime backstop.
+pub fn runnable_lifecycle_hooks(manifest: &crate::types::ExtensionManifest) -> Option<&LifecycleHooks> {
+    let hooks = manifest.lifecycle.as_ref()?;
+    if !manifest.files.is_empty() {
+        tracing::warn!(
+            extension = %manifest.name,
+            "lifecycle hooks of a signed-layout extension are never run"
+        );
+        return None;
+    }
+    Some(hooks)
+}
+
+/// Whether `hooks` declares at least one hook (any kind, any value).
+pub fn declares_any_hook(hooks: &LifecycleHooks) -> bool {
+    [
+        &hooks.on_install,
+        &hooks.on_uninstall,
+        &hooks.on_activate,
+        &hooks.on_deactivate,
+    ]
+    .iter()
+    .any(|h| h.as_deref().is_some_and(|s| !s.trim().is_empty()))
 }
 
 /// Execute a lifecycle hook script in a child process.
@@ -276,6 +319,52 @@ mod tests {
     // -----------------------------------------------------------------------
     // resolve_hook_path
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn hook_paths_outside_the_extension_tree_are_never_resolved() {
+        for bad in [
+            "/bin/sh",
+            "../other/run.sh",
+            "scripts/../../run.sh",
+            "./run.sh",
+            "scripts//run.sh",
+            "C:/Windows/system32/cmd.exe",
+            "scripts\\run.bat",
+            "",
+        ] {
+            let hooks = LifecycleHooks {
+                on_activate: Some(bad.into()),
+                ..Default::default()
+            };
+            assert_eq!(resolve_hook_path(&hooks, HookKind::OnActivate), None, "{bad:?}");
+        }
+        let hooks = LifecycleHooks {
+            on_activate: Some("scripts/activate.sh".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_hook_path(&hooks, HookKind::OnActivate),
+            Some("scripts/activate.sh")
+        );
+    }
+
+    #[test]
+    fn signed_layout_manifests_never_get_runnable_hooks() {
+        let mut manifest: crate::types::ExtensionManifest = serde_json::from_value(serde_json::json!({
+            "name": "demo",
+            "version": "1.0.0",
+            "lifecycle": {"on_activate": "scripts/activate.sh"}
+        }))
+        .unwrap();
+        assert!(runnable_lifecycle_hooks(&manifest).is_some());
+        manifest.files = vec![
+            serde_json::from_value(serde_json::json!({"path": "scripts/activate.sh", "integrity": "sha512-x"}))
+                .unwrap(),
+        ];
+        assert!(runnable_lifecycle_hooks(&manifest).is_none());
+        assert!(declares_any_hook(manifest.lifecycle.as_ref().unwrap()));
+        assert!(!declares_any_hook(&LifecycleHooks::default()));
+    }
 
     #[test]
     fn test_resolve_hook_path_present() {

@@ -417,6 +417,16 @@ pub fn pack_extension_dir(dir: &Path, options: &PackOptions) -> Result<PackOutpu
     }
     // Everything the Host checks on a signed manifest, now.
     let parsed = parse_manifest(&manifest).map_err(|e| PackError::ManifestInvalid(e.to_string()))?;
+    if parsed
+        .lifecycle
+        .as_ref()
+        .is_some_and(crate::lifecycle::declares_any_hook)
+    {
+        return Err(PackError::ManifestInvalid(
+            "`lifecycle` hooks run programs by path; a signed package cannot declare them (package_lifecycle_hooks_refused)"
+                .into(),
+        ));
+    }
     if parsed.name.len() > MAX_NAME_BYTES || parsed.version.len() > MAX_VERSION_BYTES {
         return Err(PackError::ManifestInvalid(
             "name or version is too long to be signed".into(),
@@ -900,6 +910,14 @@ mod tests {
         assert!(matches!(
             pack_extension_dir(tmp.path(), &PackOptions::default()),
             Err(PackError::ManifestInvalid(_))
+        ));
+        // Lifecycle hooks (programs run by path) are never allowed in a signed package.
+        let mut m: Value = serde_json::from_slice(&base_manifest()).unwrap();
+        m["lifecycle"] = serde_json::json!({"onActivate": "panels/board.html"});
+        write(tmp.path(), EXTENSION_MANIFEST_FILE, &serde_json::to_vec(&m).unwrap());
+        assert!(matches!(
+            pack_extension_dir(tmp.path(), &PackOptions::default()),
+            Err(PackError::ManifestInvalid(msg)) if msg.contains("package_lifecycle_hooks_refused")
         ));
     }
 
