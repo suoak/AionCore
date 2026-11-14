@@ -713,6 +713,8 @@ mod tests {
             "star*.txt",
             "lt<.txt",
             "com1.log",
+            "panels/BOARD~1.HTM",
+            "PROGRA~1/x.txt",
         ] {
             let tmp = sample();
             write(tmp.path(), name, b"x");
@@ -732,6 +734,9 @@ mod tests {
             "com10.txt",
             "lpt.txt",
             "a b/c d.txt",
+            "panels/board~x.htm",
+            "panels/longername~1.htm",
+            "panels/board~1.html",
         ] {
             write(tmp.path(), name, b"x");
         }

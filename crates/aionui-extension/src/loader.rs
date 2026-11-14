@@ -774,7 +774,6 @@ mod tests {
         assert_eq!(paths[0].source, ExtensionSource::Local);
     }
 
-    #[cfg(unix)]
     mod signed_layout {
         use super::super::*;
         use crate::hub::host_package_install::encode_component;
@@ -818,11 +817,14 @@ mod tests {
             install_layout(tmp.path(), "linked", "1.0.0", "linked", "1.0.0");
             std::fs::remove_file(tmp.path().join("linked/current")).unwrap();
             std::fs::write(tmp.path().join("real-marker"), marker("linked", "1.0.0", "1.0.0")).unwrap();
-            std::os::unix::fs::symlink(tmp.path().join("real-marker"), tmp.path().join("linked/current")).unwrap();
+            assert!(crate::hub::test_support::link_file(
+                &tmp.path().join("real-marker"),
+                &tmp.path().join("linked/current")
+            ));
             let loaded = scan_directory(tmp.path(), ExtensionSource::Local);
             let names: Vec<_> = loaded.iter().map(|e| e.manifest.name.as_str()).collect();
             assert_eq!(names, ["demo.plugin"]);
-            assert!(loaded[0].directory.ends_with("demo.plugin/1.0.0"));
+            assert!(Path::new(&loaded[0].directory).ends_with(Path::new("demo.plugin").join("1.0.0")));
         }
 
         #[test]
@@ -838,7 +840,7 @@ mod tests {
             std::fs::write(dir.join("current"), marker("x", "1.0.0", "1.0.0")).unwrap();
             let loaded = scan_directory(tmp.path(), ExtensionSource::Local);
             assert_eq!(loaded.len(), 1);
-            assert!(loaded[0].directory.ends_with("legacy"));
+            assert!(Path::new(&loaded[0].directory).ends_with("legacy"));
         }
     }
 }

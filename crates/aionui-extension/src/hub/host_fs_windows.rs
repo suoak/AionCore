@@ -13,6 +13,12 @@
 //! The listed names are first filtered by [`super::verified_reader::windows_portable_components`]
 //! (no ADS colon, no DOS device names, no trailing dot/space, bounded length/depth).
 //!
+//! Defence in depth (design §W.3): after the walk, the normalized final path of the opened file
+//! (`GetFinalPathNameByHandleW`, NT volume form) must be the final path of the retained root
+//! followed by exactly the listed components
+//! ([`super::verified_reader::final_path_is_listed_under`]); a failure of that query fails the
+//! read. The path strings are only compared, never opened.
+//!
 //! Case: NTFS is case-insensitive, so a listed `A.js` may open an on-disk `a.js`. That is safe
 //! because the caller compares the SRI of the bytes read against the signed listing; it only
 //! matters that the bytes are the signed ones.
@@ -36,14 +42,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_DATA, FileAttributeTagInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
-    FileFullDirectoryRestartInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFileType, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_TYPE_DISK, FILE_WRITE_DATA, FileAttributeTagInfo, FileDispositionInfoEx,
+    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFileType,
+    GetFinalPathNameByHandleW, SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_NT,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::verified_reader::windows_portable_components;
+use super::verified_reader::{final_path_is_listed_under, windows_portable_components};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Want {
@@ -82,6 +88,12 @@ pub(super) fn read_file_under(root: &File, rel: &str, max: u64) -> io::Result<Ve
     let len = u64::try_from(info.EndOfFile).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     if len > max {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    // Defence in depth: the opened file must sit at exactly the listed names below the root.
+    let root_final = final_path(root.as_raw_handle())?;
+    let file_final = final_path(file.as_raw_handle())?;
+    if !final_path_is_listed_under(&root_final, &file_final, &parts) {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
     }
     let mut bytes = Vec::new();
     Read::take(file, max + 1).read_to_end(&mut bytes)?;
@@ -236,6 +248,38 @@ pub(super) fn create_file_exclusive(parent: &File, name: &str, bytes: &[u8]) -> 
     )?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+/// Longest final path accepted (UTF-16 units, the NT path limit).
+const MAX_FINAL_PATH_UNITS: usize = 32_768;
+
+/// Normalized NT-volume final path of `handle` (`\Device\HarddiskVolumeN\…`). Only compared,
+/// never used to open anything.
+fn final_path(handle: RawHandle) -> io::Result<String> {
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `buf` is a valid writable buffer of `buf.len()` UTF-16 units for the call.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                handle as HANDLE,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_NT,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return String::from_utf16(&buf).map_err(|_| io::Error::from(io::ErrorKind::InvalidData));
+        }
+        // Too small: `n` is the required size including the terminator.
+        if n > MAX_FINAL_PATH_UNITS {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        buf.resize(n, 0);
+    }
 }
 
 /// Refuse a handle that is itself a reparse point (symlink, junction, mount point, …).
@@ -534,4 +578,52 @@ pub(super) fn write_file_atomic(dir: &File, tmp_name: &str, final_name: &str, by
     rename_replace(dir, tmp_name, final_name).inspect_err(|_| {
         let _ = unlink_at(dir, tmp_name);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::test_support::open_dir;
+
+    #[test]
+    fn final_path_cross_check_refuses_a_short_name_alias() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("panels")).unwrap();
+        std::fs::write(d.path().join("panels").join("abcdefghij.html"), b"long").unwrap();
+        let root = open_dir(d.path());
+
+        // The listed long name reads, and its final path passes the cross-check.
+        assert_eq!(read_file_under(&root, "panels/abcdefghij.html", 64).unwrap(), b"long");
+        let root_final = final_path(root.as_raw_handle()).unwrap();
+        assert!(root_final.starts_with(r"\Device\"), "NT volume form: {root_final}");
+
+        // An 8.3-shaped name never reaches the filesystem through the reader…
+        assert_eq!(
+            read_file_under(&root, "panels/ABCDEF~1.HTM", 64).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // …and if the volume generates short names, the alias opened handle-relative is caught by
+        // the final-path cross-check (it resolves to the long name, not the listed one).
+        let panels = open_relative(&root, "panels", Want::Directory).unwrap();
+        match open_relative(&panels, "ABCDEF~1.HTM", Want::RegularFile) {
+            Ok(alias) => {
+                let alias_final = final_path(alias.as_raw_handle()).unwrap();
+                assert!(!final_path_is_listed_under(
+                    &root_final,
+                    &alias_final,
+                    &["panels", "ABCDEF~1.HTM"]
+                ));
+                assert!(final_path_is_listed_under(
+                    &root_final,
+                    &alias_final,
+                    &["panels", "abcdefghij.html"]
+                ));
+                eprintln!("short-name alias present on this volume: cross-check refused it");
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+                eprintln!("no short-name alias on this volume: the name filter alone refuses it");
+            }
+        }
+    }
 }

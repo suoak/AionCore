@@ -1284,5 +1284,21 @@ mod tests {
             Err(LocalPackageError::UnsafeEntryName | LocalPackageError::InvalidCoveredPath)
         ));
         assert_nothing_created(&env);
+        // A covered file named like an 8.3 short-name alias (it could open another entry).
+        let manifest = format!(
+            r#"{{"name":"demo.plugin","version":"1.0.0","contributes":{{"panels":[{{"id":"p","title":"P","entryPoint":"panels/BOARD~1.HTM","entryPointIntegrity":"{}"}}]}}}}"#,
+            sri_sha512(PANEL)
+        )
+        .into_bytes();
+        let f = fixture(manifest);
+        let zip = zip_owned(&[
+            ("aion-extension.json", f.raw.clone()),
+            ("panels/BOARD~1.HTM", PANEL.to_vec()),
+        ]);
+        assert!(matches!(
+            run(&env, &f, &zip, "d", LocalPackageLimits::default()),
+            Err(LocalPackageError::UnsafeEntryName | LocalPackageError::InvalidCoveredPath)
+        ));
+        assert_nothing_created(&env);
     }
 }

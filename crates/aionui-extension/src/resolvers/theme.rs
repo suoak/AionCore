@@ -247,7 +247,6 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(unix)]
     #[test]
     fn bound_files_theme_css_comes_from_retained_root_not_ext_dir() {
         use crate::hub::curated::sri_sha512;
@@ -262,7 +261,7 @@ mod tests {
             serde_json::json!([{"path": "themes/dark.css", "integrity": sri_sha512(css)}]),
             serde_json::json!([{"id": "dark", "name": "Dark", "css_file": "themes/dark.css"}]),
         );
-        let root = std::fs::File::open(root_dir.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(root_dir.path());
         let result = resolve_theme_from(
             &theme("themes/dark.css"),
             "hello",
@@ -273,7 +272,6 @@ mod tests {
         assert_eq!(result.css_content, ":root { --bg: #000; }");
     }
 
-    #[cfg(unix)]
     #[test]
     fn bound_files_theme_css_refuses_unlisted_mismatched_symlink_and_missing() {
         use crate::hub::curated::sri_sha512;
@@ -285,7 +283,7 @@ mod tests {
         let listed = serde_json::json!([{"path": "themes/dark.css", "integrity": sri_sha512(css)}]);
         let themes = serde_json::json!([{"id": "dark", "name": "Dark", "css_file": "themes/dark.css"}]);
         let checked = checked_with_files(listed, themes.clone());
-        let root = std::fs::File::open(root_dir.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(root_dir.path());
 
         // Unlisted path (even if the bytes exist on the root).
         let err = resolve_theme_from(
@@ -322,11 +320,10 @@ mod tests {
         // Symlink with matching bytes is still refused; ext_dir is never consulted.
         std::fs::write(ext_dir.path().join("dark.css"), css).unwrap();
         std::fs::write(root_dir.path().join("real.css"), css).unwrap();
-        std::os::unix::fs::symlink(
-            root_dir.path().join("real.css"),
-            root_dir.path().join("themes/dark.css"),
-        )
-        .unwrap();
+        assert!(crate::hub::test_support::link_file(
+            &root_dir.path().join("real.css"),
+            &root_dir.path().join("themes/dark.css")
+        ));
         let err = resolve_theme_from(
             &theme("themes/dark.css"),
             "hello",
@@ -337,7 +334,6 @@ mod tests {
         assert!(matches!(err, ExtensionError::ThemeCssUnverified(_)), "{err:?}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn bound_files_theme_css_refuses_non_utf8() {
         use crate::hub::curated::sri_sha512;
@@ -350,7 +346,7 @@ mod tests {
             serde_json::json!([{"path": "themes/dark.css", "integrity": sri_sha512(bytes)}]),
             serde_json::json!([{"id": "dark", "name": "Dark", "css_file": "themes/dark.css"}]),
         );
-        let root = std::fs::File::open(root_dir.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(root_dir.path());
         let err = resolve_theme_from(
             &theme("themes/dark.css"),
             "hello",

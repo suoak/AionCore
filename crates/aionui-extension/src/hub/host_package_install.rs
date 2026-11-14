@@ -1928,6 +1928,8 @@ mod tests {
         // The same identities are fine as *names* on unix (they are only special to Windows).
         assert!(host_component("demo.plugin").is_some());
         assert!(host_component("con").is_none() && host_component("x.").is_none());
+        // An identity whose encoding has the shape of an 8.3 short name (`ab!` -> `ab~21`).
+        assert!(host_component("ab!").is_none() && host_component("a!b").is_some());
     }
 
     /// The documented Windows crash window of a same-version replace: between the two renames the

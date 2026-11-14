@@ -116,7 +116,7 @@ jobs:
         run: cargo clippy -p aionui-extension --all-targets -- -D warnings
       - name: Verified reader, local/host install, restore and pack tests (real Windows filesystem)
         run: |
-          cargo test -p aionui-extension --lib -- --nocapture --test-threads=1 hub::verified_reader hub::local_package_install hub::host_package_install pack:: 2>&1 | tee test.log
+          cargo test -p aionui-extension --lib -- --nocapture --test-threads=1 hub::verified_reader hub::host_fs_windows hub::local_package_install hub::host_package_install pack:: 2>&1 | tee test.log
           grep -E "test result: ok\. [1-9][0-9]* passed; 0 failed" test.log
           for t in windows_refuses_hard_links_streams_and_reserved_names a_linked_intermediate_directory_is_never_followed \
                    happy_path_creates_host_root_writes_only_covered_files_and_retains existing_symlink_named_like_root_is_not_followed \
@@ -130,7 +130,9 @@ jobs:
                    windows_refuses_identities_that_encode_to_device_names \
                    crash_between_the_two_renames_fails_closed_and_a_reinstall_recovers \
                    windows_refuses_identities_that_differ_only_by_case \
-                   case_alias_is_ascii_case_folding_of_a_different_entry; do
+                   case_alias_is_ascii_case_folding_of_a_different_entry \
+                   short_name_aliases_are_refused_and_lookalikes_are_not \
+                   final_path_must_be_the_root_followed_by_exactly_the_listed_names; do
             grep -E "$t \.\.\. ok" test.log
           done
           if grep -q "SKIPPED" test.log; then echo "::error::some Windows cases were SKIPPED (skipped is not passed)"; exit 1; fi
@@ -142,7 +144,15 @@ jobs:
           for t in import_skills_replaces_dangling_link_with_copy export_skill_with_symlink_replaces_a_dangling_link \
                    packed_package_installs_restores_and_is_served_verified \
                    a_third_party_package_under_a_builtin_name_is_not_restored_and_is_replaced_by_the_pin \
-                   app_update_upgrades_and_app_rollback_downgrades_to_the_pinned_version; do
+                   app_update_upgrades_and_app_rollback_downgrades_to_the_pinned_version \
+                   final_path_cross_check_refuses_a_short_name_alias \
+                   bound_files_theme_css_comes_from_retained_root_not_ext_dir \
+                   bound_files_theme_css_refuses_unlisted_mismatched_symlink_and_missing \
+                   bound_files_i18n_refuses_unlisted_missing_mismatched_symlink_and_bad_json \
+                   marked_version_dir_is_loaded_and_unmarked_or_inconsistent_layouts_are_not \
+                   verified_serve_refuses_tampered_symlinked_and_missing_listed_files_without_path_fallback \
+                   bound_files_i18n_route_omits_extension_when_root_file_is_tampered \
+                   bound_files_get_themes_omits_theme_when_css_is_unverified; do
             grep -E "$t \.\.\. ok" full.log
           done
           if grep -q "SKIPPED" full.log; then echo "::error::SKIPPED in the full suite"; exit 1; fi

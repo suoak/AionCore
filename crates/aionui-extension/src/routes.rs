@@ -1483,12 +1483,9 @@ mod tests {
 
     // -- slice F: verified serve from the retained signed root --
 
-    #[cfg(unix)]
     const V_HTML: &[u8] = b"<p>verified board</p>";
-    #[cfg(unix)]
     const V_CSS: &[u8] = b"p{color:green}";
 
-    #[cfg(unix)]
     fn signed_files_manifest() -> Vec<u8> {
         use crate::hub::curated::sri_sha512;
         serde_json::to_vec(&serde_json::json!({
@@ -1533,7 +1530,6 @@ mod tests {
     }
 
     /// Router whose on-disk extension dir holds DIFFERENT (evil) bytes than the retained root.
-    #[cfg(unix)]
     async fn verified_fixture() -> (Router, ExtensionRouterState, tempfile::TempDir, tempfile::TempDir) {
         let (state, tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(false)).await;
         std::fs::create_dir_all(ext_dir.join("panels")).unwrap();
@@ -1545,13 +1541,12 @@ mod tests {
         std::fs::write(host_root.path().join("panels/board.css"), V_CSS).unwrap();
         std::fs::write(host_root.path().join("unlisted.txt"), "x").unwrap();
         let checked = check_for_hello(&signed_files_manifest());
-        let root = std::fs::File::open(host_root.path()).unwrap();
+        let root = crate::hub::test_support::open_dir(host_root.path());
         state.host_runtime.signed_roots.install("hello", checked, root).unwrap();
         let router = extension_routes(state.clone()).layer(Extension(CurrentUser::local_default()));
         (router, state, tmp, host_root)
     }
 
-    #[cfg(unix)]
     async fn asset_body(router: &Router, uri: &str) -> (StatusCode, String, Option<String>) {
         let response = router
             .clone()
@@ -1567,7 +1562,6 @@ mod tests {
         (status, String::from_utf8_lossy(&body).into_owned(), ctype)
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn verified_serve_returns_retained_root_bytes_for_entry_and_other_listed_files() {
         let (router, _state, _tmp, _root) = verified_fixture().await;
@@ -1579,7 +1573,6 @@ mod tests {
         assert_eq!(ctype.as_deref(), Some("text/css"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn verified_serve_also_covers_the_asset_session_route() {
         let (_router, state, _tmp, _root) = verified_fixture().await;
@@ -1595,7 +1588,6 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn verified_serve_refuses_unlisted_paths_even_if_present_on_disk_or_in_root() {
         let (router, _state, _tmp, _root) = verified_fixture().await;
@@ -1611,7 +1603,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn verified_serve_refuses_tampered_symlinked_and_missing_listed_files_without_path_fallback() {
         let (router, _state, _tmp, root) = verified_fixture().await;
@@ -1627,14 +1618,16 @@ mod tests {
         );
         // A symlink with matching bytes is still refused; the on-disk copy is never consulted.
         std::fs::write(root.path().join("real.html"), V_HTML).unwrap();
-        std::os::unix::fs::symlink(root.path().join("real.html"), root.path().join("panels/board.html")).unwrap();
+        assert!(crate::hub::test_support::link_file(
+            &root.path().join("real.html"),
+            &root.path().join("panels/board.html")
+        ));
         assert_eq!(
             asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
             StatusCode::FORBIDDEN
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn verified_serve_uses_signed_files_not_the_loaded_manifest() {
         // Loaded manifest declares per-entry integrity for a different body; the retained signed
@@ -1651,7 +1644,7 @@ mod tests {
             .install(
                 "hello",
                 check_for_hello(&signed_files_manifest()),
-                std::fs::File::open(host_root.path()).unwrap(),
+                crate::hub::test_support::open_dir(host_root.path()),
             )
             .unwrap();
         let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
@@ -1682,7 +1675,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn removing_the_binding_returns_to_legacy_behaviour() {
         let (router, state, _tmp, _root) = verified_fixture().await;
@@ -1692,18 +1684,13 @@ mod tests {
         assert_eq!((status, body.as_str()), (StatusCode::OK, "EVIL-CSS"));
     }
 
-    #[cfg(unix)]
     const V_TAB: &[u8] = b"<h1>settings</h1>";
-    #[cfg(unix)]
     const V_ICON: &[u8] = b"<svg></svg>";
-    #[cfg(unix)]
     const V_COVER: &[u8] = b"PNGCOVER";
-    #[cfg(unix)]
     const V_THEME_CSS: &[u8] = b":root{--bg:#000}";
 
     /// Bound+files serve of settings-tab, icon and theme-cover paths (the kinds slice J now
     /// requires to be listed). Same retained-root / O_NOFOLLOW / SRI path as slice F; unlisted 403.
-    #[cfg(unix)]
     #[tokio::test]
     async fn verified_serve_covers_listed_settings_icon_and_theme_cover() {
         use crate::hub::curated::sri_sha512;
@@ -1751,7 +1738,7 @@ mod tests {
             .install(
                 "hello",
                 check_for_hello(&signed),
-                std::fs::File::open(host_root.path()).unwrap(),
+                crate::hub::test_support::open_dir(host_root.path()),
             )
             .unwrap();
         let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
@@ -1774,7 +1761,6 @@ mod tests {
     /// Themes API inlines CSS: for bound+files the bytes come from the retained root, not ext_dir.
     /// Bound extension fixture for the i18n route: the loaded dir holds EVIL json, the retained
     /// root holds the signed one (`good` unless `root_body` overrides it).
-    #[cfg(unix)]
     async fn i18n_bound_router(root_body: &[u8], signed_body: &[u8]) -> (Router, tempfile::TempDir, tempfile::TempDir) {
         use crate::hub::curated::sri_sha512;
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1812,7 +1798,7 @@ mod tests {
             .install(
                 "hello",
                 check_for_hello(&signed),
-                std::fs::File::open(host_root.path()).unwrap(),
+                crate::hub::test_support::open_dir(host_root.path()),
             )
             .unwrap();
         registry
@@ -1829,7 +1815,6 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
     async fn post_i18n(router: &Router, locale: &str) -> serde_json::Value {
         let response = router
             .clone()
@@ -1849,7 +1834,6 @@ mod tests {
         body["data"].clone()
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bound_files_i18n_route_returns_verified_root_messages() {
         let good: &[u8] = br#"{"k":"good"}"#;
@@ -1859,7 +1843,6 @@ mod tests {
         assert!(post_i18n(&router, "fr").await.as_object().unwrap().is_empty());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bound_files_i18n_route_omits_extension_when_root_file_is_tampered() {
         let good: &[u8] = br#"{"k":"good"}"#;
@@ -1869,7 +1852,6 @@ mod tests {
         assert!(data.as_object().unwrap().is_empty(), "{data}");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bound_files_get_themes_inlines_verified_css() {
         use crate::hub::curated::sri_sha512;
@@ -1916,7 +1898,7 @@ mod tests {
             .install(
                 "hello",
                 check_for_hello(&signed),
-                std::fs::File::open(host_root.path()).unwrap(),
+                crate::hub::test_support::open_dir(host_root.path()),
             )
             .unwrap();
         registry
@@ -1949,7 +1931,6 @@ mod tests {
         let _ = host_root;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn bound_files_get_themes_omits_theme_when_css_is_unverified() {
         use crate::hub::curated::sri_sha512;
@@ -1995,7 +1976,7 @@ mod tests {
             .install(
                 "hello",
                 check_for_hello(&signed),
-                std::fs::File::open(host_root.path()).unwrap(),
+                crate::hub::test_support::open_dir(host_root.path()),
             )
             .unwrap();
         registry
