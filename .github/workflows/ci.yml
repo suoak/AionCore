@@ -85,7 +85,14 @@ jobs:
         with:
           prefix-key: v1-rust
       - uses: taiki-e/install-action@nextest
+      # E14 SSH resume e2e (crates/aionui-app/tests/remote_host_ssh_e2e.rs) runs its
+      # own user-level sshd on a loopback high port from a temp dir; it only needs
+      # the binary. REQUIRED=1 makes a missing sshd fail instead of skip.
+      - name: OpenSSH server binary for the E14 SSH resume e2e
+        run: test -x /usr/sbin/sshd || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends openssh-server)
       - run: cargo nextest run --workspace
+        env:
+          WORKMATE_E14_SSH_REQUIRED: "1"
       # nextest already runs the workspace unit and integration suites. Keep the
       # cargo test pass for the one class nextest intentionally does not run,
       # without executing every unit test a second time in one shared harness.

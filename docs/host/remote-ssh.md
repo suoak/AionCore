@@ -54,13 +54,32 @@ On reconnect the client sends:
 Semantics (`after_sequence`): the Host replays retained events with
 `sequence > cursor.sequence` in the **same epoch**, then emits
 `resume.complete` with `status` `ok` | `gap` | `unavailable` and the current
-cursor. A **gap** means the Host restarted (new epoch) or the ring evicted
-events — fall back to HTTP journal hydrate; the ring is not durable storage.
+cursor. Replay uses the live-delivery rule: only events addressed to the
+connection's user plus explicit global events (`aionui_realtime::visibility`).
+`ok` means nothing in between was lost; **gap** means a new epoch (journal
+lost or discarded), evicted / unjournaled events, or a client cursor ahead of
+the Host — fall back to HTTP hydrate. The ring is persisted to
+`{data_dir}/realtime` (bounded: 512 events, 32 MiB), so the epoch survives a
+Host restart.
 
 ## Smoke
 
-See `scripts/remote-host-ssh-smoke.sh` (manual / local; not required in CI when
-no sshd is available).
+End-to-end (CI, Linux): `crates/aionui-app/tests/remote_host_ssh_e2e.rs` starts
+the real `aioncore --headless`, a throwaway user-level `sshd` on a loopback high
+port (config, keys and `authorized_keys` in a temp dir; no system SSH config)
+and `ssh -N -L`, then checks: live events through the tunnel; drop tunnel →
+publish → reconnect → `resume` `ok` with the missed event and no other user's
+events; SIGKILL + restart Host → same epoch, `ok`, no reused sequence; lost
+journal → `gap` with a new epoch.
+
+```bash
+WORKMATE_E14_SSH_REQUIRED=1 cargo test -p aionui-app --test remote_host_ssh_e2e -- --nocapture
+# sshd not at its compiled-in prefix: WORKMATE_E14_SSHD=/path/sshd
+#   WORKMATE_E14_SSHD_LIBEXEC=/dir/with/sshd-session+sshd-auth
+```
+
+Without sshd the test prints `SKIP` and passes unless `WORKMATE_E14_SSH_REQUIRED=1`
+(CI sets it). `scripts/remote-host-ssh-smoke.sh` remains the manual policy smoke.
 
 ## Non-goals
 
