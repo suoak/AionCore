@@ -8,6 +8,7 @@ pub mod handler;
 pub mod manager;
 pub mod router;
 pub mod types;
+pub mod visibility;
 
 pub use broadcaster::{BroadcastEventBus, EventBroadcaster};
 pub use event_journal::{
@@ -21,3 +22,4 @@ pub use types::{
     ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, PER_CONNECTION_BUFFER, WebSocketCloseCode,
     WsOutbound,
 };
+pub use visibility::{event_user_id, event_visible_to_user, is_global_websocket_event};
