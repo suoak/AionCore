@@ -72,9 +72,12 @@ following links, signature and per-file SRI re-verified on every restart). What 
   never lower-cases an identity: the signed name must keep equal to the directory it is stored in
   (restore checks that), and lower-casing would also change the layout of existing unix installs.
   Use lower-case identifiers (the curated packs all do) so the question never comes up.
-* A same-version *replace* is a two-step rename on Windows (no atomic directory exchange). A crash
-  between the two steps leaves that extension unbound after restart (fail closed); reinstall it.
-  A first install or a version change has no such window.
+* A same-version *replace* is a two-step rename on Windows (NTFS has no atomic directory exchange
+  and cannot rename over a directory). If the app stops between the two steps, the next start puts
+  the previous copy back before restoring and then re-verifies it like any install (signature and
+  every file's SRI), so the extension stays installed at that version. Only an ambiguous leftover
+  (e.g. two interrupted copies) falls back to fail closed: the extension is left unbound and has to
+  be reinstalled. A first install or a version change has no such window.
 
 ## Panel / work-panel-view listing
 

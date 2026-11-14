@@ -41,6 +41,8 @@ const MAX_PACKAGE_ZIP_BYTES: u64 = 64 * 1024 * 1024;
 pub struct StartupReport {
     pub swept_removed: usize,
     pub swept_failed: usize,
+    /// Windows: same-version replaces interrupted by a crash and put back before restore.
+    pub swept_rolled_back: usize,
     pub restored: usize,
     pub rejected: Vec<(String, RestoreRejection)>,
 }
@@ -109,6 +111,7 @@ impl HostSignedInstall {
             StartupReport {
                 swept_removed: swept.removed,
                 swept_failed: swept.failed,
+                swept_rolled_back: swept.rolled_back,
                 restored: restored.restored,
                 rejected: restored.rejected,
             }
@@ -132,6 +135,7 @@ impl HostSignedInstall {
             rejected = report.rejected.len(),
             swept_removed = report.swept_removed,
             swept_failed = report.swept_failed,
+            swept_rolled_back = report.swept_rolled_back,
             "signed extensions: startup restore finished"
         );
         report
