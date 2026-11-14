@@ -644,7 +644,7 @@ impl ExtensionRegistry {
             let ext_dir = Path::new(&ext.directory);
 
             // Check onInstall + onActivate hooks.
-            if let Some(hooks) = &ext.manifest.lifecycle {
+            if let Some(hooks) = crate::lifecycle::runnable_lifecycle_hooks(&ext.manifest) {
                 let persisted_version = persisted.get(&ext_name).map(|s| s.version.as_str());
 
                 if needs_install_hook(&ext.manifest.version, persisted_version)

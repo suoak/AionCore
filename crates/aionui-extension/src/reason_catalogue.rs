@@ -214,6 +214,11 @@ pub const CATALOGUE: &[ReasonHint] = &[
         "This extension command cannot run because its signed installation could not be verified. Reinstall the extension from the WorkMate hub.",
     ),
     r(
+        "agent_tool_not_plan_safe",
+        AgentTool,
+        "This tool can make changes, and extension tools that make changes cannot run in this version of CSBU WorkMate.",
+    ),
+    r(
         "handler_integrity_checked",
         AgentTool,
         "The command's code was verified. Running extension code is not enabled in this version, so nothing was executed.",
@@ -425,6 +430,11 @@ pub const CATALOGUE: &[ReasonHint] = &[
         "Something unexpected is in the way of this extension version. Remove the extension and install it again.",
     ),
     r(
+        "package_lifecycle_hooks_refused",
+        HubInstall,
+        "This extension asks to run setup programs, which signed extensions cannot do. Contact the extension's publisher.",
+    ),
+    r(
         "package_downgrade_refused",
         HubInstall,
         "A newer version of this extension is already installed. Older versions are not installed automatically.",
@@ -552,6 +562,7 @@ mod tests {
             E::Retain(SignedRootBindingError::RootNotDirectory),
             E::Retain(SignedRootBindingError::AlreadyBound),
             E::Unsupported,
+            E::LifecycleHooksRefused,
         ];
         all.extend(SIGNATURE.iter().map(|s| E::Signature(*s)));
         all
@@ -616,6 +627,7 @@ mod tests {
             out.insert(e.code());
         }
         out.insert(crate::host_runtime::INTEGRITY_BINDING_UNAVAILABLE_REASON);
+        out.insert(crate::host_runtime::PLAN_MODE_REFUSED_REASON);
         // aionui-app `CheckedAgentToolPrepare::ACK_REASON` (the app crate is not a dependency).
         out.insert("handler_integrity_checked");
         out.insert("theme_css_invalid_path");
