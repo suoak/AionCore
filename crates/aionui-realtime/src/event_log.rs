@@ -13,7 +13,7 @@ use aionui_api_types::{EventCursor, WebSocketMessage};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::event_journal::EventJournal;
+use crate::event_journal::{EventJournal, JournalLimits, JournalSnapshot};
 
 /// Default ring capacity (recent live events only).
 pub const DEFAULT_EVENT_LOG_CAPACITY: usize = 512;
@@ -68,18 +68,33 @@ impl EventLog {
     /// Open a durable log under `dir` (`epoch` + `events.ndjson`). Reuses the
     /// stored epoch and rehydrates up to `capacity` events so WS resume can
     /// succeed after Host process restart.
+    ///
+    /// Sequence numbers continue from the highest one the journal recorded. When
+    /// a previous run left the epoch but no record of it (journal emptied,
+    /// discarded or corrupt), continuity cannot be proven, so a new epoch starts
+    /// and resuming clients get `gap` instead of reused sequence numbers.
     pub fn open_durable(dir: impl AsRef<Path>, capacity: usize) -> std::io::Result<Self> {
+        Self::open_durable_with_limits(dir, capacity, JournalLimits::default())
+    }
+
+    pub fn open_durable_with_limits(
+        dir: impl AsRef<Path>,
+        capacity: usize,
+        limits: JournalLimits,
+    ) -> std::io::Result<Self> {
         let capacity = capacity.max(1);
-        let journal = EventJournal::open(dir.as_ref(), capacity)?;
-        let snap = journal.load_snapshot()?;
+        let journal = EventJournal::open_with_limits(dir.as_ref(), capacity, limits)?;
+        let mut snap = journal.load_snapshot()?;
+        if journal.reopened() && snap.last_sequence == 0 {
+            let epoch = journal.start_new_epoch(snap.epoch)?;
+            snap = JournalSnapshot {
+                epoch,
+                events: Vec::new(),
+                last_sequence: 0,
+            };
+        }
         let epoch = snap.epoch.max(1);
-        let next_sequence = snap
-            .events
-            .last()
-            .and_then(|e| e.cursor)
-            .map(|c| c.sequence.saturating_add(1))
-            .unwrap_or(1)
-            .max(1);
+        let next_sequence = snap.last_sequence.saturating_add(1).max(1);
         let mut ring = VecDeque::with_capacity(capacity);
         for ev in snap.events {
             if ring.len() >= capacity {
@@ -148,9 +163,12 @@ impl EventLog {
         event
     }
 
-    /// Events strictly after `after` in the current epoch, or a gap slice when
-    /// epochs differ or the ring evicted events between `after` and the oldest
-    /// retained entry (replay from the oldest retained of this epoch).
+    /// Events strictly after `after` in the current epoch.
+    ///
+    /// The status is `Ok` only when the replay is exactly the contiguous run
+    /// `after.sequence + 1 ..= current.sequence`. Anything else is a `Gap`: a
+    /// different epoch (replay all retained events), events evicted from the
+    /// ring or never journaled, or a client cursor ahead of the Host.
     pub fn events_after(&self, after: EventCursor) -> ResumeSlice {
         let current = self.current_cursor();
         let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
@@ -164,19 +182,6 @@ impl EventLog {
             };
         }
 
-        // Eviction gap: oldest retained sequence is more than one past the
-        // client's cursor, so at least one event was dropped from the ring.
-        let mut status = ResumeStatus::Ok;
-        if let Some(oldest) = ring.front().and_then(|ev| ev.cursor) {
-            if after.sequence.saturating_add(1) < oldest.sequence {
-                status = ResumeStatus::Gap;
-            }
-        } else if after.sequence < current.sequence {
-            // Everything after `after` was published then evicted (capacity
-            // edge) — treat as gap with empty replay.
-            status = ResumeStatus::Gap;
-        }
-
         let events: Vec<_> = ring
             .iter()
             .filter(|ev| match ev.cursor {
@@ -186,8 +191,27 @@ impl EventLog {
             .cloned()
             .collect();
 
+        let mut expected = after.sequence.saturating_add(1);
+        let mut contiguous = after.sequence <= current.sequence;
+        for ev in &events {
+            match ev.cursor {
+                Some(c) if c.sequence == expected => expected = expected.saturating_add(1),
+                _ => {
+                    contiguous = false;
+                    break;
+                }
+            }
+        }
+        if contiguous && expected != current.sequence.saturating_add(1) {
+            contiguous = false;
+        }
+
         ResumeSlice {
-            status,
+            status: if contiguous {
+                ResumeStatus::Ok
+            } else {
+                ResumeStatus::Gap
+            },
             current,
             events,
         }
@@ -296,6 +320,114 @@ mod tests {
         assert_eq!(slice.status, ResumeStatus::Ok);
         assert_eq!(slice.events.len(), 1);
         assert_eq!(slice.events[0].name, "b");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "workmate-event-log-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        dir
+    }
+
+    #[test]
+    fn client_cursor_ahead_of_host_is_gap() {
+        let log = EventLog::new(8);
+        log.record(WebSocketMessage::new("a", json!({})));
+        let slice = log.events_after(EventCursor::new(1, 5));
+        assert_eq!(slice.status, ResumeStatus::Gap);
+        assert!(slice.events.is_empty());
+        assert_eq!(slice.current, EventCursor::new(1, 1));
+        let caught_up = log.events_after(EventCursor::new(1, 1));
+        assert_eq!(caught_up.status, ResumeStatus::Ok);
+        assert!(caught_up.events.is_empty());
+    }
+
+    #[test]
+    fn emptied_journal_starts_new_epoch_instead_of_reusing_sequences() {
+        let dir = tmp_dir("emptied");
+        let log = EventLog::open_durable(&dir, 8).unwrap();
+        for name in ["a", "b", "c"] {
+            log.record(WebSocketMessage::new(name, json!({})));
+        }
+        let seen = log.current_cursor();
+        drop(log);
+        fs::write(dir.join("events.ndjson"), b"").unwrap();
+
+        let log2 = EventLog::open_durable(&dir, 8).unwrap();
+        assert_eq!(log2.epoch(), seen.epoch + 1);
+        let slice = log2.events_after(seen);
+        assert_eq!(slice.status, ResumeStatus::Gap);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_restart_keeps_working() {
+        let dir = tmp_dir("idle");
+        drop(EventLog::open_durable(&dir, 8).unwrap());
+        let log = EventLog::open_durable(&dir, 8).unwrap();
+        let first = log.record(WebSocketMessage::new("a", json!({})));
+        assert_eq!(first.cursor.unwrap().sequence, 1);
+        let slice = log.events_after(EventCursor::new(log.epoch(), 0));
+        assert_eq!(slice.status, ResumeStatus::Ok);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_event_is_memory_only_and_restart_reports_gap() {
+        let dir = tmp_dir("oversized");
+        let limits = JournalLimits {
+            max_bytes: 64 * 1024,
+            max_event_bytes: 256,
+        };
+        let log = EventLog::open_durable_with_limits(&dir, 8, limits).unwrap();
+        log.record(WebSocketMessage::new("small", json!({})));
+        log.record(WebSocketMessage::new("big", json!({ "blob": "x".repeat(1024) })));
+        let seen_small = EventCursor::new(log.epoch(), 1);
+        // Live process still replays the big event from memory.
+        assert_eq!(log.events_after(seen_small).status, ResumeStatus::Ok);
+        let before = log.current_cursor();
+        drop(log);
+
+        let log2 = EventLog::open_durable_with_limits(&dir, 8, limits).unwrap();
+        // Sequence continues past the omitted event; nothing is reused.
+        assert_eq!(log2.current_cursor(), before);
+        let slice = log2.events_after(seen_small);
+        assert_eq!(slice.status, ResumeStatus::Gap);
+        assert!(slice.events.is_empty());
+        assert_eq!(log2.events_after(before).status, ResumeStatus::Ok);
+        let next = log2.record(WebSocketMessage::new("next", json!({})));
+        assert_eq!(next.cursor.unwrap().sequence, before.sequence + 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_middle_line_reports_gap_after_restart() {
+        let dir = tmp_dir("corrupt");
+        let log = EventLog::open_durable(&dir, 8).unwrap();
+        for name in ["a", "b", "c"] {
+            log.record(WebSocketMessage::new(name, json!({})));
+        }
+        let epoch = log.epoch();
+        drop(log);
+        let path = dir.join("events.ndjson");
+        let raw = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        fs::write(&path, format!("{}\n{{not json\n{}\n", lines[0], lines[2])).unwrap();
+
+        let log2 = EventLog::open_durable(&dir, 8).unwrap();
+        assert_eq!(log2.epoch(), epoch);
+        assert_eq!(log2.current_cursor(), EventCursor::new(epoch, 3));
+        let slice = log2.events_after(EventCursor::new(epoch, 1));
+        assert_eq!(slice.status, ResumeStatus::Gap);
+        assert_eq!(slice.events.len(), 1);
+        assert_eq!(log2.events_after(EventCursor::new(epoch, 2)).status, ResumeStatus::Ok);
         let _ = fs::remove_dir_all(&dir);
     }
 }

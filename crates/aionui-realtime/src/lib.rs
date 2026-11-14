@@ -10,7 +10,9 @@ pub mod router;
 pub mod types;
 
 pub use broadcaster::{BroadcastEventBus, EventBroadcaster};
-pub use event_journal::{EventJournal, JournalSnapshot};
+pub use event_journal::{
+    DEFAULT_JOURNAL_MAX_BYTES, DEFAULT_JOURNAL_MAX_EVENT_BYTES, EventJournal, JournalLimits, JournalSnapshot,
+};
 pub use event_log::{DEFAULT_EVENT_LOG_CAPACITY, EventLog, ResumeSlice, ResumeStatus};
 pub use handler::{TokenExtractor, TokenUserResolver, WsHandlerState, ws_upgrade_handler};
 pub use manager::{TokenValidator, WebSocketManager};
