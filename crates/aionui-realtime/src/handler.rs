@@ -15,6 +15,7 @@ use crate::event_log::{EventLog, ResumeStatus};
 use crate::manager::{TokenValidator, WebSocketManager};
 use crate::router::MessageRouter;
 use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocketCloseCode, WsOutbound};
+use crate::visibility::event_visible_to_user;
 
 /// Extracts a JWT token from WebSocket upgrade request headers.
 ///
@@ -214,7 +215,7 @@ fn handle_text_message(conn_id: ConnectionId, user_id: &str, text: &str, state: 
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
         "resume" => {
-            handle_resume(state, conn_id, msg.cursor);
+            handle_resume(state, conn_id, user_id, msg.cursor);
         }
         name => {
             if !state.router.route(conn_id, user_id, name, msg.data) {
@@ -237,7 +238,12 @@ fn send_realtime_error(state: &WsHandlerState, conn_id: ConnectionId, error: Rea
 ///
 /// Missing `event_log` or missing cursor → `resume.complete` with `status=unavailable`
 /// / zero replay when the Host has no ring; epoch mismatch uses `status=gap`.
-fn handle_resume(state: &WsHandlerState, conn_id: ConnectionId, cursor: Option<EventCursor>) {
+///
+/// The ring is shared by all users, so replay applies the live-delivery rule
+/// ([`event_visible_to_user`]): only events addressed to this connection's user,
+/// plus explicit global events. The status is computed over the whole ring, so
+/// other users' events never turn a contiguous resume into a gap.
+fn handle_resume(state: &WsHandlerState, conn_id: ConnectionId, user_id: &str, cursor: Option<EventCursor>) {
     let Some(log) = state.event_log.as_ref() else {
         let msg = WebSocketMessage::new(
             "resume.complete",
@@ -252,9 +258,12 @@ fn handle_resume(state: &WsHandlerState, conn_id: ConnectionId, cursor: Option<E
 
     let after = cursor.unwrap_or_default();
     let slice = log.events_after(after);
-    let replayed = slice.events.len();
+    let mut replayed = 0usize;
     for event in slice.events {
-        state.manager.send_to(conn_id, event);
+        if event_visible_to_user(&event, user_id) {
+            state.manager.send_to(conn_id, event);
+            replayed += 1;
+        }
     }
     let status = match slice.status {
         ResumeStatus::Ok => "ok",
@@ -627,9 +636,9 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
 
         let log = Arc::new(EventLog::new(16));
-        log.record(WebSocketMessage::new("a", json!({"n": 1})));
-        log.record(WebSocketMessage::new("b", json!({"n": 2})));
-        log.record(WebSocketMessage::new("c", json!({"n": 3})));
+        log.record(WebSocketMessage::new("a", json!({"n": 1, "user_id": "user-1"})));
+        log.record(WebSocketMessage::new("b", json!({"n": 2, "user_id": "user-1"})));
+        log.record(WebSocketMessage::new("c", json!({"n": 3, "user_id": "user-1"})));
 
         let mut state = test_state(manager);
         state.event_log = Some(log);
@@ -669,5 +678,60 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<WsOutbound>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(WsOutbound::Text(t)) = rx.try_recv() {
+            out.push(serde_json::from_str(&t).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn resume_replays_only_the_connections_user_and_global_events() {
+        use crate::event_log::EventLog;
+        use aionui_api_types::EventCursor;
+        let manager = Arc::new(WebSocketManager::new());
+        let (tx, mut rx) = mpsc::channel(PER_CONNECTION_BUFFER);
+        let conn_id = manager.add_client_for_user("alice".into(), "tok".into(), tx);
+
+        let log = Arc::new(EventLog::new(16));
+        log.record(WebSocketMessage::new(
+            "conversation.listChanged",
+            json!({"user_id": "alice"}),
+        ));
+        log.record(WebSocketMessage::new(
+            "message.stream",
+            json!({"user_id": "bob", "text": "bob-secret"}),
+        ));
+        log.record(WebSocketMessage::new("extensions.lifecycle", json!({})));
+        log.record(WebSocketMessage::new("message.stream", json!({"text": "unscoped"})));
+        log.record(WebSocketMessage::new("turn.completed", json!({"user_id": "alice"})));
+
+        let mut state = test_state(manager);
+        state.event_log = Some(log);
+        let resume =
+            serde_json::to_string(&WebSocketMessage::new("resume", json!({})).with_cursor(EventCursor::new(1, 0)))
+                .unwrap();
+        handle_text_message(conn_id, "alice", &resume, &state);
+
+        let frames = drain(&mut rx);
+        let names: Vec<&str> = frames.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "conversation.listChanged",
+                "extensions.lifecycle",
+                "turn.completed",
+                "resume.complete"
+            ]
+        );
+        let all = serde_json::to_string(&frames).unwrap();
+        assert!(!all.contains("bob-secret") && !all.contains("unscoped"));
+        let complete = frames.last().unwrap();
+        assert_eq!(complete["data"]["status"], "ok", "hidden events must not cause a gap");
+        assert_eq!(complete["data"]["replayed"], 3);
+        assert_eq!(complete["data"]["sequence"], 5);
     }
 }
