@@ -307,14 +307,15 @@ mod tests {
         assert_eq!(gate.check_requested(Path::new("other.html")), Ok(()));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn canonical_check_catches_symlink_alias_of_declared_entry() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("panels")).unwrap();
         std::fs::write(root.join("panels/board.html"), "x").unwrap();
-        std::os::unix::fs::symlink(root.join("panels/board.html"), root.join("alias.html")).unwrap();
+        if !crate::hub::test_support::link_file(&root.join("panels/board.html"), &root.join("alias.html")) {
+            return;
+        }
         std::fs::write(root.join("other.html"), "y").unwrap();
         let gate = AssetIntegrityGate::new(&manifest(&declared_panel()), None).unwrap();
         let alias = std::fs::canonicalize(root.join("alias.html")).unwrap();

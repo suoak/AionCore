@@ -369,8 +369,15 @@ fn cli_writes_zip_and_manifest_and_update_then_check_is_clean() {
     assert!(names.iter().all(|n| !n.contains(".tmp-")), "{names:?}");
 }
 
-// Uses unix symlinks directly; Windows link refusal is covered by the pack and reader tests.
-#[cfg(unix)]
+/// File symlink on both platforms (Windows needs `SeCreateSymbolicLinkPrivilege`, which the
+/// Windows CI job requires via `AIONCORE_REQUIRE_LINK_PRIVILEGE`).
+fn symlink_file(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+}
+
 #[test]
 fn cli_refuses_outputs_inside_source_symlink_outputs_bad_sources_and_misuse() {
     let src = author_dir();
@@ -396,7 +403,7 @@ fn cli_refuses_outputs_inside_source_symlink_outputs_bad_sources_and_misuse() {
     let victim = outdir.path().join("victim");
     std::fs::write(&victim, b"keep").unwrap();
     let link = outdir.path().join("out.zip");
-    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    symlink_file(&victim, &link);
     let r = bin()
         .arg(src.path())
         .arg("--zip-out")
@@ -408,7 +415,7 @@ fn cli_refuses_outputs_inside_source_symlink_outputs_bad_sources_and_misuse() {
     assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
 
     // A symlink in the source is refused; nothing is written.
-    std::os::unix::fs::symlink("panels/board.html", src.path().join("alias.html")).unwrap();
+    symlink_file(&src.path().join("panels/board.html"), &src.path().join("alias.html"));
     let zip = outdir.path().join("never.zip");
     let r = bin().arg(src.path()).arg("--zip-out").arg(&zip).output().unwrap();
     assert_eq!(r.status.code(), Some(1));

@@ -1252,12 +1252,13 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn asset_route_refuses_symlink_alias_of_declared_entry() {
         let (state, _tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(true)).await;
         write_panel_assets(&ext_dir);
-        std::os::unix::fs::symlink(ext_dir.join("panels/board.html"), ext_dir.join("alias.html")).unwrap();
+        if !crate::hub::test_support::link_file(&ext_dir.join("panels/board.html"), &ext_dir.join("alias.html")) {
+            return;
+        }
         let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
         assert_eq!(
             asset_status(&router, "/api/extensions/hello/assets/alias.html").await,
