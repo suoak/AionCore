@@ -55,6 +55,8 @@ use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes
 use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
+// Shared with E14 resume replay so live delivery and replay apply one rule.
+use aionui_realtime::is_global_websocket_event;
 
 pub struct RouterRuntime {
     pub client_pref_service: ClientPrefService,
@@ -788,13 +790,6 @@ fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentit
         crate::config::IdentityMode::WebUi => AuthIdentityMode::UserSession,
         crate::config::IdentityMode::AionPro => AuthIdentityMode::AionPro,
     }
-}
-
-fn is_global_websocket_event(event_name: &str) -> bool {
-    matches!(
-        event_name,
-        "runtime.statusChanged" | "extensions.lifecycle" | "hub.state-changed"
-    )
 }
 
 async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {
