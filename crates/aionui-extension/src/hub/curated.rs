@@ -54,6 +54,24 @@ pub enum CuratedGateError {
     PubkeyConfig(String),
 }
 
+impl CuratedGateError {
+    /// Stable catalogue code ([`crate::reason_catalogue`]).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotInIndex => "curated_not_in_index",
+            Self::NotCurated { .. } => "curated_not_curated",
+            Self::NotAllowlisted { .. } => "curated_not_allowlisted",
+            Self::IntegrityMissing { .. } => "curated_integrity_missing",
+            Self::IntegrityMismatch { .. } => "curated_integrity_mismatch",
+            Self::SignatureRequired { .. } => "curated_signature_required",
+            Self::SignatureMissingPubkey { .. } => "curated_signature_missing_key_id",
+            Self::SignatureInvalid { .. } => "curated_signature_invalid",
+            Self::PubkeyUnknown { .. } => "curated_unknown_key",
+            Self::PubkeyConfig(_) => "curated_key_config_invalid",
+        }
+    }
+}
+
 impl std::fmt::Display for CuratedGateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

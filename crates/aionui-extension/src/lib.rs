@@ -22,6 +22,7 @@ pub mod loader;
 pub mod manifest;
 pub mod pack;
 pub mod permission;
+pub mod reason_catalogue;
 pub mod registry;
 mod registry_helpers;
 pub mod resolvers;

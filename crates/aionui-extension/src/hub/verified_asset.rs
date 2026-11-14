@@ -42,14 +42,27 @@ pub enum VerifiedAssetError {
 }
 
 impl VerifiedAssetError {
+    /// Short English reason followed by its catalogue code (see [`crate::reason_catalogue`]).
     pub fn reason(self) -> &'static str {
         match self {
-            Self::InvalidSnapshot => "signed snapshot is invalid",
-            Self::NotListed => "path is not listed in the signed files list",
-            Self::Missing => "listed file is missing",
-            Self::Unreadable => "listed file cannot be read safely",
-            Self::IntegrityMismatch => "file does not match its signed integrity",
-            Self::Unavailable => "verified serve is unavailable on this platform",
+            Self::InvalidSnapshot => "signed snapshot is invalid (verified_asset_invalid_snapshot)",
+            Self::NotListed => "path is not listed in the signed files list (verified_asset_not_listed)",
+            Self::Missing => "listed file is missing (verified_asset_missing)",
+            Self::Unreadable => "listed file cannot be read safely (verified_asset_unreadable)",
+            Self::IntegrityMismatch => "file does not match its signed integrity (verified_asset_integrity_mismatch)",
+            Self::Unavailable => "verified serve is unavailable on this platform (verified_asset_unavailable)",
+        }
+    }
+
+    /// Stable catalogue code ([`crate::reason_catalogue`]).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidSnapshot => "verified_asset_invalid_snapshot",
+            Self::NotListed => "verified_asset_not_listed",
+            Self::Missing => "verified_asset_missing",
+            Self::Unreadable => "verified_asset_unreadable",
+            Self::IntegrityMismatch => "verified_asset_integrity_mismatch",
+            Self::Unavailable => "verified_asset_unavailable",
         }
     }
 }

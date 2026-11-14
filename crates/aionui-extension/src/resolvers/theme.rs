@@ -63,12 +63,12 @@ fn read_theme_css(
 
 fn read_verified_theme_css(index: &FilesIndex, root: &File, css_file: &str) -> Result<String, ExtensionError> {
     let canonical = canonical_relative_path(css_file).ok_or(ExtensionError::ThemeCssUnverified(
-        "theme CSS path is not a canonical relative path",
+        "theme CSS path is not a canonical relative path (theme_css_invalid_path)",
     ))?;
     let (listed, integrity) = index.resolve(Path::new(&canonical)).map_err(theme_css_unverified)?;
     let asset = read_verified_listed(root, listed, integrity).map_err(theme_css_unverified)?;
     String::from_utf8(asset.into_bytes())
-        .map_err(|_| ExtensionError::ThemeCssUnverified("theme CSS is not valid UTF-8"))
+        .map_err(|_| ExtensionError::ThemeCssUnverified("theme CSS is not valid UTF-8 (theme_css_not_utf8)"))
 }
 
 fn theme_css_unverified(err: VerifiedAssetError) -> ExtensionError {

@@ -142,6 +142,28 @@ pub enum BoundBackgroundStartError {
 }
 
 impl BoundBackgroundStartError {
+    /// Every variant (tests: uniqueness here, catalogue coverage in `reason_catalogue`).
+    #[cfg(test)]
+    pub(crate) const ALL_FOR_TESTS: [Self; 17] = [
+        Self::RootMissing,
+        Self::InvalidSnapshot,
+        Self::SignedSnapshotInconclusive,
+        Self::IntegrityRequired,
+        Self::EntryMismatch,
+        Self::Missing,
+        Self::Unreadable,
+        Self::IntegrityMismatch,
+        Self::Unavailable,
+        Self::RuntimeRequired,
+        Self::RuntimeUnsupported,
+        Self::ShellScriptUnsupported,
+        Self::NativeUnsupported,
+        Self::EntryKindUnsupported,
+        Self::CapabilitiesUnavailable,
+        Self::RuntimeRequiresSignedFiles,
+        Self::RunnerUnavailable,
+    ];
+
     pub fn reason(self) -> &'static str {
         match self {
             Self::RootMissing => "bound_service_root_missing",
@@ -686,26 +708,7 @@ mod tests {
 
     #[test]
     fn reasons_are_fixed_unique_and_never_include_digests_or_paths() {
-        use BoundBackgroundStartError as E;
-        let all = [
-            E::RootMissing,
-            E::InvalidSnapshot,
-            E::SignedSnapshotInconclusive,
-            E::IntegrityRequired,
-            E::EntryMismatch,
-            E::Missing,
-            E::Unreadable,
-            E::IntegrityMismatch,
-            E::Unavailable,
-            E::RuntimeRequired,
-            E::RuntimeUnsupported,
-            E::ShellScriptUnsupported,
-            E::NativeUnsupported,
-            E::EntryKindUnsupported,
-            E::CapabilitiesUnavailable,
-            E::RuntimeRequiresSignedFiles,
-            E::RunnerUnavailable,
-        ];
+        let all = BoundBackgroundStartError::ALL_FOR_TESTS;
         let reasons: HashSet<&str> = all.iter().map(|e| e.reason()).collect();
         assert_eq!(reasons.len(), all.len());
         for e in all {

@@ -282,3 +282,14 @@ pub(crate) enum SignedPackageError {
     ReservedByBuiltin,
     Package(LocalPackageError),
 }
+
+impl SignedPackageError {
+    /// Stable catalogue code ([`crate::reason_catalogue`]).
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Curated => "curated_install_refused",
+            Self::ReservedByBuiltin => "name_reserved_by_builtin",
+            Self::Package(e) => e.code(),
+        }
+    }
+}
