@@ -1,6 +1,5 @@
 //! M9 E13 slice G: Host wiring of signed local-package install / restore / uninstall through the
-//! existing hub installer. Unix only (FD-relative Host layout).
-#![cfg(unix)]
+//! existing hub installer. Runs on unix and Windows (handle-relative Host layout on both).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -26,6 +25,24 @@ use tempfile::TempDir;
 
 const HTML: &[u8] = b"<html>signed board</html>";
 const CSS: &[u8] = b"p{color:red}";
+
+/// Open the Host-held parent directory handle the way the Host app does (on Windows a directory
+/// handle needs `FILE_FLAG_BACKUP_SEMANTICS`; the access mask lists / adds entries / deletes).
+fn open_host_dir(path: &Path) -> File {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .access_mode(0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x1_0000 | 0x10_0000)
+            .custom_flags(0x0200_0000)
+            .open(path)
+            .unwrap()
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path).unwrap()
+    }
+}
 
 fn key() -> SigningKey {
     SigningKey::from_bytes(&[41; 32])
@@ -121,7 +138,7 @@ async fn env_pinned(with_policy: bool, builtins: Option<&BuiltinSet<'_>>) -> Env
     registry.set_signed_roots(store.clone());
     let ctx = if with_policy {
         HostSignedInstall::new(
-            HostExtensionsParent::new(File::open(signed_dir.path()).unwrap()).unwrap(),
+            HostExtensionsParent::new(open_host_dir(signed_dir.path())).unwrap(),
             policy(),
             store.clone(),
         )
@@ -174,7 +191,7 @@ fn only_a_verifying_or_requiring_policy_counts_as_configured() {
         HashMap::new()
     )));
     let tmp = TempDir::new().unwrap();
-    let parent = HostExtensionsParent::new(File::open(tmp.path()).unwrap()).unwrap();
+    let parent = HostExtensionsParent::new(open_host_dir(tmp.path())).unwrap();
     assert!(
         HostSignedInstall::new(
             parent,
@@ -194,13 +211,17 @@ async fn signed_package_installs_binds_loads_and_survives_restart_and_upgrade() 
     assert!(e.store.contains("demo.plugin"));
     // The registry sees it through the Host layout, from the signed dir.
     let ext = e.registry.get_extension_by_name("demo.plugin").await.expect("loaded");
-    assert!(ext.directory.starts_with(e.signed_dir.path().to_str().unwrap()));
-    assert!(ext.directory.ends_with("demo.plugin/1.0.0"));
+    let dir = std::fs::canonicalize(&ext.directory).unwrap();
+    assert!(
+        dir.starts_with(std::fs::canonicalize(e.signed_dir.path()).unwrap()),
+        "{dir:?}"
+    );
+    assert!(dir.ends_with(Path::new("demo.plugin").join("1.0.0")), "{dir:?}");
 
     // Restart: a fresh store + restore from the marker, handles only.
     let store2 = Arc::new(SignedRootBindingStore::new());
     let ctx2 = HostSignedInstall::new(
-        HostExtensionsParent::new(File::open(e.signed_dir.path()).unwrap()).unwrap(),
+        HostExtensionsParent::new(open_host_dir(e.signed_dir.path())).unwrap(),
         policy(),
         store2.clone(),
     )
@@ -271,7 +292,7 @@ async fn restore_rejection_is_reported_and_leaves_the_extension_unbound_without_
     std::fs::create_dir(e.signed_dir.path().join("stray")).unwrap();
     let store2 = Arc::new(SignedRootBindingStore::new());
     let ctx2 = HostSignedInstall::new(
-        HostExtensionsParent::new(File::open(e.signed_dir.path()).unwrap()).unwrap(),
+        HostExtensionsParent::new(open_host_dir(e.signed_dir.path())).unwrap(),
         policy(),
         store2.clone(),
     )

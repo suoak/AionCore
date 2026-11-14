@@ -792,15 +792,20 @@ mod tests {
         assert!(panel_hint_for_command(&panels, &cmd).is_some());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exited_services_are_reaped_only_for_the_requested_user() {
         let manager = BackgroundServiceManager::new();
         for user in ["alice", "bob"] {
-            let mut child = tokio::process::Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .spawn()
-                .unwrap();
+            // Any short-lived child process will do (this tests reaping, not hooks or scripts).
+            #[cfg(unix)]
+            let mut command = tokio::process::Command::new("/bin/sh");
+            #[cfg(unix)]
+            command.args(["-c", "exit 0"]);
+            #[cfg(windows)]
+            let mut command = tokio::process::Command::new("cmd.exe");
+            #[cfg(windows)]
+            command.args(["/C", "exit 0"]);
+            let mut child = command.spawn().unwrap();
             let pid = child.id();
             // Synchronize on exit, not a timing-dependent sleep.
             child.wait().await.unwrap();
@@ -857,20 +862,25 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolve_service_script_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
+        use crate::hub::test_support::{link_dir, link_file};
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("worker.sh"), "exit 0\n").unwrap();
-        symlink(outside.path().join("worker.sh"), dir.path().join("script-link.sh")).unwrap();
-        symlink(outside.path(), dir.path().join("directory-link")).unwrap();
+        // A directory link (junction on Windows) needs no privilege.
+        link_dir(outside.path(), &dir.path().join("directory-link"));
         let root = dir.path().to_str().unwrap();
-        assert!(resolve_service_script(root, "script-link.sh").is_err());
         assert!(resolve_service_script(root, "directory-link/worker.sh").is_err());
+        if !link_file(&outside.path().join("worker.sh"), &dir.path().join("script-link.sh")) {
+            return;
+        }
+        assert!(resolve_service_script(root, "script-link.sh").is_err());
         std::fs::write(dir.path().join("inside.sh"), "exit 0\n").unwrap();
-        symlink(dir.path().join("inside.sh"), dir.path().join("inside-link.sh")).unwrap();
+        assert!(link_file(
+            &dir.path().join("inside.sh"),
+            &dir.path().join("inside-link.sh")
+        ));
         assert_eq!(
             resolve_service_script(root, "inside-link.sh").unwrap(),
             std::fs::canonicalize(dir.path().join("inside.sh")).unwrap()

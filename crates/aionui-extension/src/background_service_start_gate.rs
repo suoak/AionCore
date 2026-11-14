@@ -295,7 +295,6 @@ mod tests {
         assert!(matches!(err, ExtensionError::ManifestValidation(_)));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn manager_start_refuses_before_spawn_when_integrity_declared() {
         use crate::host_runtime::BackgroundServiceManager;
@@ -304,6 +303,9 @@ mod tests {
         let marker = dir.path().join("spawned");
         let script = dir.path().join("worker.sh");
         std::fs::write(&script, format!("#!/bin/sh\necho hi > {}\n", marker.display())).unwrap();
+        // Executable on unix so the "never spawned" assertion is meaningful there; on Windows the
+        // refusal (an error before any spawn attempt) is what is asserted.
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
