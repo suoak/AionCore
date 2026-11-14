@@ -14,6 +14,7 @@
 //!     {version-component}/     installed root (the retained handle is this very inode)
 //!     .wip-{nonce}/            staging for ONE attempt
 //!     .old-{nonce}/            superseded root awaiting deletion
+//!     .prev-{nonce}/           Windows only: the previous tree during a same-version replace
 //!     .current.tmp-{nonce}     temp file for the atomic `current` switch
 //! ```
 //!
@@ -56,10 +57,12 @@
 //!
 //! # Cleanup (deletes only what this attempt created or that is clearly superseded)
 //! FD-relative, `O_NOFOLLOW`, depth-bounded; never a path string, never the parent, never anything
-//! a symlink points to. [`sweep_abandoned_staging`] clears `.wip-*`, `.old-*` and stray
-//! `.current.tmp-*` left by a crashed attempt; call it at Host start before installing (it cannot
-//! tell a crashed attempt from a concurrent live one — the parent also serializes this process's
-//! own install/sweep/restore calls with an internal lock; other processes must not share it).
+//! a symlink points to. [`sweep_abandoned_staging`] clears `.wip-*`, `.old-*` (and on Windows
+//! `.prev-*`) and stray `.current.tmp-*` left by a crashed attempt — on Windows it first rolls an
+//! interrupted same-version replace back (see the Windows `imp` docs); call it at Host start
+//! before installing and before restore (it cannot tell a crashed attempt from a concurrent live
+//! one — the parent also serializes this process's own install/sweep/restore calls with an
+//! internal lock; other processes must not share it).
 //!
 //! # Not
 //! No route, network, exec, permission/HTTP/plan-safe change; not execution authorization or owner
@@ -124,6 +127,9 @@ impl HostExtensionsParent {
 pub struct StagingSweepReport {
     pub removed: usize,
     pub failed: usize,
+    /// Windows: interrupted same-version replaces put back (previous tree renamed into the
+    /// marker-named slot before restore re-verifies it). Always 0 on unix (atomic exchange).
+    pub rolled_back: usize,
 }
 
 /// Host choices for one install. Defaults are the safe customer path.
@@ -709,13 +715,20 @@ mod imp {
     //! `NtCreateFile` / `NtSetInformationFile` operations ([`super::super::host_fs_windows`]).
     //!
     //! Differences that matter:
-    //! * there is no atomic directory exchange, so a same-version replace is a **two-step rename**
-    //!   (`{version}` -> `.old-{nonce}`, then `.wip-{nonce}` -> `{version}`) with an undo;
-    //! * **crash window**: if the process dies between the two renames, `{version}` is missing
-    //!   while `current` still names it; the next start leaves that extension unbound
-    //!   (`VersionDirMissing`) and the startup sweep deletes the `.old-*` leftover, so the
-    //!   extension must be installed again. A first install or a version change has no such window
-    //!   (the new directory is placed with one no-replace rename before the marker switches);
+    //! * there is no atomic directory exchange (NTFS refuses to replace a *directory* by rename,
+    //!   POSIX semantics or not, and `ReplaceFileW` is files-only), so a same-version replace is a
+    //!   **two-step rename** (`{version}` -> `.prev-{nonce}`, then `.wip-{nonce}` -> `{version}`)
+    //!   with an undo;
+    //! * **crash recovery** (design §W.6): if the process dies between the two renames,
+    //!   `{version}` is missing while `current` still names it and the previous tree sits at
+    //!   `.prev-{nonce}`. The startup sweep runs before restore and, when the marker-named slot is
+    //!   absent and exactly one `.prev-*` directory exists, renames it back into the slot
+    //!   (handle-relative, no-replace) — then deletes the other leftovers. Restore re-verifies that
+    //!   tree exactly like any other (signature, identity, every covered file's SRI), so the
+    //!   rollback never grants trust by itself; anything ambiguous (no marker, a present slot, two
+    //!   `.prev-*`) is left to the old fail-closed path (`VersionDirMissing`, reinstall). A first
+    //!   install or a version change has no window (one no-replace rename before the marker
+    //!   switches);
     //! * directories cannot be fsynced through a handle on Windows; file contents are flushed.
 
     use std::fs::File;
@@ -732,6 +745,40 @@ mod imp {
         STAGING_PREFIX, SUPERSEDED_PREFIX, StagingSweepReport, UninstallOutcome, classify, encode_component, nonce,
     };
     use crate::signed_root_binding::SignedRootBindingStore;
+
+    /// The previous tree of an in-progress same-version replace (Windows two-step rename). Only
+    /// this step creates it, so after a crash it is the tree the unchanged `current` marker names.
+    const PREVIOUS_PREFIX: &str = ".prev-";
+
+    /// Put back the previous tree of a same-version replace interrupted between its two renames.
+    /// Only when the marker parses, names this directory, its slot is absent (no case alias
+    /// either), and there is exactly one `.prev-*` directory. Restore re-verifies the result.
+    fn roll_back_interrupted_replace(name_dir: &File, dir_name: &str, children: &[String]) -> bool {
+        let previous: Vec<&String> = children.iter().filter(|c| c.starts_with(PREVIOUS_PREFIX)).collect();
+        let [previous] = previous.as_slice() else {
+            return false;
+        };
+        if !matches!(kind_nofollow(name_dir, previous.as_str()), Ok(Some(Kind::Dir))) {
+            return false;
+        }
+        let Some(marker) = read_file_under(name_dir, MARKER_FILE, MAX_MARKER_BYTES)
+            .ok()
+            .and_then(|bytes| CurrentMarker::parse(&bytes))
+        else {
+            return false;
+        };
+        if encode_component(&marker.name).as_deref() != Some(dir_name)
+            || encode_component(&marker.version).as_deref() != Some(marker.component.as_str())
+        {
+            return false;
+        }
+        if !matches!(kind_nofollow(name_dir, &marker.component), Ok(None))
+            || super::has_case_alias(children, &marker.component)
+        {
+            return false;
+        }
+        rename_noreplace(name_dir, previous.as_str(), &marker.component).is_ok()
+    }
 
     /// Whether another entry of `dir` differs from `component` only by ASCII case. A Windows
     /// directory lookup is case-insensitive, so such an entry would be silently reused (a second
@@ -879,9 +926,10 @@ mod imp {
                 Placement::New
             }
             Ok(Some(Kind::Dir)) => {
-                // Two-step replace: old tree aside, new tree in; undo the first step on failure.
+                // Two-step replace: old tree aside, new tree in; undo the first step on failure. A
+                // crash in between is rolled back by the startup sweep (`.prev-*`).
                 let old_name = nonce()
-                    .map(|n| format!("{SUPERSEDED_PREFIX}{n}"))
+                    .map(|n| format!("{PREVIOUS_PREFIX}{n}"))
                     .ok_or_else(|| drop_staging(LocalPackageError::PlaceFailed))?;
                 rename_noreplace(name_dir, version_component, &old_name)
                     .map_err(|_| drop_staging(LocalPackageError::PlaceFailed))?;
@@ -999,9 +1047,14 @@ mod imp {
             let Ok(children) = list_dir(&name_dir) else {
                 continue;
             };
+            if roll_back_interrupted_replace(&name_dir, &name, &children) {
+                report.rolled_back += 1;
+            }
             let mut removed_here = 0;
             for child in children {
-                let is_dir_leftover = child.starts_with(STAGING_PREFIX) || child.starts_with(SUPERSEDED_PREFIX);
+                let is_dir_leftover = child.starts_with(STAGING_PREFIX)
+                    || child.starts_with(SUPERSEDED_PREFIX)
+                    || child.starts_with(PREVIOUS_PREFIX);
                 let is_tmp_marker = child.starts_with(MARKER_TMP_PREFIX);
                 let outcome = match kind_nofollow(&name_dir, &child) {
                     Ok(Some(Kind::Dir)) if is_dir_leftover => remove_tree_at(&name_dir, &child, 0),
@@ -1625,7 +1678,14 @@ mod tests {
         std::fs::create_dir_all(root.join("c/.wip-1")).unwrap();
 
         let report = sweep_abandoned_staging(&env.parent);
-        assert_eq!(report, StagingSweepReport { removed: 4, failed: 0 });
+        assert_eq!(
+            report,
+            StagingSweepReport {
+                removed: 4,
+                failed: 0,
+                rolled_back: 0
+            }
+        );
         assert!(!wip.exists() && !root.join("a/.old-cafe").exists() && !root.join("a/.current.tmp-1").exists());
         assert!(!root.join("c").exists());
         assert!(root.join("a/1.0.0/keep").exists() && root.join("a/current").exists());
@@ -1652,7 +1712,11 @@ mod tests {
         std::fs::create_dir_all(name_dir(&env).join(".wip-late")).unwrap();
         assert_eq!(
             sweep_abandoned_staging(&env.parent),
-            StagingSweepReport { removed: 1, failed: 0 }
+            StagingSweepReport {
+                removed: 1,
+                failed: 0,
+                rolled_back: 0
+            }
         );
         assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
     }
@@ -1932,27 +1996,96 @@ mod tests {
         assert!(host_component("ab!").is_none() && host_component("a!b").is_some());
     }
 
-    /// The documented Windows crash window of a same-version replace: between the two renames the
-    /// version directory is missing while `current` still names it. Restore must fail closed, the
-    /// sweep must clear the leftover, and a plain reinstall must recover.
+    /// The Windows crash window of a same-version replace: between the two renames the version
+    /// directory is missing while `current` still names it and the previous tree sits at
+    /// `.prev-*`. The startup sweep (which runs before restore) must put it back, delete the
+    /// abandoned new tree, and restore must then re-verify and bind it.
     #[cfg(windows)]
     #[test]
-    fn crash_between_the_two_renames_fails_closed_and_a_reinstall_recovers() {
+    fn crash_between_the_two_renames_is_rolled_back_by_the_startup_sweep() {
         let env = env();
         let p = pkg("1.0.0");
         install(&env, &p).unwrap();
-        // What a crash right after step one (version -> .old-*) leaves behind.
-        std::fs::rename(name_dir(&env).join("1.0.0"), name_dir(&env).join(".old-dead")).unwrap();
+        // What a crash right after step one (version -> .prev-*) leaves behind, plus the staged
+        // new tree that never got placed.
+        std::fs::rename(name_dir(&env).join("1.0.0"), name_dir(&env).join(".prev-dead")).unwrap();
+        std::fs::create_dir_all(name_dir(&env).join(".wip-beef/panels")).unwrap();
+        std::fs::write(name_dir(&env).join(".wip-beef/panels/board.html"), b"new").unwrap();
         env.store.clear();
-        assert_eq!(rejected_with(&env), vec![RestoreRejection::VersionDirMissing]);
         assert_eq!(
             sweep_abandoned_staging(&env.parent),
-            StagingSweepReport { removed: 1, failed: 0 }
+            StagingSweepReport {
+                removed: 1,
+                failed: 0,
+                rolled_back: 1
+            }
         );
-        assert_eq!(names(&name_dir(&env)), vec!["current"]);
-        assert_eq!(install(&env, &p).unwrap().kind, InstallKind::Reinstalled);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
         let (store, report) = restore(&env);
+        assert_eq!((report.restored, store.len()), (1, 1), "{:?}", report.rejected);
+        assert_eq!(store.lookup_checked("demo.plugin").unwrap().version(), "1.0.0");
+        // A later reinstall still works as a normal same-version replace.
+        assert_eq!(install(&env, &p).unwrap().kind, InstallKind::Reinstalled);
+        assert_eq!(names(&name_dir(&env)), vec!["1.0.0", "current"]);
+    }
+
+    /// The rollback grants nothing: a tampered previous tree is put back but restore still
+    /// re-verifies every covered file and refuses it; ambiguous states are not rolled back.
+    #[cfg(windows)]
+    #[test]
+    fn rollback_is_reverified_and_ambiguous_leftovers_fail_closed() {
+        // Tampered previous tree: rolled back, then refused by restore's SRI check.
+        let e1 = env();
+        let p = pkg("1.0.0");
+        install(&e1, &p).unwrap();
+        std::fs::rename(name_dir(&e1).join("1.0.0"), name_dir(&e1).join(".prev-dead")).unwrap();
+        std::fs::write(name_dir(&e1).join(".prev-dead/panels/board.css"), b"evil{}").unwrap();
+        e1.store.clear();
+        assert_eq!(sweep_abandoned_staging(&e1.parent).rolled_back, 1);
+        assert_eq!(rejected_with(&e1), vec![RestoreRejection::IntegrityMismatch]);
+
+        // Two `.prev-*` directories: which one is the marker's tree is unknown -> no rollback,
+        // both deleted, restore fails closed, a reinstall recovers.
+        let e2 = env();
+        install(&e2, &p).unwrap();
+        std::fs::rename(name_dir(&e2).join("1.0.0"), name_dir(&e2).join(".prev-a")).unwrap();
+        std::fs::create_dir(name_dir(&e2).join(".prev-b")).unwrap();
+        e2.store.clear();
+        assert_eq!(
+            sweep_abandoned_staging(&e2.parent),
+            StagingSweepReport {
+                removed: 2,
+                failed: 0,
+                rolled_back: 0
+            }
+        );
+        assert_eq!(names(&name_dir(&e2)), vec!["current"]);
+        assert_eq!(rejected_with(&e2), vec![RestoreRejection::VersionDirMissing]);
+        assert_eq!(install(&e2, &p).unwrap().kind, InstallKind::Reinstalled);
+        let (store, report) = restore(&e2);
         assert_eq!((report.restored, store.len()), (1, 1));
+
+        // The slot is present (crash after the second rename): the `.prev-*` is only deleted.
+        let e3 = env();
+        install(&e3, &p).unwrap();
+        std::fs::create_dir_all(name_dir(&e3).join(".prev-late/panels")).unwrap();
+        assert_eq!(
+            sweep_abandoned_staging(&e3.parent),
+            StagingSweepReport {
+                removed: 1,
+                failed: 0,
+                rolled_back: 0
+            }
+        );
+        assert_eq!(names(&name_dir(&e3)), vec!["1.0.0", "current"]);
+
+        // No valid marker: nothing to roll back into.
+        let e4 = env();
+        install(&e4, &p).unwrap();
+        std::fs::rename(name_dir(&e4).join("1.0.0"), name_dir(&e4).join(".prev-dead")).unwrap();
+        std::fs::write(name_dir(&e4).join("current"), b"not a marker").unwrap();
+        assert_eq!(sweep_abandoned_staging(&e4.parent).rolled_back, 0);
+        assert_eq!(names(&name_dir(&e4)), vec!["current"]);
     }
 
     #[test]

@@ -128,7 +128,8 @@ jobs:
                    sweep_removes_only_leftovers_and_never_follows_symlinks \
                    uninstall_handles_absent_symlinked_and_present_name_directories \
                    windows_refuses_identities_that_encode_to_device_names \
-                   crash_between_the_two_renames_fails_closed_and_a_reinstall_recovers \
+                   crash_between_the_two_renames_is_rolled_back_by_the_startup_sweep \
+                   rollback_is_reverified_and_ambiguous_leftovers_fail_closed \
                    windows_refuses_identities_that_differ_only_by_case \
                    case_alias_is_ascii_case_folding_of_a_different_entry \
                    short_name_aliases_are_refused_and_lookalikes_are_not \
