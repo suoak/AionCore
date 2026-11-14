@@ -18,7 +18,7 @@ pub(super) fn with_access_log(router: Router) -> Router {
 async fn access_log(request: Request, next: Next) -> Response {
     let started = Instant::now();
     let method = request.method().clone();
-    let path = request.uri().path().to_owned();
+    let path = redact_path(request.uri().path());
     let query_keys = query_keys(request.uri().query());
     let request_id = request
         .headers()
@@ -74,6 +74,24 @@ async fn access_log(request: Request, next: Next) -> Response {
     response
 }
 
+/// Path segment that replaces a credential carried in the URL path.
+const REDACTED_SEGMENT: &str = "[redacted]";
+
+/// The request path as logged: credentials carried **in the path** are replaced, like query values
+/// are omitted. Today that is the extension asset-session token
+/// (`/api/extensions/{name}/asset-session/{token}/...`), a bearer credential for that extension's
+/// assets; it must not end up in log files or bug reports.
+fn redact_path(path: &str) -> String {
+    let segments: Vec<&str> = path.split('/').collect();
+    // ["", "api", "extensions", name, "asset-session", token, ...]
+    if segments.len() > 5 && segments[1] == "api" && segments[2] == "extensions" && segments[4] == "asset-session" {
+        let mut out = segments.clone();
+        out[5] = REDACTED_SEGMENT;
+        return out.join("/");
+    }
+    path.to_owned()
+}
+
 fn query_keys(query: Option<&str>) -> String {
     query
         .into_iter()
@@ -90,6 +108,27 @@ fn query_keys(query: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asset_session_tokens_are_redacted_from_logged_paths() {
+        assert_eq!(
+            redact_path("/api/extensions/hello/asset-session/0123abcd/settings/index.html"),
+            "/api/extensions/hello/asset-session/[redacted]/settings/index.html"
+        );
+        assert_eq!(
+            redact_path("/api/extensions/hello/asset-session/0123abcd"),
+            "/api/extensions/hello/asset-session/[redacted]"
+        );
+        for unchanged in [
+            "/api/extensions/hello/assets/settings/index.html",
+            "/api/extensions/hello/asset-token",
+            "/api/extensions",
+            "/api/conversations/abc",
+            "/",
+        ] {
+            assert_eq!(redact_path(unchanged), unchanged);
+        }
+    }
 
     #[test]
     fn query_keys_omit_values() {
