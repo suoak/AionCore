@@ -45,9 +45,15 @@ impl From<ExtensionError> for ApiError {
             ExtensionError::InvalidWebuiRouteNamespace { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::ReservedWebuiRoute { .. } => ApiError::BadRequest(err.to_string()),
             ExtensionError::ThemeCssNotFound(path) => ApiError::NotFound(format!("Theme CSS not found: {path}")),
-            ExtensionError::ThemeCssUnverified(reason) => {
-                ApiError::Forbidden(format!("Theme CSS could not be verified: {reason}"))
-            }
+            ExtensionError::ThemeCssUnverified(reason) => match crate::reason_catalogue::find_code(reason) {
+                Some(code) => coded_refusal(
+                    StatusCode::FORBIDDEN,
+                    "FORBIDDEN",
+                    "Theme CSS could not be verified",
+                    code,
+                ),
+                None => ApiError::Forbidden(format!("Theme CSS could not be verified: {reason}")),
+            },
             ExtensionError::HookTimeout { .. } => ApiError::Internal(err.to_string()),
             ExtensionError::HookFailed { .. } => ApiError::Internal(err.to_string()),
             ExtensionError::HookNotFound(path) => ApiError::NotFound(format!("Hook script not found: {path}")),
@@ -786,17 +792,47 @@ async fn get_extension_asset_with_token(
     serve_extension_asset(&state, &user_id, &extension_name, &asset_path, "private, max-age=600").await
 }
 
+/// A refusal whose **public** message carries the fixed reason code and its catalogue hint
+/// (design §9 S16), e.g. `Extension asset refused: verified_asset_not_listed. This file is …`.
+/// Same error body as every other error (`success`, `error`, `code`; no `details`): a plain
+/// `ApiError::Forbidden` would collapse the message to the generic `Forbidden.`. The prefix and
+/// hint are fixed text and the code a fixed token, so no path, digest or name is exposed.
+fn coded_refusal(
+    status: StatusCode,
+    http_code: &'static str,
+    prefix: &'static str,
+    reason_code: &'static str,
+) -> ApiError {
+    let message = match crate::reason_catalogue::hint(reason_code) {
+        Some(hint) => format!("{prefix}: {reason_code}. {hint}"),
+        None => format!("{prefix}: {reason_code}."),
+    };
+    ApiError::coded(status, http_code, message, None)
+}
+
 fn asset_gate_refusal(err: AssetServeGateError) -> ApiError {
-    ApiError::Forbidden(format!(
-        "Extension asset refused: {} (declared entryPointIntegrity cannot be enforced by a path serve)",
-        err.reason()
-    ))
+    coded_refusal(
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "Extension asset refused",
+        err.reason(),
+    )
 }
 
 fn verified_asset_refusal(err: VerifiedAssetError) -> ApiError {
     match err {
-        VerifiedAssetError::Missing => ApiError::NotFound("Extension asset not found".into()),
-        other => ApiError::Forbidden(format!("Extension asset refused: {}", other.reason())),
+        VerifiedAssetError::Missing => coded_refusal(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Extension asset not found",
+            err.code(),
+        ),
+        other => coded_refusal(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Extension asset refused",
+            other.code(),
+        ),
     }
 }
 
@@ -1627,6 +1663,102 @@ mod tests {
             asset_status(&router, "/api/extensions/hello/assets/panels/board.html").await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    /// The UI maps refusals to translated hints by the fixed reason code (S16): every extension
+    /// asset refusal body must carry it (not the generic `Forbidden.`), in the usual error shape,
+    /// without paths, digests or the extension's file names.
+    fn assert_refusal_body(status: StatusCode, body: &str, want_status: StatusCode, want_code: &str) {
+        assert_eq!(status, want_status, "{body}");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let obj = json.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "error", "success"], "{body}");
+        assert_eq!(json["success"], false);
+        let expected_http = if want_status == StatusCode::NOT_FOUND {
+            "NOT_FOUND"
+        } else {
+            "FORBIDDEN"
+        };
+        assert_eq!(json["code"], expected_http);
+        let message = json["error"].as_str().unwrap();
+        assert_eq!(
+            crate::reason_catalogue::find_code(message),
+            Some(want_code),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(crate::reason_catalogue::hint(want_code).unwrap()),
+            "{message}"
+        );
+        for leak in ["sha512", "board", "panels", "/", "\\", "hello"] {
+            assert!(!message.contains(leak), "{message} leaks {leak:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_bodies_carry_the_fixed_reason_code_and_hint() {
+        // Verified serve: unlisted, tampered, missing (assets and asset-session routes).
+        let (router, state, _tmp, root) = verified_fixture().await;
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/unlisted.txt").await;
+        assert_refusal_body(status, &body, StatusCode::FORBIDDEN, "verified_asset_not_listed");
+        let (token, _) = state
+            .asset_tokens
+            .issue(&CurrentUser::local_default().id, "hello")
+            .unwrap();
+        let session = extension_asset_session_routes(state);
+        let base = format!("/api/extensions/hello/asset-session/{token}");
+        let (status, body, _) = asset_body(&session, &format!("{base}/settings/index.html")).await;
+        assert_refusal_body(status, &body, StatusCode::FORBIDDEN, "verified_asset_not_listed");
+        std::fs::write(root.path().join("panels/board.css"), "p{color:blue}").unwrap();
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/panels/board.css").await;
+        assert_refusal_body(
+            status,
+            &body,
+            StatusCode::FORBIDDEN,
+            "verified_asset_integrity_mismatch",
+        );
+        let (status, body, _) = asset_body(&session, &format!("{base}/panels/board.css")).await;
+        assert_refusal_body(
+            status,
+            &body,
+            StatusCode::FORBIDDEN,
+            "verified_asset_integrity_mismatch",
+        );
+        std::fs::remove_file(root.path().join("panels/board.html")).unwrap();
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/panels/board.html").await;
+        assert_refusal_body(status, &body, StatusCode::NOT_FOUND, "verified_asset_missing");
+
+        // Legacy path serve of a panel entry that declares entryPointIntegrity.
+        let (state, _tmp, ext_dir) = make_state_with_manifest(integrity_panel_manifest(true)).await;
+        write_panel_assets(&ext_dir);
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        let (status, body, _) = asset_body(&router, "/api/extensions/hello/assets/panels/board.html").await;
+        assert_refusal_body(
+            status,
+            &body,
+            StatusCode::FORBIDDEN,
+            "entry_point_integrity_declared_unchecked_serve",
+        );
+
+        // Theme CSS refusals map the same way.
+        for (reason, code) in [
+            (
+                VerifiedAssetError::IntegrityMismatch.reason(),
+                "verified_asset_integrity_mismatch",
+            ),
+            (
+                "theme CSS is not valid UTF-8 (theme_css_not_utf8)",
+                "theme_css_not_utf8",
+            ),
+        ] {
+            let response =
+                axum::response::IntoResponse::into_response(ApiError::from(ExtensionError::ThemeCssUnverified(reason)));
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_refusal_body(status, &String::from_utf8_lossy(&body), StatusCode::FORBIDDEN, code);
+        }
     }
 
     #[tokio::test]
