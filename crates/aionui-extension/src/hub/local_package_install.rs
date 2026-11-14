@@ -115,6 +115,39 @@ pub enum LocalPackageError {
     Unsupported,
 }
 
+impl LocalPackageError {
+    /// Stable catalogue code ([`crate::reason_catalogue`]); signature failures use the
+    /// signature's own code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Signature(e) => e.code(),
+            Self::InvalidPackage => "package_invalid",
+            Self::LimitExceeded => "package_limit_exceeded",
+            Self::UnsafeEntryName => "package_unsafe_entry_name",
+            Self::DuplicateEntry => "package_duplicate_entry",
+            Self::SymlinkOrSpecialEntry => "package_symlink_or_special_entry",
+            Self::EntryNotCoveredBySignature => "package_entry_not_covered_by_signature",
+            Self::CoveredFileMissing => "package_covered_file_missing",
+            Self::InvalidCoveredPath => "package_invalid_covered_path",
+            Self::ConflictingCoveredDigest => "package_conflicting_covered_digest",
+            Self::ManifestMismatch => "package_manifest_mismatch",
+            Self::IntegrityMismatch => "package_integrity_mismatch",
+            Self::InvalidDirName => "package_invalid_dir_name",
+            Self::CaseCollision => "package_case_collision",
+            Self::PlaceFailed => "package_place_failed",
+            Self::VersionSlotBlocked => "package_version_slot_blocked",
+            Self::DowngradeRefused => "package_downgrade_refused",
+            Self::MarkerWriteFailed => "package_marker_write_failed",
+            Self::ParentNotDirectory => "package_parent_not_directory",
+            Self::RemoveFailed => "package_remove_failed",
+            Self::RootCreateFailed => "package_root_create_failed",
+            Self::WriteFailed => "package_write_failed",
+            Self::Retain(_) => "package_retain_failed",
+            Self::Unsupported => "package_unsupported_platform",
+        }
+    }
+}
+
 /// Already-local inputs: the signed entry metadata, the raw manifest bytes it signs, and the
 /// package archive bytes. No path or URL: the Host must already hold these in memory.
 pub struct LocalPackageSource<'a> {

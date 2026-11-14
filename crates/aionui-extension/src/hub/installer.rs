@@ -143,7 +143,7 @@ impl HubInstaller {
         let manifest_path = ext_dir.join(EXTENSION_MANIFEST_FILE);
         let manifest_bytes = std::fs::read(&manifest_path).ok();
         if let Err(gate) = evaluate_install(&entry, manifest_bytes.as_deref()) {
-            let error = gate.to_string();
+            let error = format!("{gate} ({})", gate.code());
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -206,7 +206,7 @@ impl HubInstaller {
         let manifest_path = ext_dir.join(EXTENSION_MANIFEST_FILE);
         let manifest_bytes = std::fs::read(&manifest_path).ok();
         if let Err(gate) = evaluate_install(&entry, manifest_bytes.as_deref()) {
-            let error = gate.to_string();
+            let error = format!("{gate} ({})", gate.code());
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -241,7 +241,7 @@ impl HubInstaller {
                 Ok(Ok(UninstallOutcome::Removed)) => removed_signed = true,
                 Ok(Ok(UninstallOutcome::NotInstalled)) => {}
                 Ok(Err(err)) => {
-                    let error = format!("Failed to remove signed extension: {err:?}");
+                    let error = format!("Failed to remove signed extension: {}", err.code());
                     self.broadcast_state_changed(name, "failed", Some(error.clone()));
                     return HubResult::err(error);
                 }
@@ -290,7 +290,9 @@ impl HubInstaller {
         if !signed.is_builtin_name(name) && !signed.is_builtin_name(&entry.name) {
             return None;
         }
-        let error = format!("Extension '{name}' is built into CSBU WorkMate and is updated with the app");
+        let error = format!(
+            "Extension '{name}' is built into CSBU WorkMate and is updated with the app (name_reserved_by_builtin)"
+        );
         warn!(name, "hub: refused install/update of a built-in name");
         self.broadcast_state_changed(name, "failed", Some(error.clone()));
         Some(HubResult::err(error))
@@ -341,7 +343,7 @@ impl HubInstaller {
                 Some(HubResult::ok())
             }
             Err(err) => {
-                let error = format!("Signed package install failed: {err:?}");
+                let error = format!("Signed package install failed: {}", err.code());
                 warn!(name, "hub: signed package install refused");
                 self.broadcast_state_changed(name, "failed", Some(error.clone()));
                 Some(HubResult::err(error))

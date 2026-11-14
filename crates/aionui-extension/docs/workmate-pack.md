@@ -47,6 +47,11 @@ into CSBU WorkMate and is updated with the app"), and a copy found on disk that 
 not restored (`BuiltinPinMismatch`) and is replaced by the app's own copy at startup. Built-ins
 change only with an app update, and an app rollback rolls them back too. Pick another name.
 
+## Reason codes
+Every refusal (pack rules aside) is reported with a fixed reason code and a friendly hint; the full
+list, where each code appears and what authors can do about it is in
+[`extension-reason-codes.md`](extension-reason-codes.md).
+
 ## Windows hosts (required platform)
 Signed packages install on Windows with the same guarantees as on unix (handle-relative, never
 following links, signature and per-file SRI re-verified on every restart). What differs:

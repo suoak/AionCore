@@ -45,6 +45,28 @@ pub enum SignedManifestError {
     IdentityMismatch,
 }
 
+impl SignedManifestError {
+    /// Stable catalogue code ([`crate::reason_catalogue`]).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ManifestLimit => "signature_manifest_limit",
+            Self::MetadataLimit => "signature_metadata_limit",
+            Self::InvalidIdentity => "signature_invalid_identity",
+            Self::NotAllowlisted => "signature_not_allowlisted",
+            Self::MissingKeyId => "signature_missing_key_id",
+            Self::InvalidKeyId => "signature_invalid_key_id",
+            Self::UnknownKey => "signature_unknown_key",
+            Self::MissingIntegrity => "signature_missing_integrity",
+            Self::InvalidIntegrity => "signature_invalid_integrity",
+            Self::IntegrityMismatch => "signature_integrity_mismatch",
+            Self::MissingSignature => "signature_missing_signature",
+            Self::InvalidSignature => "signature_invalid_signature",
+            Self::InvalidManifest => "signature_invalid_manifest",
+            Self::IdentityMismatch => "signature_identity_mismatch",
+        }
+    }
+}
+
 /// Owned snapshot of exactly the checked bytes, not an execution/install permit.
 ///
 /// No unchecked constructor, Default, Deserialize or raw-data Debug formatter.
