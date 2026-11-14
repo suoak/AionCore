@@ -192,6 +192,66 @@ jobs:
           grep -E "builtin_follows_the_app_binary_on_update_and_on_rollback \.\.\. ok" app.log
           if grep -q "SKIPPED" app.log; then echo "::error::SKIPPED in the app wiring tests"; exit 1; fi
 
+  windows-builtin-diag:
+    # TEMP DIAGNOSTIC (draft PR, never merged): why does the real Host fail built-in placement?
+    name: Windows built-in diag
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-windows-diag
+      - name: Tools and the Manual Build release binary
+        run: |
+          mkdir -p diag && cd diag
+          gh run download 43569636887 -R suoak/AionCore -n aioncore-manual-windows-x64 -D rel
+          find rel -type f | head
+          for z in rel/*.zip; do [ -f "$z" ] && unzip -o -q "$z" -d rel; done
+          curl -fsSL -o Handle.zip https://download.sysinternals.com/files/Handle.zip && unzip -o -q Handle.zip
+          ls -la rel .
+      - name: Probe function
+        run: |
+          cat > diag/probe.sh <<'SH'
+          #!/usr/bin/env bash
+          # probe.sh <exe> <label> <port>
+          exe="$1"; label="$2"; port="$3"
+          d="$RUNNER_TEMP/probe-$label"; rm -rf "$d"; mkdir -p "$d/logs"
+          "$exe" --port "$port" --data-dir "$(cygpath -w "$d")" --log-level debug --log-dir "$(cygpath -w "$d/logs")" --local > "$d/stdout.txt" 2>&1 &
+          pid=$!
+          for i in $(seq 1 60); do grep -qE 'built-in (install refused|installed)|extension registry initialized' "$d/stdout.txt" 2>/dev/null && break; sleep 1; done
+          sleep 3
+          echo "===== [$label] built-in outcome"
+          grep -E 'built-in|placing|signed extensions' "$d/stdout.txt" | sed -E 's/\x1b\[[0-9;]*m//g' | cut -c1-300
+          echo "===== [$label] aioncore handles under the data dir"
+          ./diag/handle64.exe -accepteula -nobanner -a -p "$(basename "$exe")" 2>&1 | grep -iE "probe-$label|extensions-signed|workmate\.|\.wip-" | head -60
+          echo "===== [$label] tree"
+          find "$d/extensions-signed" -maxdepth 3 2>/dev/null | head -40
+          kill $pid 2>/dev/null; sleep 2
+          SH
+          chmod +x diag/probe.sh
+      - name: Probe A - Manual Build release aioncore.exe
+        run: diag/probe.sh "$(find diag/rel -name aioncore.exe | head -1)" rel 25901 || true
+      - name: Build debug and release (crt-static) binaries from this commit
+        run: |
+          cargo build -p aionui-app 2>&1 | tail -3
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p aionui-app --target x86_64-pc-windows-msvc 2>&1 | tail -3
+      - name: Probe B - debug aioncore.exe
+        run: diag/probe.sh target/debug/aioncore.exe dbg 25902 || true
+      - name: Probe C - release crt-static aioncore.exe from this commit
+        run: diag/probe.sh target/x86_64-pc-windows-msvc/release/aioncore.exe relc 25903 || true
+      - name: Probe D - production built-in test in release mode
+        run: |
+          cargo test --release -p aionui-app --lib -- host_signed_extensions::tests::production_builtins --nocapture --test-threads=1 2>&1 | grep -E 'test |result|panicked|PlaceFailed' | head -20 || true
+
   changes:
     name: Detect dependency changes
     runs-on: ubuntu-latest
