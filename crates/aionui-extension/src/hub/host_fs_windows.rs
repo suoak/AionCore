@@ -36,7 +36,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
 use windows_sys::Win32::Foundation::{
     ERROR_NO_MORE_FILES, HANDLE, NTSTATUS, OBJ_DONT_REPARSE, STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY,
     STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -522,7 +522,38 @@ pub(super) fn remove_tree_at(parent: &File, name: &str, depth: u32) -> io::Resul
 /// Rename the entry `from` to `to` inside `dir` (both single components). `replace` lets a
 /// regular file replace an existing regular file; without it an existing destination of any
 /// kind fails (`AlreadyExists`) and nothing changes. The source is never a link.
+///
+/// A rename refused with `STATUS_ACCESS_DENIED` / `STATUS_SHARING_VIOLATION` is retried for a
+/// bounded time ([`RENAME_RETRY_DELAYS_MS`]): NTFS refuses to rename a directory while any handle
+/// to an entry below it is open, and on-access scanners (Defender) and the search indexer open
+/// freshly written files for a moment right after the install closes them. The rename is atomic
+/// and no-replace semantics are re-checked by the kernel on every attempt, so a retry can only
+/// succeed or fail exactly as the first attempt would have without the transient opener.
 fn rename_in_dir(dir: &File, from: &str, to: &str, replace: bool) -> io::Result<()> {
+    let mut delays = RENAME_RETRY_DELAYS_MS.iter();
+    loop {
+        let status = rename_in_dir_once(dir, from, to, replace)?;
+        if status >= 0 {
+            return Ok(());
+        }
+        match delays.next() {
+            Some(ms) if is_transient_rename_status(status) => {
+                std::thread::sleep(std::time::Duration::from_millis(*ms));
+            }
+            _ => return Err(status_to_error(status)),
+        }
+    }
+}
+
+/// Back-off between rename attempts (about 3 s in total).
+const RENAME_RETRY_DELAYS_MS: [u64; 10] = [5, 10, 20, 40, 80, 160, 320, 500, 800, 1000];
+
+fn is_transient_rename_status(status: NTSTATUS) -> bool {
+    status == STATUS_ACCESS_DENIED || status == STATUS_SHARING_VIOLATION
+}
+
+/// One rename attempt: an error opening the source is returned as is, otherwise the raw status.
+fn rename_in_dir_once(dir: &File, from: &str, to: &str, replace: bool) -> io::Result<NTSTATUS> {
     let source = open_for_delete(dir, from, 0, true)?;
     let wide: Vec<u16> = to.encode_utf16().collect();
     let name_bytes = wide.len() * 2;
@@ -551,11 +582,7 @@ fn rename_in_dir(dir: &File, from: &str, to: &str, replace: bool) -> io::Result<
             FileRenameInformation,
         )
     };
-    if status < 0 {
-        Err(status_to_error(status))
-    } else {
-        Ok(())
-    }
+    Ok(status)
 }
 
 /// Rename `from` to `to` inside `dir`; an existing destination of any kind makes it fail.
@@ -584,6 +611,46 @@ pub(super) fn write_file_atomic(dir: &File, tmp_name: &str, final_name: &str, by
 mod tests {
     use super::*;
     use crate::hub::test_support::open_dir;
+
+    /// A handle held open below a staged directory (what an on-access scanner does for a moment
+    /// right after the install writes a file) must not make the placement rename fail.
+    #[test]
+    fn directory_rename_waits_out_a_transient_open_handle_below_it() {
+        let d = tempfile::tempdir().unwrap();
+        let parent = open_dir(d.path());
+        let staged = create_dir_exclusive(&parent, ".wip-test").unwrap();
+        create_file_exclusive(&staged, "panel.html", b"<p>hi</p>").unwrap();
+        drop(staged);
+        // The "scanner": an ordinary open of the freshly written file.
+        let scanner = std::fs::File::open(d.path().join(".wip-test").join("panel.html")).unwrap();
+
+        let first = rename_in_dir_once(&parent, ".wip-test", "1.0.0", false).unwrap();
+        eprintln!(
+            "first rename attempt with an open child handle: NTSTATUS {:#010x}",
+            first as u32
+        );
+        if first >= 0 {
+            // This volume allowed it outright; put it back so the retry path is exercised too.
+            rename_noreplace(&parent, "1.0.0", ".wip-test").unwrap();
+        } else {
+            assert!(is_transient_rename_status(first), "{:#010x}", first as u32);
+        }
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(scanner);
+        });
+        rename_noreplace(&parent, ".wip-test", "1.0.0").unwrap();
+        releaser.join().unwrap();
+        assert_eq!(read_file_under(&parent, "1.0.0/panel.html", 64).unwrap(), b"<p>hi</p>");
+        // No-replace is still enforced on the retried path.
+        let other = create_dir_exclusive(&parent, ".wip-two").unwrap();
+        drop(other);
+        assert_eq!(
+            rename_noreplace(&parent, ".wip-two", "1.0.0").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
 
     #[test]
     fn final_path_cross_check_refuses_a_short_name_alias() {
