@@ -921,8 +921,10 @@ mod imp {
         // --- place (the previous version, if any, is still live and untouched in the store) --
         let placement = match kind_nofollow(name_dir, version_component) {
             Ok(None) => {
-                rename_noreplace(name_dir, &wip, version_component)
-                    .map_err(|_| drop_staging(LocalPackageError::PlaceFailed))?;
+                rename_noreplace(name_dir, &wip, version_component).map_err(|error| {
+                    tracing::warn!(error = %error, "signed extensions: placing the staged version failed");
+                    drop_staging(LocalPackageError::PlaceFailed)
+                })?;
                 Placement::New
             }
             Ok(Some(Kind::Dir)) => {
@@ -933,7 +935,8 @@ mod imp {
                     .ok_or_else(|| drop_staging(LocalPackageError::PlaceFailed))?;
                 rename_noreplace(name_dir, version_component, &old_name)
                     .map_err(|_| drop_staging(LocalPackageError::PlaceFailed))?;
-                if rename_noreplace(name_dir, &wip, version_component).is_err() {
+                if let Err(error) = rename_noreplace(name_dir, &wip, version_component) {
+                    tracing::warn!(error = %error, "signed extensions: placing the staged version failed");
                     let _ = rename_noreplace(name_dir, &old_name, version_component);
                     return Err(drop_staging(LocalPackageError::PlaceFailed));
                 }
