@@ -188,21 +188,22 @@ fn nt_open(
     Ok(file)
 }
 
-/// Access of a Host-owned directory handle: list, add entries, delete/rename itself.
-const HOST_DIR_ACCESS: u32 = FILE_LIST_DIRECTORY
-    | FILE_ADD_FILE
-    | FILE_ADD_SUBDIRECTORY
-    | FILE_TRAVERSE
-    | FILE_READ_ATTRIBUTES
-    | DELETE
-    | SYNCHRONIZE;
+/// Access of a Host-owned directory handle: list and add entries.
+///
+/// Deliberately **without `DELETE`**: a rename into a directory makes the kernel open that target
+/// directory with `FILE_SHARE_READ | FILE_SHARE_WRITE` only, and on Windows 10 / 11 / Server 2022
+/// kernels that open fails with `STATUS_SHARING_VIOLATION` while any handle to the directory holds
+/// `DELETE`, so the built-in packs never placed on a fresh data dir (3.0.0 packaged acceptance;
+/// Server 2025 no longer checks it). Renames and deletes always open their own short-lived
+/// `DELETE` handle on the entry ([`open_for_delete`], [`remove_tree_at`]).
+const HOST_DIR_ACCESS: u32 =
+    FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
 /// Exclusively create the directory `name` below `parent` and return the handle of **that very
 /// creation** (the analogue of `mkdirat` + `openat`): `STATUS_OBJECT_NAME_COLLISION` when anything
-/// of that name exists, including a link. The handle carries `DELETE` so the Host can later
-/// rename or remove the directory through it; it is Host-internal and never used to write
-/// anything but verified bytes.
+/// of that name exists, including a link. The handle carries no `DELETE` (see
+/// [`HOST_DIR_ACCESS`]); it is Host-internal and never used to write anything but verified bytes.
 pub(super) fn create_dir_exclusive(parent: &File, name: &str) -> io::Result<File> {
     nt_open(
         parent,
@@ -611,6 +612,49 @@ pub(super) fn write_file_atomic(dir: &File, tmp_name: &str, final_name: &str, by
 mod tests {
     use super::*;
     use crate::hub::test_support::open_dir;
+
+    /// The open the kernel performs on a rename's target directory (Windows 10/11/Server 2022:
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE`, no `FILE_SHARE_DELETE`). Emulated so the regression is
+    /// caught on every Windows version, including Server 2025 where the kernel no longer does it.
+    fn open_like_rename_target(parent: &File, name: &str) -> io::Result<File> {
+        nt_open(
+            parent,
+            name,
+            FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            0,
+            // No attribute query on this probe handle (it has no FILE_READ_ATTRIBUTES, like the
+            // kernel's own open); only the share check matters.
+            false,
+        )
+    }
+
+    /// Packaged first-run flow (fresh data dir): the Host holds the parent, the name directory and
+    /// the staged root while it renames the staged root into place and then renames the marker.
+    /// None of those held handles may block the kernel's rename-target open.
+    #[test]
+    fn host_held_directory_handles_never_block_a_rename_into_them() {
+        let d = tempfile::tempdir().unwrap();
+        let parent = crate::hub::test_support::open_host_dir(d.path());
+        let name_dir = create_dir_exclusive(&parent, "workmate.pack").unwrap();
+        let staged = create_dir_exclusive(&name_dir, ".wip-1").unwrap();
+        create_file_exclusive(&staged, "aion-extension.json", b"{}").unwrap();
+        let reopened = open_or_create_dir(&parent, "workmate.pack").unwrap();
+        let existing = open_host_dir_existing(&parent, "workmate.pack").unwrap();
+
+        open_like_rename_target(&parent, "workmate.pack")
+            .expect("a Host-held handle on the name directory must not hold DELETE");
+        rename_noreplace(&name_dir, ".wip-1", "1.0.0").unwrap();
+        write_file_atomic(&name_dir, ".current.tmp-1", "current", b"marker").unwrap();
+        assert_eq!(
+            read_file_under(&parent, "workmate.pack/1.0.0/aion-extension.json", 8).unwrap(),
+            b"{}"
+        );
+        assert_eq!(read_file_under(&name_dir, "current", 8).unwrap(), b"marker");
+        drop((reopened, existing, staged));
+    }
 
     /// A handle held open below a staged directory (what an on-access scanner does for a moment
     /// right after the install writes a file) must not make the placement rename fail.

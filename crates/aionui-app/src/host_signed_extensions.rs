@@ -61,9 +61,11 @@ pub(crate) fn open_signed_extensions_parent(
     // FILE_FLAG_BACKUP_SEMANTICS (open a directory) | FILE_FLAG_OPEN_REPARSE_POINT (never traverse).
     const OPEN_FLAGS: u32 = 0x0200_0000 | 0x0020_0000;
     // FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE |
-    // FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE: what the handle-relative install code needs from
-    // its parent (the same mask `aionui-extension` gives the directories it creates itself).
-    const PARENT_ACCESS: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x1_0000 | 0x10_0000;
+    // FILE_READ_ATTRIBUTES | SYNCHRONIZE: what the handle-relative install code needs from its
+    // parent (the same mask `aionui-extension` gives the directories it creates itself). No
+    // `DELETE`: on Windows 10/11/Server 2022 a held `DELETE` handle on a directory makes every
+    // rename into it fail with STATUS_SHARING_VIOLATION.
+    const PARENT_ACCESS: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x10_0000;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     let refuse = |why: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
@@ -189,6 +191,23 @@ mod tests {
             false,
             HashMap::from([("fixture".into(), key.verifying_key())]),
         )
+    }
+
+    /// The Host-held signed-install parent must not block a rename into it: Windows 10/11/Server
+    /// 2022 open a rename's target directory sharing only read + write, which fails while any
+    /// handle to it holds `DELETE` (3.0.0 packaged first run: every built-in `PlaceFailed`).
+    #[cfg(windows)]
+    #[test]
+    fn signed_parent_handle_does_not_block_the_kernel_rename_target_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let _held = open_signed_extensions_parent(tmp.path()).unwrap();
+        std::fs::OpenOptions::new()
+            .access_mode(0x2 | 0x4 | 0x10_0000) // FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | SYNCHRONIZE
+            .share_mode(0x1 | 0x2) // FILE_SHARE_READ | FILE_SHARE_WRITE, as the kernel does
+            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS (open a directory)
+            .open(tmp.path().join(aionui_extension::SIGNED_EXTENSIONS_DIR_NAME))
+            .expect("the Host parent handle must not hold DELETE");
     }
 
     #[tokio::test]
