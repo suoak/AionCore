@@ -57,13 +57,14 @@ pub(crate) fn link_file(target: &Path, link: &Path) -> bool {
 }
 
 /// Open the Host-held *parent* directory handle the install code works relative to, with the same
-/// access mask the Host app gives it (list / add entries / traverse / delete / synchronize).
+/// access mask the Host app gives it (list / add entries / traverse / read attributes / synchronize;
+/// no `DELETE`, see `host_fs_windows::HOST_DIR_ACCESS`).
 pub(crate) fn open_host_dir(path: &Path) -> File {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
-            .access_mode(0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x1_0000 | 0x10_0000)
+            .access_mode(0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x10_0000)
             .custom_flags(0x0200_0000)
             .open(path)
             .unwrap()
