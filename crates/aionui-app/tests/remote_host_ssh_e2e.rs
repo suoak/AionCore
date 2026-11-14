@@ -271,10 +271,7 @@ struct HttpResponse {
 
 fn decode_chunked(mut raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(pos) = raw.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
+    while let Some(pos) = raw.windows(2).position(|w| w == b"\r\n") {
         let size_line = std::str::from_utf8(&raw[..pos]).unwrap_or("0");
         let size = usize::from_str_radix(size_line.split(';').next().unwrap().trim(), 16).unwrap_or(0);
         raw = &raw[pos + 2..];
