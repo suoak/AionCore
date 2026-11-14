@@ -10,7 +10,7 @@ The code is part of text the app already receives:
 
 | Situation | Where |
 |---|---|
-| Opening an extension page or file is refused | the error message of the `403` response (`Extension asset refused: …`, `Theme CSS could not be verified: …`) |
+| Opening an extension page or file is refused (`/assets/…`, `/asset-session/…`, panels, settings, theme CSS) | the `error` field of the JSON error body of the `403` (or `404` for a missing signed file) response, e.g. `{"success":false,"error":"Extension asset refused: verified_asset_not_listed. This file is not part of …","code":"FORBIDDEN"}`; the hint after the code is the English text below |
 | A background service does not start | the start error message (`background service start refused: <code> (…)`) |
 | An extension command / agent tool is invoked | the `reason` field of the invoke result |
 | Installing, updating or removing from the hub fails | the result `msg` (`Signed package install failed: <code>`, `… (<code>)`) |
