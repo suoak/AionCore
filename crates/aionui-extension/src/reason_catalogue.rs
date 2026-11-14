@@ -725,7 +725,10 @@ mod tests {
     #[test]
     fn author_doc_lists_the_catalogue() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(DOC);
-        let doc = std::fs::read_to_string(&path).expect("reason code doc");
+        // Normalize line endings: a Windows checkout may convert the doc to CRLF.
+        let doc = std::fs::read_to_string(&path)
+            .expect("reason code doc")
+            .replace("\r\n", "\n");
         let start = doc.find(BEGIN).expect("begin marker") + BEGIN.len();
         let end = doc.find(END).expect("end marker");
         let expected = format!("\n{}", render_markdown_tables());
