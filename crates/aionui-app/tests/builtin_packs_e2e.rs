@@ -17,7 +17,7 @@ use common::{body_json, get_with_token, setup_and_login};
 
 const ASSET_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
 img-src 'self' data:; font-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; \
-form-action 'none'";
+form-action 'none'; sandbox allow-scripts";
 
 fn repo_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

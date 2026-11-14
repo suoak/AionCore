@@ -28,9 +28,20 @@ fn allows_embedding(path: &str) -> bool {
 /// carry their own stricter `<meta http-equiv="Content-Security-Policy">`
 /// (the built-in samples) still block inline code, since browsers enforce every
 /// policy present (header ∩ meta).
+///
+/// `sandbox allow-scripts` (internal security review, finding F1): an extension
+/// page is served from the **same origin as the app** (WebUI) or as the backend
+/// API (desktop). Without a sandbox, its script could reach `parent` / a
+/// same-origin popup and call the API with the user's session, whatever the
+/// embedding iframe's `sandbox` attribute says (an iframe with
+/// `allow-scripts allow-same-origin`, or the page opened top-level, is not
+/// isolated). The header sandbox gives the document an opaque origin in every
+/// context: scripts run, but there is no same-origin DOM, storage or cookie
+/// access, no popups, no top navigation and no form submission. Same-URL
+/// subresources (`'self'`) still load, so packaged pages keep working.
 pub const EXTENSION_ASSET_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; \
 style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'none'; \
-object-src 'none'; base-uri 'none'; form-action 'none'";
+object-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts";
 
 /// Office preview proxies serve content loaded in same-origin iframes by
 /// the web UI; `DENY` here blanks the preview (iOfficeAI/AionUi#3177).
@@ -206,8 +217,21 @@ mod tests {
                 "object-src 'none'",
                 "base-uri 'none'",
                 "form-action 'none'",
+                "sandbox allow-scripts",
             ]
         );
+        // The sandbox must never grant a same-origin escape, popups, top navigation or forms.
+        let sandbox = directives.iter().find(|d| d.starts_with("sandbox")).unwrap();
+        for forbidden in [
+            "allow-same-origin",
+            "allow-popups",
+            "allow-top-navigation",
+            "allow-forms",
+            "allow-modals",
+            "allow-downloads",
+        ] {
+            assert!(!sandbox.contains(forbidden), "{forbidden}");
+        }
         assert!(HeaderValue::from_str(EXTENSION_ASSET_CSP).is_ok());
     }
 
