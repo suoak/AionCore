@@ -92,6 +92,7 @@ Generated from `src/reason_catalogue.rs` (checked by a test; regenerate with
 | Code | Hint |
 |---|---|
 | `integrity_binding_unavailable` | This extension command cannot run because its signed installation could not be verified. Reinstall the extension from the WorkMate hub. |
+| `agent_tool_not_plan_safe` | This tool can make changes, and extension tools that make changes cannot run in this version of CSBU WorkMate. |
 | `handler_integrity_checked` | The command's code was verified. Running extension code is not enabled in this version, so nothing was executed. |
 
 ### Installing, updating and removing extensions
@@ -139,6 +140,7 @@ Generated from `src/reason_catalogue.rs` (checked by a test; regenerate with
 | `package_case_collision` | Another installed extension or version has the same name apart from upper and lower case. Remove it first, then try again. |
 | `package_place_failed` | The extension could not be put in place. Nothing was changed; try again. |
 | `package_version_slot_blocked` | Something unexpected is in the way of this extension version. Remove the extension and install it again. |
+| `package_lifecycle_hooks_refused` | This extension asks to run setup programs, which signed extensions cannot do. Contact the extension's publisher. |
 | `package_downgrade_refused` | A newer version of this extension is already installed. Older versions are not installed automatically. |
 | `package_marker_write_failed` | The installation could not be completed. Nothing was changed; check free disk space and try again. |
 | `package_parent_not_directory` | The extensions folder of CSBU WorkMate is not usable. Restart the app; if it persists, contact support. |

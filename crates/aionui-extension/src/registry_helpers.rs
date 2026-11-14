@@ -139,7 +139,7 @@ pub(crate) async fn run_deactivation_hooks(extensions: &[LoadedExtension]) {
             continue;
         }
 
-        let Some(hooks) = &ext.manifest.lifecycle else {
+        let Some(hooks) = crate::lifecycle::runnable_lifecycle_hooks(&ext.manifest) else {
             continue;
         };
         let Some(hook_path) = resolve_hook_path(hooks, HookKind::OnDeactivate) else {

@@ -491,10 +491,13 @@ pub fn panel_hint_for_command<'a>(panels: &'a [ResolvedPanel], command: &Resolve
 }
 
 /// D13-2: plan mode may only auto-run tools that declared `planSafeActions: true`.
+/// Fixed reason code ([`crate::reason_catalogue`]) of a plan-mode refusal.
+pub const PLAN_MODE_REFUSED_REASON: &str = "agent_tool_not_plan_safe";
+
 pub fn gate_plan_safe(tool: &ResolvedAgentTool, plan_mode: bool) -> Result<(), ExtensionError> {
     if plan_mode && !tool.plan_safe_actions {
         return Err(ExtensionError::ManifestValidation(format!(
-            "agent tool '{}' refuses plan-mode invoke (planSafeActions=false)",
+            "agent tool '{}' refuses plan-mode invoke (planSafeActions=false) ({PLAN_MODE_REFUSED_REASON})",
             tool.id
         )));
     }
