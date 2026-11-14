@@ -140,6 +140,10 @@ Generated from `src/reason_catalogue.rs` (checked by a test; regenerate with
 | `package_case_collision` | Another installed extension or version has the same name apart from upper and lower case. Remove it first, then try again. |
 | `package_place_failed` | The extension could not be put in place. Nothing was changed; try again. |
 | `package_version_slot_blocked` | Something unexpected is in the way of this extension version. Remove the extension and install it again. |
+| `hub_package_not_found` | The extension's files were not found in the hub folder. Refresh the hub list and try again. |
+| `hub_verification_failed` | The extension's description file is invalid, so it was not installed. Contact the extension's publisher. |
+| `hub_not_installed` | This extension is not installed, so it cannot be updated. Install it first. |
+| `hub_remove_failed` | The extension could not be removed completely. Close anything that uses it and try again. |
 | `package_lifecycle_hooks_refused` | This extension asks to run setup programs, which signed extensions cannot do. Contact the extension's publisher. |
 | `package_downgrade_refused` | A newer version of this extension is already installed. Older versions are not installed automatically. |
 | `package_marker_write_failed` | The installation could not be completed. Nothing was changed; check free disk space and try again. |
