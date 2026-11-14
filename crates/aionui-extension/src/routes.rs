@@ -752,7 +752,8 @@ async fn get_extension_asset(
     Extension(user): Extension<CurrentUser>,
     Path((extension_name, asset_path)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    serve_extension_asset(&state, &user.id, &extension_name, &asset_path, "public, max-age=3600").await
+    // `private`: the route is authenticated per user, so a shared cache must not keep it.
+    serve_extension_asset(&state, &user.id, &extension_name, &asset_path, "private, max-age=3600").await
 }
 
 /// `POST /api/extensions/{extension_name}/asset-token` — issue a short-lived
@@ -2218,7 +2219,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "public, max-age=3600");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "private, max-age=3600");
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes, "<h1>Hello</h1>");
