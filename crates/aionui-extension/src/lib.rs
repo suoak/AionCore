@@ -40,6 +40,7 @@ pub mod state;
 pub mod template;
 pub mod theme_import;
 pub mod types;
+pub mod unsigned_code_policy;
 pub mod watcher;
 
 pub use capabilities::{
