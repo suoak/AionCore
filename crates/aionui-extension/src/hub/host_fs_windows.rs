@@ -625,7 +625,9 @@ mod tests {
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
             0,
-            true,
+            // No attribute query on this probe handle (it has no FILE_READ_ATTRIBUTES, like the
+            // kernel's own open); only the share check matters.
+            false,
         )
     }
 
