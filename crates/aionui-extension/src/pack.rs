@@ -624,30 +624,51 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn symlinks_and_special_files_are_refused() {
-        use std::os::unix::fs::symlink;
+    fn symlinks_and_directory_links_are_refused() {
+        use crate::hub::test_support::{link_dir, link_file, remove_link};
         let tmp = sample();
-        symlink("board.html", tmp.path().join("panels/alias.html")).unwrap();
+        // A directory link (junction on Windows) needs no privilege.
+        link_dir(&tmp.path().join("panels"), &tmp.path().join("dirlink"));
+        assert!(matches!(
+            pack_extension_dir(tmp.path(), &PackOptions::default()),
+            Err(PackError::SymlinkOrSpecial(_))
+        ));
+        remove_link(&tmp.path().join("dirlink"));
+        assert!(pack_extension_dir(tmp.path(), &PackOptions::default()).is_ok());
+        if !link_file(
+            &tmp.path().join("panels/board.html"),
+            &tmp.path().join("panels/alias.html"),
+        ) {
+            return;
+        }
         assert!(matches!(
             pack_extension_dir(tmp.path(), &PackOptions::default()),
             Err(PackError::SymlinkOrSpecial(p)) if p == "panels/alias.html"
         ));
-        std::fs::remove_file(tmp.path().join("panels/alias.html")).unwrap();
-        // Dangling and directory symlinks too.
-        symlink("nowhere", tmp.path().join("dangling")).unwrap();
+        remove_link(&tmp.path().join("panels/alias.html"));
+        // Dangling links too.
+        assert!(link_file(&tmp.path().join("nowhere"), &tmp.path().join("dangling")));
         assert!(matches!(
             pack_extension_dir(tmp.path(), &PackOptions::default()),
             Err(PackError::SymlinkOrSpecial(_))
         ));
-        std::fs::remove_file(tmp.path().join("dangling")).unwrap();
-        symlink("panels", tmp.path().join("dirlink")).unwrap();
+        remove_link(&tmp.path().join("dangling"));
+        // A symlinked manifest.
+        let real = tmp.path().join("real.json");
+        std::fs::rename(tmp.path().join(EXTENSION_MANIFEST_FILE), &real).unwrap();
+        assert!(link_file(&real, &tmp.path().join(EXTENSION_MANIFEST_FILE)));
         assert!(matches!(
             pack_extension_dir(tmp.path(), &PackOptions::default()),
             Err(PackError::SymlinkOrSpecial(_))
         ));
-        std::fs::remove_file(tmp.path().join("dirlink")).unwrap();
+    }
+
+    /// Unix only: FIFOs (`mkfifo`) do not exist as directory entries on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn fifos_are_refused_without_being_opened() {
+        let tmp = sample();
         // FIFO: refused without being opened (would block).
         let fifo = std::ffi::CString::new(tmp.path().join("pipe").to_str().unwrap()).unwrap();
         // SAFETY: valid NUL-terminated path.
@@ -657,14 +678,7 @@ mod tests {
             Err(PackError::SymlinkOrSpecial(p)) if p == "pipe"
         ));
         std::fs::remove_file(tmp.path().join("pipe")).unwrap();
-        // Manifest symlink / FIFO.
-        let real = tmp.path().join("real.json");
-        std::fs::rename(tmp.path().join(EXTENSION_MANIFEST_FILE), &real).unwrap();
-        symlink("real.json", tmp.path().join(EXTENSION_MANIFEST_FILE)).unwrap();
-        assert!(matches!(
-            pack_extension_dir(tmp.path(), &PackOptions::default()),
-            Err(PackError::SymlinkOrSpecial(_))
-        ));
+        // Manifest FIFO.
         std::fs::remove_file(tmp.path().join(EXTENSION_MANIFEST_FILE)).unwrap();
         let fifo = std::ffi::CString::new(tmp.path().join(EXTENSION_MANIFEST_FILE).to_str().unwrap()).unwrap();
         // SAFETY: as above.
@@ -675,6 +689,8 @@ mod tests {
         ));
     }
 
+    /// Unix only: these names (a `\` inside a name, control characters, non-UTF-8 bytes) cannot
+    /// be created on Windows at all, so there is nothing to pack there.
     #[cfg(unix)]
     #[test]
     fn non_canonical_names_are_refused() {
@@ -699,6 +715,8 @@ mod tests {
         ));
     }
 
+    /// Unix only by nature: it creates the very names Windows cannot hold, to prove a pack built
+    /// on macOS / Linux refuses them (the Windows install/reader refusal is tested on Windows).
     #[cfg(unix)]
     #[test]
     fn names_that_cannot_exist_on_windows_are_refused_at_pack_time() {

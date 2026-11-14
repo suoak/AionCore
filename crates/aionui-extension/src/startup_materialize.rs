@@ -442,12 +442,10 @@ mod materialize_lock_tests {
     /// must give up inside its budget with a classifiable timeout instead of
     /// blocking until the parent process kills us.
     ///
-    /// Unix-only: this relies on `flock` locks being owned by the open file
-    /// description, so two `open()`s in the same process genuinely contend
-    /// (verified by fs2's own tests, fs2-0.4.3/src/unix.rs `lock_replace`).
-    /// The equivalent Windows guarantee is not verified here, so the test is
-    /// gated rather than left to pass vacuously.
-    #[cfg(unix)]
+    /// Two opens in the same process genuinely contend on both platforms: on
+    /// unix `flock` locks are owned by the open file description (fs2-0.4.3
+    /// src/unix.rs `lock_replace`), on Windows `LockFileEx` locks are owned by
+    /// the handle. Runs on both so neither passes vacuously.
     #[tokio::test]
     async fn acquire_within_times_out_while_a_peer_holds_the_lock() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -488,7 +486,6 @@ mod materialize_lock_tests {
 
     /// The budget is a ceiling, not a fixed wait: once the peer releases, the
     /// poll loop must pick the lock up rather than run out the clock.
-    #[cfg(unix)]
     #[tokio::test]
     async fn acquire_within_succeeds_once_the_peer_releases() {
         let dir = tempfile::tempdir().expect("tempdir");

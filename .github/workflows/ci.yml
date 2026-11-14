@@ -153,7 +153,20 @@ jobs:
                    marked_version_dir_is_loaded_and_unmarked_or_inconsistent_layouts_are_not \
                    verified_serve_refuses_tampered_symlinked_and_missing_listed_files_without_path_fallback \
                    bound_files_i18n_route_omits_extension_when_root_file_is_tampered \
-                   bound_files_get_themes_omits_theme_when_css_is_unverified; do
+                   bound_files_get_themes_omits_theme_when_css_is_unverified \
+                   signed_package_installs_binds_loads_and_survives_restart_and_upgrade \
+                   uninstall_removes_marker_binding_and_tree_and_the_registry_entry \
+                   installed_signed_extension_is_served_verified_from_its_retained_root \
+                   startup_sweeps_abandoned_staging \
+                   canonical_check_catches_symlink_alias_of_declared_entry \
+                   asset_route_refuses_symlink_alias_of_declared_entry \
+                   manager_start_refuses_before_spawn_when_integrity_declared \
+                   exited_services_are_reaped_only_for_the_requested_user \
+                   resolve_service_script_rejects_symlink_escape \
+                   acquire_within_times_out_while_a_peer_holds_the_lock \
+                   acquire_within_succeeds_once_the_peer_releases \
+                   symlinks_and_directory_links_are_refused \
+                   cli_refuses_outputs_inside_source_symlink_outputs_bad_sources_and_misuse; do
             grep -E "$t \.\.\. ok" full.log
           done
           if grep -q "SKIPPED" full.log; then echo "::error::SKIPPED in the full suite"; exit 1; fi
