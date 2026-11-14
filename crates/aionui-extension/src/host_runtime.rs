@@ -204,6 +204,15 @@ impl BackgroundServiceManager {
             return Err(crate::bound_background_start::BoundBackgroundStartError::RuntimeRequiresSignedFiles.into());
         }
 
+        // F4: release builds never path-spawn an unsigned extension's service unless the admin
+        // opted in (`WORKMATE_ALLOW_UNSIGNED_EXTENSION_CODE=1`). A bound snapshot with `files` was
+        // handled above and never reaches this legacy path.
+        if signed.is_none() {
+            crate::unsigned_code_policy::gate_unsigned_service_start(
+                crate::unsigned_code_policy::unsigned_code_allowed(),
+            )?;
+        }
+
         // Legacy path only: `permissions.shell` gates path spawns and has no role for `workmate-js`.
         let perms = ext.manifest.permissions.clone().unwrap_or_default();
         ensure_shell_permission(&perms)?;

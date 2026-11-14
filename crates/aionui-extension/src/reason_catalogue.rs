@@ -207,6 +207,11 @@ pub const CATALOGUE: &[ReasonHint] = &[
         BackgroundService,
         "This service is verified, but running extension services is not enabled in this version of CSBU WorkMate.",
     ),
+    r(
+        "unsigned_extension_code_disabled",
+        BackgroundService,
+        "This extension is not signed, so CSBU WorkMate does not run its background services or setup scripts. Install a signed version from the WorkMate hub, or ask your administrator.",
+    ),
     // ---- agent tools / commands --------------------------------------------------------------
     r(
         "integrity_binding_unavailable",
@@ -660,6 +665,7 @@ mod tests {
         out.insert("handler_integrity_checked");
         out.insert("theme_css_invalid_path");
         out.insert("theme_css_not_utf8");
+        out.insert(crate::unsigned_code_policy::UNSIGNED_CODE_DISABLED);
         out
     }
 

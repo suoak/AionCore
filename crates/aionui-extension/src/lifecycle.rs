@@ -71,13 +71,35 @@ fn is_contained_hook_path(path: &str) -> bool {
 /// retained root and verified bytes, and a bound spawn of shell / native code is permanently refused
 /// (E13 design §3; internal security review F2). Signed installs already refuse manifests that
 /// declare hooks (`package_lifecycle_hooks_refused`); this is the runtime backstop.
+///
+/// Unsigned extensions' hooks additionally run only where
+/// [`crate::unsigned_code_policy::unsigned_code_allowed`] (debug builds, or a release build whose
+/// administrator opted in; internal security review F4).
 pub fn runnable_lifecycle_hooks(manifest: &crate::types::ExtensionManifest) -> Option<&LifecycleHooks> {
+    runnable_lifecycle_hooks_with(manifest, crate::unsigned_code_policy::unsigned_code_allowed())
+}
+
+fn runnable_lifecycle_hooks_with(
+    manifest: &crate::types::ExtensionManifest,
+    unsigned_code_allowed: bool,
+) -> Option<&LifecycleHooks> {
     let hooks = manifest.lifecycle.as_ref()?;
     if !manifest.files.is_empty() {
         tracing::warn!(
             extension = %manifest.name,
             "lifecycle hooks of a signed-layout extension are never run"
         );
+        return None;
+    }
+    if !unsigned_code_allowed {
+        if declares_any_hook(hooks) {
+            tracing::warn!(
+                extension = %manifest.name,
+                reason = crate::unsigned_code_policy::UNSIGNED_CODE_DISABLED,
+                "lifecycle hooks of an unsigned extension are not run in release builds (set {}=1 to allow)",
+                crate::unsigned_code_policy::ALLOW_UNSIGNED_CODE_ENV
+            );
+        }
         return None;
     }
     Some(hooks)
@@ -356,14 +378,33 @@ mod tests {
             "lifecycle": {"on_activate": "scripts/activate.sh"}
         }))
         .unwrap();
-        assert!(runnable_lifecycle_hooks(&manifest).is_some());
+        assert!(runnable_lifecycle_hooks_with(&manifest, true).is_some());
         manifest.files = vec![
             serde_json::from_value(serde_json::json!({"path": "scripts/activate.sh", "integrity": "sha512-x"}))
                 .unwrap(),
         ];
-        assert!(runnable_lifecycle_hooks(&manifest).is_none());
+        assert!(runnable_lifecycle_hooks_with(&manifest, true).is_none());
         assert!(declares_any_hook(manifest.lifecycle.as_ref().unwrap()));
         assert!(!declares_any_hook(&LifecycleHooks::default()));
+    }
+
+    /// F4: an unsigned extension still loads, but its hooks are not runnable where the release
+    /// policy forbids unsigned code; the admin opt-in (or a debug build) restores them.
+    #[test]
+    fn unsigned_hooks_follow_the_release_policy() {
+        let manifest: crate::types::ExtensionManifest = serde_json::from_value(serde_json::json!({
+            "name": "demo",
+            "version": "1.0.0",
+            "lifecycle": {"on_install": "scripts/install.sh", "on_activate": "scripts/activate.sh"}
+        }))
+        .unwrap();
+        assert!(runnable_lifecycle_hooks_with(&manifest, false).is_none());
+        assert!(runnable_lifecycle_hooks_with(&manifest, true).is_some());
+        // The production entry point follows the build: debug test builds allow.
+        assert_eq!(
+            runnable_lifecycle_hooks(&manifest).is_some(),
+            crate::unsigned_code_policy::unsigned_code_allowed()
+        );
     }
 
     #[test]
