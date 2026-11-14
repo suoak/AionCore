@@ -166,7 +166,9 @@ jobs:
                    acquire_within_times_out_while_a_peer_holds_the_lock \
                    acquire_within_succeeds_once_the_peer_releases \
                    symlinks_and_directory_links_are_refused \
-                   cli_refuses_outputs_inside_source_symlink_outputs_bad_sources_and_misuse; do
+                   cli_refuses_outputs_inside_source_symlink_outputs_bad_sources_and_misuse \
+                   catalogue_covers_exactly_the_codes_the_host_emits \
+                   author_doc_lists_the_catalogue; do
             grep -E "$t \.\.\. ok" full.log
           done
           if grep -q "SKIPPED" full.log; then echo "::error::SKIPPED in the full suite"; exit 1; fi
