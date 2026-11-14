@@ -158,8 +158,36 @@ async fn hm3_install_no_directory() {
 
     let result = h.installer.install("remote-ext").await;
     assert!(!result.success);
-    assert!(result.msg.is_some());
-    assert!(result.msg.unwrap().contains("not found"));
+    let msg = result.msg.unwrap();
+    assert!(msg.contains("not found"));
+    // F9: fixed text + reason code, never the local hub path.
+    assert_eq!(msg, "Extension package not found (hub_package_not_found)");
+    assert!(!msg.contains(&*h.hub_dir.path().to_string_lossy()));
+}
+
+#[tokio::test]
+async fn hub_failure_messages_carry_codes_not_paths() {
+    let h = setup();
+    write_hub_index(
+        h.hub_dir.path(),
+        &[json!({"name": "broken-ext", "version": "1.0.0", "curated": true})],
+    );
+    // Invalid manifest => install verification fails.
+    let dir = h.hub_dir.path().join("broken-ext");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aion-extension.json"), b"{\"name\": 1}").unwrap();
+    let msg = h.installer.install("broken-ext").await.msg.unwrap();
+    let hub = h.hub_dir.path().to_string_lossy().into_owned();
+    assert!(!msg.contains(&hub), "{msg}");
+    assert!(msg.ends_with(")"), "{msg}");
+    assert!(
+        msg.contains("(hub_verification_failed)") || msg.contains("(curated_"),
+        "{msg}"
+    );
+    // Update of something that is not installed.
+    std::fs::remove_dir_all(&dir).unwrap();
+    let msg = h.installer.update("broken-ext").await.msg.unwrap();
+    assert_eq!(msg, "Extension not installed (hub_not_installed)");
 }
 
 // ---------------------------------------------------------------------------

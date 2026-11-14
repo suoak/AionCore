@@ -127,10 +127,8 @@ impl HubInstaller {
         // For now, the extension directory must already exist (no remote download).
         // Future: download from entry.download_url and extract.
         if !ext_dir.exists() {
-            let error = format!(
-                "Extension directory not found: {}. Remote download not yet implemented.",
-                ext_dir.display()
-            );
+            warn!(name, dir = %ext_dir.display(), "hub: extension directory not found");
+            let error = hub_message("Extension package not found", HUB_PACKAGE_NOT_FOUND);
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -149,7 +147,8 @@ impl HubInstaller {
         }
 
         if let Err(e) = self.verify_installation(&ext_dir) {
-            let error = format!("Installation verification failed: {e}");
+            warn!(name, error = %e, "hub: installation verification failed");
+            let error = hub_message("Installation verification failed", HUB_VERIFICATION_FAILED);
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -197,7 +196,8 @@ impl HubInstaller {
         let ext_dir = target_dir.join(&entry.name);
 
         if !ext_dir.exists() {
-            let error = format!("Extension not installed: {}", ext_dir.display());
+            warn!(name, dir = %ext_dir.display(), "hub: update target not installed");
+            let error = hub_message("Extension not installed", HUB_NOT_INSTALLED);
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -212,7 +212,8 @@ impl HubInstaller {
         }
 
         if let Err(e) = self.verify_installation(&ext_dir) {
-            let error = format!("Update verification failed: {e}");
+            warn!(name, error = %e, "hub: update verification failed");
+            let error = hub_message("Update verification failed", HUB_VERIFICATION_FAILED);
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -270,7 +271,7 @@ impl HubInstaller {
                 error = %e,
                 "hub: failed to remove extension directory"
             );
-            let error = format!("Failed to remove extension directory: {e}");
+            let error = hub_message("Failed to remove extension directory", HUB_REMOVE_FAILED);
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }
@@ -437,6 +438,18 @@ impl HubInstaller {
 // ---------------------------------------------------------------------------
 
 /// Validate an extension name to prevent path traversal attacks.
+/// Fixed reason codes ([`crate::reason_catalogue`]) of the legacy hub-directory flow. The public
+/// `HubResult.msg` carries `<fixed text> (<code>)` only, never a local path or an OS error text
+/// (internal security review F9); the detail goes to the Host log.
+pub(crate) const HUB_PACKAGE_NOT_FOUND: &str = "hub_package_not_found";
+pub(crate) const HUB_VERIFICATION_FAILED: &str = "hub_verification_failed";
+pub(crate) const HUB_NOT_INSTALLED: &str = "hub_not_installed";
+pub(crate) const HUB_REMOVE_FAILED: &str = "hub_remove_failed";
+
+fn hub_message(text: &str, code: &str) -> String {
+    format!("{text} ({code})")
+}
+
 fn validate_hub_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(format!("Invalid extension name: '{name}'"));

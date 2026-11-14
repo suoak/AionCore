@@ -430,6 +430,26 @@ pub const CATALOGUE: &[ReasonHint] = &[
         "Something unexpected is in the way of this extension version. Remove the extension and install it again.",
     ),
     r(
+        "hub_package_not_found",
+        HubInstall,
+        "The extension's files were not found in the hub folder. Refresh the hub list and try again.",
+    ),
+    r(
+        "hub_verification_failed",
+        HubInstall,
+        "The extension's description file is invalid, so it was not installed. Contact the extension's publisher.",
+    ),
+    r(
+        "hub_not_installed",
+        HubInstall,
+        "This extension is not installed, so it cannot be updated. Install it first.",
+    ),
+    r(
+        "hub_remove_failed",
+        HubInstall,
+        "The extension could not be removed completely. Close anything that uses it and try again.",
+    ),
+    r(
         "package_lifecycle_hooks_refused",
         HubInstall,
         "This extension asks to run setup programs, which signed extensions cannot do. Contact the extension's publisher.",
@@ -628,6 +648,14 @@ mod tests {
         }
         out.insert(crate::host_runtime::INTEGRITY_BINDING_UNAVAILABLE_REASON);
         out.insert(crate::host_runtime::PLAN_MODE_REFUSED_REASON);
+        for code in [
+            crate::hub::installer::HUB_PACKAGE_NOT_FOUND,
+            crate::hub::installer::HUB_VERIFICATION_FAILED,
+            crate::hub::installer::HUB_NOT_INSTALLED,
+            crate::hub::installer::HUB_REMOVE_FAILED,
+        ] {
+            out.insert(code);
+        }
         // aionui-app `CheckedAgentToolPrepare::ACK_REASON` (the app crate is not a dependency).
         out.insert("handler_integrity_checked");
         out.insert("theme_css_invalid_path");
