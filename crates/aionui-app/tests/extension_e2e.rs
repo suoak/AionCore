@@ -911,7 +911,7 @@ async fn extension_enablement_and_contributions_are_isolated_by_user() {
         asset_b.headers().get("content-security-policy").unwrap(),
         "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
 img-src 'self' data:; font-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; \
-form-action 'none'"
+form-action 'none'; sandbox allow-scripts"
     );
     assert!(asset_b.headers().get("x-frame-options").is_none());
 
