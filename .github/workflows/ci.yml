@@ -194,8 +194,12 @@ jobs:
 
   windows-builtin-diag:
     # TEMP DIAGNOSTIC (draft PR, never merged): why does the real Host fail built-in placement?
-    name: Windows built-in diag
-    runs-on: windows-latest
+    name: Windows built-in diag (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
       run:
@@ -240,17 +244,6 @@ jobs:
           chmod +x diag/probe.sh
       - name: Probe A - Manual Build release aioncore.exe
         run: diag/probe.sh "$(find diag/rel -name aioncore.exe | head -1)" rel 25901 || true
-      - name: Build debug and release (crt-static) binaries from this commit
-        run: |
-          cargo build -p aionui-app 2>&1 | tail -3
-          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p aionui-app --target x86_64-pc-windows-msvc 2>&1 | tail -3
-      - name: Probe B - debug aioncore.exe
-        run: diag/probe.sh target/debug/aioncore.exe dbg 25902 || true
-      - name: Probe C - release crt-static aioncore.exe from this commit
-        run: diag/probe.sh target/x86_64-pc-windows-msvc/release/aioncore.exe relc 25903 || true
-      - name: Probe D - production built-in test in release mode
-        run: |
-          cargo test --release -p aionui-app --lib -- host_signed_extensions::tests::production_builtins --nocapture --test-threads=1 2>&1 | grep -E 'test |result|panicked|PlaceFailed' | head -20 || true
 
   changes:
     name: Detect dependency changes
