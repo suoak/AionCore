@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.1](https://github.com/suoak/AionCore/compare/v0.5.0...v0.5.1) (2026-11-18)
+
+### Behavior Changes
+
+* **acp:** third-party registry agents run newer pinned versions (upstream #989–#1030): codebuddy 2.164.0, dimcode 0.5.18, dirac 0.5.20, glm-acp-agent 1.15.0, grok 1.0.58, kilo 7.8.8, pi-acp 0.0.34, sigit 1.6.8. nova stays at 1.1.37 (later releases are no longer MIT). Verified direct-CLI versions: claude 2.1.287, agy 1.3.5. ([#308](https://github.com/suoak/AionCore/issues/308))
+
+### Features
+
+* **conversation:** seed imported transcripts into an empty journal ([#306](https://github.com/suoak/AionCore/issues/306)) ([f478efd](https://github.com/suoak/AionCore/commit/f478efd814c2232582438437b2c5d857df7d8dfe))
+
 ## [0.5.0](https://github.com/suoak/AionCore/compare/v0.4.0...v0.5.0) (2026-11-18)
 
 ### Behavior Changes
