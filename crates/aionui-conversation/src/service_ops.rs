@@ -14,10 +14,10 @@ use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
     CanonicalReplayProjectionResponse, CapabilitiesChangedEvent, ConfigOptionConfirmation, GetConfigOptionsResponse,
     HostPolicyResponse, InputChangedEvent, JournalTranscriptResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND,
-    RawTrajectoryProjectionV1, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse,
-    SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, SubmitConversationInputRequest,
-    ToolEnforcementLevel, TrajectoryProjectionV1, TrajectoryQuery, TrajectoryRecordV1, WorkspaceBrowseQuery,
-    WorkspaceEntry,
+    RawTrajectoryProjectionV1, RetainedOutputResponse, SeedJournalRequest, SeedJournalResponse, SetConfigOptionRequest,
+    SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    SubmitConversationInputRequest, ToolEnforcementLevel, TrajectoryProjectionV1, TrajectoryQuery, TrajectoryRecordV1,
+    WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_api_types::{
     ConversationCapabilities, ConversationInputMode, ConversationInputReceipt, ConversationInputResponse,
@@ -220,6 +220,87 @@ impl ConversationService {
             model_surface_reconstructible,
             approval_policy: transcript.approval_policy.to_owned(),
             compaction_keep_n: transcript.compaction_keep_n as u32,
+        })
+    }
+
+    /// Seed a parsed external transcript into an empty conversation journal.
+    ///
+    /// Refuses if the journal already has events. Items are written as
+    /// `UserPrompt` / `Text` / completed `ToolCall` events with string content
+    /// only — never as a Host `File` constructed from a path string.
+    pub async fn seed_imported_journal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request: SeedJournalRequest,
+    ) -> Result<SeedJournalResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let prepared = crate::journal_seed::prepare_seed_events(conversation_id, &request)?;
+        let journal = self.canonical_event_journal();
+        let existing = journal
+            .replay(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay canonical events: {error}")))?;
+        if !existing.is_empty() {
+            return Err(ConversationError::Busy {
+                reason: "journal is not empty".to_owned(),
+            });
+        }
+
+        let source = request.source.as_deref().unwrap_or("unknown");
+        tracing::info!(
+            user_id,
+            conversation_id,
+            source,
+            item_count = prepared.len(),
+            "seeding imported transcript into empty journal"
+        );
+
+        for event in &prepared {
+            match event {
+                crate::journal_seed::PreparedSeedEvent::UserPrompt { msg_id, content } => {
+                    journal
+                        .append_user_prompt(user_id, conversation_id, msg_id, content)
+                        .await
+                        .map_err(|error| ConversationError::internal(format!("Failed to seed user prompt: {error}")))?;
+                }
+                crate::journal_seed::PreparedSeedEvent::AssistantText { event_id, payload } => {
+                    journal
+                        .append(
+                            user_id,
+                            conversation_id,
+                            event_id.clone(),
+                            "Text".to_owned(),
+                            payload.clone(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            ConversationError::internal(format!("Failed to seed assistant text: {error}"))
+                        })?;
+                }
+                crate::journal_seed::PreparedSeedEvent::ToolCall { event_id, payload } => {
+                    journal
+                        .append(
+                            user_id,
+                            conversation_id,
+                            event_id.clone(),
+                            "ToolCall".to_owned(),
+                            payload.clone(),
+                        )
+                        .await
+                        .map_err(|error| ConversationError::internal(format!("Failed to seed tool call: {error}")))?;
+                }
+            }
+        }
+
+        let transcript = self
+            .derive_event_transcript(user_id, conversation_id, Some("model"))
+            .await?;
+        Ok(SeedJournalResponse {
+            conversation_id: conversation_id.to_owned(),
+            event_count: prepared.len() as u64,
+            model_visible_count: transcript.model_visible_count,
+            journal_sha256: transcript.journal_sha256,
         })
     }
 

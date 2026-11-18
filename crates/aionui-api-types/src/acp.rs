@@ -211,6 +211,39 @@ pub struct JournalTranscriptResponse {
     pub compaction_keep_n: u32,
 }
 
+/// One model-visible item to seed into an empty canonical journal.
+///
+/// `content` is opaque text only. Callers must not send file/path payloads;
+/// the Host never constructs a `File` from path strings here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedJournalItem {
+    pub transcript_kind: String,
+    pub content: String,
+    /// Optional stable id for `tool/call` / `tool/result` pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+}
+
+/// POST /api/conversations/{id}/journal/seed — import a parsed transcript
+/// into a new conversation's empty journal so WebUI/remote can hydrate it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedJournalRequest {
+    pub items: Vec<SeedJournalItem>,
+    /// Informational label only (`claude-code` / `codex`). Never a filesystem path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedJournalResponse {
+    pub conversation_id: String,
+    pub event_count: u64,
+    pub model_visible_count: u64,
+    pub journal_sha256: String,
+}
+
 /// Cursor query for the human-facing trajectory projection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrajectoryQuery {

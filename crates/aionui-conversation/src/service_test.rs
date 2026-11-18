@@ -13071,3 +13071,106 @@ async fn github_import_validates_input_and_maps_source_errors() {
         Err(ConversationError::NotFoundReason { .. })
     ));
 }
+
+#[tokio::test]
+async fn seed_imported_journal_writes_model_visible_events_into_an_empty_journal() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let result = svc
+        .seed_imported_journal(
+            "user_1",
+            &conv.id,
+            aionui_api_types::SeedJournalRequest {
+                items: vec![
+                    aionui_api_types::SeedJournalItem {
+                        transcript_kind: "user/message".into(),
+                        content: "hello from claude".into(),
+                        call_id: None,
+                    },
+                    aionui_api_types::SeedJournalItem {
+                        transcript_kind: "assistant/message".into(),
+                        content: "hi there".into(),
+                        call_id: None,
+                    },
+                    aionui_api_types::SeedJournalItem {
+                        transcript_kind: "tool/call".into(),
+                        content: "ls".into(),
+                        call_id: Some("t1".into()),
+                    },
+                ],
+                source: Some("claude-code".into()),
+                source_session_id: Some("sess-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.conversation_id, conv.id);
+    assert_eq!(result.event_count, 3);
+    assert_eq!(result.model_visible_count, 3);
+    assert!(!result.journal_sha256.is_empty());
+
+    let transcript = svc
+        .derive_event_transcript("user_1", &conv.id, Some("model"))
+        .await
+        .unwrap();
+    assert_eq!(
+        transcript
+            .items
+            .iter()
+            .map(|item| (item.transcript_kind.as_str(), item.content.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("user/message", "hello from claude"),
+            ("assistant/message", "hi there"),
+            ("tool/call", "ls"),
+        ]
+    );
+    assert!(transcript.tool_pairing_balanced);
+    assert!(transcript.model_surface_reconstructible);
+
+    let err = svc
+        .seed_imported_journal(
+            "user_1",
+            &conv.id,
+            aionui_api_types::SeedJournalRequest {
+                items: vec![aionui_api_types::SeedJournalItem {
+                    transcript_kind: "user/message".into(),
+                    content: "again".into(),
+                    call_id: None,
+                }],
+                source: None,
+                source_session_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ConversationError::Busy { reason } => assert!(reason.contains("not empty")),
+        other => panic!("expected Busy, got {other:?}"),
+    }
+
+    let forbidden = svc
+        .seed_imported_journal(
+            "other",
+            &conv.id,
+            aionui_api_types::SeedJournalRequest {
+                items: vec![aionui_api_types::SeedJournalItem {
+                    transcript_kind: "user/message".into(),
+                    content: "nope".into(),
+                    call_id: None,
+                }],
+                source: None,
+                source_session_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        forbidden,
+        ConversationError::NotFound { .. }
+            | ConversationError::Forbidden { .. }
+            | ConversationError::NotFoundReason { .. }
+    ));
+}

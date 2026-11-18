@@ -12,6 +12,7 @@ pub mod error;
 mod inbox;
 mod journal_compaction;
 mod journal_fork;
+mod journal_seed;
 mod journal_transcript;
 pub(crate) mod message_cursor;
 mod message_persistence;
