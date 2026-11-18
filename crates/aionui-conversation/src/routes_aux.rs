@@ -3,9 +3,9 @@
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
     ApiResponse, CanonicalReplayProjectionResponse, HostPolicyResponse, JournalTranscriptResponse,
-    RawTrajectoryProjectionV1, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse,
-    SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, TrajectoryProjectionV1,
-    TrajectoryQuery, TrajectoryRecordV1, WorkspaceBrowseQuery, WorkspaceEntry,
+    RawTrajectoryProjectionV1, RetainedOutputResponse, SeedJournalRequest, SeedJournalResponse, SetConfigOptionRequest,
+    SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    TrajectoryProjectionV1, TrajectoryQuery, TrajectoryRecordV1, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -30,6 +30,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/inbox/{id}/read", post(mark_inbox_read))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
         .route("/api/conversations/{id}/transcript", get(get_event_transcript))
+        .route("/api/conversations/{id}/journal/seed", post(seed_imported_journal))
         .route("/api/conversations/{id}/trajectory", get(get_trajectory))
         .route("/api/conversations/{id}/trajectory/raw", get(get_raw_trajectory))
         .route(
@@ -81,6 +82,22 @@ async fn get_event_transcript(
         state
             .service
             .derive_event_transcript(&user.id, &id, query.visibility.as_deref())
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn seed_imported_journal(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SeedJournalRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SeedJournalResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .seed_imported_journal(&user.id, &id, req)
             .await
             .map_err(ApiError::from)?,
     )))

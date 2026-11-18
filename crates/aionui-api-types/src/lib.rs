@@ -57,11 +57,11 @@ pub use acp::{
     ConfigOptionConfirmation, ConversationTrajectoryChangedEvent, DetectCliRequest, DetectCliResponse,
     GetConfigOptionsResponse, GetModelInfoResponse, HostPolicyResponse, JournalTranscriptItem,
     JournalTranscriptResponse, JournalTranscriptTokenNode, JournalTranscriptTokens, ModelInfoEntry, ModelInfoPayload,
-    ProbeModelRequest, RawTrajectoryEventV1, RawTrajectoryProjectionV1, RetainedOutputResponse, SetConfigOptionRequest,
-    SetConfigOptionResponse, SetHostPolicyRequest, SetModeRequest, SetModelRequest, SideQuestionRequest,
-    SideQuestionResponse, TrajectoryOverviewV1, TrajectoryProjectionV1, TrajectoryQuery, TrajectoryRecordV1,
-    TrajectoryTokenUsage, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery,
-    WorkspaceEntry,
+    ProbeModelRequest, RawTrajectoryEventV1, RawTrajectoryProjectionV1, RetainedOutputResponse, SeedJournalItem,
+    SeedJournalRequest, SeedJournalResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest,
+    SetModeRequest, SetModelRequest, SideQuestionRequest, SideQuestionResponse, TrajectoryOverviewV1,
+    TrajectoryProjectionV1, TrajectoryQuery, TrajectoryRecordV1, TrajectoryTokenUsage, TryConnectCustomAgentRequest,
+    TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
