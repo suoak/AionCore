@@ -13494,3 +13494,49 @@ async fn a_settled_turn_sends_the_task_to_review_or_failed_and_frees_the_slot() 
         aionui_api_types::TaskStartState::Started
     );
 }
+
+#[tokio::test]
+async fn start_is_gated_by_run_permissions_and_the_denial_is_audited() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(db.pool().clone()));
+    let governance = Arc::new(aionui_db::GovernanceService::new(
+        Arc::new(aionui_db::SqliteGovernanceRepository::new(db.pool().clone())),
+        Some(aionui_db::AuditSink::new(audit.clone())),
+        true,
+    ));
+    governance
+        .set_agent_run_permission(
+            aionui_db::governance::BOOTSTRAP_OWNER_USER_ID,
+            "assistant",
+            "codex-helper",
+            Some(&[aionui_db::UserRole::Owner]),
+            None,
+        )
+        .await
+        .unwrap();
+    service.with_governance(governance);
+    let id = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+
+    let err = service.start_task("user_1", &id).await.unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    assert!(port.launched.lock().unwrap().is_empty());
+    let task = service.get_task_session("user_1", &id).await.unwrap();
+    assert_eq!(task.status, TaskSessionStatus::Ready);
+    let denials = audit
+        .list(&aionui_db::AuditEventFilter {
+            action: Some("policy.deny".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].target_id.as_deref(), Some(id.as_str()));
+    let diff: serde_json::Value = serde_json::from_str(denials[0].diff.as_deref().unwrap()).unwrap();
+    assert_eq!(diff["surface"], "task");
+    assert_eq!(diff["key"], "agent_run_permission");
+}
