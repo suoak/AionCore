@@ -745,6 +745,7 @@ async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
                 status: TaskSessionStatus::Ready,
                 agent_type: "632f31d2".into(),
                 agent_session_id: None,
+                flow: Default::default(),
             },
         )
         .await

@@ -254,6 +254,35 @@ pub struct CreateTaskSessionRequest {
     pub agent_type: String,
     #[serde(default)]
     pub agent_session_id: Option<String>,
+    /// 3.0 task-flow fields (plan B C1); all optional.
+    #[serde(flatten, default)]
+    pub flow: CreateTaskFlowFields,
+}
+
+/// Optional 3.0 task-flow fields of `POST /api/task-sessions` (plan B C1).
+/// Stored with the task; `start` (C2) uses them to launch the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CreateTaskFlowFields {
+    /// Assistant that will run the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    /// Composer state (text, file refs, skills, model options); a JSON object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<serde_json::Value>,
+    /// Absolute path of the git repository (or project folder) to work in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    /// Branch or ref the task's worktree starts from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_first: Option<bool>,
+    /// `manual` or `conversation` from clients; other sources are set by Core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::TaskSource>,
+    /// Message id the task was made from (`source = conversation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
 }
 
 fn default_task_session_status() -> TaskSessionStatus {

@@ -45,7 +45,8 @@ use aionui_api_types::{
 use aionui_api_types::{
     TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind, TaskBoardColumnResponse, TaskBoardItemResponse, TaskBoardQuery,
     TaskBoardResponse, TaskBoardReviewDecision, TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus,
-    TaskCommentKind, TaskCommentResponse, UpdateTaskBoardRequest,
+    TaskCommentKind, TaskCommentResponse, TaskLane, TaskNeedsYouReason, TaskPlanSummary, TaskSource,
+    UpdateTaskBoardRequest,
 };
 use aionui_common::now_ms;
 use aionui_db::models::{TaskBoardItemRow, TaskCommentRow};
@@ -171,6 +172,77 @@ fn rejection_error(from: TaskBoardStatus, to: TaskBoardStatus, rejection: BoardR
     }
 }
 
+/// 3.0 lane (plan B C1 §4.1). Precedence: a finished column (done / cancelled)
+/// wins; then anything waiting on the user; then the column.
+pub fn derive_lane(board_status: TaskBoardStatus, run_status: &str) -> (TaskLane, Option<TaskNeedsYouReason>) {
+    use TaskBoardStatus::*;
+    match board_status {
+        Done => return (TaskLane::Done, None),
+        Cancelled => return (TaskLane::Cancelled, None),
+        _ => {}
+    }
+    match run_status {
+        "waiting_approval" => return (TaskLane::NeedsYou, Some(TaskNeedsYouReason::PlanApproval)),
+        "failed" => return (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Failed)),
+        "paused" => return (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Input)),
+        _ => {}
+    }
+    match board_status {
+        InReview => (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Review)),
+        InProgress => (TaskLane::InProgress, None),
+        Backlog | Todo if run_status == "running" => (TaskLane::InProgress, None),
+        _ => (TaskLane::Todo, None),
+    }
+}
+
+/// Stored source, else inferred for rows created before migration 082.
+pub fn task_source(stored: Option<&str>, external_ref: Option<&str>, conversation_id: Option<&str>) -> TaskSource {
+    if let Some(source) = stored.and_then(TaskSource::parse) {
+        return source;
+    }
+    if external_ref.is_some_and(|reference| reference.starts_with("github:")) {
+        TaskSource::Github
+    } else if conversation_id.is_some() {
+        TaskSource::Conversation
+    } else {
+        TaskSource::Manual
+    }
+}
+
+/// Longest `current` step text carried on the board.
+pub const PLAN_STEP_MAX_CHARS: usize = 120;
+
+/// Summarise a persisted ACP plan message (`{"entries":[{content,status}]}`).
+/// `None` when the content is not a plan or has no entries.
+pub fn plan_summary(content: &str) -> Option<TaskPlanSummary> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let entries = value.get("entries")?.as_array()?;
+    if entries.is_empty() {
+        return None;
+    }
+    fn status(entry: &serde_json::Value) -> &str {
+        entry.get("status").and_then(|s| s.as_str()).unwrap_or("pending")
+    }
+    let text = |entry: &serde_json::Value| {
+        entry
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| truncate_summary(c, PLAN_STEP_MAX_CHARS))
+            .filter(|c| !c.is_empty())
+    };
+    let done = entries.iter().filter(|entry| status(entry) == "completed").count();
+    let current = entries
+        .iter()
+        .find(|entry| status(entry) == "in_progress")
+        .or_else(|| entries.iter().find(|entry| status(entry) == "pending"))
+        .and_then(text);
+    Some(TaskPlanSummary {
+        done: u32::try_from(done).unwrap_or(u32::MAX),
+        total: u32::try_from(entries.len()).unwrap_or(u32::MAX),
+        current,
+    })
+}
+
 fn item_response(row: TaskBoardItemRow) -> Result<TaskBoardItemResponse, ConversationError> {
     let board_status = TaskBoardStatus::parse(&row.board_status)
         .ok_or_else(|| ConversationError::internal(format!("Unknown board_status '{}'", row.board_status)))?;
@@ -179,6 +251,12 @@ fn item_response(row: TaskBoardItemRow) -> Result<TaskBoardItemResponse, Convers
         _ => None,
     };
     let labels = serde_json::from_str::<Vec<String>>(&row.labels).unwrap_or_default();
+    let (lane, needs_you_reason) = derive_lane(board_status, &row.status);
+    let source = task_source(
+        row.source.as_deref(),
+        row.external_ref.as_deref(),
+        row.conversation_id.as_deref(),
+    );
     Ok(TaskBoardItemResponse {
         id: row.id,
         title: row.title,
@@ -195,6 +273,13 @@ fn item_response(row: TaskBoardItemRow) -> Result<TaskBoardItemResponse, Convers
         created_at: row.created_at,
         updated_at: row.updated_at,
         squad_run: None,
+        lane,
+        needs_you_reason,
+        latest_plan: None,
+        source,
+        assistant_id: row.assistant_id,
+        plan_first: row.plan_first != 0,
+        queued_at: row.queued_at,
     })
 }
 
@@ -304,8 +389,34 @@ fn truncate_summary(text: &str, max_chars: usize) -> String {
 }
 
 impl ConversationService {
-    /// Fills `squad_run` on cards assigned to a Squad.
+    /// Fills `latest_plan` from the newest plan message of each item's
+    /// conversation. Best effort: a read failure leaves the cards without it.
+    async fn decorate_latest_plans(&self, user_id: &str, items: &mut [TaskBoardItemResponse]) {
+        let ids: Vec<String> = items.iter().filter_map(|item| item.conversation_id.clone()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let Ok(repo) = self.task_board_repo() else {
+            return;
+        };
+        let plans = match repo.latest_plan_messages(user_id, &ids).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| plan_summary(&row.content).map(|plan| (row.conversation_id, plan)))
+                .collect::<std::collections::HashMap<_, _>>(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read latest plans for the board");
+                return;
+            }
+        };
+        for item in items.iter_mut() {
+            item.latest_plan = item.conversation_id.as_ref().and_then(|id| plans.get(id).cloned());
+        }
+    }
+
+    /// Fills `latest_plan`, and `squad_run` on cards assigned to a Squad.
     async fn decorate_squad_run(&self, user_id: &str, item: &mut TaskBoardItemResponse) {
+        self.decorate_latest_plans(user_id, std::slice::from_mut(item)).await;
         if !assigned_to_squad(item) {
             return;
         }
@@ -437,9 +548,14 @@ impl ConversationService {
                 items: Vec::new(),
             })
             .collect();
-        for row in rows {
-            let mut item = item_response(row)?;
-            self.decorate_squad_run(user_id, &mut item).await;
+        let mut items = rows.into_iter().map(item_response).collect::<Result<Vec<_>, _>>()?;
+        self.decorate_latest_plans(user_id, &mut items).await;
+        for mut item in items {
+            if assigned_to_squad(&item)
+                && let Some(port) = self.board_squad_run_port()
+            {
+                item.squad_run = port.squad_run_for_work_item(user_id, &item.id).await;
+            }
             if let Some(column) = columns
                 .iter_mut()
                 .find(|column| column.board_status == item.board_status)
@@ -921,7 +1037,9 @@ impl ConversationService {
                 "An agent-created work item must start as draft",
             ));
         }
-        let session = self.create_task_session(user_id, request).await?;
+        let session = self
+            .create_task_session_from(user_id, request, Some(TaskSource::Agent))
+            .await?;
         let row = self.board_item(user_id, &session.id).await?;
         // Defensive: creation never writes these, but the Q9 guarantee is
         // "backlog + unassigned" regardless of future column defaults.
@@ -1118,3 +1236,7 @@ mod tests {
         assert!(validate_labels(&vec!["x".to_string(); BOARD_MAX_LABELS + 1]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "board/lane_tests.rs"]
+mod lane_tests;
