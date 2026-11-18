@@ -405,6 +405,17 @@ pub async fn build_module_states(
     if let Err(error) = fanout.service.recover_on_boot().await {
         tracing::warn!(error = %error, "fanout: startup recovery failed");
     }
+    // 3.0 C2: tasks queued before the restart take free run slots again
+    // (running ones were paused by task-session recovery → needs you).
+    {
+        let conversations = services.conversation_service.clone();
+        tokio::spawn(async move {
+            let started = conversations.drain_task_queue().await;
+            if started > 0 {
+                tracing::info!(started, "task queue: resumed after restart");
+            }
+        });
+    }
     // M8 E8: interrupted batch attempts are marked failed and running jobs
     // paused; nothing restarts on its own (scale / retry resumes).
     let batch =

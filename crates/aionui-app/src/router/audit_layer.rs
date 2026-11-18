@@ -429,6 +429,14 @@ const AUDIT_RULES: &[AuditRule] = &[
         "task_board",
         NONE,
     ),
+    // 3.0 C2: start (or queue) a task run.
+    rule(
+        "POST",
+        "/api/task-sessions/{id}/start",
+        "task.start",
+        "task_session",
+        ID,
+    ),
     rule("POST", "/api/cron/jobs", "config.cron.create", "cron_job", NONE),
     rule("PUT", "/api/cron/jobs/{id}", "config.cron.update", "cron_job", ID),
     rule("DELETE", "/api/cron/jobs/{id}", "config.cron.delete", "cron_job", ID),
