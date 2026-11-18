@@ -444,3 +444,20 @@ mod tests {
         }
     }
 }
+
+/// What `POST /api/task-sessions/{id}/start` did (3.0 C2). The call is
+/// idempotent: a task already running or queued is reported, not restarted.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStartState {
+    Started,
+    Queued,
+    AlreadyRunning,
+    AlreadyQueued,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StartTaskResponse {
+    pub state: TaskStartState,
+    pub item: TaskBoardItemResponse,
+}

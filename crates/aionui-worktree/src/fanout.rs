@@ -135,9 +135,11 @@ impl FanoutService {
     ) -> Result<FanoutGroupResponse, WorktreeError> {
         let port = self.port()?;
         let n = req.slots.len();
-        if !(MIN_SLOTS..=MAX_SLOTS).contains(&n) {
+        let for_task = req.task_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
+        let min_slots = if for_task { TASK_MIN_SLOTS } else { MIN_SLOTS };
+        if !(min_slots..=MAX_SLOTS).contains(&n) {
             return Err(WorktreeError::FanoutLimit(format!(
-                "a fan-out needs {MIN_SLOTS} to {MAX_SLOTS} slots, got {n}"
+                "a fan-out needs {min_slots} to {MAX_SLOTS} slots, got {n}"
             )));
         }
         let max_parallel = match req.max_parallel {
