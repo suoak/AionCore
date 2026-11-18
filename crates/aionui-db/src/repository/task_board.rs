@@ -140,6 +140,23 @@ pub trait ITaskBoardRepository: Send + Sync {
         fanout_group_id: Option<&str>,
         updated_at: TimestampMs,
     ) -> Result<bool, DbError>;
+    /// The started (agent-mode, `running`) task whose run lives in this
+    /// conversation, directly or as the slot of its fan-out group.
+    async fn find_running_task_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, DbError>;
+    /// `running` → `status` (`completed` | `failed`), binding the run's
+    /// conversation. `false` when the task was no longer running.
+    async fn settle_started_task(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: &str,
+        status: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError>;
     async fn append_comment(&self, params: &AppendTaskCommentParams<'_>) -> Result<TaskCommentRow, DbError>;
     /// Comments oldest first.
     async fn list_comments(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskCommentRow>, DbError>;

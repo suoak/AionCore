@@ -3006,6 +3006,12 @@ impl ConversationService {
             )
             .await;
         }
+        self.on_task_turn_settled(
+            user_id,
+            conversation_id,
+            settlement == ConversationTurnSettlement::Completed,
+        )
+        .await;
     }
 
     /// Snapshot the hook list, then drop the guard before awaiting:

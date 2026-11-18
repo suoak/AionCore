@@ -215,6 +215,76 @@ impl ConversationService {
         Ok(row)
     }
 
+    /// A turn of a started task's conversation ended: completed → review
+    /// (needs you), failed → failed (needs you, retryable). Then the freed
+    /// slot goes to the queue. Plan / goal executions keep their own loop.
+    pub(crate) async fn on_task_turn_settled(&self, user_id: &str, conversation_id: &str, completed: bool) {
+        let Ok(board) = self.task_board_repo() else {
+            return;
+        };
+        let id = match board.find_running_task_for_conversation(user_id, conversation_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, conversation_id, "task settle: lookup failed");
+                return;
+            }
+        };
+        let status = if completed { "completed" } else { "failed" };
+        match board
+            .settle_started_task(user_id, &id, conversation_id, status, now_ms())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(%error, task_session_id = %id, "task settle: update failed");
+                return;
+            }
+        }
+        if completed && let Err(error) = self.move_started_task_to_review(user_id, &id).await {
+            tracing::warn!(%error, task_session_id = %id, "task settle: in_review move failed");
+        }
+        tracing::info!(task_session_id = %id, status, "task run settled");
+        // Detached: a launch can settle a turn while `start_task` holds the
+        // start lock.
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.drain_task_queue().await;
+        });
+    }
+
+    async fn move_started_task_to_review(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
+        let row = self.board_item(user_id, id).await?;
+        if row.board_status != TaskBoardStatus::InProgress.as_str() {
+            return Ok(());
+        }
+        let now = now_ms().max(row.updated_at + 1);
+        self.task_board_repo()?
+            .update_board(
+                user_id,
+                id,
+                &UpdateTaskBoardParams {
+                    board_status: Some(TaskBoardStatus::InReview.as_str()),
+                    updated_at: now,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| map_db(id, error))?;
+        self.append_event(
+            user_id,
+            id,
+            "status_change",
+            serde_json::json!({ "from": TaskBoardStatus::InProgress.as_str(), "to": TaskBoardStatus::InReview.as_str() }),
+            now,
+        )
+        .await?;
+        let item = item_response(self.board_item(user_id, id).await?)?;
+        self.publish_board_updated(user_id, TaskBoardChange::Board, TaskBoardStatus::InProgress, &item);
+        Ok(())
+    }
+
     /// Start queued tasks while run slots are free (oldest first). Called
     /// after a task run settles and on boot. Failures are logged and leave
     /// the task out of the queue so one bad task cannot block the rest.

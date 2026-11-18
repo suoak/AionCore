@@ -13406,3 +13406,91 @@ async fn failed_launch_leaves_the_task_startable() {
         aionui_api_types::TaskStartState::Started
     );
 }
+
+#[tokio::test]
+async fn a_settled_turn_sends_the_task_to_review_or_failed_and_frees_the_slot() {
+    use aionui_api_types::{TaskLane, TaskNeedsYouReason};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    service.set_max_running_tasks(1);
+    let a = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    let b = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    let c = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    service.start_task("user_1", &a).await.unwrap();
+    service.start_task("user_1", &b).await.unwrap();
+    service.start_task("user_1", &c).await.unwrap();
+    for (id, conversation) in [(&a, "conv-a"), (&b, "conv-b"), (&c, "conv-c")] {
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+             VALUES (?, 'user_1', 'Task run', 'acp', 1, 1)",
+        )
+        .bind(conversation)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE task_sessions SET conversation_id = ? WHERE id = ?")
+            .bind(conversation)
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    // Unrelated conversations are ignored.
+    service.on_task_turn_settled("user_1", "conv-other", true).await;
+    service.on_task_turn_settled("user_1", "conv-a", true).await;
+    let lane_of = |id: String| {
+        let service = &service;
+        async move {
+            service
+                .task_board("user_1", Default::default())
+                .await
+                .unwrap()
+                .columns
+                .into_iter()
+                .flat_map(|column| column.items)
+                .find(|item| item.id == id)
+                .map(|item| (item.lane, item.needs_you_reason))
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        lane_of(a.clone()).await,
+        (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Review))
+    );
+    // The freed slot went to b (drain runs detached).
+    for _ in 0..100 {
+        if port.launched.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(port.launched.lock().unwrap().len(), 2);
+    assert_eq!(lane_of(b.clone()).await, (TaskLane::InProgress, None));
+
+    service.on_task_turn_settled("user_1", "conv-b", false).await;
+    assert_eq!(
+        lane_of(b.clone()).await,
+        (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Failed))
+    );
+    // A failed task can be started again once a slot is free.
+    for _ in 0..100 {
+        if port.launched.lock().unwrap().len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sqlx::query("UPDATE task_sessions SET status = 'completed' WHERE id = ?")
+        .bind(&c)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        service.start_task("user_1", &b).await.unwrap().state,
+        aionui_api_types::TaskStartState::Started
+    );
+}
