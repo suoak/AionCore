@@ -36,12 +36,12 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// back-to-back control after three clean versions). Every release from 0.148.0
 /// on does complete turns and passes the suite, so the gate walks forward over
 /// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
-pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.236";
+pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.287";
 /// Verified from the actual WorkMate development install on 2026-10-07.
 /// Protocol evidence is the machine-generated schema under
 /// `~/aion/protocols/samples/codex-cli/0.160.1/schema-full/`.
 pub const VERIFIED_CODEX_VERSION: &str = "0.160.1";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.25";
+pub const VERIFIED_AGY_VERSION: &str = "1.3.5";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -453,8 +453,8 @@ mod tests {
     fn the_verified_release_says_nothing() {
         // Literal on purpose: this is the exact string a user on the verified
         // release reports, so the test breaks if a bump forgets to re-verify.
-        assert_eq!(classify("2.1.236", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("claude", "2.1.236", VERIFIED_CLAUDE_VERSION).is_none());
+        assert_eq!(classify("2.1.287", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("claude", "2.1.287", VERIFIED_CLAUDE_VERSION).is_none());
     }
 
     #[test]
@@ -475,10 +475,12 @@ mod tests {
 
     #[test]
     fn the_verified_agy_release_says_nothing() {
-        assert_eq!(classify("1.1.25", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("agy", "1.1.25", VERIFIED_AGY_VERSION).is_none());
-        assert_eq!(classify("1.1.24", VERIFIED_AGY_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("1.1.26", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("1.3.5", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("agy", "1.3.5", VERIFIED_AGY_VERSION).is_none());
+        // 1.1.29 is OLDER than 1.2.0: the minor component decides, and a
+        // lexical compare would get this backwards ("1.1.29" > "1.2.0").
+        assert_eq!(classify("1.1.29", VERIFIED_AGY_VERSION), VersionVerdict::Older);
+        assert_eq!(classify("1.3.6", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
     }
 
     /// Both drift directions are `Info` — the tier the frontend draws as a quiet
