@@ -1,7 +1,7 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{TaskBoardItemRow, TaskCommentRow};
+use crate::models::{LatestPlanMessageRow, TaskBoardItemRow, TaskCommentRow, TaskFlowRow};
 
 /// Board filter; every `Some` narrows the result.
 #[derive(Debug, Clone, Default)]
@@ -46,6 +46,20 @@ pub struct UpdateTaskBoardParams<'a> {
 /// `UpdateTaskBoardParams::expected_updated_at` no longer matches.
 pub const BOARD_STALE_CONFLICT_PREFIX: &str = "stale board item";
 
+/// 3.0 task-flow fields written at creation (migration 082). `None` keeps
+/// the column NULL; the service validates values before calling.
+#[derive(Debug, Clone, Default)]
+pub struct SetTaskFlowParams<'a> {
+    pub assistant_id: Option<&'a str>,
+    /// JSON object text.
+    pub prompt_json: Option<&'a str>,
+    pub repo_path: Option<&'a str>,
+    pub base_ref: Option<&'a str>,
+    pub plan_first: bool,
+    pub source: Option<&'a str>,
+    pub source_ref: Option<&'a str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppendTaskCommentParams<'a> {
     pub user_id: &'a str,
@@ -86,6 +100,23 @@ pub trait ITaskBoardRepository: Send + Sync {
         user_id: &str,
         external_ref: &str,
     ) -> Result<Option<TaskBoardItemRow>, DbError>;
+    /// Write the task-flow fields of a task (does not touch `updated_at`).
+    /// `DbError::NotFound` for another user's or a missing task;
+    /// `DbError::Conflict` for an unknown `source`.
+    async fn set_task_flow(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        params: &SetTaskFlowParams<'_>,
+    ) -> Result<TaskFlowRow, DbError>;
+    async fn get_task_flow(&self, user_id: &str, task_session_id: &str) -> Result<Option<TaskFlowRow>, DbError>;
+    /// Newest `plan` message per conversation, only for this user's
+    /// conversations. Conversations without a plan are absent.
+    async fn latest_plan_messages(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<Vec<LatestPlanMessageRow>, DbError>;
     async fn append_comment(&self, params: &AppendTaskCommentParams<'_>) -> Result<TaskCommentRow, DbError>;
     /// Comments oldest first.
     async fn list_comments(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskCommentRow>, DbError>;

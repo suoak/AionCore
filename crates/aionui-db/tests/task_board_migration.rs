@@ -83,3 +83,61 @@ async fn migration_072_maps_existing_tasks_to_board_columns() {
         .unwrap();
     assert_eq!(comments, 0);
 }
+
+#[tokio::test]
+async fn migration_082_adds_task_flow_columns_without_touching_rows() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
+    run_migrations(&pool, |version| version <= 81, false).await;
+    sqlx::query(
+        "INSERT INTO task_sessions (id, user_id, title, mode, objective, acceptance_criteria, status, agent_type, \
+         created_at, updated_at) VALUES ('old', 'system_default_user', 't', 'agent', 'o', '[]', 'running', 'codex', \
+         1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    run_migrations(&pool, |version| version == 82, true).await;
+
+    let row = sqlx::query(
+        "SELECT status, board_status, updated_at, assistant_id, prompt_json, repo_path, base_ref, plan_first, \
+         source, source_ref, fanout_group_id, delivery_json, queued_at FROM task_sessions WHERE id = 'old'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("status"), "running");
+    assert_eq!(row.get::<String, _>("board_status"), "backlog");
+    assert_eq!(row.get::<i64, _>("updated_at"), 1);
+    assert_eq!(row.get::<i64, _>("plan_first"), 0);
+    for column in [
+        "assistant_id",
+        "prompt_json",
+        "repo_path",
+        "base_ref",
+        "source",
+        "source_ref",
+        "fanout_group_id",
+        "delivery_json",
+    ] {
+        assert_eq!(row.get::<Option<String>, _>(column), None, "{column}");
+    }
+    assert_eq!(row.get::<Option<i64>, _>("queued_at"), None);
+
+    for (column, value) in [
+        ("source", "'email'"),
+        ("prompt_json", "'[]'"),
+        ("delivery_json", "'not json'"),
+        ("plan_first", "2"),
+    ] {
+        let result = sqlx::query(&format!("UPDATE task_sessions SET {column} = {value} WHERE id = 'old'"))
+            .execute(&pool)
+            .await;
+        assert!(result.is_err(), "{column} = {value} should be rejected");
+    }
+}

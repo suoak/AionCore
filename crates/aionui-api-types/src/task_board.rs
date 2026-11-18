@@ -73,6 +73,75 @@ pub struct TaskAssignee {
     pub id: String,
 }
 
+/// 3.0 board lane (plan B C1), derived at read time from `board_status` and
+/// the run state; the stored enums are unchanged.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLane {
+    /// backlog / todo, not running.
+    #[default]
+    Todo,
+    InProgress,
+    /// Waiting on the user; see `needs_you_reason`.
+    NeedsYou,
+    Done,
+    /// Hidden by default in the UI.
+    Cancelled,
+}
+
+/// Why a task sits in the `needs_you` lane.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskNeedsYouReason {
+    PlanApproval,
+    ToolPermission,
+    Review,
+    Failed,
+    MergeConflict,
+    Input,
+}
+
+/// Where a task came from. Rows created before migration 082 have no stored
+/// source; it is inferred from `external_ref` / `conversation_id`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSource {
+    #[default]
+    Manual,
+    Conversation,
+    Github,
+    Cron,
+    Agent,
+}
+
+impl TaskSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Conversation => "conversation",
+            Self::Github => "github",
+            Self::Cron => "cron",
+            Self::Agent => "agent",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::Manual, Self::Conversation, Self::Github, Self::Cron, Self::Agent]
+            .into_iter()
+            .find(|source| source.as_str() == value)
+    }
+}
+
+/// Progress of the agent's own checklist (latest ACP plan of the task's conversation).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskPlanSummary {
+    pub done: u32,
+    pub total: u32,
+    /// The step in progress, else the next pending one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskBoardItemResponse {
     pub id: String,
@@ -98,6 +167,22 @@ pub struct TaskBoardItemResponse {
     /// the item is not assigned to a Squad or no instance has anything to show.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub squad_run: Option<crate::SquadRunPayload>,
+    /// 3.0 lane (plan B C1). Older clients ignore it.
+    #[serde(default)]
+    pub lane: TaskLane,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_you_reason: Option<TaskNeedsYouReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_plan: Option<TaskPlanSummary>,
+    #[serde(default)]
+    pub source: TaskSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_first: bool,
+    /// Set while the task waits for a run slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -320,6 +405,32 @@ mod tests {
                 id: "codex".into()
             }))
         );
+    }
+
+    #[test]
+    fn board_item_new_fields_default_for_old_payloads() {
+        let item: TaskBoardItemResponse = serde_json::from_value(serde_json::json!({
+            "id": "t", "title": "T", "project_id": null, "conversation_id": null, "mode": "agent",
+            "status": "draft", "board_status": "backlog", "assignee": null, "priority": 0, "labels": [],
+            "board_rank": null, "external_ref": null, "created_at": 1, "updated_at": 1
+        }))
+        .unwrap();
+        assert_eq!(item.lane, TaskLane::Todo);
+        assert_eq!(item.source, TaskSource::Manual);
+        assert!(!item.plan_first);
+        let value = serde_json::to_value(&item).unwrap();
+        assert_eq!(value["lane"], "todo");
+        assert!(value.get("needs_you_reason").is_none());
+        assert!(value.get("latest_plan").is_none());
+        assert!(value.get("plan_first").is_none());
+    }
+
+    #[test]
+    fn task_source_round_trips() {
+        for source in ["manual", "conversation", "github", "cron", "agent"] {
+            assert_eq!(TaskSource::parse(source).unwrap().as_str(), source);
+        }
+        assert_eq!(TaskSource::parse("other"), None);
     }
 
     #[test]

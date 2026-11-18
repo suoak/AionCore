@@ -6,15 +6,23 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{
-    BOARD_ASSIGNEE_KINDS, BOARD_MAX_PRIORITY, BOARD_STATUSES, TASK_COMMENT_AUTHOR_KINDS, TASK_COMMENT_EDIT_WINDOW_MS,
-    TASK_COMMENT_KINDS, TaskBoardItemRow, TaskCommentRow,
+    BOARD_ASSIGNEE_KINDS, BOARD_MAX_PRIORITY, BOARD_STATUSES, LatestPlanMessageRow, TASK_COMMENT_AUTHOR_KINDS,
+    TASK_COMMENT_EDIT_WINDOW_MS, TASK_COMMENT_KINDS, TASK_SOURCES, TaskBoardItemRow, TaskCommentRow, TaskFlowRow,
 };
 use crate::repository::task_board::{
-    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, ITaskBoardRepository, TaskBoardFilter, UpdateTaskBoardParams,
+    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, ITaskBoardRepository, SetTaskFlowParams, TaskBoardFilter,
+    UpdateTaskBoardParams,
 };
 
 const BOARD_COLUMNS: &str = "id, user_id, title, project_id, conversation_id, mode, status, board_status, \
-     assignee_kind, assignee_id, priority, labels, board_rank, external_ref, created_at, updated_at";
+     assignee_kind, assignee_id, priority, labels, board_rank, external_ref, created_at, updated_at, \
+     source, assistant_id, plan_first, queued_at";
+
+const FLOW_COLUMNS: &str = "assistant_id, prompt_json, repo_path, base_ref, plan_first, source, source_ref, \
+     fanout_group_id, delivery_json, queued_at";
+
+/// Upper bound on conversations per `latest_plan_messages` call (SQLite bind limit headroom).
+const LATEST_PLAN_BATCH: usize = 500;
 
 /// Column order for `ORDER BY`: the display order of [`BOARD_STATUSES`].
 const BOARD_ORDER: &str = "CASE board_status WHEN 'backlog' THEN 0 WHEN 'todo' THEN 1 WHEN 'in_progress' THEN 2 \
@@ -205,6 +213,78 @@ impl ITaskBoardRepository for SqliteTaskBoardRepository {
         .bind(external_ref)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    async fn set_task_flow(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        params: &SetTaskFlowParams<'_>,
+    ) -> Result<TaskFlowRow, DbError> {
+        if let Some(source) = params.source
+            && !TASK_SOURCES.contains(&source)
+        {
+            return Err(invalid(format!("Invalid task source '{source}'")));
+        }
+        let result = sqlx::query(
+            "UPDATE task_sessions SET assistant_id = ?, prompt_json = ?, repo_path = ?, base_ref = ?, \
+             plan_first = ?, source = ?, source_ref = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(params.assistant_id)
+        .bind(params.prompt_json)
+        .bind(params.repo_path)
+        .bind(params.base_ref)
+        .bind(i64::from(params.plan_first))
+        .bind(params.source)
+        .bind(params.source_ref)
+        .bind(task_session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Task session '{task_session_id}' not found")));
+        }
+        self.get_task_flow(user_id, task_session_id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("Task session '{task_session_id}' not found")))
+    }
+
+    async fn get_task_flow(&self, user_id: &str, task_session_id: &str) -> Result<Option<TaskFlowRow>, DbError> {
+        Ok(sqlx::query_as::<_, TaskFlowRow>(&format!(
+            "SELECT {FLOW_COLUMNS} FROM task_sessions WHERE user_id = ? AND id = ?"
+        ))
+        .bind(user_id)
+        .bind(task_session_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn latest_plan_messages(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<Vec<LatestPlanMessageRow>, DbError> {
+        let mut rows = Vec::new();
+        for chunk in conversation_ids.chunks(LATEST_PLAN_BATCH) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT conversation_id, content FROM (SELECT m.conversation_id, m.content, ROW_NUMBER() OVER \
+                 (PARTITION BY m.conversation_id ORDER BY m.created_at DESC, m.id DESC) AS rn FROM messages m \
+                 JOIN conversations c ON c.id = m.conversation_id WHERE m.type = 'plan' AND c.user_id = ",
+            );
+            query.push_bind(user_id).push(" AND m.conversation_id IN (");
+            let mut separated = query.separated(", ");
+            for id in chunk {
+                separated.push_bind(id);
+            }
+            query.push(")) WHERE rn = 1");
+            rows.extend(
+                query
+                    .build_query_as::<LatestPlanMessageRow>()
+                    .fetch_all(&self.pool)
+                    .await?,
+            );
+        }
+        Ok(rows)
     }
 
     async fn append_comment(&self, params: &AppendTaskCommentParams<'_>) -> Result<TaskCommentRow, DbError> {
@@ -680,5 +760,121 @@ mod tests {
                 .await,
             Err(DbError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn task_flow_round_trips_and_defaults_are_empty() {
+        let (_db, tasks, board) = setup().await;
+        let id = create_task(&tasks, "flow").await;
+        let empty = board.get_task_flow(USER, &id).await.unwrap().unwrap();
+        assert_eq!(empty.plan_first, 0);
+        assert_eq!(empty.source, None);
+        assert_eq!(empty.queued_at, None);
+
+        let flow = board
+            .set_task_flow(
+                USER,
+                &id,
+                &SetTaskFlowParams {
+                    assistant_id: Some("asst-1"),
+                    prompt_json: Some(r#"{"text":"hi"}"#),
+                    repo_path: Some("/repo"),
+                    base_ref: Some("main"),
+                    plan_first: true,
+                    source: Some("conversation"),
+                    source_ref: Some("msg-1"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(flow.assistant_id.as_deref(), Some("asst-1"));
+        assert_eq!(flow.prompt_json.as_deref(), Some(r#"{"text":"hi"}"#));
+        assert_eq!(flow.plan_first, 1);
+        assert_eq!(flow.source.as_deref(), Some("conversation"));
+        let item = board.get_board_item(USER, &id).await.unwrap().unwrap();
+        assert_eq!(item.source.as_deref(), Some("conversation"));
+        assert_eq!(item.assistant_id.as_deref(), Some("asst-1"));
+        assert_eq!(item.plan_first, 1);
+    }
+
+    #[tokio::test]
+    async fn task_flow_rejects_bad_values_and_other_users() {
+        let (_db, tasks, board) = setup().await;
+        let id = create_task(&tasks, "flow").await;
+        let params = |source, prompt_json| SetTaskFlowParams {
+            assistant_id: None,
+            prompt_json,
+            repo_path: None,
+            base_ref: None,
+            plan_first: false,
+            source,
+            source_ref: None,
+        };
+        assert!(
+            board
+                .set_task_flow(USER, &id, &params(Some("email"), None))
+                .await
+                .is_err()
+        );
+        // The CHECK constraint rejects a non-object prompt.
+        assert!(
+            board
+                .set_task_flow(USER, &id, &params(None, Some("[1]")))
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            board.set_task_flow("someone_else", &id, &params(None, None)).await,
+            Err(DbError::NotFound(_))
+        ));
+        assert!(board.get_task_flow("someone_else", &id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_plan_messages_pick_the_newest_plan_per_owned_conversation() {
+        let (db, _tasks, board) = setup().await;
+        let pool = db.pool();
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES ('someone_else', 'other', 'x', 0, 0)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (id, user) in [("c1", USER), ("c2", USER), ("c3", "someone_else")] {
+            sqlx::query(
+                "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) VALUES (?, ?, 'n', 'acp', 1, 1)",
+            )
+            .bind(id)
+            .bind(user)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        for (id, conversation, kind, content, at) in [
+            ("m1", "c1", "plan", "old", 1),
+            ("m2", "c1", "plan", "new", 2),
+            ("m3", "c1", "text", "later text", 3),
+            ("m4", "c3", "plan", "foreign", 1),
+        ] {
+            sqlx::query("INSERT INTO messages (id, conversation_id, type, content, created_at) VALUES (?, ?, ?, ?, ?)")
+                .bind(id)
+                .bind(conversation)
+                .bind(kind)
+                .bind(content)
+                .bind(at)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let ids = ["c1", "c2", "c3"].map(String::from);
+        let rows = board.latest_plan_messages(USER, &ids).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![LatestPlanMessageRow {
+                conversation_id: "c1".into(),
+                content: "new".into(),
+            }]
+        );
+        assert!(board.latest_plan_messages(USER, &[]).await.unwrap().is_empty());
     }
 }

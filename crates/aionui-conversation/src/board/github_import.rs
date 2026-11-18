@@ -290,7 +290,7 @@ impl ConversationService {
                 }
                 None => {
                     let session = self
-                        .create_task_session(
+                        .create_task_session_from(
                             user_id,
                             CreateTaskSessionRequest {
                                 title: title.clone(),
@@ -302,7 +302,9 @@ impl ConversationService {
                                 status: TaskSessionStatus::Draft,
                                 agent_type: IMPORTED_AGENT_TYPE.to_owned(),
                                 agent_session_id: None,
+                                flow: Default::default(),
                             },
+                            Some(aionui_api_types::TaskSource::Github),
                         )
                         .await?;
                     board

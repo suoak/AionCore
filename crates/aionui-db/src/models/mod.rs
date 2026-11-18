@@ -71,8 +71,8 @@ pub use skill_source::{
 pub use squad::{SQUAD_LEADER_MODES, SQUAD_VISIBILITIES, SquadTemplateRow};
 pub use system_settings::SystemSettings;
 pub use task_board::{
-    BOARD_ASSIGNEE_KINDS, BOARD_MAX_PRIORITY, BOARD_STATUSES, TASK_COMMENT_AUTHOR_KINDS, TASK_COMMENT_EDIT_WINDOW_MS,
-    TASK_COMMENT_KINDS, TaskBoardItemRow, TaskCommentRow,
+    BOARD_ASSIGNEE_KINDS, BOARD_MAX_PRIORITY, BOARD_STATUSES, LatestPlanMessageRow, TASK_COMMENT_AUTHOR_KINDS,
+    TASK_COMMENT_EDIT_WINDOW_MS, TASK_COMMENT_KINDS, TASK_SOURCES, TaskBoardItemRow, TaskCommentRow, TaskFlowRow,
 };
 pub use task_session::{
     ContextSnapshotArtifactRow, ContextSnapshotRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow,

@@ -1211,6 +1211,18 @@ impl ConversationService {
         user_id: &str,
         request: CreateTaskSessionRequest,
     ) -> Result<TaskSessionResponse, ConversationError> {
+        self.create_task_session_from(user_id, request, None).await
+    }
+
+    /// `core_source` marks tasks Core creates itself (GitHub import, agent
+    /// proposals, cron); see [`crate::task_flow::validate_task_flow`].
+    pub(crate) async fn create_task_session_from(
+        &self,
+        user_id: &str,
+        request: CreateTaskSessionRequest,
+        core_source: Option<aionui_api_types::TaskSource>,
+    ) -> Result<TaskSessionResponse, ConversationError> {
+        let flow = crate::task_flow::validate_task_flow(&request.flow, request.conversation_id.is_some(), core_source)?;
         validate_task_session_text(
             &request.title,
             &request.objective,
@@ -1245,7 +1257,8 @@ impl ConversationService {
                 agent_session_id: request.agent_session_id.as_deref(),
             })
             .await?;
-        info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, "task session created");
+        self.store_task_flow(user_id, &row.id, &flow).await?;
+        info!(task_session_id = %row.id, mode = %row.mode, status = %row.status, source = flow.source.as_str(), "task session created");
         self.task_session_response_with_runtime(user_id, row).await
     }
 

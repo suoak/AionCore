@@ -4493,6 +4493,7 @@ async fn automatic_planning_uses_strict_aion_runtime_and_creates_pending_plan() 
                 status: TaskSessionStatus::Ready,
                 agent_type: "632f31d2".into(),
                 agent_session_id: None,
+                flow: Default::default(),
             },
         )
         .await
@@ -4581,6 +4582,7 @@ async fn automatic_planning_rejects_aion_identity_on_non_aion_conversation() {
                 status: TaskSessionStatus::Ready,
                 agent_type: "632f31d2".into(),
                 agent_session_id: None,
+                flow: Default::default(),
             },
         )
         .await
@@ -4685,6 +4687,7 @@ async fn approved_goal_execution_review_links_changes_approval_and_verification(
                 status: TaskSessionStatus::Ready,
                 agent_type: "632f31d2".into(),
                 agent_session_id: None,
+                flow: Default::default(),
             },
         )
         .await
@@ -11147,6 +11150,7 @@ async fn failed_execution_retries_once_when_policy_allows_and_links_the_chain() 
                 status: TaskSessionStatus::Ready,
                 agent_type: "632f31d2".into(),
                 agent_session_id: None,
+                flow: Default::default(),
             },
         )
         .await
@@ -11280,6 +11284,7 @@ async fn approved_plan_task_for_supervision(
                 status: TaskSessionStatus::Ready,
                 agent_type: "632f31d2".into(),
                 agent_session_id: None,
+                flow: Default::default(),
             },
         )
         .await
@@ -11484,6 +11489,7 @@ async fn board_task(service: &ConversationService, mode: TaskSessionMode) -> Str
                 status: TaskSessionStatus::Ready,
                 agent_type: "632f31d2".into(),
                 agent_session_id: None,
+                flow: Default::default(),
             },
         )
         .await
@@ -13173,4 +13179,87 @@ async fn seed_imported_journal_writes_model_visible_events_into_an_empty_journal
             | ConversationError::Forbidden { .. }
             | ConversationError::NotFoundReason { .. }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// 3.0 C1: task flow fields and the derived lane.
+// ---------------------------------------------------------------------------
+
+fn flow_request(flow: serde_json::Value) -> CreateTaskSessionRequest {
+    let mut request = json!({
+        "title": "Flow item",
+        "mode": "agent",
+        "objective": "Do it",
+        "status": "ready",
+        "agent_type": "632f31d2",
+    });
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(flow.as_object().unwrap().clone());
+    serde_json::from_value(request).unwrap()
+}
+
+#[tokio::test]
+async fn task_flow_fields_are_stored_and_surface_on_the_board() {
+    use aionui_api_types::{TaskLane, TaskSource};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let task = service
+        .create_task_session(
+            "user_1",
+            flow_request(json!({
+                "assistant_id": "codex-helper",
+                "prompt": { "text": "fix login" },
+                "repo_path": "/repo/app",
+                "base_ref": "main",
+                "plan_first": true,
+            })),
+        )
+        .await
+        .unwrap();
+    let plain = board_task(&service, TaskSessionMode::Agent).await;
+
+    let board = service.task_board("user_1", Default::default()).await.unwrap();
+    let items: Vec<_> = board.columns.iter().flat_map(|column| column.items.iter()).collect();
+    let item = items.iter().find(|item| item.id == task.id).unwrap();
+    assert_eq!(item.lane, TaskLane::Todo);
+    assert_eq!(item.needs_you_reason, None);
+    assert_eq!(item.source, TaskSource::Manual);
+    assert_eq!(item.assistant_id.as_deref(), Some("codex-helper"));
+    assert!(item.plan_first);
+    assert_eq!(item.latest_plan, None);
+    let plain = items.iter().find(|item| item.id == plain).unwrap();
+    assert_eq!(plain.source, TaskSource::Manual);
+    assert!(!plain.plan_first);
+
+    let value = serde_json::to_value(item).unwrap();
+    assert_eq!(value["lane"], "todo");
+    assert_eq!(value["source"], "manual");
+    assert_eq!(value["plan_first"], true);
+    assert!(serde_json::to_value(plain).unwrap().get("plan_first").is_none());
+}
+
+#[tokio::test]
+async fn task_flow_rejects_core_sources_and_bad_fields_before_creating() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    for flow in [
+        json!({ "source": "github" }),
+        json!({ "source": "agent" }),
+        json!({ "repo_path": "relative/path" }),
+        json!({ "base_ref": "--upload-pack=x" }),
+        json!({ "prompt": "not an object" }),
+    ] {
+        let result = service.create_task_session("user_1", flow_request(flow.clone())).await;
+        assert!(
+            matches!(result, Err(ConversationError::BadRequest { .. })),
+            "{flow}: {result:?}"
+        );
+    }
+    let board = service.task_board("user_1", Default::default()).await.unwrap();
+    assert!(board.columns.iter().all(|column| column.items.is_empty()));
 }

@@ -35,6 +35,7 @@ mod startup_recovery;
 pub mod state;
 mod stream_persistence;
 pub mod stream_relay;
+pub mod task_flow;
 pub mod task_options;
 mod task_trace;
 #[cfg(test)]

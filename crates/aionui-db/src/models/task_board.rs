@@ -36,6 +36,37 @@ pub struct TaskBoardItemRow {
     pub external_ref: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// 3.0 task flow (migration 082). `None` on rows created before it.
+    pub source: Option<String>,
+    pub assistant_id: Option<String>,
+    /// 0 / 1.
+    pub plan_first: i64,
+    pub queued_at: Option<TimestampMs>,
+}
+
+/// `task_sessions.source` values (migration 082).
+pub const TASK_SOURCES: [&str; 5] = ["manual", "conversation", "github", "cron", "agent"];
+
+/// The task-flow columns of one task (migration 082), as stored.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskFlowRow {
+    pub assistant_id: Option<String>,
+    pub prompt_json: Option<String>,
+    pub repo_path: Option<String>,
+    pub base_ref: Option<String>,
+    pub plan_first: i64,
+    pub source: Option<String>,
+    pub source_ref: Option<String>,
+    pub fanout_group_id: Option<String>,
+    pub delivery_json: Option<String>,
+    pub queued_at: Option<TimestampMs>,
+}
+
+/// Latest persisted ACP plan message of a conversation (`messages.type = 'plan'`).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct LatestPlanMessageRow {
+    pub conversation_id: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]

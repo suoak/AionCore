@@ -86,7 +86,8 @@ pub use repository::squad::{
     UpdateSquadTemplateParams, WorkItemAssignment,
 };
 pub use repository::task_board::{
-    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, BoardAssignee, TaskBoardFilter, UpdateTaskBoardParams,
+    AppendTaskCommentParams, BOARD_STALE_CONFLICT_PREFIX, BoardAssignee, SetTaskFlowParams, TaskBoardFilter,
+    UpdateTaskBoardParams,
 };
 pub use repository::task_session::{
     AppendTaskTraceEventParams, CreateContextSnapshotParams, CreatePlanningTaskRunParams, CreateRetryTaskRunParams,
