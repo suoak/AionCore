@@ -86,6 +86,7 @@ Generated from `src/reason_catalogue.rs` (checked by a test; regenerate with
 | `bound_service_capabilities_unavailable` | This service needs extra permissions that this version of CSBU WorkMate cannot grant yet. Update the app when a newer version is available. |
 | `bound_service_runtime_requires_signed_files` | This service can only run from a signed installation. Reinstall the extension from the WorkMate hub. |
 | `bound_service_runner_unavailable` | This service is verified, but running extension services is not enabled in this version of CSBU WorkMate. |
+| `unsigned_extension_code_disabled` | This extension is not signed, so CSBU WorkMate does not run its background services or setup scripts. Install a signed version from the WorkMate hub, or ask your administrator. |
 
 ### Extension commands and agent tools
 
