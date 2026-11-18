@@ -687,6 +687,35 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
+    /// The range CSBU WorkMate's plugin template, examples and Contract v1 docs
+    /// declare: it must keep loading when the app moves from 2.6.x to 3.x.
+    const WORKMATE_ENGINE_RANGE: &str = ">=2.6.0, <4.0.0";
+
+    #[test]
+    fn filter_workmate_engine_range_accepts_2_6_through_3_x() {
+        for app in ["2.6.0", "2.9.3", "3.0.0", "3.4.1"] {
+            let exts = vec![make_loaded_ext("ext-a", "1.0.0", Some(WORKMATE_ENGINE_RANGE), None)];
+            assert_eq!(filter_by_engine_compatibility(exts, app).len(), 1, "app {app}");
+        }
+        for app in ["2.5.9", "4.0.0"] {
+            let exts = vec![make_loaded_ext("ext-a", "1.0.0", Some(WORKMATE_ENGINE_RANGE), None)];
+            assert!(filter_by_engine_compatibility(exts, app).is_empty(), "app {app}");
+        }
+    }
+
+    #[test]
+    fn filter_caret_2_6_rejects_3_0_and_npm_style_ranges_are_invalid() {
+        // `^2.6.0` (the old template value) stops matching at 3.0.0.
+        let exts = vec![make_loaded_ext("ext-a", "1.0.0", Some("^2.6.0"), None)];
+        assert!(filter_by_engine_compatibility(exts, "3.0.0").is_empty());
+        // Cargo-style requirements need commas; npm's space / `||` forms do not
+        // parse and are filtered out as invalid, even for a matching app version.
+        for req in [">=2.6.0 <4.0.0", "^2.6.0 || ^3.0.0"] {
+            let exts = vec![make_loaded_ext("ext-a", "1.0.0", Some(req), None)];
+            assert!(filter_by_engine_compatibility(exts, "3.0.0").is_empty(), "{req}");
+        }
+    }
+
     #[test]
     fn filter_keeps_all_with_invalid_app_version() {
         // If the app version itself is invalid, skip filtering entirely.
