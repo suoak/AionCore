@@ -13690,3 +13690,105 @@ async fn follow_up_continues_the_same_conversation_and_reopens_the_card() {
     service.on_task_turn_settled("user_1", "conv-2", true).await;
     assert_eq!(board_entry(&service, &id).await.board_status, S::InReview);
 }
+
+#[derive(Default)]
+struct RecordingDeliveryPort {
+    calls: std::sync::Mutex<Vec<crate::board::delivery::TaskPullRequestSpec>>,
+}
+
+#[async_trait::async_trait]
+impl crate::board::delivery::TaskDeliveryPort for RecordingDeliveryPort {
+    async fn pull_request(
+        &self,
+        _user_id: &str,
+        spec: &crate::board::delivery::TaskPullRequestSpec,
+    ) -> Result<crate::board::delivery::TaskPullRequest, ConversationError> {
+        self.calls.lock().unwrap().push(spec.clone());
+        Ok(crate::board::delivery::TaskPullRequest {
+            url: (!spec.update).then(|| "https://github.com/o/r/pull/7".to_owned()),
+            number: (!spec.update).then(|| "7".to_owned()),
+            branch: "workmate/task-1".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn deliver_opens_one_pull_request_then_only_updates_it() {
+    use aionui_api_types::{DeliverTaskRequest, TaskDeliveryKind};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    let port = Arc::new(RecordingDeliveryPort::default());
+    service.with_task_delivery_port(port.clone());
+    let request = |kind| DeliverTaskRequest {
+        kind,
+        title: None,
+        body: Some("Fixes login".into()),
+        draft: false,
+    };
+
+    let fresh = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    assert!(matches!(
+        service
+            .deliver_task("user_1", &fresh, request(TaskDeliveryKind::Pr))
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let id = task_in_review(&db, &service, "conv-3").await;
+    // In review but no worktree branch yet.
+    assert!(matches!(
+        service.deliver_task("user_1", &id, request(TaskDeliveryKind::Pr)).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    sqlx::query(
+        "INSERT INTO fanout_groups (id, user_id, source_repo_path, repo_common_dir, base_ref, base_commit, prompt, \
+         status, task_session_id, created_at, updated_at) \
+         VALUES ('fg-3', 'user_1', '/repo', '/repo/.git', 'main', 'abc', 'p', 'comparing', ?, 1, 1)",
+    )
+    .bind(&id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task_sessions SET fanout_group_id = 'fg-3' WHERE id = ?")
+        .bind(&id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        service
+            .deliver_task("user_1", &id, request(TaskDeliveryKind::UpdatePr))
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let item = service
+        .deliver_task("user_1", &id, request(TaskDeliveryKind::Pr))
+        .await
+        .unwrap();
+    let pr = &item.delivery.as_ref().unwrap()["pull_request"];
+    assert_eq!(pr["url"], "https://github.com/o/r/pull/7");
+    assert_eq!(pr["branch"], "workmate/task-1");
+    {
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].fanout_group_id, "fg-3");
+        assert_eq!(calls[0].title, "Flow item", "defaults to the task title");
+        assert!(!calls[0].update);
+    }
+    assert!(matches!(
+        service.deliver_task("user_1", &id, request(TaskDeliveryKind::Pr)).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let item = service
+        .deliver_task("user_1", &id, request(TaskDeliveryKind::UpdatePr))
+        .await
+        .unwrap();
+    let pr = &item.delivery.as_ref().unwrap()["pull_request"];
+    assert_eq!(pr["url"], "https://github.com/o/r/pull/7", "update keeps the PR");
+    assert!(pr["updated_at"].is_i64());
+    assert!(port.calls.lock().unwrap()[1].update);
+}

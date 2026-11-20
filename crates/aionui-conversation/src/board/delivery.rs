@@ -282,3 +282,136 @@ impl ConversationService {
         })
     }
 }
+
+pub const PR_TITLE_MAX_CHARS: usize = 256;
+pub const PR_BODY_MAX_BYTES: usize = 24 * 1024;
+
+/// What to deliver: the task's fan-out branch, as a PR against its base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPullRequestSpec {
+    pub task_session_id: String,
+    pub fanout_group_id: String,
+    pub title: String,
+    pub body: String,
+    pub draft: bool,
+    /// Only push (the PR already exists).
+    pub update: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPullRequest {
+    pub url: Option<String>,
+    pub number: Option<String>,
+    pub branch: String,
+}
+
+/// Implemented by the app over the user's `gh` (push the task branch only,
+/// then `gh pr create`). Errors are `Unprocessable` with a stable code prefix
+/// (`github_cli_missing`, `github_not_authenticated`, …).
+#[async_trait::async_trait]
+pub trait TaskDeliveryPort: Send + Sync {
+    async fn pull_request(
+        &self,
+        user_id: &str,
+        spec: &TaskPullRequestSpec,
+    ) -> Result<TaskPullRequest, ConversationError>;
+}
+
+impl ConversationService {
+    pub fn with_task_delivery_port(&self, port: std::sync::Arc<dyn TaskDeliveryPort>) {
+        if let Ok(mut guard) = self.task_delivery.write() {
+            *guard = Some(port);
+        }
+    }
+
+    /// `POST /api/task-sessions/{id}/deliver`.
+    pub async fn deliver_task(
+        &self,
+        user_id: &str,
+        id: &str,
+        request: aionui_api_types::DeliverTaskRequest,
+    ) -> Result<aionui_api_types::TaskBoardItemResponse, ConversationError> {
+        let port = self
+            .task_delivery
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| ConversationError::internal("Task delivery is not configured"))?;
+        let task = self
+            .task_session_repo()?
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
+        let row = self.board_item(user_id, id).await?;
+        if !matches!(row.board_status.as_str(), "in_review" | "done") || task.status == "running" {
+            return Err(ConversationError::bad_request(
+                "Open a pull request once the task is waiting for review or done",
+            ));
+        }
+        let flow = self
+            .task_board_repo()?
+            .get_task_flow(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
+        let fanout_group_id = flow.fanout_group_id.clone().ok_or_else(|| {
+            ConversationError::bad_request("Only a task that ran in its own worktree has a branch to deliver")
+        })?;
+        let mut delivery = self.delivery_object(user_id, id).await?;
+        let existing = delivery.get("pull_request").cloned();
+        let update = request.kind == aionui_api_types::TaskDeliveryKind::UpdatePr;
+        if update && existing.is_none() {
+            return Err(ConversationError::bad_request("The task has no pull request to update"));
+        }
+        if !update && existing.is_some() {
+            return Err(ConversationError::bad_request(
+                "The task already has a pull request; update it instead",
+            ));
+        }
+        let title = request
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(task.title.trim())
+            .to_owned();
+        if !update && (title.is_empty() || title.chars().count() > PR_TITLE_MAX_CHARS) {
+            return Err(ConversationError::bad_request(format!(
+                "A pull request title needs 1 to {PR_TITLE_MAX_CHARS} characters"
+            )));
+        }
+        let body = request.body.unwrap_or_default();
+        if body.len() > PR_BODY_MAX_BYTES {
+            return Err(ConversationError::bad_request(format!(
+                "A pull request description is limited to {PR_BODY_MAX_BYTES} bytes"
+            )));
+        }
+        let pr = port
+            .pull_request(
+                user_id,
+                &TaskPullRequestSpec {
+                    task_session_id: id.to_owned(),
+                    fanout_group_id,
+                    title,
+                    body,
+                    draft: request.draft,
+                    update,
+                },
+            )
+            .await?;
+        let now = now_ms();
+        let record = match existing {
+            Some(Value::Object(mut previous)) if update => {
+                previous.insert("updated_at".into(), json!(now));
+                Value::Object(previous)
+            }
+            _ => json!({ "url": pr.url, "number": pr.number, "branch": pr.branch, "at": now }),
+        };
+        delivery.insert("pull_request".into(), record);
+        self.write_delivery(user_id, id, delivery).await?;
+        let row = self.board_item(user_id, id).await?;
+        let from = TaskBoardStatus::parse(&row.board_status).unwrap_or(TaskBoardStatus::Backlog);
+        self.publish_item(user_id, from, row.clone());
+        tracing::info!(task_session_id = %id, update, "task delivered as a pull request");
+        item_response(row)
+    }
+}

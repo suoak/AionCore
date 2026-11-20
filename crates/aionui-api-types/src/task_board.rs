@@ -465,3 +465,25 @@ pub struct StartTaskResponse {
     pub state: TaskStartState,
     pub item: TaskBoardItemResponse,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDeliveryKind {
+    /// Push the task branch and open a pull request.
+    Pr,
+    /// Push new commits to the branch of the task's open pull request.
+    UpdatePr,
+}
+
+/// `POST /api/task-sessions/{id}/deliver` (3.0 C3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeliverTaskRequest {
+    pub kind: TaskDeliveryKind,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+}

@@ -647,3 +647,100 @@ mod q12_tests {
         assert!(f.adapter.ensure(USER, &bare, None, None).await.unwrap().is_none());
     }
 }
+
+/// 3.0 C3: a task's pull request. Pushes only the task's own fan-out branch
+/// (to `origin`, never force), then opens the PR through the existing
+/// `gh` / `glab` delivery (WorkMate never reads the CLI's token).
+pub(crate) struct TaskDeliveryAdapter {
+    pub(crate) fanout: aionui_worktree::FanoutService,
+    pub(crate) delivery: Arc<aionui_review::DeliveryService>,
+    pub(crate) git: aionui_worktree::GitCli,
+}
+
+fn delivery_error(code: &str, message: impl std::fmt::Display) -> aionui_conversation::ConversationError {
+    let code = match code {
+        aionui_review::delivery::CODE_CLI_NOT_INSTALLED => "github_cli_missing",
+        aionui_review::delivery::CODE_CLI_NOT_AUTHENTICATED => "github_not_authenticated",
+        aionui_review::delivery::CODE_PROVIDER_UNSUPPORTED => "pr_provider_unsupported",
+        aionui_review::delivery::CODE_NO_REMOTE => "pr_no_remote",
+        "push" => "task_branch_push_failed",
+        _ => "pr_create_failed",
+    };
+    aionui_conversation::ConversationError::Unprocessable {
+        reason: format!("{code}: {message}"),
+    }
+}
+
+#[async_trait]
+impl aionui_conversation::board::delivery::TaskDeliveryPort for TaskDeliveryAdapter {
+    async fn pull_request(
+        &self,
+        user_id: &str,
+        spec: &aionui_conversation::board::delivery::TaskPullRequestSpec,
+    ) -> Result<aionui_conversation::board::delivery::TaskPullRequest, aionui_conversation::ConversationError> {
+        let group = self.fanout.get(user_id, &spec.fanout_group_id).await.map_err(|error| {
+            aionui_conversation::ConversationError::BadRequest {
+                reason: format!("task worktree: {error}"),
+            }
+        })?;
+        if group.task_session_id.as_deref() != Some(spec.task_session_id.as_str()) {
+            return Err(aionui_conversation::ConversationError::BadRequest {
+                reason: "the fan-out group does not belong to this task".into(),
+            });
+        }
+        let slot = group
+            .slots
+            .first()
+            .ok_or_else(|| aionui_conversation::ConversationError::BadRequest {
+                reason: "the task worktree has no branch".into(),
+            })?;
+        let branch = slot.branch.clone();
+        aionui_worktree::git_cli::validate_branch_name(&branch).map_err(|error| delivery_error("push", error))?;
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let push = self
+            .git
+            .run(
+                ["push", "--porcelain", "origin", refspec.as_str()],
+                aionui_worktree::git_cli::RunOptions::in_dir(std::path::Path::new(&group.source_repo_path)),
+            )
+            .await
+            .map_err(|error| delivery_error("push", error))?;
+        if !push.success() {
+            return Err(delivery_error("push", push.stderr.trim()));
+        }
+        if spec.update {
+            return Ok(aionui_conversation::board::delivery::TaskPullRequest {
+                url: None,
+                number: None,
+                branch,
+            });
+        }
+        let created = self
+            .delivery
+            .create_pull_request(
+                user_id,
+                aionui_review::delivery::CreatePullRequestRequest {
+                    repo_path: group.source_repo_path.clone(),
+                    branch: branch.clone(),
+                    base: group.base_ref.clone(),
+                    title: spec.title.clone(),
+                    body: spec.body.clone(),
+                    draft: spec.draft,
+                    remote: None,
+                    task_session_id: Some(spec.task_session_id.clone()),
+                    run_id: None,
+                    worktree_id: Some(slot.worktree_id.clone()),
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                aionui_review::ReviewError::Conflict { code, message } => delivery_error(code, message),
+                other => delivery_error("", other),
+            })?;
+        Ok(aionui_conversation::board::delivery::TaskPullRequest {
+            url: Some(created.pr_url),
+            number: created.pr_number,
+            branch,
+        })
+    }
+}

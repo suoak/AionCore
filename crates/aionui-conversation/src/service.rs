@@ -901,6 +901,8 @@ pub struct ConversationService {
     pub(crate) task_launch: Arc<RwLock<Option<Arc<dyn crate::board::start::TaskLaunchPort>>>>,
     /// Serializes start / dequeue so the run-slot limit holds.
     pub(crate) task_start_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 3.0 C3: opens / updates a task's pull request.
+    pub(crate) task_delivery: Arc<RwLock<Option<Arc<dyn crate::board::delivery::TaskDeliveryPort>>>>,
     pub(crate) max_running_tasks: Arc<std::sync::atomic::AtomicUsize>,
     /// M8 E6-7: read-only GitHub Issue source (the app wires `gh`).
     pub(crate) github_issue_source: Arc<RwLock<Option<Arc<dyn crate::board::github_import::GithubIssueSource>>>>,
@@ -1074,6 +1076,7 @@ impl ConversationService {
             board_squad_run: Arc::new(RwLock::new(None)),
             task_launch: Arc::new(RwLock::new(None)),
             task_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            task_delivery: Arc::new(RwLock::new(None)),
             max_running_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(
                 crate::board::start::DEFAULT_MAX_RUNNING_TASKS,
             )),

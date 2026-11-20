@@ -188,6 +188,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/task-sessions/{id}/execute", post(execute_approved_plan))
         .route("/api/task-sessions/{id}/start", post(start_task))
         .route("/api/task-sessions/{id}/follow-up", post(follow_up_task))
+        .route("/api/task-sessions/{id}/deliver", post(deliver_task))
         .route("/api/task-sessions/{id}/runs", get(list_task_runs))
         .route("/api/task-sessions/{id}/runs/{run_id}/review", get(get_task_run_review))
         .route("/api/task-sessions/{id}/runs/{run_id}/trace", get(get_task_run_trace))
@@ -583,6 +584,19 @@ async fn follow_up_task(
     let Json(request) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state.service.follow_up_task(&user.id, &id, &request.text).await?,
+    )))
+}
+
+/// 3.0 C3: push the task branch and open (or update) its pull request.
+async fn deliver_task(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::DeliverTaskRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::TaskBoardItemResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.deliver_task(&user.id, &id, request).await?,
     )))
 }
 
