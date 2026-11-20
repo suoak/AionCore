@@ -72,6 +72,7 @@ fn make_job(id: &str) -> CronJobRow {
         autopilot: false,
         autopilot_yolo: false,
         notify_channel_id: None,
+        task_options: None,
     }
 }
 

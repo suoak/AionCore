@@ -39,9 +39,9 @@ impl ICronRepository for SqliteCronRepository {
                 conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
                 last_status, last_error, run_count, retry_count, max_retries, queue_enabled, \
-                autopilot, autopilot_yolo, notify_channel_id\
+                autopilot, autopilot_yolo, notify_channel_id, task_options\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
@@ -73,6 +73,7 @@ impl ICronRepository for SqliteCronRepository {
         .bind(row.autopilot)
         .bind(row.autopilot_yolo)
         .bind(&row.notify_channel_id)
+        .bind(&row.task_options)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -476,6 +477,7 @@ impl SqliteCronRepository {
         push_opt_str!(skill_content);
         push_opt_str!(description);
         push_opt_str!(notify_channel_id);
+        push_opt_str!(task_options);
         push_opt_i64!(next_run_at);
         push_opt_i64!(last_run_at);
         push_opt_str!(last_status);
@@ -606,6 +608,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task_options: None,
         }
     }
 
@@ -767,6 +770,46 @@ mod tests {
 
         assert_eq!(repo.cleanup_runs_before(1_000, 0).await.unwrap(), 1);
         assert_eq!(run_ids(&db, "cron_w").await, vec!["cron_w_run_2"]);
+    }
+
+    #[tokio::test]
+    async fn task_options_round_trip_clear_and_must_be_an_object() {
+        let (repo, _db) = setup().await;
+        let mut row = make_row("cron_task");
+        row.task_options = Some(r#"{"start":true}"#.into());
+        repo.insert(&row).await.unwrap();
+        let found = repo.get_by_id_system("cron_task").await.unwrap().unwrap();
+        assert_eq!(found.task_options.as_deref(), Some(r#"{"start":true}"#));
+
+        repo.update_for_user(
+            "user_1",
+            "cron_task",
+            &UpdateCronJobParams {
+                task_options: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let found = repo.get_by_id_system("cron_task").await.unwrap().unwrap();
+        assert!(found.task_options.is_none());
+
+        for bad in ["[1]", "not json", "\"text\""] {
+            let mut row = make_row(&format!("cron_bad_{}", bad.len()));
+            row.task_options = Some(bad.into());
+            assert!(repo.insert(&row).await.is_err(), "{bad}");
+        }
+        // Legacy rows default to conversation runs.
+        let legacy = make_row("cron_legacy");
+        repo.insert(&legacy).await.unwrap();
+        assert!(
+            repo.get_by_id_system("cron_legacy")
+                .await
+                .unwrap()
+                .unwrap()
+                .task_options
+                .is_none()
+        );
     }
 
     #[tokio::test]

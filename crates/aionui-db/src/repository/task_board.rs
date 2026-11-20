@@ -100,6 +100,14 @@ pub trait ITaskBoardRepository: Send + Sync {
         user_id: &str,
         external_ref: &str,
     ) -> Result<Option<TaskBoardItemRow>, DbError>;
+    /// 3.0 C6: newest task of `source` / `source_ref` that is not done or
+    /// cancelled (a cron job's previous occurrence still on the board).
+    async fn find_open_task_by_source(
+        &self,
+        user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<String>, DbError>;
     /// Write the task-flow fields of a task (does not touch `updated_at`).
     /// `DbError::NotFound` for another user's or a missing task;
     /// `DbError::Conflict` for an unknown `source`.

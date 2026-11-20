@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use aionui_api_types::{
     CronAgentConfigReadDto, CronJobMetadataDto, CronJobPayloadDto, CronJobResponse, CronJobStateDto, CronJobTargetDto,
-    CronScheduleDto,
+    CronRunAs, CronScheduleDto, CronTaskOptionsDto,
 };
 use aionui_common::{ProviderWithModel, TimestampMs};
 use aionui_db::models::CronJobRow;
@@ -182,6 +182,9 @@ pub struct CronJob {
     pub autopilot_yolo: bool,
     /// Channel session (`assistant_sessions.id`) receiving run summaries.
     pub notify_channel_id: Option<String>,
+    /// 3.0 C6: `Some` = each occurrence creates a board task instead of a
+    /// conversation turn (migration 085).
+    pub task: Option<CronTaskOptionsDto>,
 }
 
 /// Session mode requested for Autopilot jobs running in Ask mode. Backends
@@ -190,6 +193,14 @@ pub struct CronJob {
 pub const AUTOPILOT_ASK_SESSION_MODE: &str = "default";
 
 impl CronJob {
+    pub fn run_as(&self) -> CronRunAs {
+        if self.task.is_some() {
+            CronRunAs::Task
+        } else {
+            CronRunAs::Conversation
+        }
+    }
+
     /// Autopilot job that must NOT be escalated to full-auto (guardrail 1).
     pub fn is_autopilot_ask(&self) -> bool {
         self.autopilot && !self.autopilot_yolo
@@ -245,6 +256,11 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
         .transpose()?;
 
     let last_status = row.last_status.as_deref().map(JobStatus::from_str).transpose()?;
+    let task = row
+        .task_options
+        .as_deref()
+        .map(serde_json::from_str::<CronTaskOptionsDto>)
+        .transpose()?;
 
     Ok(CronJob {
         id: row.id,
@@ -274,6 +290,7 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
         autopilot: row.autopilot,
         autopilot_yolo: row.autopilot_yolo,
         notify_channel_id: row.notify_channel_id,
+        task,
     })
 }
 
@@ -350,6 +367,7 @@ pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
         autopilot: job.autopilot,
         autopilot_yolo: job.autopilot_yolo,
         notify_channel_id: job.notify_channel_id.clone(),
+        task_options: job.task.as_ref().map(serde_json::to_string).transpose()?,
     })
 }
 
@@ -418,6 +436,8 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
                 text: job.message.clone(),
             },
             execution_mode: Some(job.execution_mode.as_str().to_owned()),
+            run_as: job.run_as(),
+            task: job.task.clone(),
         },
         metadata: CronJobMetadataDto {
             conversation_id: job.conversation_id.clone(),
@@ -641,6 +661,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task_options: None,
         }
     }
 
@@ -687,6 +708,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task: None,
         }
     }
 

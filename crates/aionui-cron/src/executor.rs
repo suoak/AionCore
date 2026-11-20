@@ -33,10 +33,20 @@ pub const MAX_RETRIES_DEFAULT: i64 = 3;
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
-    Success { conversation_id: String },
-    Retrying { attempt: i64 },
+    Success {
+        conversation_id: String,
+    },
+    /// 3.0 C6: a `run_as = task` occurrence created (and maybe started) a task.
+    Task {
+        task_session_id: String,
+    },
+    Retrying {
+        attempt: i64,
+    },
     Skipped,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +101,57 @@ impl JobExecutor {
         }
     }
 
+    /// 3.0 C6: a `run_as = task` occurrence. Creates a board task (source =
+    /// cron) and, when the job asks for it, starts it under the task rules.
+    /// No conversation turn is sent and nothing is merged.
+    pub async fn execute_as_task(&self, job: &CronJob) -> ExecutionResult {
+        use aionui_conversation::board::cron_task::{CronTaskOutcome, CronTaskRequest};
+        let Some(options) = job.task.as_ref() else {
+            return ExecutionResult::Error {
+                message: "This job does not run as a task".into(),
+            };
+        };
+        let request = CronTaskRequest {
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+            message: job.message.clone(),
+            agent_type: job.agent_type.clone(),
+            assistant_id: job
+                .agent_config
+                .as_ref()
+                .and_then(|config| config.assistant_id.clone().or_else(|| config.custom_agent_id.clone())),
+            repo_path: options.repo_path.clone(),
+            base_ref: options.base_ref.clone(),
+            start: options.start,
+            skip_if_open: job.skips_overlap(),
+        };
+        match self.conversation_service.enqueue_cron_task(&job.user_id, request).await {
+            Ok(CronTaskOutcome::SkippedOpen { task_session_id }) => {
+                info!(job_id = %job.id, task_session_id, "Cron task skipped: previous task still open");
+                ExecutionResult::Skipped
+            }
+            Ok(CronTaskOutcome::Created { task_session_id } | CronTaskOutcome::Started { task_session_id, .. }) => {
+                ExecutionResult::Task { task_session_id }
+            }
+            Ok(CronTaskOutcome::StartRefused {
+                task_session_id,
+                reason,
+            }) => ExecutionResult::Error {
+                message: format!("Task {task_session_id} was created but could not start: {reason}"),
+            },
+            Err(error) => {
+                error!(job_id = %job.id, error = %error, "Failed to create cron task");
+                ExecutionResult::Error {
+                    message: error.to_string(),
+                }
+            }
+        }
+    }
+
     pub async fn execute(&self, job: &CronJob) -> ExecutionResult {
+        if job.task.is_some() {
+            return self.execute_as_task(job).await;
+        }
         let prepared = match self.prepare_scheduled(job).await {
             Ok(prepared) => prepared,
             Err(result) => return result,
@@ -1386,6 +1446,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task: None,
         }
     }
 
