@@ -3,6 +3,7 @@ pub mod availability;
 pub mod codex_account;
 pub(crate) mod codex_account_state;
 pub mod custom;
+pub mod preflight;
 pub mod provider_health;
 pub mod remote;
 

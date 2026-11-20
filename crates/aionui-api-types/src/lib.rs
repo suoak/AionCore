@@ -7,6 +7,7 @@ mod agent_build_extra;
 mod agent_center;
 mod agent_discovery;
 mod agent_error;
+mod agent_preflight;
 mod antigravity_hook;
 mod ask;
 mod assistant;
@@ -88,6 +89,9 @@ pub use agent_discovery::{
 pub use agent_error::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
     AgentStreamErrorData,
+};
+pub use agent_preflight::{
+    AgentPreflight, PreflightCheck, PreflightCheckKey, PreflightFix, PreflightFixAction, PreflightLevel,
 };
 pub use antigravity_hook::{
     AntigravityHookConfig, AntigravityHookDecision, AntigravityHookInput, AntigravityHookOutput,

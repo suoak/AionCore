@@ -16,13 +16,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use aionui_api_types::{
-    AgentLogoEntry, AgentManagementRow, ManagedRuntimeState, ManagedRuntimeStatus, ProviderHealthCheckRequest,
-    ProviderHealthCheckResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND,
+    AgentLogoEntry, AgentManagementRow, AgentPreflight, ManagedRuntimeState, ManagedRuntimeStatus,
+    ProviderHealthCheckRequest, ProviderHealthCheckResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND,
 };
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
 
 use super::availability::{AgentAvailabilityFeedbackPort, AgentAvailabilityService};
+use super::preflight;
 use super::provider_health::ProviderHealthCheckService;
 use crate::error::AgentError;
 use crate::registry::AgentRegistry;
@@ -125,6 +126,22 @@ impl AgentService {
     pub async fn health_check_agent_by_id(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
         let row = self.availability.run_manual_health_check(user_id, id).await?;
         Ok(self.overlay_runtime_status(row))
+    }
+
+    /// Aggregated readiness report for every agent visible to the user.
+    pub async fn preflight_agents(&self, user_id: &str) -> Result<Vec<AgentPreflight>, AgentError> {
+        let rows = self.list_management_agents(user_id).await?;
+        Ok(rows.iter().map(preflight::preflight_for_row).collect())
+    }
+
+    /// Readiness report for a single agent.
+    pub async fn preflight_agent_by_id(&self, user_id: &str, id: &str) -> Result<AgentPreflight, AgentError> {
+        let row = self
+            .availability
+            .management_row_by_id(user_id, id)
+            .await?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
+        Ok(preflight::preflight_for_row(&self.overlay_runtime_status(row)))
     }
 
     pub async fn prepare_agent_runtime(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
