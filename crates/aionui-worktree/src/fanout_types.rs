@@ -62,6 +62,10 @@ pub struct CreateFanoutGroupRequest {
     #[serde(default)]
     pub title: Option<String>,
     pub slots: Vec<FanoutSlotRequest>,
+    /// 3.0 C4: create the slot conversation but do not send the prompt (Core
+    /// plans first). Never settable over HTTP.
+    #[serde(skip)]
+    pub hold_prompt: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

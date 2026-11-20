@@ -143,11 +143,14 @@ pub trait ITaskBoardRepository: Send + Sync {
     /// 3.0 C4: a plan-first task got its conversation; it stays startable
     /// (`ready`) so the strict planning run can claim it. `false` when it is
     /// not a startable Plan task.
+    /// A worktree task binds its fan-out group first and its slot
+    /// conversation once the slot starts (`None` keeps the stored value).
     async fn bind_task_for_planning(
         &self,
         user_id: &str,
         task_session_id: &str,
-        conversation_id: &str,
+        conversation_id: Option<&str>,
+        fanout_group_id: Option<&str>,
         updated_at: TimestampMs,
     ) -> Result<bool, DbError>;
     /// 3.0 C4: planning could not start → `paused` (needs you). `ready` only.

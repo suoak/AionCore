@@ -60,7 +60,7 @@ pub trait TaskLaunchPort: Send + Sync {
     async fn follow_up(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<(), ConversationError>;
 }
 
-fn prompt_text(prompt_json: Option<&str>, objective: &str, title: &str) -> String {
+pub(super) fn prompt_text(prompt_json: Option<&str>, objective: &str, title: &str) -> String {
     let from_prompt = prompt_json
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .and_then(|value| value.get("text").and_then(|text| text.as_str()).map(str::to_owned))
@@ -131,13 +131,12 @@ impl ConversationService {
         }
         // Between binding and the planning run claiming the task it is
         // `ready` + in progress: a second start must not plan twice.
-        if plan_first && task.conversation_id.is_some() && task.status == "ready" && row.board_status == "in_progress" {
+        if plan_first
+            && (task.conversation_id.is_some() || flow.fanout_group_id.is_some())
+            && task.status == "ready"
+            && row.board_status == "in_progress"
+        {
             return respond(TaskStartState::AlreadyRunning, row);
-        }
-        if plan_first && flow.repo_path.is_some() {
-            return Err(ConversationError::Unprocessable {
-                reason: "plan_first_repo_unsupported: plan-first tasks cannot use a repository worktree yet".into(),
-            });
         }
         self.task_launch_port()?;
 
@@ -203,11 +202,20 @@ impl ConversationService {
         };
         let now = now_ms();
         let bound = if spec.plan_first {
-            let conversation_id = launched
-                .conversation_id
-                .as_deref()
-                .ok_or_else(|| ConversationError::internal("A plan-first launch returned no conversation"))?;
-            board.bind_task_for_planning(user_id, id, conversation_id, now).await?
+            if launched.conversation_id.is_none() && launched.fanout_group_id.is_none() {
+                return Err(ConversationError::internal(
+                    "A plan-first launch returned no conversation",
+                ));
+            }
+            board
+                .bind_task_for_planning(
+                    user_id,
+                    id,
+                    launched.conversation_id.as_deref(),
+                    launched.fanout_group_id.as_deref(),
+                    now,
+                )
+                .await?
         } else {
             board
                 .mark_task_started(
@@ -253,7 +261,9 @@ impl ConversationService {
             worktree = launched.fanout_group_id.is_some(),
             "task started"
         );
-        if spec.plan_first {
+        // A worktree slot starts in the background; its planning begins in
+        // `on_task_slot_started`.
+        if spec.plan_first && launched.conversation_id.is_some() {
             // Detached: the planning turn runs to completion (minutes).
             tokio::spawn(super::plan_first::planning_job(
                 self.clone(),
