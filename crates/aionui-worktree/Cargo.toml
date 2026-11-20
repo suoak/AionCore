@@ -8,6 +8,8 @@ edition.workspace = true
 # docs/workmate-agent-v1/42-e3-worktree-service.md.
 
 [dependencies]
+hex.workspace = true
+sha2.workspace = true
 aionui-common.workspace = true
 aionui-db.workspace = true
 aionui-api-types.workspace = true

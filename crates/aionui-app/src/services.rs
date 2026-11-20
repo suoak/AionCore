@@ -155,6 +155,8 @@ impl AppServices {
             user_order_store: self.user_order_store.clone(),
         });
         self.conversation_service.with_governance(self.governance.clone());
+        self.conversation_service
+            .with_remote_approval_audit(self.audit_sink.clone());
         self
     }
 
@@ -479,6 +481,7 @@ impl AppServices {
             user_order_store: user_order_store.clone(),
         });
         conversation_service.with_governance(governance.clone());
+        conversation_service.with_remote_approval_audit(audit_sink.clone());
         conversation_service
             .recover_task_sessions()
             .await
@@ -615,6 +618,9 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         deps.database.pool().clone(),
     )));
     service.with_delegation_repo(Arc::new(aionui_db::SqliteDelegationRepository::new(
+        deps.database.pool().clone(),
+    )));
+    service.with_approval_request_repo(Arc::new(aionui_db::SqliteApprovalRequestRepository::new(
         deps.database.pool().clone(),
     )));
     service.with_evolution_evidence_repo(Arc::new(aionui_db::SqliteExperienceArticleRepository::new(

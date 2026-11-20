@@ -14122,3 +14122,780 @@ async fn plan_first_start_never_sends_the_prompt_and_pauses_when_planning_is_una
     );
     assert_eq!(port.launched.lock().unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// 3.0 C9: remote approve-to-execute (plan B §5.4).
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct FakeAdoptPort {
+    digest: std::sync::Mutex<String>,
+    adopts: std::sync::Mutex<Vec<(String, String, String, Option<String>, String)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_approval::AdoptApprovalPort for FakeAdoptPort {
+    async fn digest(
+        &self,
+        _user_id: &str,
+        _group_id: &str,
+        _slot: &str,
+        strategy: &str,
+        target_branch: Option<&str>,
+    ) -> Result<crate::remote_approval::AdoptDigestInfo, ConversationError> {
+        // The strategy is part of what is bound.
+        Ok(crate::remote_approval::AdoptDigestInfo {
+            digest: format!("{}{}", self.digest.lock().unwrap(), &format!("{strategy:0>8}")[..8]),
+            target_branch: Some(target_branch.unwrap_or("main").to_owned()),
+        })
+    }
+
+    async fn adopt(
+        &self,
+        _user_id: &str,
+        group_id: &str,
+        slot: &str,
+        strategy: &str,
+        target_branch: Option<&str>,
+        expected_digest: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        self.adopts.lock().unwrap().push((
+            group_id.to_owned(),
+            slot.to_owned(),
+            strategy.to_owned(),
+            target_branch.map(str::to_owned),
+            expected_digest.to_owned(),
+        ));
+        Ok(Some("c0ffee".into()))
+    }
+}
+
+struct FakeImPort {
+    paired: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_approval::ImIdentityPort for FakeImPort {
+    async fn is_paired(&self, _user_id: &str, _platform: &str, _identity: &str) -> bool {
+        self.paired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct C9 {
+    db: aionui_db::Database,
+    service: ConversationService,
+    audit: Arc<dyn aionui_db::IAuditEventRepository>,
+    adopt: Arc<FakeAdoptPort>,
+    im: Arc<FakeImPort>,
+}
+
+async fn c9() -> C9 {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    seed_test_user(db.pool(), "user_2").await;
+    let service = board_service(&db);
+    service.with_inbox_repo(Arc::new(aionui_db::SqliteInboxRepository::new(db.pool().clone())));
+    service.with_approval_request_repo(Arc::new(aionui_db::SqliteApprovalRequestRepository::new(
+        db.pool().clone(),
+    )));
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(db.pool().clone()));
+    service.with_remote_approval_audit(aionui_db::AuditSink::new(audit.clone()));
+    let adopt = Arc::new(FakeAdoptPort::default());
+    *adopt.digest.lock().unwrap() = "a".repeat(56);
+    service.with_adopt_approval_port(adopt.clone());
+    let im = Arc::new(FakeImPort {
+        paired: std::sync::atomic::AtomicBool::new(true),
+    });
+    service.with_im_identity_port(im.clone());
+    C9 {
+        db,
+        service,
+        audit,
+        adopt,
+        im,
+    }
+}
+
+impl C9 {
+    async fn plan_task(&self, content: &str) -> (String, aionui_api_types::SubmitTaskArtifactResponse) {
+        let id = startable_task(&self.service, json!({ "mode": "plan", "assistant_id": "codex-helper" })).await;
+        let plan = self
+            .service
+            .submit_task_artifact("user_1", &id, plan_submit(content))
+            .await
+            .unwrap();
+        (id, plan)
+    }
+
+    async fn pending(&self, task: &str) -> aionui_api_types::ApprovalRequestResponse {
+        self.service
+            .list_approval_requests("user_1", Some(task))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.status == aionui_api_types::ApprovalRequestStatus::Pending)
+            .expect("a pending request")
+    }
+
+    async fn audited(&self, action: &str) -> Vec<aionui_db::AuditEventRow> {
+        self.audit
+            .list(&aionui_db::AuditEventFilter {
+                action: Some(format!("remote_approval.{action}")),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn in_review_task(&self) -> String {
+        let id = startable_task(&self.service, json!({ "assistant_id": "codex-helper" })).await;
+        sqlx::query(
+            "INSERT INTO fanout_groups (id, user_id, source_repo_path, repo_common_dir, base_ref, base_commit, prompt, \
+             status, task_session_id, created_at, updated_at) \
+             VALUES (?, 'user_1', '/repo', '/repo/.git', 'main', 'abc', 'p', 'comparing', ?, 1, 1)",
+        )
+        .bind(format!("fg-{id}"))
+        .bind(&id)
+        .execute(self.db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE task_sessions SET fanout_group_id = ?, board_status = 'in_review' WHERE id = ?")
+            .bind(format!("fg-{id}"))
+            .bind(&id)
+            .execute(self.db.pool())
+            .await
+            .unwrap();
+        id
+    }
+}
+
+fn device() -> crate::remote_approval::RemoteDecider {
+    crate::remote_approval::RemoteDecider::Device("phone-1".into())
+}
+
+fn remote(
+    decision: aionui_api_types::RemoteApprovalDecision,
+    digest: &str,
+) -> aionui_api_types::RemoteApprovalDecisionRequest {
+    aionui_api_types::RemoteApprovalDecisionRequest {
+        decision,
+        digest: digest.to_owned(),
+        comment: None,
+    }
+}
+
+fn assert_conflict(err: &ConversationError, code: &str) {
+    match err {
+        ConversationError::Busy { reason } => assert!(reason.starts_with(code), "{reason}"),
+        other => panic!("expected 409 {code}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_pending_plan_gets_a_bound_expiring_remote_request() {
+    let t = c9().await;
+    let before = aionui_common::now_ms();
+    let (task, plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+    assert_eq!(request.kind, aionui_api_types::ApprovalRequestKind::Plan);
+    assert_eq!(request.digest, plan.artifact.content_hash);
+    assert_eq!(request.approval_id.as_deref(), Some(plan.approval.id.as_str()));
+    assert_eq!(request.id.len(), 16);
+    let ttl = request.expires_at - request.requested_at;
+    assert_eq!(ttl, 30 * 60_000, "default 30 minutes");
+    assert!(request.requested_at >= before);
+    assert_eq!(t.audited("request").await.len(), 1);
+
+    // A newer plan voids the old request (and its card).
+    let second = t
+        .service
+        .submit_task_artifact("user_1", &task, plan_submit("Step 1 and 2"))
+        .await
+        .unwrap();
+    let all = t.service.list_approval_requests("user_1", Some(&task)).await.unwrap();
+    let old = all.iter().find(|r| r.id == request.id).unwrap();
+    assert_eq!(old.status, aionui_api_types::ApprovalRequestStatus::Invalidated);
+    assert_eq!(old.reason.as_deref(), Some("superseded"));
+    assert_eq!(t.pending(&task).await.digest, second.artifact.content_hash);
+    let err = t
+        .service
+        .decide_approval_request_remotely(
+            "user_1",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            device(),
+        )
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_already_decided");
+}
+
+#[tokio::test]
+async fn a_remote_approval_runs_once_and_a_replay_is_409() {
+    let t = c9().await;
+    let (task, plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+
+    let decided = t
+        .service
+        .decide_approval_request_remotely(
+            "user_1",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            device(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(decided.status, aionui_api_types::ApprovalRequestStatus::Approved);
+    assert_eq!(decided.decided_by.as_deref(), Some("device:phone-1"));
+    let approvals = t.service.list_task_approvals("user_1", &task).await.unwrap();
+    assert_eq!(approvals[0].id, plan.approval.id);
+    assert_eq!(approvals[0].status, aionui_api_types::TaskApprovalStatus::Approved);
+    assert_eq!(t.audited("approve").await.len(), 1);
+
+    // Replays — same device, another device, a reject — run nothing.
+    for (decider, decision) in [
+        (device(), aionui_api_types::RemoteApprovalDecision::Approve),
+        (
+            crate::remote_approval::RemoteDecider::Device("phone-2".into()),
+            aionui_api_types::RemoteApprovalDecision::Approve,
+        ),
+        (device(), aionui_api_types::RemoteApprovalDecision::Reject),
+    ] {
+        let err = t
+            .service
+            .decide_approval_request_remotely("user_1", &request.id, remote(decision, &request.digest), decider)
+            .await
+            .unwrap_err();
+        assert_conflict(&err, "approval_already_decided");
+    }
+    assert_eq!(t.audited("replay").await.len(), 3);
+    assert_eq!(t.audited("approve").await.len(), 1);
+
+    // The approved plan was handed to execution once; its outcome is recorded.
+    let mut recorded = None;
+    for _ in 0..100 {
+        let row = t.service.get_approval_request("user_1", &request.id).await.unwrap();
+        if row.result_ref.is_some() || row.error.is_some() {
+            recorded = Some(row);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(recorded.is_some(), "the execution outcome is recorded on the request");
+    let executions = t.audited("executed").await.len() + t.audited("execute_failed").await.len();
+    assert_eq!(executions, 1);
+}
+
+#[tokio::test]
+async fn concurrent_remote_approvals_have_exactly_one_winner() {
+    let t = c9().await;
+    let task = t.in_review_task().await;
+    let request = t
+        .service
+        .issue_approval_request(
+            "user_1",
+            &task,
+            aionui_api_types::IssueApprovalRequest {
+                kind: aionui_api_types::ApprovalRequestKind::Adopt,
+                strategy: None,
+                target_branch: None,
+            },
+        )
+        .await
+        .unwrap();
+    let decide = |id: &'static str| {
+        t.service.decide_approval_request_remotely(
+            "user_1",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            crate::remote_approval::RemoteDecider::Device(id.into()),
+        )
+    };
+    let (a, b) = tokio::join!(decide("phone-1"), decide("phone-2"));
+    assert!(a.is_ok() ^ b.is_ok(), "{a:?} / {b:?}");
+    assert_conflict(
+        a.as_ref().err().or(b.as_ref().err()).unwrap(),
+        "approval_already_decided",
+    );
+    assert_eq!(t.adopt.adopts.lock().unwrap().len(), 1, "adopted exactly once");
+}
+
+#[tokio::test]
+async fn an_expired_request_is_refused_and_can_be_reissued() {
+    let t = c9().await;
+    let (task, _plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+    sqlx::query("UPDATE approval_requests SET expires_at = ? WHERE id = ?")
+        .bind(aionui_common::now_ms() - 1)
+        .bind(&request.id)
+        .execute(t.db.pool())
+        .await
+        .unwrap();
+
+    let err = t
+        .service
+        .decide_approval_request_remotely(
+            "user_1",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            device(),
+        )
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_expired");
+    let row = t.service.get_approval_request("user_1", &request.id).await.unwrap();
+    assert_eq!(row.status, aionui_api_types::ApprovalRequestStatus::Expired);
+    assert_eq!(t.audited("expire").await.len(), 1);
+    assert_eq!(t.audited("expired_attempt").await.len(), 1);
+    // The approval itself still waits (needs you) and the desktop re-issues.
+    let approvals = t.service.list_task_approvals("user_1", &task).await.unwrap();
+    assert_eq!(approvals[0].status, aionui_api_types::TaskApprovalStatus::Pending);
+    let fresh = t
+        .service
+        .issue_approval_request(
+            "user_1",
+            &task,
+            aionui_api_types::IssueApprovalRequest {
+                kind: aionui_api_types::ApprovalRequestKind::Plan,
+                strategy: None,
+                target_branch: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(fresh.id, request.id);
+    t.service
+        .decide_approval_request_remotely(
+            "user_1",
+            &fresh.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Reject, &fresh.digest),
+            device(),
+        )
+        .await
+        .unwrap();
+
+    // The timer path expires overdue requests on its own.
+    let (task2, _) = t.plan_task("Other").await;
+    let other = t.pending(&task2).await;
+    sqlx::query("UPDATE approval_requests SET expires_at = 1 WHERE id = ?")
+        .bind(&other.id)
+        .execute(t.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(t.service.expire_due_approval_requests().await, 1);
+    assert_eq!(
+        t.service
+            .get_approval_request("user_1", &other.id)
+            .await
+            .unwrap()
+            .status,
+        aionui_api_types::ApprovalRequestStatus::Expired
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_or_stale_digest_is_refused_and_audited() {
+    let t = c9().await;
+    let (task, _plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+    for wrong in ["", "deadbeef", &"0".repeat(64), &request.digest[..63]] {
+        let err = t
+            .service
+            .decide_approval_request_remotely(
+                "user_1",
+                &request.id,
+                remote(aionui_api_types::RemoteApprovalDecision::Approve, wrong),
+                device(),
+            )
+            .await
+            .unwrap_err();
+        assert_conflict(&err, "approval_digest_mismatch");
+    }
+    assert_eq!(t.audited("digest_mismatch").await.len(), 4);
+    // A wrong echo does not consume the request.
+    assert_eq!(t.pending(&task).await.id, request.id);
+
+    // An adopt whose diff changed after the request was issued: voided, not run.
+    let task = t.in_review_task().await;
+    let adopt = t
+        .service
+        .issue_approval_request(
+            "user_1",
+            &task,
+            aionui_api_types::IssueApprovalRequest {
+                kind: aionui_api_types::ApprovalRequestKind::Adopt,
+                strategy: None,
+                target_branch: None,
+            },
+        )
+        .await
+        .unwrap();
+    *t.adopt.digest.lock().unwrap() = "b".repeat(56);
+    let err = t
+        .service
+        .decide_approval_request_remotely(
+            "user_1",
+            &adopt.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &adopt.digest),
+            device(),
+        )
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_digest_mismatch");
+    let row = t.service.get_approval_request("user_1", &adopt.id).await.unwrap();
+    assert_eq!(row.status, aionui_api_types::ApprovalRequestStatus::Invalidated);
+    assert_eq!(row.reason.as_deref(), Some("diff_changed"));
+    assert!(t.adopt.adopts.lock().unwrap().is_empty(), "nothing adopted");
+}
+
+#[tokio::test]
+async fn untrusted_identities_are_refused_and_audited() {
+    let t = c9().await;
+    let (task, _plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+    let prefix = &request.digest[..24];
+    let im = |identity: &str| crate::remote_approval::RemoteDecider::Im {
+        platform: "telegram".into(),
+        identity: identity.into(),
+    };
+
+    // An IM account that is not bound as an approver.
+    let err = t
+        .service
+        .decide_approval_request_from_im("user_1", "telegram", "42", &request.id, prefix, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ConversationError::Forbidden { reason } if reason.starts_with("approval_identity_untrusted")),
+        "{err:?}"
+    );
+    // Binding needs a paired identity.
+    t.im.paired.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        t.service
+            .add_remote_approver(
+                "user_1",
+                aionui_api_types::RemoteApproverRequest {
+                    platform_type: "telegram".into(),
+                    platform_user_id: "42".into(),
+                },
+            )
+            .await
+            .is_err()
+    );
+    t.im.paired.store(true, std::sync::atomic::Ordering::SeqCst);
+    t.service
+        .add_remote_approver(
+            "user_1",
+            aionui_api_types::RemoteApproverRequest {
+                platform_type: "telegram".into(),
+                platform_user_id: "42".into(),
+            },
+        )
+        .await
+        .unwrap();
+    // Bound, but no longer paired in the channel.
+    t.im.paired.store(false, std::sync::atomic::Ordering::SeqCst);
+    let err = t
+        .service
+        .decide_approval_request_from_im("user_1", "telegram", "42", &request.id, prefix, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    t.im.paired.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Someone else in the same group chat, and the same id on another platform.
+    for (platform, identity) in [("telegram", "43"), ("slack", "42")] {
+        let err = t
+            .service
+            .decide_approval_request_from_im("user_1", platform, identity, &request.id, prefix, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ConversationError::Forbidden { .. }),
+            "{platform}:{identity} {err:?}"
+        );
+    }
+    // Another WorkMate user never sees this request.
+    let err = t
+        .service
+        .decide_approval_request_remotely(
+            "user_2",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            device(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::NotFoundReason { .. }), "{err:?}");
+    // A blank device id is not an identity.
+    let err = t
+        .service
+        .decide_approval_request_remotely(
+            "user_1",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            crate::remote_approval::RemoteDecider::Device(" ".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    assert_eq!(t.audited("identity_denied").await.len(), 6);
+    assert_eq!(t.pending(&task).await.id, request.id, "still pending");
+
+    // A too-short prefix from the bound identity is a digest mismatch.
+    let err = t
+        .service
+        .decide_approval_request_from_im("user_1", "telegram", "42", &request.id, &request.digest[..8], true)
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_digest_mismatch");
+    // The bound, paired identity is accepted.
+    let decided = t
+        .service
+        .decide_approval_request_from_im("user_1", "telegram", "42", &request.id, prefix, false)
+        .await
+        .unwrap();
+    assert_eq!(decided.status, aionui_api_types::ApprovalRequestStatus::Rejected);
+    assert_eq!(decided.decided_by.as_deref(), Some(im("42").label().as_str()));
+    let rejects = t.audited("reject").await;
+    assert_eq!(rejects[0].actor_id.as_deref(), Some("im:telegram:42"));
+}
+
+#[tokio::test]
+async fn a_user_without_run_permission_cannot_approve_remotely() {
+    let t = c9().await;
+    let (task, _plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(t.db.pool().clone()));
+    let governance = Arc::new(aionui_db::GovernanceService::new(
+        Arc::new(aionui_db::SqliteGovernanceRepository::new(t.db.pool().clone())),
+        Some(aionui_db::AuditSink::new(audit)),
+        true,
+    ));
+    governance
+        .set_agent_run_permission(
+            aionui_db::governance::BOOTSTRAP_OWNER_USER_ID,
+            "assistant",
+            "codex-helper",
+            Some(&[aionui_db::UserRole::Owner]),
+            None,
+        )
+        .await
+        .unwrap();
+    t.service.with_governance(governance);
+    let err = t
+        .service
+        .decide_approval_request_remotely(
+            "user_1",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            device(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    assert_eq!(t.audited("identity_denied").await.len(), 1);
+    assert_eq!(t.pending(&task).await.id, request.id, "still pending");
+}
+
+#[tokio::test]
+async fn a_remote_adopt_runs_exactly_what_was_requested() {
+    let t = c9().await;
+    let task = t.in_review_task().await;
+    // Only a task in review with a worktree can be adopted.
+    let plain = startable_task(&t.service, json!({ "assistant_id": "codex-helper" })).await;
+    let issue = |strategy: Option<&str>, target: Option<&str>| aionui_api_types::IssueApprovalRequest {
+        kind: aionui_api_types::ApprovalRequestKind::Adopt,
+        strategy: strategy.map(str::to_owned),
+        target_branch: target.map(str::to_owned),
+    };
+    assert_conflict(
+        &t.service
+            .issue_approval_request("user_1", &plain, issue(None, None))
+            .await
+            .unwrap_err(),
+        "adopt_unavailable",
+    );
+    assert!(matches!(
+        t.service
+            .issue_approval_request("user_1", &task, issue(Some("rebase"), None))
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    let request = t
+        .service
+        .issue_approval_request("user_1", &task, issue(Some("no_ff"), Some("release")))
+        .await
+        .unwrap();
+    assert_eq!(request.strategy.as_deref(), Some("no_ff"));
+    assert_eq!(request.target_branch.as_deref(), Some("release"));
+
+    // The decision body carries nothing that could change plan, agent,
+    // permission mode, strategy or target.
+    for extra in [
+        json!({ "strategy": "squash" }),
+        json!({ "target_branch": "main" }),
+        json!({ "assistant_id": "other" }),
+        json!({ "permission": "bypassPermissions" }),
+        json!({ "content": "a different plan" }),
+        json!({ "mode": "agent" }),
+    ] {
+        let mut body = json!({ "decision": "approve", "digest": request.digest });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        assert!(
+            serde_json::from_value::<aionui_api_types::RemoteApprovalDecisionRequest>(body.clone()).is_err(),
+            "{body}"
+        );
+    }
+
+    t.service
+        .add_remote_approver(
+            "user_1",
+            aionui_api_types::RemoteApproverRequest {
+                platform_type: "telegram".into(),
+                platform_user_id: "42".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let decided = t
+        .service
+        .decide_approval_request_from_im("user_1", "telegram", "42", &request.id, &request.digest[..24], true)
+        .await
+        .unwrap();
+    assert_eq!(decided.status, aionui_api_types::ApprovalRequestStatus::Approved);
+    assert_eq!(decided.result_ref.as_deref(), Some("commit:c0ffee"));
+    let adopts = t.adopt.adopts.lock().unwrap().clone();
+    assert_eq!(
+        adopts,
+        [(
+            format!("fg-{task}"),
+            "A".to_owned(),
+            "no_ff".to_owned(),
+            Some("release".to_owned()),
+            request.digest.clone()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_desktop_decision_settles_the_remote_request() {
+    let t = c9().await;
+    let (task, plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+    t.service
+        .decide_task_approval(
+            "user_1",
+            &task,
+            &plan.approval.id,
+            DecideTaskApprovalRequest {
+                decision: TaskApprovalDecision::Approve,
+                artifact_id: plan.artifact.id.clone(),
+                artifact_hash: plan.artifact.content_hash.clone(),
+                comment: None,
+            },
+        )
+        .await
+        .unwrap();
+    let row = t.service.get_approval_request("user_1", &request.id).await.unwrap();
+    assert_eq!(row.status, aionui_api_types::ApprovalRequestStatus::Approved);
+    assert_eq!(row.decided_by.as_deref(), Some("desktop"));
+    let err = t
+        .service
+        .decide_approval_request_remotely(
+            "user_1",
+            &request.id,
+            remote(aionui_api_types::RemoteApprovalDecision::Approve, &request.digest),
+            device(),
+        )
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_already_decided");
+}
+
+#[tokio::test]
+async fn the_pre_c9_phone_route_runs_under_the_same_rules() {
+    let t = c9().await;
+    let (task, plan) = t.plan_task("Step 1").await;
+    let decide = |hash: &str, artifact: &str| DecideTaskApprovalRequest {
+        decision: TaskApprovalDecision::Approve,
+        artifact_id: artifact.to_owned(),
+        artifact_hash: hash.to_owned(),
+        comment: None,
+    };
+    let err = t
+        .service
+        .decide_task_approval_by(
+            "user_1",
+            &task,
+            &plan.approval.id,
+            decide(&"0".repeat(64), &plan.artifact.id),
+            crate::TaskApprovalDecider::Device("phone-1"),
+        )
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_digest_mismatch");
+    let err = t
+        .service
+        .decide_task_approval_by(
+            "user_1",
+            &task,
+            &plan.approval.id,
+            decide(&plan.artifact.content_hash, "another-artifact"),
+            crate::TaskApprovalDecider::Device("phone-1"),
+        )
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_digest_mismatch");
+    let approved = t
+        .service
+        .decide_task_approval_by(
+            "user_1",
+            &task,
+            &plan.approval.id,
+            decide(&plan.artifact.content_hash, &plan.artifact.id),
+            crate::TaskApprovalDecider::Device("phone-1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status, aionui_api_types::TaskApprovalStatus::Approved);
+    let err = t
+        .service
+        .decide_task_approval_by(
+            "user_1",
+            &task,
+            &plan.approval.id,
+            decide(&plan.artifact.content_hash, &plan.artifact.id),
+            crate::TaskApprovalDecider::Device("phone-1"),
+        )
+        .await
+        .unwrap_err();
+    assert_conflict(&err, "approval_already_decided");
+}
+
+#[tokio::test]
+async fn the_request_lifetime_setting_is_bounded() {
+    let t = c9().await;
+    assert_eq!(
+        t.service.remote_approval_settings("user_1").await.unwrap().ttl_minutes,
+        30
+    );
+    for bad in [0, -5, 24 * 60 + 1] {
+        assert!(matches!(
+            t.service
+                .set_remote_approval_settings("user_1", aionui_api_types::RemoteApprovalSettings { ttl_minutes: bad })
+                .await,
+            Err(ConversationError::BadRequest { .. })
+        ));
+    }
+    t.service
+        .set_remote_approval_settings("user_1", aionui_api_types::RemoteApprovalSettings { ttl_minutes: 45 })
+        .await
+        .unwrap();
+    let (task, _plan) = t.plan_task("Step 1").await;
+    let request = t.pending(&task).await;
+    assert_eq!(request.expires_at - request.requested_at, 45 * 60_000);
+}

@@ -48,6 +48,44 @@ pub(crate) fn execute_job(
     })
 }
 
+/// 3.0 C9: an approved plan answered remotely runs at once; the run (or why
+/// it did not run) is recorded on the approval request.
+pub(crate) fn remote_execute_job(
+    service: ConversationService,
+    user_id: String,
+    approval: aionui_db::models::TaskApprovalRow,
+    request_id: String,
+) -> Job {
+    Box::pin(async move {
+        let request = aionui_api_types::ExecuteApprovedPlanRequest {
+            approval_id: approval.id.clone(),
+            artifact_id: approval.artifact_id.clone(),
+            artifact_hash: approval.artifact_hash.clone(),
+        };
+        let id = approval.task_session_id.clone();
+        match service.execute_approved_plan(&user_id, &id, request).await {
+            Ok(run) => {
+                service
+                    .record_remote_run(&user_id, &request_id, Some(&run.id), None)
+                    .await;
+                if run.status == aionui_api_types::TaskRunStatus::Completed
+                    && let Ok(board) = service.task_board_repo()
+                    && matches!(board.get_task_flow(&user_id, &id).await, Ok(Some(flow)) if flow.plan_first != 0)
+                    && let Err(error) = service.move_started_task_to_review(&user_id, &id).await
+                {
+                    tracing::warn!(%error, task_session_id = %id, "remote approval: in_review move failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_session_id = %id, "remote approval: approved plan did not run");
+                service
+                    .record_remote_run(&user_id, &request_id, None, Some(&error.to_string()))
+                    .await;
+            }
+        }
+    })
+}
+
 impl ConversationService {
     /// 3.0 C4: strict planning in the task's conversation → plan approval
     /// (needs you). When planning cannot start (the agent cannot guarantee

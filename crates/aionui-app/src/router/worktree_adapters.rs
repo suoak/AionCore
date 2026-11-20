@@ -281,6 +281,11 @@ pub(crate) fn build_fanout_state(
         }));
     services
         .conversation_service
+        .with_adopt_approval_port(Arc::new(AdoptApprovalAdapter {
+            fanout: service.clone(),
+        }));
+    services
+        .conversation_service
         .with_delegation_launch_port(Arc::new(DelegationLaunchAdapter {
             slots: FanoutConversationsAdapter {
                 conversations: services.conversation_service.clone(),
@@ -460,6 +465,85 @@ impl aionui_conversation::board::start::TaskLaunchPort for TaskLaunchAdapter {
             )
             .await
             .map_err(launch_error)
+    }
+}
+
+/// 3.0 C9: remote adopt approvals compute and re-check the adopt digest.
+pub(crate) struct AdoptApprovalAdapter {
+    fanout: aionui_worktree::FanoutService,
+}
+
+fn adopt_strategy(
+    raw: &str,
+) -> Result<aionui_worktree::fanout_types::AdoptStrategy, aionui_conversation::ConversationError> {
+    use aionui_worktree::fanout_types::AdoptStrategy;
+    Ok(match raw {
+        "squash" => AdoptStrategy::Squash,
+        "no_ff" => AdoptStrategy::NoFf,
+        "cherry_pick" => AdoptStrategy::CherryPick,
+        "branch_only" => AdoptStrategy::BranchOnly,
+        other => return Err(launch_error(format!("unknown adopt strategy '{other}'"))),
+    })
+}
+
+fn adopt_error(error: aionui_worktree::WorktreeError) -> aionui_conversation::ConversationError {
+    match error {
+        aionui_worktree::WorktreeError::DigestMismatch(detail) => aionui_conversation::ConversationError::Busy {
+            reason: format!("approval_digest_mismatch: the diff changed ({detail})"),
+        },
+        other => aionui_conversation::ConversationError::Busy {
+            reason: format!("{}: {other}", other.code()),
+        },
+    }
+}
+
+#[async_trait]
+impl aionui_conversation::remote_approval::AdoptApprovalPort for AdoptApprovalAdapter {
+    async fn digest(
+        &self,
+        user_id: &str,
+        group_id: &str,
+        slot: &str,
+        strategy: &str,
+        target_branch: Option<&str>,
+    ) -> Result<aionui_conversation::remote_approval::AdoptDigestInfo, aionui_conversation::ConversationError> {
+        let info = self
+            .fanout
+            .adopt_digest(user_id, group_id, slot, adopt_strategy(strategy)?, target_branch)
+            .await
+            .map_err(adopt_error)?;
+        Ok(aionui_conversation::remote_approval::AdoptDigestInfo {
+            digest: info.digest,
+            target_branch: info.target_branch,
+        })
+    }
+
+    async fn adopt(
+        &self,
+        user_id: &str,
+        group_id: &str,
+        slot: &str,
+        strategy: &str,
+        target_branch: Option<&str>,
+        expected_digest: &str,
+    ) -> Result<Option<String>, aionui_conversation::ConversationError> {
+        let group = self
+            .fanout
+            .adopt(
+                user_id,
+                group_id,
+                aionui_worktree::fanout_types::AdoptFanoutRequest {
+                    slot: slot.to_owned(),
+                    strategy: adopt_strategy(strategy)?,
+                    target_branch: target_branch.map(str::to_owned),
+                    snapshot_message: None,
+                    cleanup: Default::default(),
+                    expected_digest: Some(expected_digest.to_owned()),
+                },
+            )
+            .await
+            .map_err(adopt_error)?;
+        Ok(group.adopt_result.and_then(|result| result.result_commit))
     }
 }
 

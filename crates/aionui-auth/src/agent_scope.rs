@@ -431,6 +431,29 @@ mod tests {
     }
 
     #[test]
+    fn remote_approval_is_out_of_agent_scope() {
+        // 3.0 C9: an agent can neither read nor answer approval requests,
+        // nor touch their settings or IM approver bindings.
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            for path in [
+                "/api/approval-requests",
+                "/api/approval-requests/r1",
+                "/api/approval-requests/r1/decision",
+                "/api/task-sessions/t1/approval-requests",
+                "/api/remote-approval/settings",
+                "/api/remote-approval/approvers",
+                "/api/remote-approval/approvers/telegram/42",
+            ] {
+                assert_eq!(
+                    classify_agent_request(&method, path, "c1"),
+                    AgentRouteDecision::Deny,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reads_are_limited_to_the_allowlist() {
         for path in [
             "/api/mcp/servers",

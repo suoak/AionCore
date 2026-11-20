@@ -831,4 +831,197 @@ async fn t8_3_phone_decides_plan_approval_and_desktop_is_told() {
     assert_eq!(open, 0, "the approval's inbox item is closed");
     let one: Value = get_item(&jwt, &item_id).await.unwrap().json().await.unwrap();
     assert!(one["data"]["resolved_at"].is_i64(), "{one}");
+
+    // 3.0 C9 (D8, replaces E9-3 "record only"): the phone's answer went
+    // through the bound remote request — decided once, by this device.
+    let requests: Value = reqwest::Client::new()
+        .get(format!(
+            "http://{}/api/task-sessions/{}/approval-requests",
+            app.addr, task.id
+        ))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let request = &requests["data"][0];
+    assert_eq!(request["status"], "approved", "{requests}");
+    assert_eq!(request["decided_by"], format!("device:{device_id}"), "{requests}");
+    assert_eq!(request["digest"], plan.artifact.content_hash.as_str());
+    let replay = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/task-sessions/{}/approvals/{}/decision",
+            app.addr, task.id, plan.approval.id
+        ))
+        .bearer_auth(&device_token)
+        .json(&json!({
+            "decision": "approve",
+            "artifact_id": plan.artifact.id,
+            "artifact_hash": plan.artifact.content_hash,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), 409, "a replay runs nothing");
+}
+
+/// 3.0 C9: the remote decision route is for paired devices only, accepts only
+/// `{decision, digest, comment?}`, and the admin routes stay desktop-only.
+#[tokio::test]
+async fn c9_remote_decisions_are_device_only_and_cannot_change_anything() {
+    use aionui_api_types::{
+        CreateTaskSessionRequest, SubmitTaskArtifactRequest, TaskArtifactKind, TaskSessionMode, TaskSessionStatus,
+    };
+    let app = start_app().await;
+    let jwt = sign_token(&app, "user1").await;
+    let (_device_id, device_token) = seed_device(&app, "user1").await;
+    let service = &app.services.conversation_service;
+    let task = service
+        .create_task_session(
+            "user1",
+            CreateTaskSessionRequest {
+                title: "Ship export".into(),
+                project_id: None,
+                conversation_id: None,
+                mode: TaskSessionMode::Plan,
+                objective: "Ship it".into(),
+                acceptance_criteria: Vec::new(),
+                status: TaskSessionStatus::Ready,
+                agent_type: "632f31d2".into(),
+                agent_session_id: None,
+                flow: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let plan = service
+        .submit_task_artifact(
+            "user1",
+            &task.id,
+            SubmitTaskArtifactRequest {
+                kind: TaskArtifactKind::Plan,
+                content: "Step 1".into(),
+                acceptance_criteria: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let url = |path: &str| format!("http://{}{path}", app.addr);
+    let pending: Value = client
+        .get(url("/api/approval-requests"))
+        .bearer_auth(&device_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let request_id = pending["data"][0]["id"].as_str().unwrap().to_owned();
+    let digest = pending["data"][0]["digest"].as_str().unwrap().to_owned();
+    assert_eq!(digest, plan.artifact.content_hash);
+    let decision = url(&format!("/api/approval-requests/{request_id}/decision"));
+
+    // The desktop session cannot use the remote route.
+    let resp = client
+        .post(&decision)
+        .bearer_auth(&jwt)
+        .json(&json!({ "decision": "approve", "digest": digest }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    // Nothing but the decision: extra fields are refused.
+    for extra in [
+        json!({ "content": "another plan" }),
+        json!({ "strategy": "no_ff" }),
+        json!({ "assistant_id": "other" }),
+        json!({ "permission": "bypassPermissions" }),
+    ] {
+        let mut body = json!({ "decision": "approve", "digest": digest });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let resp = client
+            .post(&decision)
+            .bearer_auth(&device_token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{body} → {}", resp.status());
+        assert_ne!(resp.status(), 200);
+    }
+    // The phone cannot issue requests, change the lifetime or bind approvers.
+    for (method, path) in [
+        (
+            reqwest::Method::POST,
+            format!("/api/task-sessions/{}/approval-requests", task.id),
+        ),
+        (reqwest::Method::PUT, "/api/remote-approval/settings".to_owned()),
+        (reqwest::Method::GET, "/api/remote-approval/settings".to_owned()),
+        (reqwest::Method::POST, "/api/remote-approval/approvers".to_owned()),
+        (
+            reqwest::Method::POST,
+            format!("/api/task-sessions/{}/artifacts", task.id),
+        ),
+    ] {
+        let resp = client
+            .request(method.clone(), url(&path))
+            .bearer_auth(&device_token)
+            .json(&json!({ "kind": "plan", "ttl_minutes": 1440 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{method} {path}");
+    }
+    let one: Value = client
+        .get(url(&format!("/api/approval-requests/{request_id}")))
+        .bearer_auth(&device_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["data"]["status"], "pending", "{one}");
+
+    // The bound answer is accepted once.
+    let resp = client
+        .post(&decision)
+        .bearer_auth(&device_token)
+        .json(&json!({ "decision": "reject", "digest": digest }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap_or_default());
+    let resp = client
+        .post(&decision)
+        .bearer_auth(&device_token)
+        .json(&json!({ "decision": "approve", "digest": digest }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    // The desktop reads the outcome and the ledger has it.
+    let settings: Value = client
+        .get(url("/api/remote-approval/settings"))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["data"]["ttl_minutes"], 30);
+    let rejected: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'remote_approval.reject'")
+        .fetch_one(app.services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(rejected, 1);
+    let replays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'remote_approval.replay'")
+        .fetch_one(app.services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(replays, 1);
 }
