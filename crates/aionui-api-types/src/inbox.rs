@@ -43,6 +43,8 @@ pub fn inbox_task_approval_id(dedupe_key: &str) -> Option<&str> {
 pub const INBOX_ORIGIN_BATCH: &str = "batch";
 /// `origin` of an Autopilot run failure.
 pub const INBOX_ORIGIN_AUTOPILOT: &str = "autopilot";
+/// `origin` of a task's Plan/Goal approval (3.0 C4; key `task_approval:{id}`).
+pub const INBOX_ORIGIN_TASK: &str = "task";
 /// Title prefix the Autopilot notifier gives its Inbox items.
 pub const AUTOPILOT_INBOX_TITLE_PREFIX: &str = "Autopilot: ";
 
@@ -52,6 +54,8 @@ pub const AUTOPILOT_INBOX_TITLE_PREFIX: &str = "Autopilot: ";
 pub fn inbox_origin(dedupe_key: &str, kind: &str, title: &str) -> Option<&'static str> {
     if dedupe_key.starts_with("batch:") {
         Some(INBOX_ORIGIN_BATCH)
+    } else if dedupe_key.starts_with(TASK_APPROVAL_INBOX_KEY_PREFIX) {
+        Some(INBOX_ORIGIN_TASK)
     } else if dedupe_key.starts_with("cron:") || (kind == "failed" && title.starts_with(AUTOPILOT_INBOX_TITLE_PREFIX)) {
         Some(INBOX_ORIGIN_AUTOPILOT)
     } else {
@@ -97,6 +101,10 @@ mod origin_tests {
         assert_eq!(inbox_origin("turn:c1", "completed", "Autopilot: Nightly"), None);
         assert_eq!(inbox_origin("turn:c1", "failed", "Fix build"), None);
         assert_eq!(inbox_origin("approval:c1:x", "approval", "Autopilot: x"), None);
+        assert_eq!(
+            inbox_origin("task_approval:ap_1", "approval", "Plan ready"),
+            Some(INBOX_ORIGIN_TASK)
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@
 
 pub mod delivery;
 pub mod github_import;
+mod plan_first;
 pub mod start;
 
 use aionui_api_types::{
