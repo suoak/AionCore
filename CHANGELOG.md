@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.6.0](https://github.com/suoak/AionCore/compare/v0.5.1...v0.6.0) (2026-11-21)
+
+### Behavior Changes
+
+* **tasks:** migration 082 adds nullable task-flow columns to `task_sessions` (assistant, prompt, repo path, base ref, plan-first, source, delivery, queue time); the board API adds a derived `lane`, `needs_you_reason`, `latest_plan`, `source`, `queued_at` and `delivery` per item. Older clients ignore the new fields.
+* **tasks:** `POST /api/task-sessions/{id}/start` runs a task in its own one-slot worktree (or the project folder), at most 2 at once by default, queueing the rest; every start goes through the launch governance check. Adopting a task's worktree marks it done; tasks never merge on their own.
+* **approvals:** a plan or adopt approval from a paired device or a bound IM identity now executes directly, without a desktop confirmation. Each request is bound to a digest, single-use, expires (30 minutes by default) and is audited.
+* **cron:** jobs can run as tasks (`run_as: task`); such tasks queue to the backlog and stop at review.
+* **delegation:** `@assistant` delegation (depth 1, up to 3 at once per turn) through the delegation service, runtime routes and the `aioncore delegate` CLI.
+
+### Features
+
+* **agent:** add GET /api/agents/preflight readiness aggregate (C5) ([#310](https://github.com/suoak/AionCore/issues/310)) ([24e9779](https://github.com/suoak/AionCore/commit/24e97797ee858cddc40eafeaa239c418de1defa2))
+* **c6:** cron jobs can run as tasks that queue to the backlog and stop at review ([#319](https://github.com/suoak/AionCore/issues/319)) ([f9730f8](https://github.com/suoak/AionCore/commit/f9730f876840ef83eef31a6382eeba3335bad1ec))
+* **c8:** Issue start options and a confirmed, once-only Issue comment ([#320](https://github.com/suoak/AionCore/issues/320)) ([0ff15e8](https://github.com/suoak/AionCore/commit/0ff15e8660f84d00e5fd6f79bdb831bdb840d67c))
+* **c9:** remote approve-to-execute bound to a digest, one-shot, expiring and audited ([#318](https://github.com/suoak/AionCore/issues/318)) ([e1e5902](https://github.com/suoak/AionCore/commit/e1e5902eba1ec854a6226e2dfedccbc107e0ab12))
+* **conversation:** start tasks with run slots and a queue (3.0 C2) ([#312](https://github.com/suoak/AionCore/issues/312)) ([b4cd85b](https://github.com/suoak/AionCore/commit/b4cd85bce3463ed4c606dea82cd82e58cfcf3e50))
+* **conversation:** task flow fields and derived board lane (3.0 C1) ([#311](https://github.com/suoak/AionCore/issues/311)) ([70e4e2c](https://github.com/suoak/AionCore/commit/70e4e2c1eb3618dec0951f3cb31133863f0dcd95))
+* **conversation:** task follow-up, adopt → done, and PR delivery (3.0 C3) ([#313](https://github.com/suoak/AionCore/issues/313)) ([90398c8](https://github.com/suoak/AionCore/commit/90398c8c693449cc827987b29081975f8852e3c0))
+* **delegation:** [@assistant](https://github.com/assistant) delegation service and runtime routes (C7) ([#314](https://github.com/suoak/AionCore/issues/314)) ([5e0a5fa](https://github.com/suoak/AionCore/commit/5e0a5faeed1bd04b5799fb1f5aafec21dba64117))
+* **delegation:** aioncore delegate CLI and capabilities contract (3.0 C7, part 2) ([#315](https://github.com/suoak/AionCore/issues/315)) ([c14574b](https://github.com/suoak/AionCore/commit/c14574bbc6db040378a07e1e757fcb728bfbd2d8))
+* **tasks:** C4b plan-first tasks in repo worktrees ([#317](https://github.com/suoak/AionCore/issues/317)) ([de9891d](https://github.com/suoak/AionCore/commit/de9891dc87ce26d51885110f794bebf007133463))
+* **tasks:** plan-first tasks plan, wait for approval, then continue (3.0 C4) ([#316](https://github.com/suoak/AionCore/issues/316)) ([4860197](https://github.com/suoak/AionCore/commit/486019763b7ba0e15334e3ebc7082797bba78289))
+
 ## [0.5.1](https://github.com/suoak/AionCore/compare/v0.5.0...v0.5.1) (2026-11-18)
 
 ### Behavior Changes
