@@ -18,6 +18,7 @@ mod journal_transcript;
 pub(crate) mod message_cursor;
 mod message_persistence;
 mod model_visible;
+pub mod remote_approval;
 pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;

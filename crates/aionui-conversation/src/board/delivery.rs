@@ -122,6 +122,8 @@ impl ConversationService {
         id: &str,
         adopted: &TaskAdopted,
     ) -> Result<(), ConversationError> {
+        // 3.0 C9: adopted (on the desktop, or by this very remote request).
+        self.invalidate_adopt_requests(user_id, id, "adopted").await;
         let mut delivery = self.delivery_object(user_id, id).await?;
         delivery.insert(
             "adopt".into(),
@@ -180,6 +182,7 @@ impl ConversationService {
         group_id: &str,
         message: &str,
     ) -> Result<(), ConversationError> {
+        self.invalidate_adopt_requests(user_id, id, "adopt_conflicted").await;
         let mut delivery = self.delivery_object(user_id, id).await?;
         delivery.insert(
             "adopt".into(),
@@ -270,6 +273,8 @@ impl ConversationService {
             delivery.remove("adopt");
             self.write_delivery(user_id, id, delivery).await?;
         }
+        // 3.0 C9: the reviewed diff is about to change.
+        self.invalidate_adopt_requests(user_id, id, "superseded").await;
         if from == TaskBoardStatus::InReview {
             self.move_board(user_id, id, from, TaskBoardStatus::InProgress).await?;
         }

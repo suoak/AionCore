@@ -34,6 +34,7 @@ mod office;
 mod project;
 mod provider;
 mod remote_agent;
+mod remote_approval;
 mod response;
 mod runtime;
 mod session_tools;
@@ -232,6 +233,11 @@ pub use provider::{
 pub use remote_agent::{
     CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
+};
+pub use remote_approval::{
+    ApprovalRequestKind, ApprovalRequestResponse, ApprovalRequestStatus, DEFAULT_APPROVAL_TTL_MINUTES,
+    IssueApprovalRequest, MAX_APPROVAL_TTL_MINUTES, MIN_IM_DIGEST_PREFIX, RemoteApprovalDecision,
+    RemoteApprovalDecisionRequest, RemoteApprovalSettings, RemoteApproverRequest, RemoteApproverResponse,
 };
 pub use response::{ApiResponse, ErrorResponse};
 pub use runtime::{

@@ -10,6 +10,7 @@ mod device_ws;
 mod fs_monitor;
 mod health;
 mod item_revealer;
+mod remote_approval_adapters;
 mod routes;
 mod runtime_team_tools;
 mod scm_monitor;

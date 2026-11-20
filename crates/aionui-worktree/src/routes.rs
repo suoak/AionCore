@@ -44,7 +44,8 @@ impl From<WorktreeError> for ApiError {
             | WorktreeError::FanoutInvalidState { .. }
             | WorktreeError::SlotBusy(_)
             | WorktreeError::AdoptConflict(_)
-            | WorktreeError::TargetNotClean(_) => StatusCode::CONFLICT,
+            | WorktreeError::TargetNotClean(_)
+            | WorktreeError::DigestMismatch(_) => StatusCode::CONFLICT,
             WorktreeError::FanoutUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             WorktreeError::GitNotAvailable(_) | WorktreeError::GitTooOld { .. } => StatusCode::FAILED_DEPENDENCY,
             WorktreeError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,

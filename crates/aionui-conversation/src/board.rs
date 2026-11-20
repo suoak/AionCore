@@ -38,7 +38,7 @@
 
 pub mod delivery;
 pub mod github_import;
-mod plan_first;
+pub(crate) mod plan_first;
 pub mod start;
 
 use aionui_api_types::{
@@ -479,7 +479,7 @@ impl ConversationService {
         Ok(true)
     }
 
-    async fn board_item(&self, user_id: &str, id: &str) -> Result<TaskBoardItemRow, ConversationError> {
+    pub(crate) async fn board_item(&self, user_id: &str, id: &str) -> Result<TaskBoardItemRow, ConversationError> {
         self.task_board_repo()?
             .get_board_item(user_id, id)
             .await?

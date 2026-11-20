@@ -870,6 +870,16 @@ impl FanoutService {
             Some(self.check_target(&repo, req.target_branch.as_deref()).await?)
         };
 
+        if let Some(expected) = req.expected_digest.as_deref() {
+            let now = self
+                .compute_adopt_digest(&group, &winner, req.strategy, target_branch.as_deref())
+                .await?;
+            if now.digest != expected {
+                tracing::warn!(group_id = %id, slot = %label, "adopt refused: the approved diff changed");
+                return Err(WorktreeError::DigestMismatch(format!("slot {label}")));
+            }
+        }
+
         // Snapshot uncommitted winner work onto its branch.
         let mut snapshot_commit = None;
         if self.inner.worktrees.is_dirty(&wt_path).await {
@@ -970,6 +980,121 @@ impl FanoutService {
             )
             .await;
         self.get(user_id, id).await
+    }
+
+    /// 3.0 C9: the digest a remote adopt approval of `slot` is bound to.
+    pub async fn adopt_digest(
+        &self,
+        user_id: &str,
+        id: &str,
+        slot: &str,
+        strategy: AdoptStrategy,
+        target_branch: Option<&str>,
+    ) -> Result<AdoptDigest, WorktreeError> {
+        let group = self.inner.store.get(user_id, id).await?;
+        let rows = self.inner.worktrees.store().list_by_group(id).await?;
+        let label = slot.trim().to_ascii_uppercase();
+        let winner = rows
+            .iter()
+            .find(|r| r.slot.as_deref() == Some(label.as_str()))
+            .cloned()
+            .ok_or_else(|| WorktreeError::BadRequest(format!("unknown slot: {slot}")))?;
+        let repo = Path::new(&group.source_repo_path).to_path_buf();
+        let target = if strategy == AdoptStrategy::BranchOnly {
+            None
+        } else {
+            Some(self.check_target(&repo, target_branch).await?)
+        };
+        self.compute_adopt_digest(&group, &winner, strategy, target.as_deref())
+            .await
+    }
+
+    async fn compute_adopt_digest(
+        &self,
+        group: &FanoutGroupRow,
+        winner: &crate::store::WorktreeRow,
+        strategy: AdoptStrategy,
+        target_branch: Option<&str>,
+    ) -> Result<AdoptDigest, WorktreeError> {
+        use sha2::{Digest, Sha256};
+        let repo = Path::new(&group.source_repo_path).to_path_buf();
+        let wt_path = Path::new(&winner.path).to_path_buf();
+        let branch_commit = self
+            .inner
+            .worktrees
+            .branch_tip(&repo, &winner.branch)
+            .await?
+            .ok_or_else(|| WorktreeError::RefNotFound(winner.branch.clone()))?;
+        let target_commit = match target_branch {
+            Some(target) => Some(self.rev_parse(&repo, &format!("refs/heads/{target}")).await?),
+            None => None,
+        };
+        let git = self.inner.worktrees.git();
+        let diff = git
+            .run(
+                [
+                    "-c",
+                    "core.quotepath=off",
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    "--full-index",
+                    "--binary",
+                    group.base_commit.as_str(),
+                    "--",
+                ],
+                RunOptions::in_dir(&wt_path),
+            )
+            .await?;
+        if !diff.success() {
+            return Err(WorktreeError::Git(format!("git diff: {}", diff.stderr.trim())));
+        }
+        let untracked = git
+            .run(
+                ["ls-files", "--others", "--exclude-standard", "-z"],
+                RunOptions::in_dir(&wt_path),
+            )
+            .await?;
+        if !untracked.success() {
+            return Err(WorktreeError::Git(format!("git ls-files: {}", untracked.stderr.trim())));
+        }
+        let mut paths: Vec<&str> = untracked.stdout.split('\0').filter(|p| !p.is_empty()).collect();
+        paths.sort_unstable();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"workmate-adopt-digest-v1\n");
+        for (key, value) in [
+            ("base", group.base_commit.as_str()),
+            ("branch", branch_commit.as_str()),
+            ("strategy", strategy.as_str()),
+            ("target", target_branch.unwrap_or("")),
+            ("target_head", target_commit.as_deref().unwrap_or("")),
+        ] {
+            hasher.update(format!("{key}:{value}\n").as_bytes());
+        }
+        hasher.update(format!("diff:{}\n", diff.stdout.len()).as_bytes());
+        hasher.update(diff.stdout.as_bytes());
+        for path in paths {
+            // A symlink is hashed by its target, never followed.
+            let full = wt_path.join(path);
+            let bytes = match tokio::fs::symlink_metadata(&full).await {
+                Ok(meta) if meta.file_type().is_symlink() => tokio::fs::read_link(&full)
+                    .await
+                    .map(|target| target.to_string_lossy().into_owned().into_bytes())
+                    .unwrap_or_default(),
+                Ok(_) => tokio::fs::read(&full).await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            hasher.update(format!("untracked:{path}:{}\n", hex::encode(Sha256::digest(&bytes))).as_bytes());
+        }
+        Ok(AdoptDigest {
+            digest: hex::encode(hasher.finalize()),
+            base_commit: group.base_commit.clone(),
+            branch_commit,
+            target_branch: target_branch.map(str::to_owned),
+            target_commit,
+        })
     }
 
     /// The merge target must be the branch checked out in the source

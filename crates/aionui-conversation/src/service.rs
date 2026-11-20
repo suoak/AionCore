@@ -365,7 +365,7 @@ async fn pending_task_approval_ids(
     }
 }
 
-fn task_approval_response(row: TaskApprovalRow) -> Result<TaskApprovalResponse, ConversationError> {
+pub(crate) fn task_approval_response(row: TaskApprovalRow) -> Result<TaskApprovalResponse, ConversationError> {
     Ok(TaskApprovalResponse {
         id: row.id,
         task_session_id: row.task_session_id,
@@ -906,6 +906,8 @@ pub struct ConversationService {
     pub(crate) max_running_tasks: Arc<std::sync::atomic::AtomicUsize>,
     /// 3.0 C7: `@assistant` delegation.
     pub(crate) delegation_repo: Arc<RwLock<Option<Arc<dyn aionui_db::IDelegationRepository>>>>,
+    /// 3.0 C9: remote approve-to-execute.
+    pub(crate) remote_approval: Arc<crate::remote_approval::RemoteApprovalSlots>,
     pub(crate) delegation_launch: Arc<RwLock<Option<Arc<dyn crate::delegation::DelegationLaunchPort>>>>,
     /// M8 E6-7: read-only GitHub Issue source (the app wires `gh`).
     pub(crate) github_issue_source: Arc<RwLock<Option<Arc<dyn crate::board::github_import::GithubIssueSource>>>>,
@@ -1080,6 +1082,7 @@ impl ConversationService {
             task_launch: Arc::new(RwLock::new(None)),
             task_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             delegation_repo: Arc::new(RwLock::new(None)),
+            remote_approval: Arc::default(),
             delegation_launch: Arc::new(RwLock::new(None)),
             task_delivery: Arc::new(RwLock::new(None)),
             max_running_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -1539,6 +1542,8 @@ impl ConversationService {
             .await;
         self.task_approval_changed(user_id, Some(&task.title), approval, None)
             .await;
+        // 3.0 C9: bind a remote request (phone / IM) to the new approval.
+        self.issue_plan_approval_request(user_id, &task.title, approval).await;
     }
 
     async fn fail_automatic_planning(
@@ -1863,6 +1868,13 @@ impl ConversationService {
         request: DecideTaskApprovalRequest,
         decider: TaskApprovalDecider<'_>,
     ) -> Result<TaskApprovalResponse, ConversationError> {
+        // 3.0 C9: a paired device's answer is a remote approval — bound,
+        // one-shot, expiring, audited — and executes like one.
+        if let TaskApprovalDecider::Device(device_id) = decider {
+            return self
+                .decide_task_approval_from_device(user_id, task_session_id, approval_id, request, device_id)
+                .await;
+        }
         if request
             .comment
             .as_ref()
@@ -1891,9 +1903,9 @@ impl ConversationService {
             })
             .await?;
         self.task_approval_changed(user_id, None, &row, Some(decider)).await;
+        self.settle_approval_request_from_desktop(user_id, &row).await;
         // 3.0 C4: an approved plan of a plan-first task continues on its own.
-        // Desktop decisions only — remote approve-to-execute is C9 (bound,
-        // one-shot, trusted identity) and must not ride on this path.
+        // Desktop decisions here; remote ones run through C9 (`remote_approval`).
         if matches!(decider, TaskApprovalDecider::User) && status == TaskApprovalStatus::Approved {
             self.continue_plan_first_task(user_id, &row).await;
         }

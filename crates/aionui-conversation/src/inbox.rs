@@ -24,6 +24,8 @@ pub(crate) const EVENT_TASK_APPROVAL_CHANGED: &str = "task.approval.changed";
 pub enum TaskApprovalDecider<'a> {
     User,
     Device(&'a str),
+    /// 3.0 C9: a bound IM identity (`im:<platform>:<identity>`).
+    Im(&'a str),
 }
 
 /// Why a pending Plan/Goal approval stopped being answerable without a
@@ -34,6 +36,10 @@ pub(crate) enum TaskApprovalInvalidation {
     Superseded,
     /// The work item completed, failed or was cancelled.
     TaskEnded,
+    /// 3.0 C9: what a remote request was bound to changed.
+    DiffChanged,
+    /// 3.0 C9: the remote request outlived its lifetime.
+    Expired,
 }
 
 impl TaskApprovalInvalidation {
@@ -41,6 +47,8 @@ impl TaskApprovalInvalidation {
         match self {
             Self::Superseded => "superseded",
             Self::TaskEnded => "task_ended",
+            Self::DiffChanged => "diff_changed",
+            Self::Expired => "expired",
         }
     }
 }
@@ -365,6 +373,7 @@ impl ConversationService {
     ) {
         let (decided_via, device_id) = match decision {
             Some(TaskApprovalDecider::Device(id)) => (Some("device"), Some(id)),
+            Some(TaskApprovalDecider::Im(_)) => (Some("im"), None),
             Some(TaskApprovalDecider::User) => (Some("user"), None),
             None => (None, None),
         };
@@ -438,6 +447,8 @@ impl ConversationService {
             self.resolve_inbox_item(user_id, &task_approval_inbox_key(&approval.id))
                 .await;
         }
+        self.invalidate_approval_requests_for(user_id, approvals, reason.as_str())
+            .await;
     }
 
     /// The work item ended (completed / failed / cancelled): cancel its
@@ -451,11 +462,14 @@ impl ConversationService {
             .cancel_pending_approvals_of_ended_task(user_id, task_session_id, now_ms())
             .await
         {
-            Ok(cancelled) if !cancelled.is_empty() => {
-                self.task_approvals_invalidated(user_id, &cancelled, TaskApprovalInvalidation::TaskEnded)
+            Ok(cancelled) => {
+                if !cancelled.is_empty() {
+                    self.task_approvals_invalidated(user_id, &cancelled, TaskApprovalInvalidation::TaskEnded)
+                        .await;
+                }
+                self.invalidate_adopt_requests(user_id, task_session_id, TaskApprovalInvalidation::TaskEnded.as_str())
                     .await;
             }
-            Ok(_) => {}
             Err(error) => {
                 tracing::warn!(user_id, task_session_id, error = %error, "cancelling approvals of ended task failed");
             }

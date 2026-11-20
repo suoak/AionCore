@@ -12,6 +12,10 @@
 //!   Plan/Goal task approvals, agent config-write approvals (D9-5)
 //! - read / mark Inbox items (list and `GET /api/inbox/{id}`)
 //! - read work items and their approvals (`GET /api/task-sessions/**`)
+//! - 3.0 C9: read and answer remote approval requests
+//!   (`GET /api/approval-requests/**`, `POST /api/approval-requests/{id}/decision`);
+//!   issuing requests, the lifetime setting and IM approver bindings stay
+//!   desktop-only
 //! - `GET /api/auth/user`
 //!
 //! Denied: everything else — provider / MCP / settings writes, device
@@ -35,6 +39,8 @@ const READ_PREFIXES: &[&str] = &[
     "/api/task-sessions",
     "/api/agent-approvals",
     "/api/auth/user",
+    // 3.0 C9: remote approval requests (read).
+    "/api/approval-requests",
 ];
 
 /// Conversation subpaths a device may POST to: `/api/conversations/{id}/<pattern>`
@@ -72,6 +78,10 @@ fn classify_post(path: &str) -> DeviceRouteDecision {
     } else if let Some(rest) = path.strip_prefix("/api/agent-approvals/") {
         let segments: Vec<&str> = rest.split('/').collect();
         matches_pattern(&segments, &["*", "approve"]) || matches_pattern(&segments, &["*", "deny"])
+    } else if let Some(rest) = path.strip_prefix("/api/approval-requests/") {
+        // 3.0 C9: answer one remote approval request.
+        let segments: Vec<&str> = rest.split('/').collect();
+        matches_pattern(&segments, &["*", "decision"])
     } else if path == "/api/inbox/read-all" {
         true
     } else if let Some(rest) = path.strip_prefix("/api/inbox/") {
@@ -169,6 +179,7 @@ mod tests {
             "/api/inbox/read-all",
             "/api/inbox/i1/read",
             "/api/inbox/i1/read/",
+            "/api/approval-requests/r1/decision",
         ] {
             assert_eq!(post(path), Allow, "{path}");
         }
@@ -195,8 +206,38 @@ mod tests {
             "/api/batch-jobs",
             "/api/fs/read",
             "/api/inbox/i1/x",
+            // 3.0 C9: a phone answers requests; it cannot issue them, adopt
+            // directly, change the plan, the lifetime or the approvers.
+            "/api/approval-requests",
+            "/api/approval-requests/r1",
+            "/api/approval-requests/r1/decision/x",
+            "/api/approval-requests//decision",
+            "/api/task-sessions/t1/approval-requests",
+            "/api/task-sessions/t1/artifacts",
+            "/api/task-sessions/t1/start",
+            "/api/task-sessions/t1/deliver",
+            "/api/fanout-groups/g1/adopt",
+            "/api/remote-approval/settings",
+            "/api/remote-approval/approvers",
         ] {
             assert_eq!(post(path), Deny, "{path}");
+        }
+    }
+
+    #[test]
+    fn remote_approval_admin_routes_are_desktop_only() {
+        // 3.0 C9: reads of requests are allowed; their settings and IM
+        // approver bindings are not.
+        assert_eq!(get("/api/approval-requests"), Allow);
+        assert_eq!(get("/api/approval-requests/r1"), Allow);
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            for path in [
+                "/api/remote-approval/settings",
+                "/api/remote-approval/approvers",
+                "/api/remote-approval/approvers/telegram/42",
+            ] {
+                assert_eq!(classify_device_request(&method, path), Deny, "{method} {path}");
+            }
         }
     }
 

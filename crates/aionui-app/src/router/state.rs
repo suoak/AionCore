@@ -422,6 +422,18 @@ pub async fn build_module_states(
             }
         });
     }
+    // 3.0 C9: overdue remote approval requests expire (needs you again; the
+    // desktop can re-issue). A timer, so phones and IM cards see `expired`.
+    {
+        let conversations = services.conversation_service.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                conversations.expire_due_approval_requests().await;
+            }
+        });
+    }
     // M8 E8: interrupted batch attempts are marked failed and running jobs
     // paused; nothing restarts on its own (scale / retry resumes).
     let batch =
@@ -1333,6 +1345,25 @@ pub async fn build_channel_state(
         Arc::clone(&session_manager),
         Arc::clone(&channel_settings),
         startup_owner_user_id.clone(),
+    ));
+
+    // 3.0 C9: IM approval cards, the presser's identity check, and decisions.
+    action_executor.set_approval_port(Arc::new(
+        crate::router::remote_approval_adapters::ChannelApprovalAdapter {
+            conversations: services.conversation_service.clone(),
+        },
+    ));
+    services.conversation_service.with_im_identity_port(Arc::new(
+        crate::router::remote_approval_adapters::ImIdentityAdapter { repo: repo.clone() },
+    ));
+    services.conversation_service.with_remote_approval_notifier(Arc::new(
+        crate::router::remote_approval_adapters::ImApprovalNotifier {
+            repo: repo.clone(),
+            manager: Arc::clone(&manager),
+            approvers: Arc::new(aionui_db::SqliteApprovalRequestRepository::new(
+                services.database.pool().clone(),
+            )),
+        },
     ));
 
     let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;

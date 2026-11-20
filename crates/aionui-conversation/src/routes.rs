@@ -218,6 +218,26 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/delegation-grants", post(grant_delegations))
+        // 3.0 C9: remote approve-to-execute.
+        .route(
+            "/api/task-sessions/{id}/approval-requests",
+            post(issue_approval_request).get(list_task_approval_requests),
+        )
+        .route("/api/approval-requests", get(list_pending_approval_requests))
+        .route("/api/approval-requests/{id}", get(get_approval_request))
+        .route("/api/approval-requests/{id}/decision", post(decide_approval_request))
+        .route(
+            "/api/remote-approval/settings",
+            get(get_remote_approval_settings).put(put_remote_approval_settings),
+        )
+        .route(
+            "/api/remote-approval/approvers",
+            get(list_remote_approvers).post(add_remote_approver),
+        )
+        .route(
+            "/api/remote-approval/approvers/{platform}/{identity}",
+            axum::routing::delete(remove_remote_approver),
+        )
         .route("/api/conversations/{id}/delegations", get(list_delegations))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
@@ -793,6 +813,134 @@ async fn reset(
 
 /// 3.0 C7: the user's explicit `@assistant` picks. User auth only — the
 /// agent-token scope denies this route, so an agent cannot grant itself.
+/// 3.0 C9: desktop issues (or re-issues) a remote approval request.
+async fn issue_approval_request(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<DevicePrincipal>>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::IssueApprovalRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_api_types::ApprovalRequestResponse>>), ApiError> {
+    if device.is_some() {
+        return Err(ConversationError::Forbidden {
+            reason: "Approval requests are issued from the desktop".into(),
+        }
+        .into());
+    }
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state.service.issue_approval_request(&user.id, &id, req).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
+async fn list_task_approval_requests(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<aionui_api_types::ApprovalRequestResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_approval_requests(&user.id, Some(&id)).await?,
+    )))
+}
+
+async fn list_pending_approval_requests(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<aionui_api_types::ApprovalRequestResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_approval_requests(&user.id, None).await?,
+    )))
+}
+
+async fn get_approval_request(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::ApprovalRequestResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.get_approval_request(&user.id, &id).await?,
+    )))
+}
+
+/// 3.0 C9: a paired device answers one request. The body is only
+/// `{decision, digest, comment?}` (unknown fields refused).
+async fn decide_approval_request(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<DevicePrincipal>>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::RemoteApprovalDecisionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::ApprovalRequestResponse>>, ApiError> {
+    let Some(Extension(device)) = device else {
+        return Err(ConversationError::Forbidden {
+            reason: "approval_identity_untrusted: remote decisions need a paired device".into(),
+        }
+        .into());
+    };
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .decide_approval_request_remotely(
+                &user.id,
+                &id,
+                req,
+                crate::remote_approval::RemoteDecider::Device(device.device_id.clone()),
+            )
+            .await?,
+    )))
+}
+
+async fn get_remote_approval_settings(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<aionui_api_types::RemoteApprovalSettings>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.remote_approval_settings(&user.id).await?,
+    )))
+}
+
+async fn put_remote_approval_settings(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<aionui_api_types::RemoteApprovalSettings>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::RemoteApprovalSettings>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.set_remote_approval_settings(&user.id, req).await?,
+    )))
+}
+
+async fn list_remote_approvers(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<aionui_api_types::RemoteApproverResponse>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.list_remote_approvers(&user.id).await?,
+    )))
+}
+
+async fn add_remote_approver(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<aionui_api_types::RemoteApproverRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<aionui_api_types::RemoteApproverResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state.service.add_remote_approver(&user.id, req).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
+async fn remove_remote_approver(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((platform, identity)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .remove_remote_approver(&user.id, &platform, &identity)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
 async fn grant_delegations(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,

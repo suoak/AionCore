@@ -203,6 +203,7 @@ fn adopt(slot: &str, strategy: AdoptStrategy) -> AdoptFanoutRequest {
         target_branch: None,
         snapshot_message: None,
         cleanup: AdoptCleanup::default(),
+        expected_digest: None,
     }
 }
 
@@ -822,4 +823,84 @@ async fn task_group_adopts_report_to_the_board() {
         .await
         .unwrap();
     assert!(hooks2.events.lock().unwrap().is_empty());
+}
+
+/// 3.0 C9: the adopt digest covers the worktree diff, the branch head and the
+/// target head; an adopt bound to a stale digest changes nothing.
+#[tokio::test]
+async fn an_adopt_bound_to_a_stale_digest_is_refused() {
+    require_git!();
+    let fx = fixture(&[
+        ("a1", Script::Write(vec![("a.txt", "from A\n")])),
+        ("a2", Script::Write(vec![("b.txt", "from B\n")])),
+    ])
+    .await;
+    let repo = &fx.h.repo;
+    let g = fx.fanout.create(USER, group_req(repo, &["a1", "a2"])).await.unwrap();
+    fx.fanout.wait_settled(&g.id).await;
+    let g = wait_group(&fx, &g.id, "comparing").await;
+    let wt = PathBuf::from(&g.slots[0].path);
+
+    let first = fx
+        .fanout
+        .adopt_digest(USER, &g.id, "A", AdoptStrategy::Squash, None)
+        .await
+        .unwrap();
+    assert_eq!(first.digest.len(), 64);
+    assert_eq!(first.target_branch.as_deref(), Some("main"));
+    let again = fx
+        .fanout
+        .adopt_digest(USER, &g.id, "a", AdoptStrategy::Squash, None)
+        .await
+        .unwrap();
+    assert_eq!(first, again, "stable");
+    let merge = fx
+        .fanout
+        .adopt_digest(USER, &g.id, "A", AdoptStrategy::NoFf, None)
+        .await
+        .unwrap();
+    assert_ne!(first.digest, merge.digest, "the strategy is bound");
+
+    // An edit (or a new untracked file) in the worktree changes the digest.
+    std::fs::write(wt.join("a.txt"), "from A, edited\n").unwrap();
+    let edited = fx
+        .fanout
+        .adopt_digest(USER, &g.id, "A", AdoptStrategy::Squash, None)
+        .await
+        .unwrap();
+    assert_ne!(first.digest, edited.digest);
+    std::fs::write(wt.join("extra.txt"), "x\n").unwrap();
+    let untracked = fx
+        .fanout
+        .adopt_digest(USER, &g.id, "A", AdoptStrategy::Squash, None)
+        .await
+        .unwrap();
+    assert_ne!(edited.digest, untracked.digest);
+
+    // The target moving changes it too.
+    std::fs::write(repo.join("main.txt"), "moved\n").unwrap();
+    git(repo, &["add", "main.txt"]);
+    git(repo, &["commit", "-q", "-m", "target moved"]);
+    let moved = fx
+        .fanout
+        .adopt_digest(USER, &g.id, "A", AdoptStrategy::Squash, None)
+        .await
+        .unwrap();
+    assert_ne!(untracked.digest, moved.digest);
+    assert_ne!(untracked.target_commit, moved.target_commit);
+
+    let head = git(repo, &["rev-parse", "HEAD"]);
+    let mut stale = adopt("A", AdoptStrategy::Squash);
+    stale.expected_digest = Some(first.digest.clone());
+    let err = fx.fanout.adopt(USER, &g.id, stale).await.unwrap_err();
+    assert_eq!(err.code(), "ADOPT_DIGEST_MISMATCH", "{err}");
+    assert_eq!(git(repo, &["rev-parse", "HEAD"]), head, "nothing merged");
+    assert!(wt.join("extra.txt").is_file(), "the worktree is untouched");
+    assert_eq!(fx.fanout.get(USER, &g.id).await.unwrap().status, "comparing");
+
+    let mut current = adopt("A", AdoptStrategy::Squash);
+    current.expected_digest = Some(moved.digest.clone());
+    let done = fx.fanout.adopt(USER, &g.id, current).await.unwrap();
+    assert_eq!(done.status, "adopted");
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "from A, edited\n");
 }
