@@ -343,6 +343,45 @@ impl ITaskBoardRepository for SqliteTaskBoardRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn bind_task_for_planning(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE task_sessions SET status = 'ready', queued_at = NULL, conversation_id = ?, \
+             updated_at = MAX(updated_at + 1, ?) \
+             WHERE id = ? AND user_id = ? AND mode = 'plan' AND status IN ('draft', 'ready', 'paused', 'failed')",
+        )
+        .bind(conversation_id)
+        .bind(updated_at)
+        .bind(task_session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn pause_ready_task(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE task_sessions SET status = 'paused', updated_at = MAX(updated_at + 1, ?) \
+             WHERE id = ? AND user_id = ? AND status = 'ready'",
+        )
+        .bind(updated_at)
+        .bind(task_session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn find_running_task_for_conversation(
         &self,
         user_id: &str,
