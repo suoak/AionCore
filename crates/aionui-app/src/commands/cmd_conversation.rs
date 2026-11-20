@@ -61,8 +61,9 @@ async fn create() -> Result<(), ExitCode> {
     print_response(command, response).await
 }
 
-struct RuntimeEnv {
-    base_url: String,
+/// Shared with `cmd_delegate.rs` (same envelope and error-code family).
+pub(crate) struct RuntimeEnv {
+    pub(crate) base_url: String,
     user_id: String,
     conversation_id: String,
     runtime_token: String,
@@ -71,7 +72,7 @@ struct RuntimeEnv {
 impl RuntimeEnv {
     /// Fallible on purpose: a malformed `AIONUI_*` value must come back as an
     /// envelope, not a panic (same reasoning as `cmd_session.rs`).
-    fn headers(&self, command: &str) -> Result<reqwest::header::HeaderMap, ExitCode> {
+    pub(crate) fn headers(&self, command: &str) -> Result<reqwest::header::HeaderMap, ExitCode> {
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in [
             ("x-aionui-user-id", &self.user_id),
@@ -92,7 +93,7 @@ impl RuntimeEnv {
     }
 }
 
-fn runtime_env(command: &str) -> Result<RuntimeEnv, ExitCode> {
+pub(crate) fn runtime_env(command: &str) -> Result<RuntimeEnv, ExitCode> {
     Ok(RuntimeEnv {
         base_url: required_env(command, ENV_BASE_URL)?,
         user_id: required_env(command, ENV_USER_ID)?,
@@ -187,7 +188,7 @@ fn validate_against_descriptor(command: &str, tool: ConversationToolName, value:
     Ok(value)
 }
 
-async fn print_response(command: &str, response: reqwest::Response) -> Result<(), ExitCode> {
+pub(crate) async fn print_response(command: &str, response: reqwest::Response) -> Result<(), ExitCode> {
     let status = response.status();
     let text = response
         .text()
@@ -204,7 +205,7 @@ async fn print_response(command: &str, response: reqwest::Response) -> Result<()
     Ok(())
 }
 
-fn runtime_error(command: &str, code: &'static str, message: String) -> ExitCode {
+pub(crate) fn runtime_error(command: &str, code: &'static str, message: String) -> ExitCode {
     print_failure(
         command,
         code,
@@ -212,7 +213,7 @@ fn runtime_error(command: &str, code: &'static str, message: String) -> ExitCode
     )
 }
 
-fn unknown_command(prefix: &str, path: Vec<OsString>, message: &'static str) -> ExitCode {
+pub(crate) fn unknown_command(prefix: &str, path: Vec<OsString>, message: &'static str) -> ExitCode {
     let suffix = path
         .into_iter()
         .map(|part| part.to_string_lossy().into_owned())
@@ -230,7 +231,7 @@ fn unknown_command(prefix: &str, path: Vec<OsString>, message: &'static str) -> 
     )
 }
 
-fn print_failure(command: &str, stderr_code: &'static str, error: ConversationToolErrorPayload) -> ExitCode {
+pub(crate) fn print_failure(command: &str, stderr_code: &'static str, error: ConversationToolErrorPayload) -> ExitCode {
     eprintln!("{stderr_code} command={command}: {}", error.message);
     let _ = print_json(&ConversationCliEnvelope::<Value>::failure(
         error,
@@ -239,7 +240,7 @@ fn print_failure(command: &str, stderr_code: &'static str, error: ConversationTo
     ExitCode::from(2)
 }
 
-fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
+pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
     let rendered = serde_json::to_string_pretty(value).map_err(|_| ExitCode::from(1))?;
     let mut stdout = io::stdout();
     stdout

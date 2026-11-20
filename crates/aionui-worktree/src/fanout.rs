@@ -286,9 +286,10 @@ impl FanoutService {
             sessions: req.sessions,
         };
         let run_group = group.clone();
+        let hold = req.hold_prompt;
         tokio::spawn(async move {
             let id = run_group.id.clone();
-            this.run_group(run_group, slots, prompt, token).await;
+            this.run_group(run_group, slots, prompt, hold, token).await;
             this.inner.runs.remove(&id);
         });
         self.get(user_id, &group.id).await
@@ -299,6 +300,7 @@ impl FanoutService {
         group: FanoutGroupRow,
         slots: Vec<(String, String, FanoutSlotRequest)>,
         prompt: FanoutPrompt,
+        hold: bool,
         token: CancellationToken,
     ) {
         let prompt = Arc::new(prompt);
@@ -309,7 +311,8 @@ impl FanoutService {
             let prompt = prompt.clone();
             let token = token.clone();
             set.spawn(async move {
-                this.start_slot(&group, &label, &worktree_id, spec, &prompt, &token)
+                let prompt = (!hold).then_some(prompt.as_ref());
+                this.start_slot(&group, &label, &worktree_id, spec, prompt, &token)
                     .await
             });
         }
@@ -355,7 +358,8 @@ impl FanoutService {
         label: &str,
         worktree_id: &str,
         spec: FanoutSlotRequest,
-        prompt: &FanoutPrompt,
+        // `None`: hold the prompt (plan-first task).
+        prompt: Option<&FanoutPrompt>,
         token: &CancellationToken,
     ) -> bool {
         let worktrees = &self.inner.worktrees;
@@ -402,8 +406,19 @@ impl FanoutService {
         if token.is_cancelled() {
             return false;
         }
-        if let Err(e) = port.send_prompt(&group.user_id, &conversation_id, prompt).await {
-            return fail(format!("send prompt: {e}")).await;
+        match prompt {
+            None => {
+                if let (Some(hooks), Some(task)) = (self.inner.task_hooks.get(), group.task_session_id.as_deref()) {
+                    hooks
+                        .slot_started(&group.user_id, task, &group.id, &conversation_id)
+                        .await;
+                }
+            }
+            Some(prompt) => {
+                if let Err(e) = port.send_prompt(&group.user_id, &conversation_id, prompt).await {
+                    return fail(format!("send prompt: {e}")).await;
+                }
+            }
         }
         if let Ok(true) = self
             .inner
@@ -512,6 +527,9 @@ impl FanoutService {
         if group.status != GROUP_RUNNING {
             return Ok(group.status);
         }
+        if self.plan_task_unfinished(user_id, &group).await {
+            return Ok(group.status);
+        }
         let rows = self.inner.worktrees.store().list_by_group(id).await?;
         let runtimes = self.runtimes(user_id, &rows).await;
         let settled = rows.iter().all(|row| {
@@ -532,6 +550,21 @@ impl FanoutService {
             return Ok(GROUP_COMPARING.into());
         }
         Ok(group.status)
+    }
+
+    /// 3.0 C4: a plan-first task's slot is idle between planning, approval
+    /// and execution; its group compares only once the task's run finished.
+    async fn plan_task_unfinished(&self, user_id: &str, group: &FanoutGroupRow) -> bool {
+        let (Some(repo), Some(task_id)) = (self.inner.worktrees.task_sessions(), group.task_session_id.as_deref())
+        else {
+            return false;
+        };
+        match repo.get(user_id, task_id).await {
+            Ok(Some(task)) => {
+                task.mode == "plan" && !matches!(task.status.as_str(), "completed" | "failed" | "cancelled")
+            }
+            _ => false,
+        }
     }
 
     pub async fn get(&self, user_id: &str, id: &str) -> Result<FanoutGroupResponse, WorktreeError> {
@@ -837,6 +870,16 @@ impl FanoutService {
             Some(self.check_target(&repo, req.target_branch.as_deref()).await?)
         };
 
+        if let Some(expected) = req.expected_digest.as_deref() {
+            let now = self
+                .compute_adopt_digest(&group, &winner, req.strategy, target_branch.as_deref())
+                .await?;
+            if now.digest != expected {
+                tracing::warn!(group_id = %id, slot = %label, "adopt refused: the approved diff changed");
+                return Err(WorktreeError::DigestMismatch(format!("slot {label}")));
+            }
+        }
+
         // Snapshot uncommitted winner work onto its branch.
         let mut snapshot_commit = None;
         if self.inner.worktrees.is_dirty(&wt_path).await {
@@ -937,6 +980,121 @@ impl FanoutService {
             )
             .await;
         self.get(user_id, id).await
+    }
+
+    /// 3.0 C9: the digest a remote adopt approval of `slot` is bound to.
+    pub async fn adopt_digest(
+        &self,
+        user_id: &str,
+        id: &str,
+        slot: &str,
+        strategy: AdoptStrategy,
+        target_branch: Option<&str>,
+    ) -> Result<AdoptDigest, WorktreeError> {
+        let group = self.inner.store.get(user_id, id).await?;
+        let rows = self.inner.worktrees.store().list_by_group(id).await?;
+        let label = slot.trim().to_ascii_uppercase();
+        let winner = rows
+            .iter()
+            .find(|r| r.slot.as_deref() == Some(label.as_str()))
+            .cloned()
+            .ok_or_else(|| WorktreeError::BadRequest(format!("unknown slot: {slot}")))?;
+        let repo = Path::new(&group.source_repo_path).to_path_buf();
+        let target = if strategy == AdoptStrategy::BranchOnly {
+            None
+        } else {
+            Some(self.check_target(&repo, target_branch).await?)
+        };
+        self.compute_adopt_digest(&group, &winner, strategy, target.as_deref())
+            .await
+    }
+
+    async fn compute_adopt_digest(
+        &self,
+        group: &FanoutGroupRow,
+        winner: &crate::store::WorktreeRow,
+        strategy: AdoptStrategy,
+        target_branch: Option<&str>,
+    ) -> Result<AdoptDigest, WorktreeError> {
+        use sha2::{Digest, Sha256};
+        let repo = Path::new(&group.source_repo_path).to_path_buf();
+        let wt_path = Path::new(&winner.path).to_path_buf();
+        let branch_commit = self
+            .inner
+            .worktrees
+            .branch_tip(&repo, &winner.branch)
+            .await?
+            .ok_or_else(|| WorktreeError::RefNotFound(winner.branch.clone()))?;
+        let target_commit = match target_branch {
+            Some(target) => Some(self.rev_parse(&repo, &format!("refs/heads/{target}")).await?),
+            None => None,
+        };
+        let git = self.inner.worktrees.git();
+        let diff = git
+            .run(
+                [
+                    "-c",
+                    "core.quotepath=off",
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    "--full-index",
+                    "--binary",
+                    group.base_commit.as_str(),
+                    "--",
+                ],
+                RunOptions::in_dir(&wt_path),
+            )
+            .await?;
+        if !diff.success() {
+            return Err(WorktreeError::Git(format!("git diff: {}", diff.stderr.trim())));
+        }
+        let untracked = git
+            .run(
+                ["ls-files", "--others", "--exclude-standard", "-z"],
+                RunOptions::in_dir(&wt_path),
+            )
+            .await?;
+        if !untracked.success() {
+            return Err(WorktreeError::Git(format!("git ls-files: {}", untracked.stderr.trim())));
+        }
+        let mut paths: Vec<&str> = untracked.stdout.split('\0').filter(|p| !p.is_empty()).collect();
+        paths.sort_unstable();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"workmate-adopt-digest-v1\n");
+        for (key, value) in [
+            ("base", group.base_commit.as_str()),
+            ("branch", branch_commit.as_str()),
+            ("strategy", strategy.as_str()),
+            ("target", target_branch.unwrap_or("")),
+            ("target_head", target_commit.as_deref().unwrap_or("")),
+        ] {
+            hasher.update(format!("{key}:{value}\n").as_bytes());
+        }
+        hasher.update(format!("diff:{}\n", diff.stdout.len()).as_bytes());
+        hasher.update(diff.stdout.as_bytes());
+        for path in paths {
+            // A symlink is hashed by its target, never followed.
+            let full = wt_path.join(path);
+            let bytes = match tokio::fs::symlink_metadata(&full).await {
+                Ok(meta) if meta.file_type().is_symlink() => tokio::fs::read_link(&full)
+                    .await
+                    .map(|target| target.to_string_lossy().into_owned().into_bytes())
+                    .unwrap_or_default(),
+                Ok(_) => tokio::fs::read(&full).await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            hasher.update(format!("untracked:{path}:{}\n", hex::encode(Sha256::digest(&bytes))).as_bytes());
+        }
+        Ok(AdoptDigest {
+            digest: hex::encode(hasher.finalize()),
+            base_commit: group.base_commit.clone(),
+            branch_commit,
+            target_branch: target_branch.map(str::to_owned),
+            target_commit,
+        })
     }
 
     /// The merge target must be the branch checked out in the source

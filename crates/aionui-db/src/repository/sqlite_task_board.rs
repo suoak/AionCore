@@ -366,15 +366,18 @@ impl ITaskBoardRepository for SqliteTaskBoardRepository {
         &self,
         user_id: &str,
         task_session_id: &str,
-        conversation_id: &str,
+        conversation_id: Option<&str>,
+        fanout_group_id: Option<&str>,
         updated_at: TimestampMs,
     ) -> Result<bool, DbError> {
         let result = sqlx::query(
-            "UPDATE task_sessions SET status = 'ready', queued_at = NULL, conversation_id = ?, \
+            "UPDATE task_sessions SET status = 'ready', queued_at = NULL, \
+             conversation_id = COALESCE(?, conversation_id), fanout_group_id = COALESCE(?, fanout_group_id), \
              updated_at = MAX(updated_at + 1, ?) \
              WHERE id = ? AND user_id = ? AND mode = 'plan' AND status IN ('draft', 'ready', 'paused', 'failed')",
         )
         .bind(conversation_id)
+        .bind(fanout_group_id)
         .bind(updated_at)
         .bind(task_session_id)
         .bind(user_id)

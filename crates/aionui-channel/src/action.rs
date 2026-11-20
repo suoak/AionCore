@@ -42,6 +42,8 @@ pub struct ActionExecutor {
     session_mgr: Arc<SessionManager>,
     settings: Arc<ChannelSettingsService>,
     owner_user_id: Option<String>,
+    /// 3.0 C9: answers approval-card button presses.
+    approvals: std::sync::OnceLock<Arc<dyn crate::remote_approval::ChannelApprovalPort>>,
 }
 
 impl ActionExecutor {
@@ -56,6 +58,53 @@ impl ActionExecutor {
             session_mgr,
             settings,
             owner_user_id,
+            approvals: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 3.0 C9: set once at startup.
+    pub fn set_approval_port(&self, port: Arc<dyn crate::remote_approval::ChannelApprovalPort>) {
+        let _ = self.approvals.set(port);
+    }
+
+    /// 3.0 C9: an approval-card button. The decider is the platform user who
+    /// pressed it (`msg.user`), never the card's author or a typed message.
+    async fn handle_approval_action(
+        &self,
+        owner_user_id: &str,
+        msg: &UnifiedIncomingMessage,
+        action: &UnifiedAction,
+    ) -> ActionResponse {
+        let Some(port) = self.approvals.get() else {
+            return crate::remote_approval::answer("Remote approval is not available.".into());
+        };
+        let param = |key: &str| {
+            action
+                .params
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .map(String::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let approve = match param("v").as_str() {
+            "a" => true,
+            "r" => false,
+            _ => return crate::remote_approval::answer("Unknown approval answer.".into()),
+        };
+        let platform = msg.platform.to_string();
+        match port
+            .decide(
+                owner_user_id,
+                &platform,
+                &msg.user.id,
+                &param("r"),
+                &param("d"),
+                approve,
+            )
+            .await
+        {
+            Ok(text) | Err(text) => crate::remote_approval::answer(text),
         }
     }
 
@@ -96,6 +145,13 @@ impl ActionExecutor {
         };
 
         // 2. Button callback → action routing
+        if let Some(action) = &msg.action
+            && action.action == crate::remote_approval::APPROVAL_ACTION
+        {
+            return Ok(MessageResult::Action(
+                self.handle_approval_action(owner_user_id, msg, action).await,
+            ));
+        }
         if let Some(action) = &msg.action {
             let response = self.route_action(owner_user_id, action, &internal_user_id).await?;
             return Ok(MessageResult::Action(response));

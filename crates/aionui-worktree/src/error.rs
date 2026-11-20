@@ -54,6 +54,9 @@ pub enum WorktreeError {
     AdoptConflict(String),
     #[error("target branch is not clean: {0}")]
     TargetNotClean(String),
+    /// 3.0 C9: what a remote approval was bound to changed before the adopt.
+    #[error("the diff changed since it was approved: {0}")]
+    DigestMismatch(String),
 }
 
 impl WorktreeError {
@@ -85,6 +88,7 @@ impl WorktreeError {
             Self::SlotBusy(_) => "SLOT_BUSY",
             Self::AdoptConflict(_) => "ADOPT_CONFLICT",
             Self::TargetNotClean(_) => "TARGET_NOT_CLEAN",
+            Self::DigestMismatch(_) => "ADOPT_DIGEST_MISMATCH",
         }
     }
 }

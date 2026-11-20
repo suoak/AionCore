@@ -580,6 +580,37 @@ const AUDIT_RULES: &[AuditRule] = &[
         "conversation",
         NONE,
     ),
+    // 3.0 C9: remote approval — the phone's decision (the service adds the
+    // bound outcome: approve / reject / replay / expired / digest mismatch),
+    // the lifetime setting and the IM approver bindings.
+    approval(
+        "/api/approval-requests/{id}/decision",
+        "approval.remote.decide",
+        "approval_request",
+        ID,
+        "id",
+    ),
+    rule(
+        "PUT",
+        "/api/remote-approval/settings",
+        "remote_approval.settings",
+        "remote_approval",
+        NONE,
+    ),
+    rule(
+        "POST",
+        "/api/remote-approval/approvers",
+        "remote_approval.approver_add",
+        "remote_approval",
+        NONE,
+    ),
+    rule(
+        "DELETE",
+        "/api/remote-approval/approvers/{platform}/{identity}",
+        "remote_approval.approver_remove",
+        "remote_approval",
+        NONE,
+    ),
     // Phone follow-ups (desktop sends are ordinary chat, not audited)
     AuditRule {
         method: "POST",

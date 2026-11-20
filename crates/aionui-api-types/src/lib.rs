@@ -34,6 +34,7 @@ mod office;
 mod project;
 mod provider;
 mod remote_agent;
+mod remote_approval;
 mod response;
 mod runtime;
 mod session_tools;
@@ -183,8 +184,9 @@ pub use custom_agent::{
     SetAgentOverridesRequest, SetEnabledRequest,
 };
 pub use delegation::{
-    CreateDelegationRequest, DelegationResponse, DelegationStatus, GrantDelegationRequest, MAX_CONCURRENT_DELEGATIONS,
-    MAX_DELEGATION_TASK_CHARS,
+    CreateDelegationRequest, DELEGATE_TOOLS_SCHEMA_VERSION, DelegateToolDescriptor, DelegateToolName,
+    DelegationResponse, DelegationStatus, GrantDelegationRequest, MAX_CONCURRENT_DELEGATIONS,
+    MAX_DELEGATION_TASK_CHARS, delegate_tool_descriptor, delegate_tool_descriptors,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
@@ -200,9 +202,8 @@ pub use file::{
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
 pub use inbox::{
-    AUTOPILOT_INBOX_TITLE_PREFIX, INBOX_ORIGIN_AUTOPILOT, INBOX_ORIGIN_BATCH, INBOX_ORIGIN_TASK, InboxItemDto,
-    InboxListQuery, InboxListResponse, InboxMarkReadResponse, TASK_APPROVAL_INBOX_KEY_PREFIX, inbox_origin,
-    inbox_task_approval_id,
+    AUTOPILOT_INBOX_TITLE_PREFIX, INBOX_ORIGIN_AUTOPILOT, INBOX_ORIGIN_BATCH, InboxItemDto, InboxListQuery,
+    InboxListResponse, InboxMarkReadResponse, TASK_APPROVAL_INBOX_KEY_PREFIX, inbox_origin, inbox_task_approval_id,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
@@ -233,6 +234,11 @@ pub use provider::{
 pub use remote_agent::{
     CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
+};
+pub use remote_approval::{
+    ApprovalRequestKind, ApprovalRequestResponse, ApprovalRequestStatus, DEFAULT_APPROVAL_TTL_MINUTES,
+    IssueApprovalRequest, MAX_APPROVAL_TTL_MINUTES, MIN_IM_DIGEST_PREFIX, RemoteApprovalDecision,
+    RemoteApprovalDecisionRequest, RemoteApprovalSettings, RemoteApproverRequest, RemoteApproverResponse,
 };
 pub use response::{ApiResponse, ErrorResponse};
 pub use runtime::{

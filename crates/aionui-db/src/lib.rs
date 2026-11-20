@@ -56,6 +56,7 @@ pub use repository::ILocalKbRepository;
 pub use repository::SqliteAuditEventRepository;
 pub use repository::SqliteLocalKbRepository;
 pub use repository::SqliteUserDeviceRepository;
+pub use repository::approval_request::{ApprovalRequestRow, NewApprovalRequest, RemoteApproverRow};
 pub use repository::audit_event::{
     AUDIT_LIST_DEFAULT_LIMIT, AUDIT_LIST_MAX_LIMIT, AuditActorKind, AuditChainVerification, AuditEventFilter,
     AuditOrder, AuditVia, IAuditEventRepository, NewAuditEvent,
@@ -124,6 +125,7 @@ pub use repository::{
     SqliteTeamRepository, SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository,
     UpsertInboxItemParams, UsageEventFilter,
 };
+pub use repository::{IApprovalRequestRepository, SqliteApprovalRequestRepository};
 pub use repository::{IDelegationRepository, SqliteDelegationRepository};
 pub use repository::{evolution_evidence_tags, record_evolution_evidence};
 

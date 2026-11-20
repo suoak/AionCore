@@ -62,6 +62,10 @@ pub struct CreateFanoutGroupRequest {
     #[serde(default)]
     pub title: Option<String>,
     pub slots: Vec<FanoutSlotRequest>,
+    /// 3.0 C4: create the slot conversation but do not send the prompt (Core
+    /// plans first). Never settable over HTTP.
+    #[serde(skip)]
+    pub hold_prompt: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -133,6 +137,23 @@ pub struct AdoptFanoutRequest {
     pub snapshot_message: Option<String>,
     #[serde(default)]
     pub cleanup: AdoptCleanup,
+    /// 3.0 C9: internal only (never read from a request body). When set, the
+    /// adopt runs only if the current [`AdoptDigest`] still equals it.
+    #[serde(skip)]
+    pub expected_digest: Option<String>,
+}
+
+/// 3.0 C9: what a remote adopt approval is bound to. `digest` is sha256 over
+/// the base commit, the slot branch head, the target branch and its head,
+/// the strategy, and the normalized diff of the slot worktree against the
+/// base (tracked changes, committed or not, plus untracked files).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdoptDigest {
+    pub digest: String,
+    pub base_commit: String,
+    pub branch_commit: String,
+    pub target_branch: Option<String>,
+    pub target_commit: Option<String>,
 }
 
 /// Persisted in `fanout_groups.adopt_result`.

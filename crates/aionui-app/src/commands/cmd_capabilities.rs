@@ -139,6 +139,23 @@ fn data() -> Value {
                 }
             },
             {
+                "name": "delegate",
+                "mode": "assistant-delegation",
+                "description": "Hand a task to an assistant the user picked with @ in this conversation (non-blocking), then read its result by handle.",
+                "contract": "agent-facing-delegate-cli",
+                "contract_command": "delegate capabilities",
+                "invocation": "aioncore delegate capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["delegate capabilities"],
+                "safety": {
+                    "can_write": true,
+                    "runtime_token_required_for_context_and_call": true,
+                    "does_not_accept_identity_authority_from_stdin": true,
+                    "only_user_granted_assistants": true,
+                    "depth_one": true
+                }
+            },
+            {
                 "name": "skills",
                 "mode": "read-only",
                 "description": "Read the skills enabled in THIS conversation: list them, get a skill's full body plus its absolute directory, and read its supplementary files.",
@@ -206,8 +223,8 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::commands::{
-        config_capabilities, conversation_capabilities, diagnose_capabilities, session_capabilities,
-        skills_capabilities, team_capabilities,
+        config_capabilities, conversation_capabilities, delegate_capabilities, diagnose_capabilities,
+        session_capabilities, skills_capabilities, team_capabilities,
     };
 
     /// `capabilities` is its own entrypoint — `data()` declares it under
@@ -290,6 +307,7 @@ mod tests {
             ("team", team_capabilities::data()),
             ("session", session_capabilities::data()),
             ("conversation", conversation_capabilities::data()),
+            ("delegate", delegate_capabilities::data()),
             ("skills", skills_capabilities::data()),
         ] {
             let entry = domains

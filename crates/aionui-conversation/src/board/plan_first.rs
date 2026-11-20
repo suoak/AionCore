@@ -48,6 +48,44 @@ pub(crate) fn execute_job(
     })
 }
 
+/// 3.0 C9: an approved plan answered remotely runs at once; the run (or why
+/// it did not run) is recorded on the approval request.
+pub(crate) fn remote_execute_job(
+    service: ConversationService,
+    user_id: String,
+    approval: aionui_db::models::TaskApprovalRow,
+    request_id: String,
+) -> Job {
+    Box::pin(async move {
+        let request = aionui_api_types::ExecuteApprovedPlanRequest {
+            approval_id: approval.id.clone(),
+            artifact_id: approval.artifact_id.clone(),
+            artifact_hash: approval.artifact_hash.clone(),
+        };
+        let id = approval.task_session_id.clone();
+        match service.execute_approved_plan(&user_id, &id, request).await {
+            Ok(run) => {
+                service
+                    .record_remote_run(&user_id, &request_id, Some(&run.id), None)
+                    .await;
+                if run.status == aionui_api_types::TaskRunStatus::Completed
+                    && let Ok(board) = service.task_board_repo()
+                    && matches!(board.get_task_flow(&user_id, &id).await, Ok(Some(flow)) if flow.plan_first != 0)
+                    && let Err(error) = service.move_started_task_to_review(&user_id, &id).await
+                {
+                    tracing::warn!(%error, task_session_id = %id, "remote approval: in_review move failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_session_id = %id, "remote approval: approved plan did not run");
+                service
+                    .record_remote_run(&user_id, &request_id, None, Some(&error.to_string()))
+                    .await;
+            }
+        }
+    })
+}
+
 impl ConversationService {
     /// 3.0 C4: strict planning in the task's conversation → plan approval
     /// (needs you). When planning cannot start (the agent cannot guarantee
@@ -93,5 +131,45 @@ impl ConversationService {
             _ => return,
         }
         tokio::spawn(execute_job(self.clone(), user_id.to_owned(), approval.clone()));
+    }
+
+    /// 3.0 C4: a plan-first task's worktree slot has its conversation (the
+    /// prompt was held). Bind it and start planning there.
+    pub async fn on_task_slot_started(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), crate::error::ConversationError> {
+        let board = self.task_board_repo()?;
+        let Some(flow) = board.get_task_flow(user_id, task_session_id).await? else {
+            return Ok(());
+        };
+        if flow.plan_first == 0 {
+            return Ok(());
+        }
+        if !board
+            .bind_task_for_planning(user_id, task_session_id, Some(conversation_id), None, now_ms())
+            .await?
+        {
+            tracing::info!(
+                task_session_id,
+                "plan-first slot started but the task is no longer startable"
+            );
+            return Ok(());
+        }
+        let task = self
+            .task_session_repo()?
+            .get(user_id, task_session_id)
+            .await?
+            .ok_or_else(|| crate::error::ConversationError::not_found_reason("Task session not found"))?;
+        let prompt = super::start::prompt_text(flow.prompt_json.as_deref(), &task.objective, &task.title);
+        tokio::spawn(planning_job(
+            self.clone(),
+            user_id.to_owned(),
+            task_session_id.to_owned(),
+            prompt,
+        ));
+        Ok(())
     }
 }
