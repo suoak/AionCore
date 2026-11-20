@@ -463,6 +463,7 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task_options: None,
         })
         .await
         .unwrap();
@@ -1273,4 +1274,102 @@ async fn no_yolo_refuses_autopilot_full_auto_on_create_and_update() {
         .await
         .unwrap();
     assert_eq!(denials.len(), 2, "{denials:?}");
+}
+
+// ── 3.0 C6: run_as = task ────────────────────────────────────────────
+
+#[tokio::test]
+async fn c6_run_now_of_a_task_job_creates_a_backlog_task_and_no_conversation_turn() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let mut body = create_job_body("Nightly deps");
+    body["run_as"] = json!("task");
+    body["task"] = json!({ "start": false });
+    let created = create_job(&mut app, &services, &token, &csrf, body).await;
+    assert_eq!(created["target"]["run_as"], "task");
+    assert_eq!(created["target"]["execution_mode"], "new_conversation");
+    let job_id = created["id"].as_str().unwrap().to_owned();
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/cron/jobs/{job_id}/run"),
+            json!({}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let run = body_json(resp).await;
+    assert_eq!(run["data"]["conversation_id"], "");
+    let task_id = run["data"]["task_session_id"].as_str().unwrap().to_owned();
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/task-sessions/board", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let board = body_json(resp).await;
+    let item = board["data"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|column| column["items"].as_array().unwrap().iter())
+        .find(|item| item["id"] == task_id.as_str())
+        .cloned()
+        .expect("the cron task is on the board");
+    assert_eq!(item["source"], "cron");
+    assert_eq!(item["board_status"], "backlog");
+    assert_eq!(item["title"], "Nightly deps");
+    assert_eq!(item["assistant_id"], DEFAULT_CRON_ASSISTANT_ID);
+    // No conversation turn was sent for the occurrence.
+    let job = body_json(
+        app.clone()
+            .oneshot(get_with_token(&format!("/api/cron/jobs/{job_id}"), &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(job["data"]["state"]["last_status"], "ok");
+    assert_eq!(job["data"]["state"]["run_count"], 1);
+}
+
+#[tokio::test]
+async fn c6_task_job_input_is_strict() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_assistant(&mut app, &token, &csrf).await;
+    for (patch, expected) in [
+        (
+            json!({ "run_as": "task", "task": { "start": false, "auto_merge": true } }),
+            "unknown task field",
+        ),
+        (json!({ "run_as": "task", "autopilot": true }), "autopilot"),
+        (
+            json!({ "run_as": "task", "execution_mode": "existing" }),
+            "existing conversation",
+        ),
+        (
+            json!({ "run_as": "task", "task": { "repo_path": "relative" } }),
+            "relative repo",
+        ),
+        (
+            json!({ "run_as": "task", "task": { "start": true }, "agent_config": { "name": "x" } }),
+            "no assistant",
+        ),
+        (json!({ "task": { "start": false } }), "options without run_as"),
+        (json!({ "run_as": "pipeline" }), "unknown run_as"),
+    ] {
+        let mut body = create_job_body("Strict");
+        body.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+        let resp = app
+            .clone()
+            .oneshot(json_with_token("POST", "/api/cron/jobs", body, &token, &csrf))
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{expected}: {}", resp.status());
+    }
 }

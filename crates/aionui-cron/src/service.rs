@@ -3,8 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse,
-    CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
+    CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse, CronRunAs,
+    CronScheduleDto, CronTaskOptionsDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_common::{
@@ -311,6 +311,8 @@ impl CronService {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         };
 
         let job = self
@@ -403,6 +405,8 @@ impl CronService {
                     autopilot: None,
                     autopilot_yolo: None,
                     notify_channel_id: None,
+                    run_as: None,
+                    task: None,
                 },
             )
             .await?;
@@ -454,8 +458,26 @@ impl CronService {
         };
         validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
 
-        let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
+        let run_as = req.run_as.unwrap_or(CronRunAs::Conversation);
+        // A task run never uses an existing conversation (3.0 C6).
+        let execution_mode = match (run_as, req.execution_mode.as_deref()) {
+            (CronRunAs::Task, None) => ExecutionMode::NewConversation,
+            (_, mode) => parse_execution_mode(mode)?,
+        };
         let created_by = CreatedBy::from_str(&req.created_by)?;
+        let task = validate_run_as(&RunAsCheck {
+            run_as,
+            task: req.task.as_ref(),
+            actor,
+            created_by,
+            autopilot: req.autopilot,
+            execution_mode,
+            assistant_id: req
+                .agent_config
+                .as_ref()
+                .and_then(|config| config.assistant_id.as_deref()),
+            message: req.message.as_deref().or(req.prompt.as_deref()).unwrap_or_default(),
+        })?;
         validate_autopilot_request(&AutopilotCheck {
             autopilot: req.autopilot,
             yolo: req.autopilot && req.autopilot_yolo,
@@ -516,6 +538,7 @@ impl CronService {
             autopilot: req.autopilot,
             autopilot_yolo: req.autopilot && req.autopilot_yolo,
             notify_channel_id: normalize_notify_channel_id(req.notify_channel_id.as_deref()),
+            task,
         };
 
         self.validate_job_workspace(&job).await?;
@@ -633,6 +656,31 @@ impl CronService {
         if let Some(channel) = &req.notify_channel_id {
             job.notify_channel_id = normalize_notify_channel_id(Some(channel));
         }
+        let original_task = job.task.clone();
+        let run_as = req.run_as.unwrap_or(job.run_as());
+        let requested_task = match (run_as, &req.task) {
+            (CronRunAs::Task, Some(task)) => Some(task.clone()),
+            (CronRunAs::Task, None) => job.task.clone(),
+            (CronRunAs::Conversation, task) => task.clone(),
+        };
+        if run_as == CronRunAs::Task && req.execution_mode.is_none() && job.execution_mode == ExecutionMode::Existing {
+            job.execution_mode = ExecutionMode::NewConversation;
+            clear_conversation_binding = original_execution_mode == ExecutionMode::Existing;
+        }
+        job.task = validate_run_as(&RunAsCheck {
+            run_as,
+            task: requested_task.as_ref(),
+            actor,
+            created_by: job.created_by,
+            autopilot: job.autopilot,
+            execution_mode: job.execution_mode,
+            assistant_id: job
+                .agent_config
+                .as_ref()
+                .and_then(|config| config.assistant_id.as_deref().or(config.custom_agent_id.as_deref())),
+            message: &job.message,
+        })?;
+        let task_changed = job.task != original_task;
         validate_autopilot_request(&AutopilotCheck {
             autopilot: job.autopilot,
             yolo: job.autopilot_yolo,
@@ -663,6 +711,12 @@ impl CronService {
         }
 
         let mut params = build_update_params(&job, &req);
+        if task_changed {
+            params.task_options = Some(job.task.as_ref().map(serde_json::to_string).transpose()?);
+        }
+        if clear_conversation_binding && req.execution_mode.is_none() {
+            params.execution_mode = Some(job.execution_mode.as_str().to_owned());
+        }
         if clear_conversation_binding {
             params.conversation_title = Some(None);
         }
@@ -937,6 +991,13 @@ impl CronService {
 
         let heartbeat = self.spawn_run_lease_heartbeat(job_id.to_owned(), scheduled_at);
 
+        if job.task.is_some() {
+            let result = self.executor.execute_as_task(&job).await;
+            heartbeat.abort();
+            self.handle_execution_result(job, scheduled_at, result).await;
+            return;
+        }
+
         let prepared = match self.executor.prepare_scheduled(&job).await {
             Ok(prepared) => prepared,
             Err(result) => {
@@ -1039,10 +1100,35 @@ impl CronService {
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
         job.agent_type = self.resolve_job_agent_type(&job).await?;
+        if job.task.is_some() {
+            // Synchronous: the task exists (and is started or queued) when
+            // the response returns. The E12 check runs inside `start_task`.
+            self.enforce_job_launch_policy(user_id, &job).await?;
+            let result = self.executor.execute_as_task(&job).await;
+            let task_session_id = match &result {
+                ExecutionResult::Task { task_session_id } => Some(task_session_id.clone()),
+                _ => None,
+            };
+            let error = match &result {
+                ExecutionResult::Error { message } => Some(message.clone()),
+                _ => None,
+            };
+            self.handle_run_now_result(user_id, job_id, result).await;
+            if let Some(message) = error {
+                return Err(CronError::Forbidden(message));
+            }
+            return Ok(RunNowResponse {
+                conversation_id: String::new(),
+                task_session_id,
+            });
+        }
         let prepared = match self.executor.prepare_run_now(&job).await? {
             PreparedRunNow::Ready(prepared) => prepared,
             PreparedRunNow::AlreadyRunning { conversation_id } => {
-                return Ok(RunNowResponse { conversation_id });
+                return Ok(RunNowResponse {
+                    conversation_id,
+                    task_session_id: None,
+                });
             }
         };
         self.bind_materialized_existing_conversation_if_needed(&mut job, &prepared.conversation_id)
@@ -1057,7 +1143,10 @@ impl CronService {
             service.handle_run_now_result(&user_id, &job_id, result).await;
         });
 
-        Ok(RunNowResponse { conversation_id })
+        Ok(RunNowResponse {
+            conversation_id,
+            task_session_id: None,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1436,6 +1525,17 @@ impl CronService {
                     None,
                 );
             }
+            ExecutionResult::Task { task_session_id } => {
+                if !self.finish_scheduled_run(job_id, scheduled_at, "ok", None, None).await {
+                    return;
+                }
+                info!(job_id, task_session_id, "Cron occurrence created a task");
+                self.update_job_after_success(&job.user_id, job_id, "").await;
+                self.reschedule_after_execution(&job, scheduled_at).await;
+                if let Some(user_id) = owner_user_id.as_deref() {
+                    self.emitter.emit_job_executed(user_id, job_id, "ok", None);
+                }
+            }
             ExecutionResult::Retrying { attempt } => {
                 if !self.schedule_retry(job_id, scheduled_at, attempt).await {
                     return;
@@ -1499,6 +1599,10 @@ impl CronService {
         match result {
             ExecutionResult::Success { conversation_id } => {
                 self.update_job_after_success(user_id, job_id, &conversation_id).await;
+                self.emitter.emit_job_executed(user_id, job_id, "ok", None);
+            }
+            ExecutionResult::Task { .. } => {
+                self.update_job_after_success(user_id, job_id, "").await;
                 self.emitter.emit_job_executed(user_id, job_id, "ok", None);
             }
             ExecutionResult::Error { message } => {
@@ -2555,7 +2659,99 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         autopilot: (req.autopilot.is_some() || req.autopilot_yolo.is_some()).then_some(job.autopilot),
         autopilot_yolo: (req.autopilot.is_some() || req.autopilot_yolo.is_some()).then_some(job.autopilot_yolo),
         notify_channel_id: req.notify_channel_id.as_ref().map(|_| job.notify_channel_id.clone()),
+        task_options: None,
     }
+}
+
+/// Inputs of the 3.0 C6 `run_as` check.
+struct RunAsCheck<'a> {
+    run_as: CronRunAs,
+    task: Option<&'a CronTaskOptionsDto>,
+    actor: CronActor,
+    created_by: CreatedBy,
+    autopilot: bool,
+    execution_mode: ExecutionMode,
+    assistant_id: Option<&'a str>,
+    message: &'a str,
+}
+
+/// Task objectives are at most 20000 characters (task session limit).
+const CRON_TASK_MESSAGE_MAX_CHARS: usize = 20_000;
+const CRON_TASK_REPO_PATH_MAX_CHARS: usize = 4096;
+
+/// 3.0 C6: validate `run_as` / `task` and return the task options to store
+/// (`None` = the job runs as a conversation).
+///
+/// A task run is a user decision: agents (runtime tokens, the cron helper,
+/// `created_by = agent`) cannot create one. Autopilot guardrails belong to
+/// conversation runs; a task run instead always stops at review.
+fn validate_run_as(check: &RunAsCheck<'_>) -> Result<Option<CronTaskOptionsDto>, CronError> {
+    let bad = |message: &str| CronError::InvalidAgentConfig(message.to_owned());
+    if check.run_as == CronRunAs::Conversation {
+        if check.task.is_some() {
+            return Err(bad("`task` options need `run_as = task`"));
+        }
+        return Ok(None);
+    }
+    if check.actor == CronActor::Agent || check.created_by == CreatedBy::Agent {
+        return Err(CronError::Forbidden(
+            "Only a user can make a scheduled job run as a task".into(),
+        ));
+    }
+    if check.autopilot {
+        return Err(bad(
+            "Autopilot applies to conversation runs; a scheduled task always stops at review",
+        ));
+    }
+    if check.execution_mode == ExecutionMode::Existing {
+        return Err(CronError::InvalidExecutionMode(
+            "A scheduled task cannot run in an existing conversation".into(),
+        ));
+    }
+    if check.message.trim().is_empty() {
+        return Err(bad("A scheduled task needs a message to work on"));
+    }
+    if check.message.chars().count() > CRON_TASK_MESSAGE_MAX_CHARS {
+        return Err(bad("A scheduled task message must be at most 20000 characters"));
+    }
+    let options = check.task.cloned().unwrap_or_default();
+    let trimmed = |value: Option<String>, field: &str| -> Result<Option<String>, CronError> {
+        match value {
+            None => Ok(None),
+            Some(value) => {
+                let value = value.trim().to_owned();
+                if value.is_empty() || value.chars().any(char::is_control) {
+                    return Err(bad(&format!("`task.{field}` must be a non-empty single line")));
+                }
+                Ok(Some(value))
+            }
+        }
+    };
+    let repo_path = trimmed(options.repo_path, "repo_path")?;
+    if let Some(path) = &repo_path
+        && (!Path::new(path).is_absolute() || path.chars().count() > CRON_TASK_REPO_PATH_MAX_CHARS)
+    {
+        return Err(bad("`task.repo_path` must be an absolute path"));
+    }
+    let base_ref = trimmed(options.base_ref, "base_ref")?;
+    if let Some(base_ref) = &base_ref {
+        if repo_path.is_none() {
+            return Err(bad("`task.base_ref` needs `task.repo_path`"));
+        }
+        if base_ref.chars().count() > 255 || !aionui_conversation::task_flow::is_safe_git_ref(base_ref) {
+            return Err(bad("`task.base_ref` is not a valid git ref"));
+        }
+    }
+    if options.start && check.assistant_id.is_none_or(|id| id.trim().is_empty()) {
+        return Err(bad(
+            "Starting a scheduled task needs an assistant (`agent_config.assistant_id`)",
+        ));
+    }
+    Ok(Some(CronTaskOptionsDto {
+        start: options.start,
+        repo_path,
+        base_ref,
+    }))
 }
 
 /// Who is calling a cron write API.
@@ -2950,6 +3146,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task: None,
         }
     }
 
@@ -2970,6 +3167,8 @@ mod tests {
             autopilot: None,
             autopilot_yolo: None,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.name.as_deref(), Some("New Name"));
@@ -3007,6 +3206,8 @@ mod tests {
             autopilot: None,
             autopilot_yolo: None,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.schedule_kind.as_deref(), Some("cron"));
@@ -3052,6 +3253,8 @@ mod tests {
             autopilot: None,
             autopilot_yolo: None,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         };
 
         let params = build_update_params(&job, &req);
@@ -3118,6 +3321,8 @@ mod tests {
             autopilot: None,
             autopilot_yolo: None,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(params.enabled, Some(false));
@@ -3141,6 +3346,8 @@ mod tests {
             autopilot: None,
             autopilot_yolo: None,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         };
         let params = build_update_params(&job, &req);
         assert_eq!(
@@ -3186,5 +3393,114 @@ mod tests {
         assert_eq!(value, "0 0 * * * *");
         assert_eq!(tz.as_deref(), Some("UTC"));
         assert_eq!(desc.as_deref(), Some("hourly"));
+    }
+}
+
+#[cfg(test)]
+mod run_as_tests {
+    use super::*;
+
+    fn check<'a>(task: Option<&'a CronTaskOptionsDto>) -> RunAsCheck<'a> {
+        RunAsCheck {
+            run_as: CronRunAs::Task,
+            task,
+            actor: CronActor::User,
+            created_by: CreatedBy::User,
+            autopilot: false,
+            execution_mode: ExecutionMode::NewConversation,
+            assistant_id: Some("assistant-1"),
+            message: "Check dependencies",
+        }
+    }
+
+    fn options(start: bool, repo_path: Option<&str>, base_ref: Option<&str>) -> CronTaskOptionsDto {
+        CronTaskOptionsDto {
+            start,
+            repo_path: repo_path.map(str::to_owned),
+            base_ref: base_ref.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_user_task_job_keeps_its_normalized_options() {
+        let task = options(true, Some(" /repo/app "), Some("main"));
+        assert_eq!(
+            validate_run_as(&check(Some(&task))).unwrap(),
+            Some(options(true, Some("/repo/app"), Some("main")))
+        );
+        assert_eq!(
+            validate_run_as(&check(None)).unwrap(),
+            Some(CronTaskOptionsDto::default())
+        );
+    }
+
+    #[test]
+    fn conversation_jobs_store_no_task_options() {
+        let mut conversation = check(None);
+        conversation.run_as = CronRunAs::Conversation;
+        assert_eq!(validate_run_as(&conversation).unwrap(), None);
+        let task = options(false, None, None);
+        conversation.task = Some(&task);
+        assert!(matches!(
+            validate_run_as(&conversation),
+            Err(CronError::InvalidAgentConfig(_))
+        ));
+    }
+
+    #[test]
+    fn agents_cannot_make_a_job_run_as_a_task() {
+        let mut by_agent = check(None);
+        by_agent.actor = CronActor::Agent;
+        assert!(matches!(validate_run_as(&by_agent), Err(CronError::Forbidden(_))));
+        let mut created_by_agent = check(None);
+        created_by_agent.created_by = CreatedBy::Agent;
+        assert!(matches!(
+            validate_run_as(&created_by_agent),
+            Err(CronError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn task_jobs_refuse_autopilot_existing_conversations_and_bad_input() {
+        let mut autopilot = check(None);
+        autopilot.autopilot = true;
+        assert!(validate_run_as(&autopilot).is_err());
+        let mut existing = check(None);
+        existing.execution_mode = ExecutionMode::Existing;
+        assert!(matches!(
+            validate_run_as(&existing),
+            Err(CronError::InvalidExecutionMode(_))
+        ));
+        let mut empty = check(None);
+        empty.message = "  ";
+        assert!(validate_run_as(&empty).is_err());
+        let long = "x".repeat(CRON_TASK_MESSAGE_MAX_CHARS + 1);
+        let mut too_long = check(None);
+        too_long.message = &long;
+        assert!(validate_run_as(&too_long).is_err());
+        for task in [
+            options(false, Some("relative"), None),
+            options(false, Some(""), None),
+            options(false, Some("/repo\napp"), None),
+            options(false, None, Some("main")),
+            options(false, Some("/repo"), Some("--upload-pack=x")),
+            options(false, Some("/repo"), Some("a..b")),
+        ] {
+            assert!(validate_run_as(&check(Some(&task))).is_err(), "{task:?}");
+        }
+    }
+
+    #[test]
+    fn starting_a_task_needs_an_assistant() {
+        let start = options(true, None, None);
+        let mut no_assistant = check(Some(&start));
+        no_assistant.assistant_id = None;
+        assert!(validate_run_as(&no_assistant).is_err());
+        no_assistant.assistant_id = Some(" ");
+        assert!(validate_run_as(&no_assistant).is_err());
+        let backlog = options(false, None, None);
+        let mut backlog_only = check(Some(&backlog));
+        backlog_only.assistant_id = None;
+        assert!(validate_run_as(&backlog_only).is_ok(), "the backlog can pick one later");
     }
 }

@@ -124,6 +124,8 @@ mod tests {
             target: CronJobTargetDto {
                 payload: CronJobPayloadDto::Message { text: "hello".into() },
                 execution_mode: Some("existing".into()),
+                run_as: Default::default(),
+                task: None,
             },
             metadata: CronJobMetadataDto {
                 conversation_id: "conv_1".into(),

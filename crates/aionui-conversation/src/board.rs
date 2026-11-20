@@ -36,6 +36,7 @@
 //! otherwise the call fails with 409 `board_item_stale`. Omitted, the update
 //! stays last-write-wins.
 
+pub mod cron_task;
 pub mod delivery;
 pub mod github_import;
 pub mod issue_flow;

@@ -175,8 +175,9 @@ pub use conversation_tools::{
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
     CronAgentConfigWriteDto, CronJobExecutedEvent, CronJobMetadataDto, CronJobPayloadDto, CronJobRemovedPayload,
-    CronJobResponse, CronJobStateDto, CronJobTargetDto, CronScheduleDto, HasSkillResponse, ListCronJobsQuery,
-    RunNowResponse, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
+    CronJobResponse, CronJobStateDto, CronJobTargetDto, CronRunAs, CronScheduleDto, CronTaskOptionsDto,
+    HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest, UpdateConversationCronRequest,
+    UpdateCronJobRequest,
 };
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,

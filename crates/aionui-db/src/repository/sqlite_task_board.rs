@@ -215,6 +215,25 @@ impl ITaskBoardRepository for SqliteTaskBoardRepository {
         .await?)
     }
 
+    async fn find_open_task_by_source(
+        &self,
+        user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM task_sessions \
+             WHERE user_id = ? AND source = ? AND source_ref = ? \
+               AND board_status NOT IN ('done', 'cancelled') \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(source)
+        .bind(source_ref)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     async fn set_task_flow(
         &self,
         user_id: &str,

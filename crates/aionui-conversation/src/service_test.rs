@@ -14968,6 +14968,319 @@ async fn the_request_lifetime_setting_is_bounded() {
 }
 
 // ---------------------------------------------------------------------------
+// 3.0 C6: cron `run_as = task`.
+// ---------------------------------------------------------------------------
+
+fn cron_task(job_id: &str, start: bool) -> crate::board::cron_task::CronTaskRequest {
+    crate::board::cron_task::CronTaskRequest {
+        job_id: job_id.into(),
+        job_name: "Nightly dependency check".into(),
+        message: "Check for outdated dependencies and propose upgrades".into(),
+        agent_type: "632f31d2".into(),
+        assistant_id: Some("codex-helper".into()),
+        repo_path: Some("/repo/app".into()),
+        base_ref: Some("main".into()),
+        start,
+        skip_if_open: false,
+    }
+}
+
+async fn cron_board_item(service: &ConversationService, id: &str) -> aionui_api_types::TaskBoardItemResponse {
+    service
+        .task_board("user_1", Default::default())
+        .await
+        .unwrap()
+        .columns
+        .into_iter()
+        .flat_map(|column| column.items)
+        .find(|item| item.id == id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_cron_task_lands_in_the_backlog_with_its_job_as_source() {
+    use crate::board::cron_task::CronTaskOutcome;
+    use aionui_api_types::{TaskBoardStatus, TaskSource};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+
+    let outcome = service
+        .enqueue_cron_task("user_1", cron_task("cron_1", false))
+        .await
+        .unwrap();
+    let CronTaskOutcome::Created { task_session_id } = outcome else {
+        panic!("{outcome:?}");
+    };
+    let item = cron_board_item(&service, &task_session_id).await;
+    assert_eq!(item.source, TaskSource::Cron);
+    assert_eq!(item.board_status, TaskBoardStatus::Backlog);
+    assert_eq!(item.title, "Nightly dependency check");
+    assert_eq!(item.assistant_id.as_deref(), Some("codex-helper"));
+    let flow = aionui_db::SqliteTaskBoardRepository::new(db.pool().clone());
+    let flow = aionui_db::ITaskBoardRepository::get_task_flow(&flow, "user_1", &task_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow.source.as_deref(), Some("cron"));
+    assert_eq!(flow.source_ref.as_deref(), Some("cron_1"));
+    assert_eq!(flow.repo_path.as_deref(), Some("/repo/app"));
+    assert_eq!(flow.base_ref.as_deref(), Some("main"));
+    assert!(port.launched.lock().unwrap().is_empty(), "start = false runs nothing");
+
+    // Core-only source: clients still cannot claim it.
+    let claimed = service
+        .create_task_session("user_1", flow_request(json!({ "source": "cron" })))
+        .await;
+    assert!(
+        matches!(claimed, Err(ConversationError::BadRequest { .. })),
+        "{claimed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_started_cron_task_runs_under_the_task_rules_and_stops_at_review() {
+    use crate::board::BoardActor;
+    use crate::board::cron_task::CronTaskOutcome;
+    use aionui_api_types::{TaskBoardStatus, TaskLane, TaskNeedsYouReason, TaskStartState, UpdateTaskBoardRequest};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES ('conv-cron', 'user_1', 'Task run', 'acp', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    *port.conversation_id.lock().unwrap() = Some("conv-cron".into());
+
+    let outcome = service
+        .enqueue_cron_task("user_1", cron_task("cron_1", true))
+        .await
+        .unwrap();
+    let CronTaskOutcome::Started { task_session_id, state } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(state, TaskStartState::Started);
+    let launched = port.launched.lock().unwrap().clone();
+    assert_eq!(launched.len(), 1);
+    assert_eq!(launched[0].assistant_id, "codex-helper");
+    assert_eq!(
+        launched[0].prompt,
+        "Check for outdated dependencies and propose upgrades"
+    );
+    assert_eq!(launched[0].repo_path.as_deref(), Some("/repo/app"));
+    assert!(!launched[0].plan_first);
+
+    // The run finishes → review, never done.
+    service.on_task_turn_settled("user_1", "conv-cron", true).await;
+    let item = cron_board_item(&service, &task_session_id).await;
+    assert_eq!(item.board_status, TaskBoardStatus::InReview);
+    assert_eq!(
+        (item.lane, item.needs_you_reason),
+        (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Review))
+    );
+    // Neither the agent nor a plain board move can finish it.
+    for actor in [BoardActor::Agent, BoardActor::User] {
+        let moved = service
+            .update_task_board(
+                "user_1",
+                &task_session_id,
+                actor,
+                UpdateTaskBoardRequest {
+                    board_status: Some(TaskBoardStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(moved.is_err(), "{actor:?}: {moved:?}");
+    }
+    assert_eq!(
+        cron_board_item(&service, &task_session_id).await.board_status,
+        TaskBoardStatus::InReview
+    );
+}
+
+#[tokio::test]
+async fn a_cron_task_queues_when_every_run_slot_is_busy() {
+    use crate::board::cron_task::CronTaskOutcome;
+    use aionui_api_types::TaskStartState;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    service.set_max_running_tasks(1);
+    let busy = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    service.start_task("user_1", &busy).await.unwrap();
+
+    let outcome = service
+        .enqueue_cron_task("user_1", cron_task("cron_1", true))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            CronTaskOutcome::Started {
+                state: TaskStartState::Queued,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(port.launched.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_cron_task_start_is_gated_by_run_permissions_and_audited() {
+    use crate::board::cron_task::CronTaskOutcome;
+    use aionui_api_types::TaskBoardStatus;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(db.pool().clone()));
+    let governance = Arc::new(aionui_db::GovernanceService::new(
+        Arc::new(aionui_db::SqliteGovernanceRepository::new(db.pool().clone())),
+        Some(aionui_db::AuditSink::new(audit.clone())),
+        true,
+    ));
+    governance
+        .set_agent_run_permission(
+            aionui_db::governance::BOOTSTRAP_OWNER_USER_ID,
+            "assistant",
+            "codex-helper",
+            Some(&[aionui_db::UserRole::Owner]),
+            None,
+        )
+        .await
+        .unwrap();
+    service.with_governance(governance);
+
+    let outcome = service
+        .enqueue_cron_task("user_1", cron_task("cron_1", true))
+        .await
+        .unwrap();
+    let CronTaskOutcome::StartRefused {
+        task_session_id,
+        reason,
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert!(!reason.is_empty());
+    assert!(port.launched.lock().unwrap().is_empty());
+    assert_eq!(
+        cron_board_item(&service, &task_session_id).await.board_status,
+        TaskBoardStatus::Backlog
+    );
+    let denials = audit
+        .list(&aionui_db::AuditEventFilter {
+            action: Some("policy.deny".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].target_id.as_deref(), Some(task_session_id.as_str()));
+    let diff: serde_json::Value = serde_json::from_str(denials[0].diff.as_deref().unwrap()).unwrap();
+    assert_eq!(diff["surface"], "task");
+}
+
+#[tokio::test]
+async fn an_open_cron_task_skips_the_next_occurrence_when_overlap_is_off() {
+    use crate::board::cron_task::CronTaskOutcome;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    let mut request = cron_task("cron_1", false);
+    request.skip_if_open = true;
+
+    let first = service.enqueue_cron_task("user_1", request.clone()).await.unwrap();
+    let first_id = first.task_session_id().to_owned();
+    assert!(matches!(first, CronTaskOutcome::Created { .. }));
+    let second = service.enqueue_cron_task("user_1", request.clone()).await.unwrap();
+    assert_eq!(
+        second,
+        CronTaskOutcome::SkippedOpen {
+            task_session_id: first_id.clone()
+        }
+    );
+    // Another job's open task does not count.
+    let other = service
+        .enqueue_cron_task(
+            "user_1",
+            crate::board::cron_task::CronTaskRequest {
+                job_id: "cron_2".into(),
+                ..request.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(other, CronTaskOutcome::Created { .. }));
+    // Once the first task is closed the job creates a new one.
+    sqlx::query("UPDATE task_sessions SET board_status = 'cancelled' WHERE id = ?")
+        .bind(&first_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let third = service.enqueue_cron_task("user_1", request.clone()).await.unwrap();
+    assert!(matches!(third, CronTaskOutcome::Created { .. }));
+    assert_ne!(third.task_session_id(), first_id);
+    // Without skip_if_open every occurrence makes a task.
+    request.skip_if_open = false;
+    let fourth = service.enqueue_cron_task("user_1", request).await.unwrap();
+    assert_ne!(fourth.task_session_id(), third.task_session_id());
+}
+
+#[tokio::test]
+async fn a_cron_task_is_validated_like_any_task() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    for request in [
+        crate::board::cron_task::CronTaskRequest {
+            job_id: " ".into(),
+            ..cron_task("cron_1", false)
+        },
+        crate::board::cron_task::CronTaskRequest {
+            repo_path: Some("relative/path".into()),
+            ..cron_task("cron_1", false)
+        },
+        crate::board::cron_task::CronTaskRequest {
+            base_ref: Some("--upload-pack=x".into()),
+            ..cron_task("cron_1", false)
+        },
+        crate::board::cron_task::CronTaskRequest {
+            message: "x".repeat(20_001),
+            ..cron_task("cron_1", false)
+        },
+    ] {
+        let result = service.enqueue_cron_task("user_1", request).await;
+        assert!(
+            matches!(result, Err(ConversationError::BadRequest { .. })),
+            "{result:?}"
+        );
+    }
+    let board = service.task_board("user_1", Default::default()).await.unwrap();
+    assert!(board.columns.iter().all(|column| column.items.is_empty()));
+}
+
+// ---------------------------------------------------------------------------
 // 3.0 C8: Issue start options and the confirmed Issue comment.
 // ---------------------------------------------------------------------------
 
