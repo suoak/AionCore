@@ -40,7 +40,9 @@ pub mod work_item;
 pub use error::WorktreeError;
 pub use events::WorktreeEvents;
 pub use fanout::FanoutService;
-pub use fanout_port::{FanoutPrompt, IFanoutConversations, SlotConversationSpec, SlotRuntime};
+pub use fanout_port::{
+    FanoutPrompt, IFanoutConversations, IFanoutTaskHooks, SlotConversationSpec, SlotRuntime, TaskAdoptOutcome,
+};
 pub use fanout_routes::{FanoutRouterState, fanout_routes};
 pub use fanout_store::FanoutStore;
 pub use git_cli::{GitCli, GitCliError, GitVersion, MIN_GIT_VERSION};

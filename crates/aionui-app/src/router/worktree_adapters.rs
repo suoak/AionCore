@@ -266,6 +266,9 @@ pub(crate) fn build_fanout_state(
         task_manager: services.worker_task_manager.clone(),
         assistants: assistants.clone(),
     }));
+    service.set_task_hooks(Arc::new(TaskAdoptHooks {
+        conversations: services.conversation_service.clone(),
+    }));
     services
         .conversation_service
         .with_task_launch_port(Arc::new(TaskLaunchAdapter {
@@ -362,6 +365,61 @@ impl aionui_conversation::board::start::TaskLaunchPort for TaskLaunchAdapter {
             conversation_id: Some(conversation_id),
             fanout_group_id: None,
         })
+    }
+
+    async fn follow_up(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        text: &str,
+    ) -> Result<(), aionui_conversation::ConversationError> {
+        use aionui_worktree::IFanoutConversations;
+        self.slots
+            .send_prompt(
+                user_id,
+                conversation_id,
+                &aionui_worktree::FanoutPrompt {
+                    content: text.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(launch_error)
+    }
+}
+
+/// 3.0 C3: adopts of task groups drive the board (done / merge conflict).
+pub(crate) struct TaskAdoptHooks {
+    conversations: aionui_conversation::ConversationService,
+}
+
+#[async_trait]
+impl aionui_worktree::IFanoutTaskHooks for TaskAdoptHooks {
+    async fn adopted(&self, user_id: &str, task_session_id: &str, outcome: &aionui_worktree::TaskAdoptOutcome) {
+        let adopted = aionui_conversation::board::delivery::TaskAdopted {
+            group_id: outcome.group_id.clone(),
+            strategy: outcome.strategy.clone(),
+            branch: outcome.branch.clone(),
+            target_branch: outcome.target_branch.clone(),
+            result_commit: outcome.result_commit.clone(),
+        };
+        if let Err(error) = self
+            .conversations
+            .on_task_adopted(user_id, task_session_id, &adopted)
+            .await
+        {
+            tracing::warn!(%error, task_session_id, "task adopt → board failed");
+        }
+    }
+
+    async fn adopt_conflicted(&self, user_id: &str, task_session_id: &str, group_id: &str, message: &str) {
+        if let Err(error) = self
+            .conversations
+            .on_task_adopt_conflicted(user_id, task_session_id, group_id, message)
+            .await
+        {
+            tracing::warn!(%error, task_session_id, "task adopt conflict → board failed");
+        }
     }
 }
 

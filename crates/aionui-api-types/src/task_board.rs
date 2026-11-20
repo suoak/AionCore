@@ -183,6 +183,10 @@ pub struct TaskBoardItemResponse {
     /// Set while the task waits for a run slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_at: Option<i64>,
+    /// 3.0 C3: adopt / PR outcome, e.g. `{"adopt": {"status": "adopted",
+    /// "strategy": "squash", "result_commit": "…"}, "pull_request": {"url": "…"}}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

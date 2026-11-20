@@ -36,6 +36,7 @@
 //! otherwise the call fails with 409 `board_item_stale`. Omitted, the update
 //! stays last-write-wins.
 
+pub mod delivery;
 pub mod github_import;
 pub mod start;
 
@@ -252,7 +253,19 @@ fn item_response(row: TaskBoardItemRow) -> Result<TaskBoardItemResponse, Convers
         _ => None,
     };
     let labels = serde_json::from_str::<Vec<String>>(&row.labels).unwrap_or_default();
-    let (lane, needs_you_reason) = derive_lane(board_status, &row.status);
+    let delivery = row
+        .delivery_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(serde_json::Value::is_object);
+    let (lane, needs_you_reason) = if adopt_conflicted(delivery.as_ref())
+        && matches!(board_status, TaskBoardStatus::InProgress | TaskBoardStatus::InReview)
+        && row.status != "running"
+    {
+        (TaskLane::NeedsYou, Some(TaskNeedsYouReason::MergeConflict))
+    } else {
+        derive_lane(board_status, &row.status)
+    };
     let source = task_source(
         row.source.as_deref(),
         row.external_ref.as_deref(),
@@ -281,7 +294,16 @@ fn item_response(row: TaskBoardItemRow) -> Result<TaskBoardItemResponse, Convers
         assistant_id: row.assistant_id,
         plan_first: row.plan_first != 0,
         queued_at: row.queued_at,
+        delivery,
     })
+}
+
+/// The last adopt attempt stopped on a merge conflict.
+pub fn adopt_conflicted(delivery: Option<&serde_json::Value>) -> bool {
+    delivery
+        .and_then(|value| value.pointer("/adopt/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("conflict")
 }
 
 fn comment_kind(kind: &str) -> TaskCommentKind {

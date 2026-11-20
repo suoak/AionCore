@@ -187,6 +187,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         )
         .route("/api/task-sessions/{id}/execute", post(execute_approved_plan))
         .route("/api/task-sessions/{id}/start", post(start_task))
+        .route("/api/task-sessions/{id}/follow-up", post(follow_up_task))
         .route("/api/task-sessions/{id}/runs", get(list_task_runs))
         .route("/api/task-sessions/{id}/runs/{run_id}/review", get(get_task_run_review))
         .route("/api/task-sessions/{id}/runs/{run_id}/trace", get(get_task_run_trace))
@@ -564,6 +565,25 @@ async fn start_task(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<aionui_api_types::StartTaskResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(state.service.start_task(&user.id, &id).await?)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FollowUpTaskRequest {
+    text: String,
+}
+
+/// 3.0 C3: "request changes" — continue in the same conversation / worktree.
+async fn follow_up_task(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<FollowUpTaskRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::StartTaskResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.follow_up_task(&user.id, &id, &request.text).await?,
+    )))
 }
 
 async fn list_task_runs(

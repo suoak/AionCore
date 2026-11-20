@@ -24,7 +24,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::WorktreeError;
-use crate::fanout_port::{FanoutPrompt, IFanoutConversations, SlotConversationSpec, SlotRuntime};
+use crate::fanout_port::{
+    FanoutPrompt, IFanoutConversations, IFanoutTaskHooks, SlotConversationSpec, SlotRuntime, TaskAdoptOutcome,
+};
 use crate::fanout_store::{FanoutGroupRow, FanoutStore, NewFanoutGroup};
 use crate::fanout_types::*;
 use crate::git_cli::RunOptions;
@@ -45,6 +47,7 @@ struct Inner {
     worktrees: WorktreeService,
     store: FanoutStore,
     conversations: OnceLock<Arc<dyn IFanoutConversations>>,
+    task_hooks: OnceLock<Arc<dyn IFanoutTaskHooks>>,
     /// Live group orchestrators (start + watch), by group id.
     runs: DashMap<String, CancellationToken>,
     /// Groups with an adopt / discard / cancel in progress.
@@ -80,6 +83,7 @@ impl FanoutService {
                 worktrees,
                 store,
                 conversations: OnceLock::new(),
+                task_hooks: OnceLock::new(),
                 runs: DashMap::new(),
                 busy: DashMap::new(),
                 watch_interval,
@@ -91,6 +95,11 @@ impl FanoutService {
     /// mutating route answers `FANOUT_UNAVAILABLE`.
     pub fn set_conversations(&self, port: Arc<dyn IFanoutConversations>) {
         let _ = self.inner.conversations.set(port);
+    }
+
+    /// 3.0 C3: board hooks for task groups (first call wins).
+    pub fn set_task_hooks(&self, hooks: Arc<dyn IFanoutTaskHooks>) {
+        let _ = self.inner.task_hooks.set(hooks);
     }
 
     fn port(&self) -> Result<Arc<dyn IFanoutConversations>, WorktreeError> {
@@ -852,10 +861,16 @@ impl FanoutService {
 
         let result_commit = match (req.strategy, target_branch.as_deref()) {
             (AdoptStrategy::BranchOnly, _) | (_, None) => None,
-            (strategy, Some(_)) => Some(
-                self.merge_into_target(&repo, strategy, &winner, &group, &message)
-                    .await?,
-            ),
+            (strategy, Some(_)) => match self.merge_into_target(&repo, strategy, &winner, &group, &message).await {
+                Ok(commit) => Some(commit),
+                Err(WorktreeError::AdoptConflict(detail)) => {
+                    if let (Some(hooks), Some(task)) = (self.inner.task_hooks.get(), group.task_session_id.as_deref()) {
+                        hooks.adopt_conflicted(user_id, task, id, &detail).await;
+                    }
+                    return Err(WorktreeError::AdoptConflict(detail));
+                }
+                Err(error) => return Err(error),
+            },
         };
 
         let mut result = AdoptResult {
@@ -898,6 +913,21 @@ impl FanoutService {
             "fan-out slot adopted"
         );
         self.emit(&group, GROUP_ADOPTED, Some((&label, "adopted")));
+        if let (Some(hooks), Some(task)) = (self.inner.task_hooks.get(), group.task_session_id.as_deref()) {
+            hooks
+                .adopted(
+                    user_id,
+                    task,
+                    &TaskAdoptOutcome {
+                        group_id: id.to_owned(),
+                        strategy: req.strategy.as_str().to_owned(),
+                        branch: result.branch.clone(),
+                        target_branch: result.target_branch.clone(),
+                        result_commit: result.result_commit.clone(),
+                    },
+                )
+                .await;
+        }
         self.inner
             .worktrees
             .trace(
