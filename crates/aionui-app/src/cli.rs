@@ -135,6 +135,9 @@ pub(crate) enum Command {
     /// Agent-facing conversation CLI: create a new conversation for this user
     /// that inherits (or overrides) the current conversation's setup.
     Conversation(ConversationArgs),
+    /// Agent-facing `@assistant` delegation: hand a task to an assistant the
+    /// user picked in this conversation and read its result later.
+    Delegate(DelegateArgs),
     /// Agent-facing read-only runtime CLI for THIS conversation's skills.
     /// Channel A of skill delivery: a normal tool call instead of the
     /// `[LOAD_SKILL]` text-protocol round trip.
@@ -179,6 +182,7 @@ impl Command {
             Self::Team(_) => "team",
             Self::Session(_) => "session",
             Self::Conversation(_) => "conversation",
+            Self::Delegate(_) => "delegate",
             Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
@@ -273,6 +277,26 @@ pub(crate) struct ConversationArgs {
 pub(crate) enum ConversationCommand {
     Capabilities,
     Create,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DelegateArgs {
+    #[command(subcommand)]
+    pub command: DelegateCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DelegateCommand {
+    /// Print the agent-readable delegate CLI contract.
+    Capabilities,
+    /// Start a delegation; stdin `{ assistant_id, task_text }`.
+    Start,
+    /// Read one delegation; stdin `{ id }`.
+    Result,
+    /// List this conversation's delegations; stdin `{}` or empty.
+    List,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
