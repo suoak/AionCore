@@ -70,6 +70,7 @@ pub use repository::conversation::{
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
 };
+pub use repository::delegation::{DelegationRow, NewDelegation};
 pub use repository::governance::{
     AgentRunPermissionRow, IGovernanceRepository, PolicyRow, SqliteGovernanceRepository, UserRoleRow,
 };
@@ -123,6 +124,7 @@ pub use repository::{
     SqliteTeamRepository, SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository,
     UpsertInboxItemParams, UsageEventFilter,
 };
+pub use repository::{IDelegationRepository, SqliteDelegationRepository};
 pub use repository::{evolution_evidence_tags, record_evolution_evidence};
 
 // Re-export sqlx pool type for downstream crates
