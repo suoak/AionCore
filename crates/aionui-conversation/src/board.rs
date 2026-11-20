@@ -37,6 +37,7 @@
 //! stays last-write-wins.
 
 pub mod github_import;
+pub mod start;
 
 use aionui_api_types::{
     EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED, SquadRunPayload, TaskBoardChange,

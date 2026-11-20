@@ -264,9 +264,105 @@ pub(crate) fn build_fanout_state(
     service.set_conversations(Arc::new(FanoutConversationsAdapter {
         conversations: services.conversation_service.clone(),
         task_manager: services.worker_task_manager.clone(),
-        assistants,
+        assistants: assistants.clone(),
     }));
+    services
+        .conversation_service
+        .with_task_launch_port(Arc::new(TaskLaunchAdapter {
+            fanout: service.clone(),
+            slots: FanoutConversationsAdapter {
+                conversations: services.conversation_service.clone(),
+                task_manager: services.worker_task_manager.clone(),
+                assistants: assistants.clone(),
+            },
+        }));
     aionui_worktree::FanoutRouterState { service }
+}
+
+/// 3.0 C2: a task with a repository runs in a one-slot fan-out (own
+/// worktree, branch, pinned base, compare/adopt reused); without one it runs
+/// in a plain conversation from the assistant. Both use the assistant's own
+/// permission mode.
+pub(crate) struct TaskLaunchAdapter {
+    fanout: aionui_worktree::FanoutService,
+    slots: FanoutConversationsAdapter,
+}
+
+fn launch_error(message: String) -> aionui_conversation::ConversationError {
+    aionui_conversation::ConversationError::BadRequest { reason: message }
+}
+
+#[async_trait]
+impl aionui_conversation::board::start::TaskLaunchPort for TaskLaunchAdapter {
+    async fn launch(
+        &self,
+        user_id: &str,
+        spec: &aionui_conversation::board::start::TaskLaunchSpec,
+    ) -> Result<aionui_conversation::board::start::TaskLaunched, aionui_conversation::ConversationError> {
+        use aionui_worktree::IFanoutConversations;
+        if let Some(repo_path) = spec.repo_path.clone() {
+            let group = self
+                .fanout
+                .create(
+                    user_id,
+                    aionui_worktree::fanout_types::CreateFanoutGroupRequest {
+                        repo_path,
+                        base_ref: spec.base_ref.clone(),
+                        prompt: spec.prompt.clone(),
+                        files: Vec::new(),
+                        sessions: Vec::new(),
+                        task_session_id: Some(spec.task_session_id.clone()),
+                        max_parallel: None,
+                        title: Some(spec.title.clone()),
+                        slots: vec![aionui_worktree::fanout_types::FanoutSlotRequest {
+                            assistant_id: spec.assistant_id.clone(),
+                            model: None,
+                            permission: None,
+                        }],
+                    },
+                )
+                .await
+                .map_err(|error| launch_error(format!("{}: {error}", error.code())))?;
+            return Ok(aionui_conversation::board::start::TaskLaunched {
+                conversation_id: group.slots.first().and_then(|slot| slot.conversation_id.clone()),
+                fanout_group_id: Some(group.id),
+            });
+        }
+        self.slots
+            .check_assistant(user_id, &spec.assistant_id)
+            .await
+            .map_err(|error| launch_error(format!("assistant {}: {error}", spec.assistant_id)))?;
+        let req = aionui_api_types::CreateConversationRequest {
+            r#type: None,
+            name: Some(spec.title.clone()),
+            model: None,
+            assistant: Some(aionui_api_types::AssistantConversationRequest {
+                id: spec.assistant_id.clone(),
+                locale: None,
+                conversation_overrides: None,
+            }),
+            source: None,
+            channel_chat_id: None,
+            extra: serde_json::json!({}),
+            worktree_id: None,
+        };
+        let conversation_id = self.slots.conversations.create(user_id, req).await?.id;
+        self.slots
+            .send_prompt(
+                user_id,
+                &conversation_id,
+                &aionui_worktree::FanoutPrompt {
+                    content: spec.prompt.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(launch_error)?;
+        Ok(aionui_conversation::board::start::TaskLaunched {
+            conversation_id: Some(conversation_id),
+            fanout_group_id: None,
+        })
+    }
 }
 
 /// M8 Q12 / D7-3: one shared managed worktree per work item for Squad

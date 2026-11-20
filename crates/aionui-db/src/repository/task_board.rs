@@ -117,6 +117,46 @@ pub trait ITaskBoardRepository: Send + Sync {
         user_id: &str,
         conversation_ids: &[String],
     ) -> Result<Vec<LatestPlanMessageRow>, DbError>;
+    /// 3.0 C2: tasks whose run is live, across all users (the run-slot
+    /// limit is per Host).
+    async fn count_running_tasks(&self) -> Result<i64, DbError>;
+    /// Put a task in (`Some(at)`) or take it out of (`None`) the run queue.
+    async fn set_task_queued(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        queued_at: Option<TimestampMs>,
+    ) -> Result<bool, DbError>;
+    /// Oldest queued tasks first, as `(user_id, task_session_id)`.
+    async fn list_queued_tasks(&self, limit: i64) -> Result<Vec<(String, String)>, DbError>;
+    /// Startable (`draft|ready|paused|failed`) → `running`, dequeued, bound to
+    /// its conversation / fan-out group. `false` when the task was not in a
+    /// startable state (someone else started it).
+    async fn mark_task_started(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: Option<&str>,
+        fanout_group_id: Option<&str>,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError>;
+    /// The started (agent-mode, `running`) task whose run lives in this
+    /// conversation, directly or as the slot of its fan-out group.
+    async fn find_running_task_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, DbError>;
+    /// `running` → `status` (`completed` | `failed`), binding the run's
+    /// conversation. `false` when the task was no longer running.
+    async fn settle_started_task(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: &str,
+        status: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError>;
     async fn append_comment(&self, params: &AppendTaskCommentParams<'_>) -> Result<TaskCommentRow, DbError>;
     /// Comments oldest first.
     async fn list_comments(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskCommentRow>, DbError>;

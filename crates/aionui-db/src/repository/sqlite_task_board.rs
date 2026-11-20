@@ -287,6 +287,105 @@ impl ITaskBoardRepository for SqliteTaskBoardRepository {
         Ok(rows)
     }
 
+    async fn count_running_tasks(&self) -> Result<i64, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_sessions WHERE status = 'running'")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn set_task_queued(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        queued_at: Option<TimestampMs>,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE task_sessions SET queued_at = ? WHERE id = ? AND user_id = ?")
+            .bind(queued_at)
+            .bind(task_session_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_queued_tasks(&self, limit: i64) -> Result<Vec<(String, String)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT user_id, id FROM task_sessions WHERE queued_at IS NOT NULL ORDER BY queued_at ASC, id ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn mark_task_started(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: Option<&str>,
+        fanout_group_id: Option<&str>,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE task_sessions SET status = 'running', queued_at = NULL, \
+             conversation_id = COALESCE(?, conversation_id), fanout_group_id = COALESCE(?, fanout_group_id), \
+             updated_at = MAX(updated_at + 1, ?) \
+             WHERE id = ? AND user_id = ? AND status IN ('draft', 'ready', 'paused', 'failed')",
+        )
+        .bind(conversation_id)
+        .bind(fanout_group_id)
+        .bind(updated_at)
+        .bind(task_session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn find_running_task_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT t.id FROM task_sessions t WHERE t.user_id = ? AND t.status = 'running' AND t.mode = 'agent' \
+             AND (t.conversation_id = ? OR t.fanout_group_id IN \
+             (SELECT w.fanout_group_id FROM task_worktrees w WHERE w.conversation_id = ? AND w.fanout_group_id IS NOT NULL)) \
+             ORDER BY t.updated_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn settle_started_task(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: &str,
+        status: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        if !matches!(status, "completed" | "failed") {
+            return Err(invalid(format!("Invalid settled status '{status}'")));
+        }
+        let result = sqlx::query(
+            "UPDATE task_sessions SET status = ?, conversation_id = COALESCE(conversation_id, ?), \
+             updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND status = 'running'",
+        )
+        .bind(status)
+        .bind(conversation_id)
+        .bind(updated_at)
+        .bind(task_session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn append_comment(&self, params: &AppendTaskCommentParams<'_>) -> Result<TaskCommentRow, DbError> {
         if !TASK_COMMENT_AUTHOR_KINDS.contains(&params.author_kind) {
             return Err(invalid(format!("Invalid author_kind '{}'", params.author_kind)));

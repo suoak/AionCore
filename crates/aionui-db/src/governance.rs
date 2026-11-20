@@ -259,6 +259,8 @@ pub enum LaunchSurface {
     Cron,
     /// A batch job being created.
     Batch,
+    /// A task being started, retried or resumed from the queue (3.0 C2).
+    Task,
 }
 
 impl LaunchSurface {
@@ -268,6 +270,7 @@ impl LaunchSurface {
             Self::ModeChange => "mode_change",
             Self::Cron => "cron",
             Self::Batch => "batch",
+            Self::Task => "task",
         }
     }
 }

@@ -18,6 +18,8 @@ pub const GROUP_TERMINAL: [&str; 4] = [GROUP_ADOPTED, GROUP_DISCARDED, GROUP_CAN
 
 /// Slots per group (inclusive).
 pub const MIN_SLOTS: usize = 2;
+/// A task (3.0 C2) runs in a one-slot group: same isolation, nothing to compare.
+pub const TASK_MIN_SLOTS: usize = 1;
 pub const MAX_SLOTS: usize = 5;
 /// `max_parallel` when the request omits it (capped at the slot count).
 pub const DEFAULT_MAX_PARALLEL: u8 = 3;

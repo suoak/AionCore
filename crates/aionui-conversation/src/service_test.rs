@@ -13263,3 +13263,280 @@ async fn task_flow_rejects_core_sources_and_bad_fields_before_creating() {
     let board = service.task_board("user_1", Default::default()).await.unwrap();
     assert!(board.columns.iter().all(|column| column.items.is_empty()));
 }
+
+// ---------------------------------------------------------------------------
+// 3.0 C2: start, run slots and the queue.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct RecordingLaunchPort {
+    launched: std::sync::Mutex<Vec<crate::board::start::TaskLaunchSpec>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::board::start::TaskLaunchPort for RecordingLaunchPort {
+    async fn launch(
+        &self,
+        _user_id: &str,
+        spec: &crate::board::start::TaskLaunchSpec,
+    ) -> Result<crate::board::start::TaskLaunched, ConversationError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConversationError::bad_request("worktree source invalid"));
+        }
+        self.launched.lock().unwrap().push(spec.clone());
+        Ok(crate::board::start::TaskLaunched::default())
+    }
+}
+
+async fn startable_task(service: &ConversationService, flow: serde_json::Value) -> String {
+    service
+        .create_task_session("user_1", flow_request(flow))
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn start_launches_once_and_moves_the_card_to_in_progress() {
+    use aionui_api_types::{TaskBoardStatus as S, TaskLane, TaskStartState};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+
+    let no_assistant = startable_task(&service, json!({})).await;
+    assert!(matches!(
+        service.start_task("user_1", &no_assistant).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let id = startable_task(
+        &service,
+        json!({ "assistant_id": "codex-helper", "prompt": { "text": "fix login" }, "repo_path": "/repo/app" }),
+    )
+    .await;
+    let started = service.start_task("user_1", &id).await.unwrap();
+    assert_eq!(started.state, TaskStartState::Started);
+    assert_eq!(started.item.board_status, S::InProgress);
+    assert_eq!(started.item.lane, TaskLane::InProgress);
+    let launched = port.launched.lock().unwrap().clone();
+    assert_eq!(launched.len(), 1);
+    assert_eq!(launched[0].assistant_id, "codex-helper");
+    assert_eq!(launched[0].prompt, "fix login");
+    assert_eq!(launched[0].repo_path.as_deref(), Some("/repo/app"));
+    assert_eq!(
+        service.get_task_session("user_1", &id).await.unwrap().status,
+        TaskSessionStatus::Running
+    );
+
+    // Idempotent: a second start reports, never launches again.
+    let again = service.start_task("user_1", &id).await.unwrap();
+    assert_eq!(again.state, TaskStartState::AlreadyRunning);
+    assert_eq!(port.launched.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn start_queues_past_the_run_slot_limit_and_drains_in_order() {
+    use aionui_api_types::{TaskLane, TaskStartState};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    service.set_max_running_tasks(2);
+
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ids.push(startable_task(&service, json!({ "assistant_id": "codex-helper" })).await);
+    }
+    let mut states = Vec::new();
+    for id in &ids {
+        states.push(service.start_task("user_1", id).await.unwrap().state);
+    }
+    assert_eq!(
+        states,
+        vec![
+            TaskStartState::Started,
+            TaskStartState::Started,
+            TaskStartState::Queued,
+            TaskStartState::Queued
+        ]
+    );
+    let queued = service.start_task("user_1", &ids[2]).await.unwrap();
+    assert_eq!(queued.state, TaskStartState::AlreadyQueued);
+    assert_eq!(queued.item.lane, TaskLane::Todo);
+    assert!(queued.item.queued_at.is_some());
+    assert_eq!(service.drain_task_queue().await, 0, "no free slot yet");
+
+    // One run settles → the oldest queued task takes the slot.
+    sqlx::query("UPDATE task_sessions SET status = 'completed' WHERE id = ?")
+        .bind(&ids[0])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(service.drain_task_queue().await, 1);
+    let status = |id: String| {
+        let service = &service;
+        async move { service.get_task_session("user_1", &id).await.unwrap().status }
+    };
+    assert_eq!(status(ids[2].clone()).await, TaskSessionStatus::Running);
+    assert_eq!(status(ids[3].clone()).await, TaskSessionStatus::Ready);
+    assert_eq!(port.launched.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn failed_launch_leaves_the_task_startable() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    service.with_task_launch_port(port.clone());
+    let id = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    assert!(service.start_task("user_1", &id).await.is_err());
+    let task = service.get_task_session("user_1", &id).await.unwrap();
+    assert_eq!(task.status, TaskSessionStatus::Ready);
+    port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        service.start_task("user_1", &id).await.unwrap().state,
+        aionui_api_types::TaskStartState::Started
+    );
+}
+
+#[tokio::test]
+async fn a_settled_turn_sends_the_task_to_review_or_failed_and_frees_the_slot() {
+    use aionui_api_types::{TaskLane, TaskNeedsYouReason};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    service.set_max_running_tasks(1);
+    let a = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    let b = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    let c = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    service.start_task("user_1", &a).await.unwrap();
+    service.start_task("user_1", &b).await.unwrap();
+    service.start_task("user_1", &c).await.unwrap();
+    for (id, conversation) in [(&a, "conv-a"), (&b, "conv-b"), (&c, "conv-c")] {
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+             VALUES (?, 'user_1', 'Task run', 'acp', 1, 1)",
+        )
+        .bind(conversation)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE task_sessions SET conversation_id = ? WHERE id = ?")
+            .bind(conversation)
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    // Unrelated conversations are ignored.
+    service.on_task_turn_settled("user_1", "conv-other", true).await;
+    service.on_task_turn_settled("user_1", "conv-a", true).await;
+    let lane_of = |id: String| {
+        let service = &service;
+        async move {
+            service
+                .task_board("user_1", Default::default())
+                .await
+                .unwrap()
+                .columns
+                .into_iter()
+                .flat_map(|column| column.items)
+                .find(|item| item.id == id)
+                .map(|item| (item.lane, item.needs_you_reason))
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        lane_of(a.clone()).await,
+        (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Review))
+    );
+    // The freed slot went to b (drain runs detached).
+    for _ in 0..100 {
+        if port.launched.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(port.launched.lock().unwrap().len(), 2);
+    assert_eq!(lane_of(b.clone()).await, (TaskLane::InProgress, None));
+
+    service.on_task_turn_settled("user_1", "conv-b", false).await;
+    assert_eq!(
+        lane_of(b.clone()).await,
+        (TaskLane::NeedsYou, Some(TaskNeedsYouReason::Failed))
+    );
+    // A failed task can be started again once a slot is free.
+    for _ in 0..100 {
+        if port.launched.lock().unwrap().len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sqlx::query("UPDATE task_sessions SET status = 'completed' WHERE id = ?")
+        .bind(&c)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        service.start_task("user_1", &b).await.unwrap().state,
+        aionui_api_types::TaskStartState::Started
+    );
+}
+
+#[tokio::test]
+async fn start_is_gated_by_run_permissions_and_the_denial_is_audited() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(db.pool().clone()));
+    let governance = Arc::new(aionui_db::GovernanceService::new(
+        Arc::new(aionui_db::SqliteGovernanceRepository::new(db.pool().clone())),
+        Some(aionui_db::AuditSink::new(audit.clone())),
+        true,
+    ));
+    governance
+        .set_agent_run_permission(
+            aionui_db::governance::BOOTSTRAP_OWNER_USER_ID,
+            "assistant",
+            "codex-helper",
+            Some(&[aionui_db::UserRole::Owner]),
+            None,
+        )
+        .await
+        .unwrap();
+    service.with_governance(governance);
+    let id = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+
+    let err = service.start_task("user_1", &id).await.unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    assert!(port.launched.lock().unwrap().is_empty());
+    let task = service.get_task_session("user_1", &id).await.unwrap();
+    assert_eq!(task.status, TaskSessionStatus::Ready);
+    let denials = audit
+        .list(&aionui_db::AuditEventFilter {
+            action: Some("policy.deny".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].target_id.as_deref(), Some(id.as_str()));
+    let diff: serde_json::Value = serde_json::from_str(denials[0].diff.as_deref().unwrap()).unwrap();
+    assert_eq!(diff["surface"], "task");
+    assert_eq!(diff["key"], "agent_run_permission");
+}

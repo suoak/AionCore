@@ -186,6 +186,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
             post(decide_task_approval),
         )
         .route("/api/task-sessions/{id}/execute", post(execute_approved_plan))
+        .route("/api/task-sessions/{id}/start", post(start_task))
         .route("/api/task-sessions/{id}/runs", get(list_task_runs))
         .route("/api/task-sessions/{id}/runs/{run_id}/review", get(get_task_run_review))
         .route("/api/task-sessions/{id}/runs/{run_id}/trace", get(get_task_run_trace))
@@ -554,6 +555,15 @@ async fn execute_approved_plan(
     Ok(Json(ApiResponse::ok(
         state.service.execute_approved_plan(&user.id, &id, request).await?,
     )))
+}
+
+/// 3.0 C2: start now or queue for a run slot; idempotent.
+async fn start_task(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::StartTaskResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(state.service.start_task(&user.id, &id).await?)))
 }
 
 async fn list_task_runs(

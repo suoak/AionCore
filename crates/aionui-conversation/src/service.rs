@@ -897,6 +897,11 @@ pub struct ConversationService {
     /// Squad run lookup for board cards (M8 E7-6). `None` until the
     /// composition layer wires the team service; cards then omit `squad_run`.
     board_squad_run: Arc<RwLock<Option<Arc<dyn crate::board::BoardSquadRunPort>>>>,
+    /// 3.0 C2: starts task runs (worktree fan-out or plain conversation).
+    pub(crate) task_launch: Arc<RwLock<Option<Arc<dyn crate::board::start::TaskLaunchPort>>>>,
+    /// Serializes start / dequeue so the run-slot limit holds.
+    pub(crate) task_start_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) max_running_tasks: Arc<std::sync::atomic::AtomicUsize>,
     /// M8 E6-7: read-only GitHub Issue source (the app wires `gh`).
     pub(crate) github_issue_source: Arc<RwLock<Option<Arc<dyn crate::board::github_import::GithubIssueSource>>>>,
     /// Managed worktree port (M7 E3-2). `None` until the composition layer
@@ -1067,6 +1072,11 @@ impl ConversationService {
             task_board_repo: Arc::new(RwLock::new(None)),
             evolution_evidence_repo: Arc::new(RwLock::new(None)),
             board_squad_run: Arc::new(RwLock::new(None)),
+            task_launch: Arc::new(RwLock::new(None)),
+            task_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            max_running_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(
+                crate::board::start::DEFAULT_MAX_RUNNING_TASKS,
+            )),
             github_issue_source: Arc::new(RwLock::new(None)),
             worktree_binding: Arc::new(RwLock::new(None)),
             governance: Arc::new(RwLock::new(None)),
@@ -2996,6 +3006,12 @@ impl ConversationService {
             )
             .await;
         }
+        self.on_task_turn_settled(
+            user_id,
+            conversation_id,
+            settlement == ConversationTurnSettlement::Completed,
+        )
+        .await;
     }
 
     /// Snapshot the hook list, then drop the guard before awaiting:

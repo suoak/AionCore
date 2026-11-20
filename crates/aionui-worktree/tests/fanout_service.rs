@@ -637,3 +637,35 @@ async fn group_fails_when_no_slot_starts() {
     // A failed group can still be discarded.
     assert_eq!(fx.fanout.discard(USER, &g.id).await.unwrap().status, "discarded");
 }
+
+#[tokio::test]
+async fn a_task_may_run_in_a_single_slot_group() {
+    require_git!();
+    let fx = fixture(&[("a1", Script::Hold)]).await;
+    let repo = &fx.h.repo;
+    // Without a task, one slot is still too few to compare.
+    let err = fx.fanout.create(USER, group_req(repo, &["a1"])).await.unwrap_err();
+    assert!(matches!(err, WorktreeError::FanoutLimit(_)), "{err:?}");
+    let mut blank = group_req(repo, &["a1"]);
+    blank.task_session_id = Some("  ".into());
+    assert!(matches!(
+        fx.fanout.create(USER, blank).await.unwrap_err(),
+        WorktreeError::FanoutLimit(_)
+    ));
+
+    sqlx::query(
+        "INSERT INTO task_sessions (id, user_id, title, mode, objective, acceptance_criteria, status, agent_type, \
+         created_at, updated_at) VALUES ('task-1', ?, 't', 'agent', 'o', '[]', 'ready', 'codex', 1, 1)",
+    )
+    .bind(USER)
+    .execute(fx.h.db.pool())
+    .await
+    .unwrap();
+    let mut req = group_req(repo, &["a1"]);
+    req.task_session_id = Some("task-1".into());
+    let group = fx.fanout.create(USER, req).await.unwrap();
+    assert_eq!(group.task_session_id.as_deref(), Some("task-1"));
+    assert_eq!(group.slots.len(), 1);
+    assert_eq!(group.slots[0].slot, "A");
+    fx.fanout.cancel(USER, &group.id).await.unwrap();
+}
