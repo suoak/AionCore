@@ -187,6 +187,8 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         )
         .route("/api/task-sessions/{id}/execute", post(execute_approved_plan))
         .route("/api/task-sessions/{id}/start", post(start_task))
+        .route("/api/task-sessions/{id}/issue-comment/draft", get(issue_comment_draft))
+        .route("/api/task-sessions/{id}/issue-comment", post(post_issue_comment))
         .route("/api/task-sessions/{id}/follow-up", post(follow_up_task))
         .route("/api/task-sessions/{id}/deliver", post(deliver_task))
         .route("/api/task-sessions/{id}/runs", get(list_task_runs))
@@ -586,8 +588,35 @@ async fn start_task(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
+    body: Option<Json<aionui_api_types::StartTaskRequest>>,
 ) -> Result<Json<ApiResponse<aionui_api_types::StartTaskResponse>>, ApiError> {
-    Ok(Json(ApiResponse::ok(state.service.start_task(&user.id, &id).await?)))
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    Ok(Json(ApiResponse::ok(
+        state.service.start_task_with(&user.id, &id, request).await?,
+    )))
+}
+
+/// 3.0 C8: a suggested comment for the task's Issue; posts nothing.
+async fn issue_comment_draft(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<aionui_api_types::IssueCommentDraftResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.issue_comment_draft(&user.id, &id).await?,
+    )))
+}
+
+/// 3.0 C8: post the user-edited comment under the Issue (`confirm: true`).
+async fn post_issue_comment(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(request): Json<aionui_api_types::PostIssueCommentRequest>,
+) -> Result<Json<ApiResponse<aionui_api_types::TaskBoardItemResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.post_issue_comment(&user.id, &id, request).await?,
+    )))
 }
 
 #[derive(Debug, serde::Deserialize)]

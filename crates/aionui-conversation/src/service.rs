@@ -903,6 +903,8 @@ pub struct ConversationService {
     pub(crate) task_start_lock: Arc<tokio::sync::Mutex<()>>,
     /// 3.0 C3: opens / updates a task's pull request.
     pub(crate) task_delivery: Arc<RwLock<Option<Arc<dyn crate::board::delivery::TaskDeliveryPort>>>>,
+    /// 3.0 C8: posts a confirmed comment under a task's GitHub Issue.
+    pub(crate) issue_comment: Arc<RwLock<Option<Arc<dyn crate::board::issue_flow::IssueCommentPort>>>>,
     pub(crate) max_running_tasks: Arc<std::sync::atomic::AtomicUsize>,
     /// 3.0 C7: `@assistant` delegation.
     pub(crate) delegation_repo: Arc<RwLock<Option<Arc<dyn aionui_db::IDelegationRepository>>>>,
@@ -1085,6 +1087,7 @@ impl ConversationService {
             remote_approval: Arc::default(),
             delegation_launch: Arc::new(RwLock::new(None)),
             task_delivery: Arc::new(RwLock::new(None)),
+            issue_comment: Arc::new(RwLock::new(None)),
             max_running_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(
                 crate::board::start::DEFAULT_MAX_RUNNING_TASKS,
             )),

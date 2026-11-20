@@ -48,7 +48,11 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 impl ConversationService {
-    async fn delivery_object(&self, user_id: &str, id: &str) -> Result<Map<String, Value>, ConversationError> {
+    pub(super) async fn delivery_object(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Map<String, Value>, ConversationError> {
         let flow = self
             .task_board_repo()?
             .get_task_flow(user_id, id)
@@ -65,7 +69,12 @@ impl ConversationService {
             .unwrap_or_default())
     }
 
-    async fn write_delivery(&self, user_id: &str, id: &str, map: Map<String, Value>) -> Result<(), ConversationError> {
+    pub(super) async fn write_delivery(
+        &self,
+        user_id: &str,
+        id: &str,
+        map: Map<String, Value>,
+    ) -> Result<(), ConversationError> {
         let raw = if map.is_empty() {
             None
         } else {
@@ -109,7 +118,7 @@ impl ConversationService {
         Ok(())
     }
 
-    fn publish_item(&self, user_id: &str, from: TaskBoardStatus, row: aionui_db::models::TaskBoardItemRow) {
+    pub(super) fn publish_item(&self, user_id: &str, from: TaskBoardStatus, row: aionui_db::models::TaskBoardItemRow) {
         if let Ok(item) = item_response(row) {
             self.publish_board_updated(user_id, TaskBoardChange::Board, from, &item);
         }
@@ -342,6 +351,7 @@ impl ConversationService {
             .ok()
             .and_then(|guard| guard.clone())
             .ok_or_else(|| ConversationError::internal("Task delivery is not configured"))?;
+        self.ensure_task_deliverable(user_id, id).await?;
         let task = self
             .task_session_repo()?
             .get(user_id, id)

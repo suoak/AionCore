@@ -57,6 +57,9 @@ pub enum WorktreeError {
     /// 3.0 C9: what a remote approval was bound to changed before the adopt.
     #[error("the diff changed since it was approved: {0}")]
     DigestMismatch(String),
+    /// 3.0 C8: the task refuses adopts (a review-only Issue task).
+    #[error("this task cannot be adopted: {0}")]
+    AdoptNotAllowed(String),
 }
 
 impl WorktreeError {
@@ -89,6 +92,7 @@ impl WorktreeError {
             Self::AdoptConflict(_) => "ADOPT_CONFLICT",
             Self::TargetNotClean(_) => "TARGET_NOT_CLEAN",
             Self::DigestMismatch(_) => "ADOPT_DIGEST_MISMATCH",
+            Self::AdoptNotAllowed(_) => "ADOPT_NOT_ALLOWED",
         }
     }
 }

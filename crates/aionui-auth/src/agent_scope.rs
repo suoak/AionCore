@@ -563,6 +563,8 @@ mod tests {
             (Method::POST, "/api/task-sessions/t1/start"),
             (Method::POST, "/api/task-sessions/t1/follow-up"),
             (Method::POST, "/api/task-sessions/t1/deliver"),
+            (Method::POST, "/api/task-sessions/t1/issue-comment"),
+            (Method::GET, "/api/task-sessions/t1/issue-comment/draft"),
             (Method::PATCH, "/api/task-sessions/t1"),
             (Method::POST, "/api/task-sessions/t1/comments"),
             (Method::POST, "/api/task-sessions/t1/execute"),

@@ -487,3 +487,97 @@ pub struct DeliverTaskRequest {
     #[serde(default)]
     pub draft: bool,
 }
+
+/// 3.0 C8: how an Issue task is handled, chosen when it starts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueApproach {
+    /// Work on a fix in the task's worktree; review, then adopt or open a PR.
+    Fix,
+    /// Plan first, wait for plan approval, then implement (C4).
+    PlanFirst,
+    /// Analyse and report only. The task can never be adopted or delivered.
+    ReviewOnly,
+}
+
+impl IssueApproach {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fix => "fix",
+            Self::PlanFirst => "plan_first",
+            Self::ReviewOnly => "review_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::Fix, Self::PlanFirst, Self::ReviewOnly]
+            .into_iter()
+            .find(|approach| approach.as_str() == value)
+    }
+}
+
+/// Optional body of `POST /api/task-sessions/{id}/start` (3.0 C8). Only a
+/// task that has not run yet can take options; `approach` is for Issue
+/// tasks (`source = github`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StartTaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach: Option<IssueApproach>,
+    /// Pick the assistant now (imported Issues have none yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+}
+
+/// `GET /api/task-sessions/{id}/issue-comment/draft` (3.0 C8): a suggested
+/// comment for the task's Issue. Nothing is posted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueCommentDraftResponse {
+    /// `owner/name`.
+    pub repo: String,
+    pub number: u64,
+    pub body: String,
+    /// Set once a comment was posted for this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posted_url: Option<String>,
+}
+
+/// `POST /api/task-sessions/{id}/issue-comment` (3.0 C8). Posts exactly
+/// `body` (the user-edited draft) under the Issue; `confirm` must be `true`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostIssueCommentRequest {
+    pub body: String,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[cfg(test)]
+mod c8_tests {
+    use super::*;
+
+    #[test]
+    fn start_options_and_comment_bodies_are_strict() {
+        assert_eq!(
+            serde_json::from_value::<StartTaskRequest>(serde_json::json!({})).unwrap(),
+            StartTaskRequest::default()
+        );
+        let start: StartTaskRequest =
+            serde_json::from_value(serde_json::json!({ "approach": "review_only", "assistant_id": "a1" })).unwrap();
+        assert_eq!(start.approach, Some(IssueApproach::ReviewOnly));
+        assert!(serde_json::from_value::<StartTaskRequest>(serde_json::json!({ "approach": "merge" })).is_err());
+        assert!(serde_json::from_value::<StartTaskRequest>(serde_json::json!({ "mode": "yolo" })).is_err());
+        for approach in [IssueApproach::Fix, IssueApproach::PlanFirst, IssueApproach::ReviewOnly] {
+            assert_eq!(IssueApproach::parse(approach.as_str()), Some(approach));
+        }
+
+        let post: PostIssueCommentRequest = serde_json::from_value(serde_json::json!({ "body": "Fixed" })).unwrap();
+        assert!(!post.confirm, "confirmation is never implied");
+        assert!(
+            serde_json::from_value::<PostIssueCommentRequest>(
+                serde_json::json!({ "body": "x", "confirm": true, "repo": "other/repo" })
+            )
+            .is_err()
+        );
+    }
+}
