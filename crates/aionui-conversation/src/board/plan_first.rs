@@ -33,8 +33,17 @@ pub(crate) fn execute_job(
             artifact_hash: approval.artifact_hash.clone(),
         };
         let id = approval.task_session_id;
-        if let Err(error) = service.execute_approved_plan(&user_id, &id, request).await {
-            tracing::warn!(%error, task_session_id = %id, "plan-first: approved plan did not run");
+        match service.execute_approved_plan(&user_id, &id, request).await {
+            // Done → review (needs you), like an agent task's settled turn.
+            Ok(run) if run.status == aionui_api_types::TaskRunStatus::Completed => {
+                if let Err(error) = service.move_started_task_to_review(&user_id, &id).await {
+                    tracing::warn!(%error, task_session_id = %id, "plan-first: in_review move failed");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, task_session_id = %id, "plan-first: approved plan did not run");
+            }
         }
     })
 }

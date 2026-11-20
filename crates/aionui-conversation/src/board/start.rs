@@ -308,7 +308,7 @@ impl ConversationService {
         });
     }
 
-    async fn move_started_task_to_review(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
+    pub(super) async fn move_started_task_to_review(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         let row = self.board_item(user_id, id).await?;
         if row.board_status != TaskBoardStatus::InProgress.as_str() {
             return Ok(());
