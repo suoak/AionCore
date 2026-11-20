@@ -322,6 +322,7 @@ impl aionui_conversation::board::start::TaskLaunchPort for TaskLaunchAdapter {
                             model: None,
                             permission: None,
                         }],
+                        hold_prompt: spec.plan_first,
                     },
                 )
                 .await
@@ -422,6 +423,15 @@ impl aionui_worktree::IFanoutTaskHooks for TaskAdoptHooks {
             .await
         {
             tracing::warn!(%error, task_session_id, "task adopt conflict → board failed");
+        }
+    }
+    async fn slot_started(&self, user_id: &str, task_session_id: &str, _group_id: &str, conversation_id: &str) {
+        if let Err(error) = self
+            .conversations
+            .on_task_slot_started(user_id, task_session_id, conversation_id)
+            .await
+        {
+            tracing::warn!(%error, task_session_id, "plan-first slot → planning failed");
         }
     }
 }

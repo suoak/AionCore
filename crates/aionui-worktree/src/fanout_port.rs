@@ -65,4 +65,7 @@ pub struct TaskAdoptOutcome {
 pub trait IFanoutTaskHooks: Send + Sync {
     async fn adopted(&self, user_id: &str, task_session_id: &str, outcome: &TaskAdoptOutcome);
     async fn adopt_conflicted(&self, user_id: &str, task_session_id: &str, group_id: &str, message: &str);
+    /// 3.0 C4: a held (plan-first) task slot has its conversation; the prompt
+    /// was not sent.
+    async fn slot_started(&self, _user_id: &str, _task_session_id: &str, _group_id: &str, _conversation_id: &str) {}
 }

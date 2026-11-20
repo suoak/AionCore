@@ -286,9 +286,10 @@ impl FanoutService {
             sessions: req.sessions,
         };
         let run_group = group.clone();
+        let hold = req.hold_prompt;
         tokio::spawn(async move {
             let id = run_group.id.clone();
-            this.run_group(run_group, slots, prompt, token).await;
+            this.run_group(run_group, slots, prompt, hold, token).await;
             this.inner.runs.remove(&id);
         });
         self.get(user_id, &group.id).await
@@ -299,6 +300,7 @@ impl FanoutService {
         group: FanoutGroupRow,
         slots: Vec<(String, String, FanoutSlotRequest)>,
         prompt: FanoutPrompt,
+        hold: bool,
         token: CancellationToken,
     ) {
         let prompt = Arc::new(prompt);
@@ -309,7 +311,8 @@ impl FanoutService {
             let prompt = prompt.clone();
             let token = token.clone();
             set.spawn(async move {
-                this.start_slot(&group, &label, &worktree_id, spec, &prompt, &token)
+                let prompt = (!hold).then_some(prompt.as_ref());
+                this.start_slot(&group, &label, &worktree_id, spec, prompt, &token)
                     .await
             });
         }
@@ -355,7 +358,8 @@ impl FanoutService {
         label: &str,
         worktree_id: &str,
         spec: FanoutSlotRequest,
-        prompt: &FanoutPrompt,
+        // `None`: hold the prompt (plan-first task).
+        prompt: Option<&FanoutPrompt>,
         token: &CancellationToken,
     ) -> bool {
         let worktrees = &self.inner.worktrees;
@@ -402,8 +406,19 @@ impl FanoutService {
         if token.is_cancelled() {
             return false;
         }
-        if let Err(e) = port.send_prompt(&group.user_id, &conversation_id, prompt).await {
-            return fail(format!("send prompt: {e}")).await;
+        match prompt {
+            None => {
+                if let (Some(hooks), Some(task)) = (self.inner.task_hooks.get(), group.task_session_id.as_deref()) {
+                    hooks
+                        .slot_started(&group.user_id, task, &group.id, &conversation_id)
+                        .await;
+                }
+            }
+            Some(prompt) => {
+                if let Err(e) = port.send_prompt(&group.user_id, &conversation_id, prompt).await {
+                    return fail(format!("send prompt: {e}")).await;
+                }
+            }
         }
         if let Ok(true) = self
             .inner
@@ -512,6 +527,9 @@ impl FanoutService {
         if group.status != GROUP_RUNNING {
             return Ok(group.status);
         }
+        if self.plan_task_unfinished(user_id, &group).await {
+            return Ok(group.status);
+        }
         let rows = self.inner.worktrees.store().list_by_group(id).await?;
         let runtimes = self.runtimes(user_id, &rows).await;
         let settled = rows.iter().all(|row| {
@@ -532,6 +550,21 @@ impl FanoutService {
             return Ok(GROUP_COMPARING.into());
         }
         Ok(group.status)
+    }
+
+    /// 3.0 C4: a plan-first task's slot is idle between planning, approval
+    /// and execution; its group compares only once the task's run finished.
+    async fn plan_task_unfinished(&self, user_id: &str, group: &FanoutGroupRow) -> bool {
+        let (Some(repo), Some(task_id)) = (self.inner.worktrees.task_sessions(), group.task_session_id.as_deref())
+        else {
+            return false;
+        };
+        match repo.get(user_id, task_id).await {
+            Ok(Some(task)) => {
+                task.mode == "plan" && !matches!(task.status.as_str(), "completed" | "failed" | "cancelled")
+            }
+            _ => false,
+        }
     }
 
     pub async fn get(&self, user_id: &str, id: &str) -> Result<FanoutGroupResponse, WorktreeError> {

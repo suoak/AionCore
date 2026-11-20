@@ -94,4 +94,44 @@ impl ConversationService {
         }
         tokio::spawn(execute_job(self.clone(), user_id.to_owned(), approval.clone()));
     }
+
+    /// 3.0 C4: a plan-first task's worktree slot has its conversation (the
+    /// prompt was held). Bind it and start planning there.
+    pub async fn on_task_slot_started(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), crate::error::ConversationError> {
+        let board = self.task_board_repo()?;
+        let Some(flow) = board.get_task_flow(user_id, task_session_id).await? else {
+            return Ok(());
+        };
+        if flow.plan_first == 0 {
+            return Ok(());
+        }
+        if !board
+            .bind_task_for_planning(user_id, task_session_id, Some(conversation_id), None, now_ms())
+            .await?
+        {
+            tracing::info!(
+                task_session_id,
+                "plan-first slot started but the task is no longer startable"
+            );
+            return Ok(());
+        }
+        let task = self
+            .task_session_repo()?
+            .get(user_id, task_session_id)
+            .await?
+            .ok_or_else(|| crate::error::ConversationError::not_found_reason("Task session not found"))?;
+        let prompt = super::start::prompt_text(flow.prompt_json.as_deref(), &task.objective, &task.title);
+        tokio::spawn(planning_job(
+            self.clone(),
+            user_id.to_owned(),
+            task_session_id.to_owned(),
+            prompt,
+        ));
+        Ok(())
+    }
 }

@@ -13276,6 +13276,7 @@ struct RecordingLaunchPort {
     fail: std::sync::atomic::AtomicBool,
     /// Returned as the launched conversation when set (plan-first needs one).
     conversation_id: std::sync::Mutex<Option<String>>,
+    fanout_group_id: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -13291,7 +13292,7 @@ impl crate::board::start::TaskLaunchPort for RecordingLaunchPort {
         self.launched.lock().unwrap().push(spec.clone());
         Ok(crate::board::start::TaskLaunched {
             conversation_id: self.conversation_id.lock().unwrap().clone(),
-            fanout_group_id: None,
+            fanout_group_id: self.fanout_group_id.lock().unwrap().clone(),
         })
     }
 
@@ -13804,7 +13805,7 @@ async fn deliver_opens_one_pull_request_then_only_updates_it() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn plan_first_requires_a_plan_task_and_no_repository_yet() {
+async fn plan_first_requires_a_plan_task() {
     let db = init_database_memory().await.unwrap();
     seed_test_user(db.pool(), "user_1").await;
     let service = board_service(&db);
@@ -13815,15 +13816,81 @@ async fn plan_first_requires_a_plan_task_and_no_repository_yet() {
             .await,
         Err(ConversationError::BadRequest { .. })
     ));
-    let with_repo = startable_task(
+}
+
+#[tokio::test]
+async fn a_plan_first_worktree_task_plans_once_its_slot_starts() {
+    use aionui_api_types::{TaskLane, TaskStartState};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    let id = startable_task(
         &service,
         json!({ "mode": "plan", "plan_first": true, "assistant_id": "codex-helper", "repo_path": "/repo/app" }),
     )
     .await;
-    assert!(matches!(
-        service.start_task("user_1", &with_repo).await,
-        Err(ConversationError::Unprocessable { .. })
-    ));
+    sqlx::query(
+        "INSERT INTO fanout_groups (id, user_id, source_repo_path, repo_common_dir, base_ref, base_commit, prompt, \
+         status, task_session_id, created_at, updated_at) \
+         VALUES ('fg-p', 'user_1', '/repo', '/repo/.git', 'main', 'abc', 'p', 'running', ?, 1, 1)",
+    )
+    .bind(&id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+         VALUES ('slot-conv', 'user_1', 'c', 'acp', '{}', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    port.fanout_group_id.lock().unwrap().replace("fg-p".to_owned());
+
+    let started = service.start_task("user_1", &id).await.unwrap();
+    assert_eq!(started.state, TaskStartState::Started);
+    assert!(port.launched.lock().unwrap()[0].plan_first);
+    // Waiting for the slot: still startable-ready, but a second start is a no-op.
+    assert_eq!(
+        service.get_task_session("user_1", &id).await.unwrap().status,
+        TaskSessionStatus::Ready
+    );
+    assert_eq!(
+        service.start_task("user_1", &id).await.unwrap().state,
+        TaskStartState::AlreadyRunning
+    );
+    assert_eq!(port.launched.lock().unwrap().len(), 1);
+
+    service.on_task_slot_started("user_1", &id, "slot-conv").await.unwrap();
+    let mut lane = None;
+    for _ in 0..200 {
+        let board = service.task_board("user_1", Default::default()).await.unwrap();
+        let item = board
+            .columns
+            .into_iter()
+            .flat_map(|column| column.items)
+            .find(|candidate| candidate.id == id)
+            .unwrap();
+        if item.lane == TaskLane::NeedsYou {
+            lane = Some(item.lane);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The mock agent cannot plan safely → paused for the user.
+    assert_eq!(lane, Some(TaskLane::NeedsYou));
+    assert_eq!(
+        service
+            .get_task_session("user_1", &id)
+            .await
+            .unwrap()
+            .conversation_id
+            .as_deref(),
+        Some("slot-conv")
+    );
 }
 
 #[tokio::test]
