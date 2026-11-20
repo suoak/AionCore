@@ -95,6 +95,22 @@ impl IWorkerTaskManager for NoopTaskManager {
     }
 }
 
+/// No route test here gets as far as launching: grants are checked first.
+struct RefusingDelegationPort;
+
+#[async_trait::async_trait]
+impl aionui_conversation::delegation::DelegationLaunchPort for RefusingDelegationPort {
+    async fn launch(
+        &self,
+        _: &str,
+        _: &aionui_conversation::delegation::DelegationLaunchSpec,
+    ) -> Result<String, aionui_conversation::ConversationError> {
+        Err(aionui_conversation::ConversationError::Internal {
+            reason: "launch is not expected in route tests".to_owned(),
+        })
+    }
+}
+
 struct Ctx {
     router: Router,
     repo: Arc<SqliteConversationRepository>,
@@ -138,6 +154,10 @@ async fn setup() -> Ctx {
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone())));
     service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(pool.clone())));
     service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone())));
+
+    // 3.0 C7: delegation routes share this router.
+    service.with_delegation_repo(Arc::new(aionui_db::SqliteDelegationRepository::new(pool.clone())));
+    service.with_delegation_launch_port(Arc::new(RefusingDelegationPort));
 
     let tokens = Arc::new(RuntimeTokenService::new());
     let router = conversation_runtime_routes(ConversationRuntimeRouterState {
@@ -448,4 +468,92 @@ async fn a_helper_token_without_the_conversation_create_skill_is_403_skill_not_e
             .unwrap()
             .contains("conversation-create")
     );
+}
+
+// ── 3.0 C7: delegation routes ───────────────────────────────────────
+
+fn delegation_request(
+    method: &str,
+    uri: &str,
+    conversation_id: &str,
+    token: Option<&str>,
+    body: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header(HEADER_USER_ID, USER)
+        .header(HEADER_CONVERSATION_ID, conversation_id);
+    if let Some(token) = token {
+        builder = builder.header(HEADER_RUNTIME_TOKEN, token);
+    }
+    builder.body(Body::from(body.to_owned())).unwrap()
+}
+
+#[tokio::test]
+async fn delegation_routes_require_the_runtime_token() {
+    let ctx = setup().await;
+    ctx.caller("conv_a").await;
+    for (method, uri) in [
+        ("POST", "/api/runtime/delegations"),
+        ("GET", "/api/runtime/delegations"),
+        ("GET", "/api/runtime/delegations/d1"),
+    ] {
+        let body = r#"{"assistant_id":"writer","task_text":"x"}"#;
+        let (status, envelope) = call(&ctx, delegation_request(method, uri, "conv_a", None, body)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        assert_eq!(envelope["error"]["code"], serde_json::json!("runtime_auth_failed"));
+        assert_eq!(envelope["meta"]["command"], serde_json::json!("delegate"));
+    }
+}
+
+#[tokio::test]
+async fn an_agent_cannot_delegate_to_an_assistant_the_user_did_not_pick() {
+    let ctx = setup().await;
+    ctx.caller("conv_a").await;
+    let token = ctx.mint(USER, "conv_a");
+    let (status, envelope) = call(
+        &ctx,
+        delegation_request(
+            "POST",
+            "/api/runtime/delegations",
+            "conv_a",
+            Some(&token),
+            r#"{"assistant_id":"writer","task_text":"draft it"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(envelope["error"]["code"], serde_json::json!("delegation_not_granted"));
+
+    let (status, envelope) = call(
+        &ctx,
+        delegation_request(
+            "POST",
+            "/api/runtime/delegations",
+            "conv_a",
+            Some(&token),
+            r#"{"assistant_id":"writer","task_text":"x","permission":"yolo"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(envelope["error"]["code"], serde_json::json!("schema_validation_failed"));
+
+    let (status, envelope) = call(
+        &ctx,
+        delegation_request("GET", "/api/runtime/delegations", "conv_a", Some(&token), ""),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(envelope["data"], serde_json::json!([]));
+
+    let (status, envelope) = call(
+        &ctx,
+        delegation_request("GET", "/api/runtime/delegations/missing", "conv_a", Some(&token), ""),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(envelope["error"]["code"], serde_json::json!("not_found"));
 }

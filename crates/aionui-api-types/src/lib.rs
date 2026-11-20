@@ -182,8 +182,9 @@ pub use custom_agent::{
     SetAgentOverridesRequest, SetEnabledRequest,
 };
 pub use delegation::{
-    CreateDelegationRequest, DelegationResponse, DelegationStatus, GrantDelegationRequest, MAX_CONCURRENT_DELEGATIONS,
-    MAX_DELEGATION_TASK_CHARS,
+    CreateDelegationRequest, DELEGATE_TOOLS_SCHEMA_VERSION, DelegateToolDescriptor, DelegateToolName,
+    DelegationResponse, DelegationStatus, GrantDelegationRequest, MAX_CONCURRENT_DELEGATIONS,
+    MAX_DELEGATION_TASK_CHARS, delegate_tool_descriptor, delegate_tool_descriptors,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
