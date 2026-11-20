@@ -22,7 +22,7 @@ use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus
 use aionui_db::UpsertAgentMetadataParams;
 use async_trait::async_trait;
 
-use common::{body_json, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, get_request, get_with_token, json_with_token, setup_and_login};
 
 // ── Mock Agent ──────────────────────────────────────────────────
 
@@ -321,6 +321,85 @@ async fn management_endpoint_handles_openclaw_as_acp_backend() {
     assert_eq!(openclaw["agent_type"], "acp");
     assert_eq!(openclaw["command"], "openclaw");
     assert_eq!(openclaw["args"], json!(["acp"]));
+}
+
+#[tokio::test]
+async fn preflight_endpoint_reports_checks_for_every_management_row() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    let mresp = app
+        .clone()
+        .oneshot(get_with_token("/api/agents/management", &token))
+        .await
+        .unwrap();
+    let rows = body_json(mresp).await["data"].as_array().cloned().unwrap();
+    assert!(!rows.is_empty(), "seeded agents should be listed");
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/agents/preflight", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let reports = body["data"].as_array().expect("data should be array");
+    assert_eq!(reports.len(), rows.len(), "one report per management row");
+
+    for report in reports {
+        let checks = report["checks"].as_array().expect("checks array");
+        assert_eq!(checks[0]["key"], "enabled");
+        assert_eq!(checks[1]["key"], "installed");
+        for check in checks {
+            assert!(matches!(check["level"].as_str(), Some("pass" | "warn" | "fail")));
+            assert!(check["message"].as_str().is_some_and(|m| !m.is_empty()));
+        }
+        let worst = checks
+            .iter()
+            .map(|c| match c["level"].as_str() {
+                Some("fail") => 2,
+                Some("warn") => 1,
+                _ => 0,
+            })
+            .max()
+            .unwrap();
+        let expected = ["pass", "warn", "fail"][worst];
+        assert_eq!(report["level"], expected, "level is the worst check");
+        if worst == 2 {
+            assert_eq!(report["ready"], false);
+        }
+    }
+
+    // Single-agent variant matches the list entry.
+    let first_id = reports[0]["id"].as_str().unwrap().to_owned();
+    let one = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/agents/{first_id}/preflight"), &token))
+        .await
+        .unwrap();
+    assert_eq!(one.status(), StatusCode::OK);
+    let one_body = body_json(one).await;
+    assert_eq!(one_body["data"]["id"], first_id.as_str());
+    assert_eq!(one_body["data"]["checks"], reports[0]["checks"]);
+}
+
+#[tokio::test]
+async fn preflight_endpoint_rejects_unknown_agent_and_anonymous_requests() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/agents/does-not-exist/preflight", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], false);
+    assert_eq!(body["code"], "NOT_FOUND");
+
+    let anon = app.clone().oneshot(get_request("/api/agents/preflight")).await.unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
