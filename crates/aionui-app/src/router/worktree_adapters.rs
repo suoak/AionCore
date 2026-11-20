@@ -350,17 +350,20 @@ impl aionui_conversation::board::start::TaskLaunchPort for TaskLaunchAdapter {
             worktree_id: None,
         };
         let conversation_id = self.slots.conversations.create(user_id, req).await?.id;
-        self.slots
-            .send_prompt(
-                user_id,
-                &conversation_id,
-                &aionui_worktree::FanoutPrompt {
-                    content: spec.prompt.clone(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(launch_error)?;
+        // 3.0 C4: a plan-first task gets its strict planning turn from Core.
+        if !spec.plan_first {
+            self.slots
+                .send_prompt(
+                    user_id,
+                    &conversation_id,
+                    &aionui_worktree::FanoutPrompt {
+                        content: spec.prompt.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(launch_error)?;
+        }
         Ok(aionui_conversation::board::start::TaskLaunched {
             conversation_id: Some(conversation_id),
             fanout_group_id: None,

@@ -37,6 +37,12 @@ pub struct TaskLaunchSpec {
     pub prompt: String,
     pub repo_path: Option<String>,
     pub base_ref: Option<String>,
+    /// 3.0 C4: create the conversation but do not send the prompt; Core runs
+    /// the strict planning turn instead and continues after approval.
+    pub plan_first: bool,
+    /// Plan-first only: plan in the conversation the task is already bound
+    /// to (created from a conversation, or a retry) instead of a new one.
+    pub existing_conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,6 +125,20 @@ impl ConversationService {
             .assistant_id
             .clone()
             .ok_or_else(|| ConversationError::bad_request("Pick an assistant before starting the task"))?;
+        let plan_first = flow.plan_first != 0;
+        if plan_first && task.mode != "plan" {
+            return Err(ConversationError::bad_request("A plan-first task must be a Plan task"));
+        }
+        // Between binding and the planning run claiming the task it is
+        // `ready` + in progress: a second start must not plan twice.
+        if plan_first && task.conversation_id.is_some() && task.status == "ready" && row.board_status == "in_progress" {
+            return respond(TaskStartState::AlreadyRunning, row);
+        }
+        if plan_first && flow.repo_path.is_some() {
+            return Err(ConversationError::Unprocessable {
+                reason: "plan_first_repo_unsupported: plan-first tasks cannot use a repository worktree yet".into(),
+            });
+        }
         self.task_launch_port()?;
 
         let mut facts = aionui_db::LaunchFacts::new(aionui_db::LaunchSurface::Task);
@@ -146,6 +166,8 @@ impl ConversationService {
             prompt: prompt_text(flow.prompt_json.as_deref(), &task.objective, &task.title),
             repo_path: flow.repo_path.clone(),
             base_ref: flow.base_ref.clone(),
+            plan_first,
+            existing_conversation_id: if plan_first { task.conversation_id.clone() } else { None },
         };
         let row = self.launch_task(user_id, &spec, row).await?;
         respond(TaskStartState::Started, row)
@@ -159,7 +181,19 @@ impl ConversationService {
     ) -> Result<aionui_db::models::TaskBoardItemRow, ConversationError> {
         let id = spec.task_session_id.as_str();
         let board = self.task_board_repo()?;
-        let launched = match self.task_launch_port()?.launch(user_id, spec).await {
+        let reused = spec
+            .existing_conversation_id
+            .clone()
+            .filter(|_| spec.plan_first)
+            .map(|conversation_id| TaskLaunched {
+                conversation_id: Some(conversation_id),
+                fanout_group_id: None,
+            });
+        let launched = match reused {
+            Some(launched) => Ok(launched),
+            None => self.task_launch_port()?.launch(user_id, spec).await,
+        };
+        let launched = match launched {
             Ok(launched) => launched,
             Err(error) => {
                 // Leave it startable; the error explains why (stays queued: no).
@@ -168,16 +202,24 @@ impl ConversationService {
             }
         };
         let now = now_ms();
-        if !board
-            .mark_task_started(
-                user_id,
-                id,
-                launched.conversation_id.as_deref(),
-                launched.fanout_group_id.as_deref(),
-                now,
-            )
-            .await?
-        {
+        let bound = if spec.plan_first {
+            let conversation_id = launched
+                .conversation_id
+                .as_deref()
+                .ok_or_else(|| ConversationError::internal("A plan-first launch returned no conversation"))?;
+            board.bind_task_for_planning(user_id, id, conversation_id, now).await?
+        } else {
+            board
+                .mark_task_started(
+                    user_id,
+                    id,
+                    launched.conversation_id.as_deref(),
+                    launched.fanout_group_id.as_deref(),
+                    now,
+                )
+                .await?
+        };
+        if !bound {
             return Err(ConversationError::Busy {
                 reason: format!("Task session '{id}' changed while starting"),
             });
@@ -211,6 +253,15 @@ impl ConversationService {
             worktree = launched.fanout_group_id.is_some(),
             "task started"
         );
+        if spec.plan_first {
+            // Detached: the planning turn runs to completion (minutes).
+            tokio::spawn(super::plan_first::planning_job(
+                self.clone(),
+                user_id.to_owned(),
+                id.to_owned(),
+                spec.prompt.clone(),
+            ));
+        }
         let row = self.board_item(user_id, id).await?;
         if let Ok(item) = item_response(row.clone()) {
             self.publish_board_updated(user_id, TaskBoardChange::Board, from, &item);

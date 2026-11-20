@@ -1247,6 +1247,10 @@ impl ConversationService {
                 "A task session must be created as draft or ready",
             ));
         }
+        // 3.0 C4: plan-first runs the strict planning loop, which is Plan mode.
+        if flow.plan_first && request.mode != TaskSessionMode::Plan {
+            return Err(ConversationError::bad_request("`plan_first` requires mode `plan`"));
+        }
         self.validate_task_conversation_binding(user_id, request.conversation_id.as_deref())
             .await?;
         self.validate_task_project_binding(user_id, request.project_id.as_deref())
@@ -1882,6 +1886,12 @@ impl ConversationService {
             })
             .await?;
         self.task_approval_changed(user_id, None, &row, Some(decider)).await;
+        // 3.0 C4: an approved plan of a plan-first task continues on its own.
+        // Desktop decisions only — remote approve-to-execute is C9 (bound,
+        // one-shot, trusted identity) and must not ride on this path.
+        if matches!(decider, TaskApprovalDecider::User) && status == TaskApprovalStatus::Approved {
+            self.continue_plan_first_task(user_id, &row).await;
+        }
         task_approval_response(row)
     }
 

@@ -13216,6 +13216,7 @@ async fn task_flow_fields_are_stored_and_surface_on_the_board() {
                 "repo_path": "/repo/app",
                 "base_ref": "main",
                 "plan_first": true,
+                "mode": "plan",
             })),
         )
         .await
@@ -13273,6 +13274,8 @@ struct RecordingLaunchPort {
     launched: std::sync::Mutex<Vec<crate::board::start::TaskLaunchSpec>>,
     follow_ups: std::sync::Mutex<Vec<(String, String)>>,
     fail: std::sync::atomic::AtomicBool,
+    /// Returned as the launched conversation when set (plan-first needs one).
+    conversation_id: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -13286,7 +13289,10 @@ impl crate::board::start::TaskLaunchPort for RecordingLaunchPort {
             return Err(ConversationError::bad_request("worktree source invalid"));
         }
         self.launched.lock().unwrap().push(spec.clone());
-        Ok(crate::board::start::TaskLaunched::default())
+        Ok(crate::board::start::TaskLaunched {
+            conversation_id: self.conversation_id.lock().unwrap().clone(),
+            fanout_group_id: None,
+        })
     }
 
     async fn follow_up(&self, _user_id: &str, conversation_id: &str, text: &str) -> Result<(), ConversationError> {
@@ -13791,4 +13797,86 @@ async fn deliver_opens_one_pull_request_then_only_updates_it() {
     assert_eq!(pr["url"], "https://github.com/o/r/pull/7", "update keeps the PR");
     assert!(pr["updated_at"].is_i64());
     assert!(port.calls.lock().unwrap()[1].update);
+}
+
+// ---------------------------------------------------------------------------
+// 3.0 C4: plan-first tasks.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn plan_first_requires_a_plan_task_and_no_repository_yet() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    assert!(matches!(
+        service
+            .create_task_session("user_1", flow_request(json!({ "plan_first": true })))
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    let with_repo = startable_task(
+        &service,
+        json!({ "mode": "plan", "plan_first": true, "assistant_id": "codex-helper", "repo_path": "/repo/app" }),
+    )
+    .await;
+    assert!(matches!(
+        service.start_task("user_1", &with_repo).await,
+        Err(ConversationError::Unprocessable { .. })
+    ));
+}
+
+#[tokio::test]
+async fn plan_first_start_never_sends_the_prompt_and_pauses_when_planning_is_unavailable() {
+    use aionui_api_types::{TaskLane, TaskNeedsYouReason, TaskStartState};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+         VALUES ('plan-conv', 'user_1', 'c', 'acp', '{}', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    port.conversation_id.lock().unwrap().replace("plan-conv".to_owned());
+
+    let id = startable_task(
+        &service,
+        json!({ "mode": "plan", "plan_first": true, "assistant_id": "codex-helper", "prompt": { "text": "add sso" } }),
+    )
+    .await;
+    let started = service.start_task("user_1", &id).await.unwrap();
+    assert_eq!(started.state, TaskStartState::Started);
+    let launched = port.launched.lock().unwrap().clone();
+    assert_eq!(launched.len(), 1);
+    assert!(launched[0].plan_first);
+
+    // The mock agent has no guaranteed non-mutating planning: the task is
+    // paused for the user, never executed unplanned.
+    let mut item = None;
+    for _ in 0..200 {
+        let board = service.task_board("user_1", Default::default()).await.unwrap();
+        let current = board
+            .columns
+            .into_iter()
+            .flat_map(|column| column.items)
+            .find(|candidate| candidate.id == id)
+            .unwrap();
+        if current.lane == TaskLane::NeedsYou {
+            item = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let item = item.expect("plan-first task should need the user");
+    assert_eq!(item.needs_you_reason, Some(TaskNeedsYouReason::Input));
+    assert_eq!(
+        service.get_task_session("user_1", &id).await.unwrap().status,
+        TaskSessionStatus::Paused
+    );
+    assert_eq!(port.launched.lock().unwrap().len(), 1);
 }

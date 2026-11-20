@@ -140,6 +140,23 @@ pub trait ITaskBoardRepository: Send + Sync {
         fanout_group_id: Option<&str>,
         updated_at: TimestampMs,
     ) -> Result<bool, DbError>;
+    /// 3.0 C4: a plan-first task got its conversation; it stays startable
+    /// (`ready`) so the strict planning run can claim it. `false` when it is
+    /// not a startable Plan task.
+    async fn bind_task_for_planning(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        conversation_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError>;
+    /// 3.0 C4: planning could not start → `paused` (needs you). `ready` only.
+    async fn pause_ready_task(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError>;
     /// The started (agent-mode, `running`) task whose run lives in this
     /// conversation, directly or as the slot of its fan-out group.
     async fn find_running_task_for_conversation(
