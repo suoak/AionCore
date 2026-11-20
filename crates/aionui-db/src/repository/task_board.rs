@@ -157,6 +157,21 @@ pub trait ITaskBoardRepository: Send + Sync {
         status: &str,
         updated_at: TimestampMs,
     ) -> Result<bool, DbError>;
+    /// Replace the task's delivery record (JSON object text, or clear it).
+    async fn set_task_delivery(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        delivery_json: Option<&str>,
+    ) -> Result<bool, DbError>;
+    /// A finished run (`completed|failed|paused`) → `running` again for a
+    /// follow-up in the same conversation. `false` when not resumable.
+    async fn mark_task_resumed(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError>;
     async fn append_comment(&self, params: &AppendTaskCommentParams<'_>) -> Result<TaskCommentRow, DbError>;
     /// Comments oldest first.
     async fn list_comments(&self, user_id: &str, task_session_id: &str) -> Result<Vec<TaskCommentRow>, DbError>;

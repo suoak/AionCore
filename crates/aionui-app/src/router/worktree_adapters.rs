@@ -266,6 +266,9 @@ pub(crate) fn build_fanout_state(
         task_manager: services.worker_task_manager.clone(),
         assistants: assistants.clone(),
     }));
+    service.set_task_hooks(Arc::new(TaskAdoptHooks {
+        conversations: services.conversation_service.clone(),
+    }));
     services
         .conversation_service
         .with_task_launch_port(Arc::new(TaskLaunchAdapter {
@@ -434,6 +437,61 @@ impl aionui_conversation::board::start::TaskLaunchPort for TaskLaunchAdapter {
             conversation_id: Some(conversation_id),
             fanout_group_id: None,
         })
+    }
+
+    async fn follow_up(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        text: &str,
+    ) -> Result<(), aionui_conversation::ConversationError> {
+        use aionui_worktree::IFanoutConversations;
+        self.slots
+            .send_prompt(
+                user_id,
+                conversation_id,
+                &aionui_worktree::FanoutPrompt {
+                    content: text.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(launch_error)
+    }
+}
+
+/// 3.0 C3: adopts of task groups drive the board (done / merge conflict).
+pub(crate) struct TaskAdoptHooks {
+    conversations: aionui_conversation::ConversationService,
+}
+
+#[async_trait]
+impl aionui_worktree::IFanoutTaskHooks for TaskAdoptHooks {
+    async fn adopted(&self, user_id: &str, task_session_id: &str, outcome: &aionui_worktree::TaskAdoptOutcome) {
+        let adopted = aionui_conversation::board::delivery::TaskAdopted {
+            group_id: outcome.group_id.clone(),
+            strategy: outcome.strategy.clone(),
+            branch: outcome.branch.clone(),
+            target_branch: outcome.target_branch.clone(),
+            result_commit: outcome.result_commit.clone(),
+        };
+        if let Err(error) = self
+            .conversations
+            .on_task_adopted(user_id, task_session_id, &adopted)
+            .await
+        {
+            tracing::warn!(%error, task_session_id, "task adopt → board failed");
+        }
+    }
+
+    async fn adopt_conflicted(&self, user_id: &str, task_session_id: &str, group_id: &str, message: &str) {
+        if let Err(error) = self
+            .conversations
+            .on_task_adopt_conflicted(user_id, task_session_id, group_id, message)
+            .await
+        {
+            tracing::warn!(%error, task_session_id, "task adopt conflict → board failed");
+        }
     }
 }
 
@@ -659,5 +717,102 @@ mod q12_tests {
         // No project, no source: nothing to do.
         let bare = item(&f, None).await;
         assert!(f.adapter.ensure(USER, &bare, None, None).await.unwrap().is_none());
+    }
+}
+
+/// 3.0 C3: a task's pull request. Pushes only the task's own fan-out branch
+/// (to `origin`, never force), then opens the PR through the existing
+/// `gh` / `glab` delivery (WorkMate never reads the CLI's token).
+pub(crate) struct TaskDeliveryAdapter {
+    pub(crate) fanout: aionui_worktree::FanoutService,
+    pub(crate) delivery: Arc<aionui_review::DeliveryService>,
+    pub(crate) git: aionui_worktree::GitCli,
+}
+
+fn delivery_error(code: &str, message: impl std::fmt::Display) -> aionui_conversation::ConversationError {
+    let code = match code {
+        aionui_review::delivery::CODE_CLI_NOT_INSTALLED => "github_cli_missing",
+        aionui_review::delivery::CODE_CLI_NOT_AUTHENTICATED => "github_not_authenticated",
+        aionui_review::delivery::CODE_PROVIDER_UNSUPPORTED => "pr_provider_unsupported",
+        aionui_review::delivery::CODE_NO_REMOTE => "pr_no_remote",
+        "push" => "task_branch_push_failed",
+        _ => "pr_create_failed",
+    };
+    aionui_conversation::ConversationError::Unprocessable {
+        reason: format!("{code}: {message}"),
+    }
+}
+
+#[async_trait]
+impl aionui_conversation::board::delivery::TaskDeliveryPort for TaskDeliveryAdapter {
+    async fn pull_request(
+        &self,
+        user_id: &str,
+        spec: &aionui_conversation::board::delivery::TaskPullRequestSpec,
+    ) -> Result<aionui_conversation::board::delivery::TaskPullRequest, aionui_conversation::ConversationError> {
+        let group = self.fanout.get(user_id, &spec.fanout_group_id).await.map_err(|error| {
+            aionui_conversation::ConversationError::BadRequest {
+                reason: format!("task worktree: {error}"),
+            }
+        })?;
+        if group.task_session_id.as_deref() != Some(spec.task_session_id.as_str()) {
+            return Err(aionui_conversation::ConversationError::BadRequest {
+                reason: "the fan-out group does not belong to this task".into(),
+            });
+        }
+        let slot = group
+            .slots
+            .first()
+            .ok_or_else(|| aionui_conversation::ConversationError::BadRequest {
+                reason: "the task worktree has no branch".into(),
+            })?;
+        let branch = slot.branch.clone();
+        aionui_worktree::git_cli::validate_branch_name(&branch).map_err(|error| delivery_error("push", error))?;
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let push = self
+            .git
+            .run(
+                ["push", "--porcelain", "origin", refspec.as_str()],
+                aionui_worktree::git_cli::RunOptions::in_dir(std::path::Path::new(&group.source_repo_path)),
+            )
+            .await
+            .map_err(|error| delivery_error("push", error))?;
+        if !push.success() {
+            return Err(delivery_error("push", push.stderr.trim()));
+        }
+        if spec.update {
+            return Ok(aionui_conversation::board::delivery::TaskPullRequest {
+                url: None,
+                number: None,
+                branch,
+            });
+        }
+        let created = self
+            .delivery
+            .create_pull_request(
+                user_id,
+                aionui_review::delivery::CreatePullRequestRequest {
+                    repo_path: group.source_repo_path.clone(),
+                    branch: branch.clone(),
+                    base: group.base_ref.clone(),
+                    title: spec.title.clone(),
+                    body: spec.body.clone(),
+                    draft: spec.draft,
+                    remote: None,
+                    task_session_id: Some(spec.task_session_id.clone()),
+                    run_id: None,
+                    worktree_id: Some(slot.worktree_id.clone()),
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                aionui_review::ReviewError::Conflict { code, message } => delivery_error(code, message),
+                other => delivery_error("", other),
+            })?;
+        Ok(aionui_conversation::board::delivery::TaskPullRequest {
+            url: Some(created.pr_url),
+            number: created.pr_number,
+            branch,
+        })
     }
 }

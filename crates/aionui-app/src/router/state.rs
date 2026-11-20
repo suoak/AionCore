@@ -490,6 +490,14 @@ pub async fn build_module_states(
         fanout,
         batch,
     };
+    // 3.0 C3: task pull requests reuse the fan-out branch and PR delivery.
+    services.conversation_service.with_task_delivery_port(Arc::new(
+        crate::router::worktree_adapters::TaskDeliveryAdapter {
+            fanout: states.fanout.service.clone(),
+            delivery: states.scm_delivery.service.clone(),
+            git: aionui_worktree::GitCli::default(),
+        },
+    ));
     // M8 E7-2: Squad instantiation provisions through the shared Team service.
     states.squad.teams = Some(states.team.service.clone());
     // M8 Q12: Squad instances of one work item share one managed worktree.

@@ -48,3 +48,21 @@ pub trait IFanoutConversations: Send + Sync {
     /// The slot's latest assistant reply text.
     async fn last_reply(&self, user_id: &str, conversation_id: &str) -> Option<String>;
 }
+
+/// 3.0 C3: what an adopt did for a task's (one-slot) group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAdoptOutcome {
+    pub group_id: String,
+    pub strategy: String,
+    pub branch: String,
+    pub target_branch: Option<String>,
+    pub result_commit: Option<String>,
+}
+
+/// Lets the task board follow adopts of groups that carry a
+/// `task_session_id` (implemented by the app over the conversation service).
+#[async_trait]
+pub trait IFanoutTaskHooks: Send + Sync {
+    async fn adopted(&self, user_id: &str, task_session_id: &str, outcome: &TaskAdoptOutcome);
+    async fn adopt_conflicted(&self, user_id: &str, task_session_id: &str, group_id: &str, message: &str);
+}

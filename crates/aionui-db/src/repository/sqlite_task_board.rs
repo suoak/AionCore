@@ -16,7 +16,7 @@ use crate::repository::task_board::{
 
 const BOARD_COLUMNS: &str = "id, user_id, title, project_id, conversation_id, mode, status, board_status, \
      assignee_kind, assignee_id, priority, labels, board_rank, external_ref, created_at, updated_at, \
-     source, assistant_id, plan_first, queued_at";
+     source, assistant_id, plan_first, queued_at, delivery_json";
 
 const FLOW_COLUMNS: &str = "assistant_id, prompt_json, repo_path, base_ref, plan_first, source, source_ref, \
      fanout_group_id, delivery_json, queued_at";
@@ -378,6 +378,39 @@ impl ITaskBoardRepository for SqliteTaskBoardRepository {
         )
         .bind(status)
         .bind(conversation_id)
+        .bind(updated_at)
+        .bind(task_session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_task_delivery(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        delivery_json: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE task_sessions SET delivery_json = ? WHERE id = ? AND user_id = ?")
+            .bind(delivery_json)
+            .bind(task_session_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn mark_task_resumed(
+        &self,
+        user_id: &str,
+        task_session_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE task_sessions SET status = 'running', queued_at = NULL, updated_at = MAX(updated_at + 1, ?) \
+             WHERE id = ? AND user_id = ? AND status IN ('completed', 'failed', 'paused')",
+        )
         .bind(updated_at)
         .bind(task_session_id)
         .bind(user_id)

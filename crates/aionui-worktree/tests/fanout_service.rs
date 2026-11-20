@@ -669,3 +669,90 @@ async fn a_task_may_run_in_a_single_slot_group() {
     assert_eq!(group.slots[0].slot, "A");
     fx.fanout.cancel(USER, &group.id).await.unwrap();
 }
+
+#[derive(Default)]
+struct RecordingTaskHooks {
+    events: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl aionui_worktree::IFanoutTaskHooks for RecordingTaskHooks {
+    async fn adopted(&self, _user_id: &str, task_session_id: &str, outcome: &aionui_worktree::TaskAdoptOutcome) {
+        self.events.lock().unwrap().push(format!(
+            "adopted {task_session_id} {} {}",
+            outcome.strategy,
+            outcome.result_commit.is_some()
+        ));
+    }
+
+    async fn adopt_conflicted(&self, _user_id: &str, task_session_id: &str, _group_id: &str, message: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("conflict {task_session_id} {}", message.contains("README.md")));
+    }
+}
+
+#[tokio::test]
+async fn task_group_adopts_report_to_the_board() {
+    require_git!();
+    let fx = fixture(&[("a1", Script::Commit(vec![("README.md", "task change\n")]))]).await;
+    let hooks = Arc::new(RecordingTaskHooks::default());
+    fx.fanout.set_task_hooks(hooks.clone());
+    let repo = &fx.h.repo;
+    sqlx::query(
+        "INSERT INTO task_sessions (id, user_id, title, mode, objective, acceptance_criteria, status, agent_type, \
+         created_at, updated_at) VALUES ('task-h', ?, 't', 'agent', 'o', '[]', 'ready', 'codex', 1, 1)",
+    )
+    .bind(USER)
+    .execute(fx.h.db.pool())
+    .await
+    .unwrap();
+    let mut req = group_req(repo, &["a1"]);
+    req.task_session_id = Some("task-h".into());
+    let g = fx.fanout.create(USER, req).await.unwrap();
+    fx.fanout.wait_settled(&g.id).await;
+    wait_group(&fx, &g.id, "comparing").await;
+
+    commit_file(repo, "README.md", "main moved on\n");
+    let err = fx
+        .fanout
+        .adopt(USER, &g.id, adopt("A", AdoptStrategy::Squash))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorktreeError::AdoptConflict(_)), "{err:?}");
+    assert_eq!(
+        hooks.events.lock().unwrap().clone(),
+        vec!["conflict task-h true".to_owned()]
+    );
+
+    // branch_only never conflicts; the board still hears about the adopt.
+    fx.fanout
+        .adopt(USER, &g.id, adopt("A", AdoptStrategy::BranchOnly))
+        .await
+        .unwrap();
+    assert_eq!(
+        hooks.events.lock().unwrap().clone(),
+        vec![
+            "conflict task-h true".to_owned(),
+            "adopted task-h branch_only false".to_owned()
+        ]
+    );
+
+    // Groups without a task never call the hooks.
+    let fx2 = fixture(&[("a1", Script::Commit(vec![("x.txt", "x\n")]))]).await;
+    let hooks2 = Arc::new(RecordingTaskHooks::default());
+    fx2.fanout.set_task_hooks(hooks2.clone());
+    let g2 = fx2
+        .fanout
+        .create(USER, group_req(&fx2.h.repo, &["a1", "a1"]))
+        .await
+        .unwrap();
+    fx2.fanout.wait_settled(&g2.id).await;
+    wait_group(&fx2, &g2.id, "comparing").await;
+    fx2.fanout
+        .adopt(USER, &g2.id, adopt("A", AdoptStrategy::Squash))
+        .await
+        .unwrap();
+    assert!(hooks2.events.lock().unwrap().is_empty());
+}
