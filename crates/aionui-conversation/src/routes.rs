@@ -217,6 +217,8 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
+        .route("/api/conversations/{id}/delegation-grants", post(grant_delegations))
+        .route("/api/conversations/{id}/delegations", get(list_delegations))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         // MUST precede the `{messageId}` wildcard below: registered after it,
@@ -787,6 +789,36 @@ async fn reset(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.reset(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// 3.0 C7: the user's explicit `@assistant` picks. User auth only — the
+/// agent-token scope denies this route, so an agent cannot grant itself.
+async fn grant_delegations(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::GrantDelegationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .grant_delegations(&user.id, &id, &req.assistant_ids)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn list_delegations(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<aionui_api_types::DelegationResponse>>>, ApiError> {
+    let delegations = state
+        .service
+        .list_delegations(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(delegations)))
 }
 
 async fn fork(

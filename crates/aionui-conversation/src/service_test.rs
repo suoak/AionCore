@@ -13558,6 +13558,248 @@ async fn start_is_gated_by_run_permissions_and_the_denial_is_audited() {
 }
 
 // ---------------------------------------------------------------------------
+// 3.0 C7: `@assistant` delegation.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct RecordingDelegationPort {
+    launched: std::sync::Mutex<Vec<crate::delegation::DelegationLaunchSpec>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::delegation::DelegationLaunchPort for RecordingDelegationPort {
+    async fn launch(
+        &self,
+        _user_id: &str,
+        spec: &crate::delegation::DelegationLaunchSpec,
+    ) -> Result<String, ConversationError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConversationError::bad_request("assistant not found"));
+        }
+        let mut launched = self.launched.lock().unwrap();
+        launched.push(spec.clone());
+        Ok(format!("child-{}", launched.len()))
+    }
+}
+
+async fn delegation_service(db: &aionui_db::Database) -> (ConversationService, Arc<RecordingDelegationPort>) {
+    seed_test_user(db.pool(), "user_1").await;
+    for (id, extra) in [
+        ("parent", r#"{"workspace":"/work/app"}"#),
+        ("child-1", "{}"),
+        ("child-2", "{}"),
+        ("child-3", "{}"),
+        ("child-4", "{}"),
+    ] {
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+             VALUES (?, 'user_1', 'c', 'acp', ?, 1, 1)",
+        )
+        .bind(id)
+        .bind(extra)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        Arc::new(MockTaskManager::new()),
+        Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone())),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    service.with_delegation_repo(Arc::new(aionui_db::SqliteDelegationRepository::new(db.pool().clone())));
+    let port = Arc::new(RecordingDelegationPort::default());
+    service.with_delegation_launch_port(port.clone());
+    (service, port)
+}
+
+#[tokio::test]
+async fn only_assistants_the_user_picked_can_be_delegated_to() {
+    use aionui_api_types::DelegationStatus;
+
+    let db = init_database_memory().await.unwrap();
+    let (service, port) = delegation_service(&db).await;
+    assert!(matches!(
+        service.delegate("user_1", "parent", "writer", "draft it").await,
+        Err(ConversationError::Forbidden { .. })
+    ));
+    assert!(port.launched.lock().unwrap().is_empty());
+
+    service
+        .grant_delegations("user_1", "parent", &["writer".to_owned(), " ".to_owned()])
+        .await
+        .unwrap();
+    let started = service
+        .delegate("user_1", "parent", "writer", "  draft the release notes  ")
+        .await
+        .unwrap();
+    assert_eq!(started.status, DelegationStatus::Running);
+    assert_eq!(started.child_conversation_id.as_deref(), Some("child-1"));
+    let launched = port.launched.lock().unwrap().clone();
+    // Cold start: only the task text, in the parent's workspace.
+    assert_eq!(launched[0].task_text, "draft the release notes");
+    assert_eq!(launched[0].workspace.as_deref(), Some("/work/app"));
+    assert_eq!(launched[0].assistant_id, "writer");
+
+    // Another user's conversation is invisible.
+    assert!(
+        service
+            .grant_delegations("user_2", "parent", &["writer".into()])
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .delegation_result("user_1", "child-1", &started.id)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn the_child_reply_becomes_the_delegation_result() {
+    use aionui_api_types::DelegationStatus;
+
+    let db = init_database_memory().await.unwrap();
+    let (service, _port) = delegation_service(&db).await;
+    service
+        .grant_delegations("user_1", "parent", &["writer".into()])
+        .await
+        .unwrap();
+    let ok = service.delegate("user_1", "parent", "writer", "a").await.unwrap();
+    let bad = service.delegate("user_1", "parent", "writer", "b").await.unwrap();
+
+    service
+        .notify_turn_settled(
+            "user_1",
+            "child-1",
+            "turn-1",
+            ConversationTurnSettlement::Completed,
+            None,
+            Some("Here are the notes."),
+        )
+        .await;
+    service
+        .notify_turn_settled(
+            "user_1",
+            "child-2",
+            "turn-1",
+            ConversationTurnSettlement::Failed,
+            Some("model overloaded"),
+            None,
+        )
+        .await;
+    let ok = service.delegation_result("user_1", "parent", &ok.id).await.unwrap();
+    assert_eq!(ok.status, DelegationStatus::Completed);
+    assert_eq!(ok.result_text.as_deref(), Some("Here are the notes."));
+    let bad = service.delegation_result("user_1", "parent", &bad.id).await.unwrap();
+    assert_eq!(bad.status, DelegationStatus::Failed);
+    assert_eq!(bad.error.as_deref(), Some("model overloaded"));
+    assert_eq!(service.list_delegations("user_1", "parent").await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn delegation_is_depth_one_and_capped_per_conversation() {
+    let db = init_database_memory().await.unwrap();
+    let (service, port) = delegation_service(&db).await;
+    service
+        .grant_delegations("user_1", "parent", &["writer".into()])
+        .await
+        .unwrap();
+    for text in ["a", "b", "c"] {
+        service.delegate("user_1", "parent", "writer", text).await.unwrap();
+    }
+    assert!(matches!(
+        service.delegate("user_1", "parent", "writer", "d").await,
+        Err(ConversationError::Busy { .. })
+    ));
+    assert_eq!(port.launched.lock().unwrap().len(), 3);
+
+    // A child cannot be granted, so it cannot delegate.
+    assert!(matches!(
+        service.grant_delegations("user_1", "child-1", &["writer".into()]).await,
+        Err(ConversationError::Unprocessable { .. })
+    ));
+    assert!(matches!(
+        service.delegate("user_1", "child-1", "writer", "x").await,
+        Err(ConversationError::Unprocessable { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_failed_launch_frees_the_slot_and_a_restart_fails_running_children() {
+    use aionui_api_types::DelegationStatus;
+
+    let db = init_database_memory().await.unwrap();
+    let (service, port) = delegation_service(&db).await;
+    service
+        .grant_delegations("user_1", "parent", &["writer".into()])
+        .await
+        .unwrap();
+    assert!(
+        service
+            .delegate(
+                "user_1",
+                "parent",
+                "writer",
+                &"x".repeat(aionui_api_types::MAX_DELEGATION_TASK_CHARS + 1)
+            )
+            .await
+            .is_err()
+    );
+    port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(service.delegate("user_1", "parent", "writer", "a").await.is_err());
+    port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let running = service.delegate("user_1", "parent", "writer", "b").await.unwrap();
+    let all = service.list_delegations("user_1", "parent").await.unwrap();
+    assert_eq!(all[0].status, DelegationStatus::Failed);
+
+    assert_eq!(service.fail_interrupted_delegations().await.unwrap(), 1);
+    let running = service
+        .delegation_result("user_1", "parent", &running.id)
+        .await
+        .unwrap();
+    assert_eq!(running.status, DelegationStatus::Failed);
+}
+
+#[tokio::test]
+async fn delegation_is_gated_by_run_permissions() {
+    let db = init_database_memory().await.unwrap();
+    let (service, port) = delegation_service(&db).await;
+    let audit: Arc<dyn aionui_db::IAuditEventRepository> =
+        Arc::new(aionui_db::SqliteAuditEventRepository::new(db.pool().clone()));
+    let governance = Arc::new(aionui_db::GovernanceService::new(
+        Arc::new(aionui_db::SqliteGovernanceRepository::new(db.pool().clone())),
+        Some(aionui_db::AuditSink::new(audit.clone())),
+        true,
+    ));
+    governance
+        .set_agent_run_permission(
+            aionui_db::governance::BOOTSTRAP_OWNER_USER_ID,
+            "assistant",
+            "writer",
+            Some(&[aionui_db::UserRole::Owner]),
+            None,
+        )
+        .await
+        .unwrap();
+    service.with_governance(governance);
+    service
+        .grant_delegations("user_1", "parent", &["writer".into()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.delegate("user_1", "parent", "writer", "a").await,
+        Err(ConversationError::Forbidden { .. })
+    ));
+    assert!(port.launched.lock().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // 3.0 C3: follow-up, adopt → done, adopt conflict → needs you.
 // ---------------------------------------------------------------------------
 

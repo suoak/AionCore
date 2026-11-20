@@ -614,6 +614,9 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     service.with_task_board_repo(Arc::new(aionui_db::SqliteTaskBoardRepository::new(
         deps.database.pool().clone(),
     )));
+    service.with_delegation_repo(Arc::new(aionui_db::SqliteDelegationRepository::new(
+        deps.database.pool().clone(),
+    )));
     service.with_evolution_evidence_repo(Arc::new(aionui_db::SqliteExperienceArticleRepository::new(
         deps.database.pool().clone(),
     )));

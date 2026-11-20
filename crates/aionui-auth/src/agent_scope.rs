@@ -585,6 +585,8 @@ mod tests {
             (Method::POST, "/api/conversations"),
             (Method::POST, "/api/conversations/conv-own/messages"),
             (Method::DELETE, "/api/conversations/conv-own"),
+            // 3.0 C7: an agent must never grant itself `@assistant` delegation.
+            (Method::POST, "/api/conversations/conv-own/delegation-grants"),
             (Method::POST, "/api/agent-approvals/abc/approve"),
             (Method::POST, "/api/webui/reset-password"),
             (Method::POST, "/api/fs/write"),
