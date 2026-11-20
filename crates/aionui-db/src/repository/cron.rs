@@ -65,6 +65,8 @@ pub struct UpdateCronJobParams {
     pub autopilot: Option<bool>,
     pub autopilot_yolo: Option<bool>,
     pub notify_channel_id: Option<Option<String>>,
+    /// 3.0 C6: `Some(None)` = run as a conversation again.
+    pub task_options: Option<Option<String>>,
 }
 
 /// Data access abstraction for the `cron_jobs` table.

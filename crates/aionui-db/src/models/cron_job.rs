@@ -36,6 +36,10 @@ pub struct CronJobRow {
     pub autopilot_yolo: bool,
     /// `assistant_sessions.id` that receives Autopilot run summaries.
     pub notify_channel_id: Option<String>,
+    /// 3.0 C6 (migration 085): JSON task options; `None` = runs as a
+    /// conversation, `Some` = each occurrence creates a board task.
+    #[serde(default)]
+    pub task_options: Option<String>,
 }
 
 #[cfg(test)]
@@ -74,6 +78,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task_options: None,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         let restored: CronJobRow = serde_json::from_str(&json).expect("deserialize");
@@ -116,6 +121,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task_options: None,
         };
         assert!(row.schedule_tz.is_none());
         assert!(row.agent_config.is_none());

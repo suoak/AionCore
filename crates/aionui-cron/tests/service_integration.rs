@@ -1122,6 +1122,8 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
         autopilot: false,
         autopilot_yolo: false,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     }
 }
 
@@ -1171,6 +1173,7 @@ fn make_cron_row_with_workspace(id: &str, user_id: &str, conversation_id: &str, 
         autopilot: false,
         autopilot_yolo: false,
         notify_channel_id: None,
+        task_options: None,
     }
 }
 
@@ -1596,6 +1599,7 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task_options: None,
         })
         .await
         .unwrap();
@@ -1678,6 +1682,8 @@ async fn cj8_update_job() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
 
     let updated = svc.update_job("u1", &created.id, req).await.unwrap();
@@ -1725,6 +1731,8 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
 
     let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
@@ -1767,6 +1775,8 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
 
     let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
@@ -1806,6 +1816,8 @@ async fn update_existing_job_to_new_conversation_keeps_owner_anchor() {
                 autopilot: None,
                 autopilot_yolo: None,
                 notify_channel_id: None,
+                run_as: None,
+                task: None,
             },
         )
         .await
@@ -1870,6 +1882,8 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
             autopilot: None,
             autopilot_yolo: None,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         },
     )
     .await
@@ -1918,6 +1932,8 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
             autopilot: None,
             autopilot_yolo: None,
             notify_channel_id: None,
+            run_as: None,
+            task: None,
         },
     )
     .await
@@ -1956,6 +1972,8 @@ async fn update_team_conversation_job_rejects_execution_mode_change() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
 
     let err = svc.update_job("u1", &created.id, req).await.unwrap_err();
@@ -1993,6 +2011,8 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
 
     let updated = svc.update_job("u1", &created.id, req).await.unwrap();
@@ -2033,6 +2053,8 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
 
     let err = svc
@@ -2071,6 +2093,8 @@ async fn cj9_update_schedule_type() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
 
     let updated = svc.update_job("u1", &created.id, req).await.unwrap();
@@ -2100,6 +2124,8 @@ async fn cj10_update_nonexistent() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
     let err = svc.update_job("u1", "cron_nonexistent", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::JobNotFound(_)));
@@ -3269,6 +3295,8 @@ async fn update_max_retries() {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     };
     let updated = svc.update_job("u1", &job.id, req).await.unwrap();
     assert_eq!(updated.max_retries, 5);
@@ -3303,6 +3331,8 @@ async fn create_and_update_queue_enabled() {
                     autopilot: None,
                     autopilot_yolo: None,
                     notify_channel_id: None,
+                    run_as: None,
+                    task: None,
                 }
             },
         )
@@ -3675,6 +3705,8 @@ fn empty_update_req() -> UpdateCronJobRequest {
         autopilot: None,
         autopilot_yolo: None,
         notify_channel_id: None,
+        run_as: None,
+        task: None,
     }
 }
 
@@ -4031,4 +4063,134 @@ async fn autopilot_report_before_notifier_install_is_delivered_on_install() {
     wait_for_reports(&notifier, 2).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(notifier.reports.lock().unwrap().len(), 2);
+}
+
+// ── 3.0 C6: run_as = task ──────────────────────────────────────────
+
+fn task_job_req(start: bool) -> CreateCronJobRequest {
+    let mut req = make_create_req("Nightly deps", every_60s());
+    req.run_as = Some(aionui_api_types::CronRunAs::Task);
+    req.task = Some(aionui_api_types::CronTaskOptionsDto {
+        start,
+        repo_path: Some("/repo/app".into()),
+        base_ref: Some("main".into()),
+    });
+    req
+}
+
+#[tokio::test]
+async fn a_task_job_is_stored_and_reported_as_run_as_task() {
+    let (svc, cron_repo, _) = setup().await;
+    let job = svc.add_job("u1", task_job_req(true)).await.unwrap();
+
+    assert_eq!(job.run_as(), aionui_api_types::CronRunAs::Task);
+    assert_eq!(
+        job.execution_mode,
+        aionui_cron::types::ExecutionMode::NewConversation,
+        "a task run never uses an existing conversation"
+    );
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    let stored: serde_json::Value = serde_json::from_str(row.task_options.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        stored,
+        serde_json::json!({ "start": true, "repo_path": "/repo/app", "base_ref": "main" })
+    );
+    let response = aionui_cron::types::cron_job_to_response(&svc.get_job("u1", &job.id).await.unwrap());
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["target"]["run_as"], "task");
+    assert_eq!(json["target"]["task"]["start"], true);
+
+    // Legacy jobs read back as conversation runs.
+    let legacy = svc.add_job("u1", make_create_req("Legacy", every_60s())).await.unwrap();
+    let json = serde_json::to_value(aionui_cron::types::cron_job_to_response(&legacy)).unwrap();
+    assert_eq!(json["target"]["run_as"], "conversation");
+    assert!(json["target"].get("task").is_none());
+}
+
+#[tokio::test]
+async fn task_jobs_are_refused_for_agents_autopilot_and_existing_conversations() {
+    let (svc, _, _) = setup().await;
+    let refused = svc
+        .add_job_as("u1", task_job_req(false), aionui_cron::service::CronActor::Agent)
+        .await;
+    assert!(
+        matches!(refused, Err(aionui_cron::error::CronError::Forbidden(_))),
+        "{refused:?}"
+    );
+    let mut by_agent = task_job_req(false);
+    by_agent.created_by = "agent".into();
+    assert!(svc.add_job("u1", by_agent).await.is_err());
+    let mut autopilot = task_job_req(false);
+    autopilot.autopilot = true;
+    assert!(svc.add_job("u1", autopilot).await.is_err());
+    let mut existing = task_job_req(false);
+    existing.execution_mode = Some("existing".into());
+    assert!(svc.add_job("u1", existing).await.is_err());
+    let mut options_only = make_create_req("Options only", every_60s());
+    options_only.task = Some(Default::default());
+    assert!(svc.add_job("u1", options_only).await.is_err());
+    assert!(svc.list_jobs("u1", &Default::default()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_job_can_switch_between_task_and_conversation_runs() {
+    let (svc, cron_repo, _) = setup().await;
+    let job = svc.add_job("u1", make_create_req("Switch", every_60s())).await.unwrap();
+    let update = |run_as, task| UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: Some("new_conversation".into()),
+        agent_config: None,
+        conversation_title: None,
+        max_retries: None,
+        queue_enabled: None,
+        autopilot: None,
+        autopilot_yolo: None,
+        notify_channel_id: None,
+        run_as: Some(run_as),
+        task,
+    };
+    let as_task = svc
+        .update_job(
+            "u1",
+            &job.id,
+            update(
+                aionui_api_types::CronRunAs::Task,
+                Some(aionui_api_types::CronTaskOptionsDto {
+                    start: false,
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(as_task.run_as(), aionui_api_types::CronRunAs::Task);
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert!(row.task_options.is_some());
+    assert_eq!(row.execution_mode, "new_conversation");
+
+    // An agent may not edit a task job.
+    let by_agent = svc
+        .update_job_as(
+            "u1",
+            &job.id,
+            update(aionui_api_types::CronRunAs::Task, None),
+            aionui_cron::service::CronActor::Agent,
+        )
+        .await;
+    assert!(
+        matches!(by_agent, Err(aionui_cron::error::CronError::Forbidden(_))),
+        "{by_agent:?}"
+    );
+
+    let back = svc
+        .update_job("u1", &job.id, update(aionui_api_types::CronRunAs::Conversation, None))
+        .await
+        .unwrap();
+    assert_eq!(back.run_as(), aionui_api_types::CronRunAs::Conversation);
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert!(row.task_options.is_none());
 }

@@ -132,6 +132,7 @@ mod tests {
             autopilot: false,
             autopilot_yolo: false,
             notify_channel_id: None,
+            task: None,
         }
     }
 

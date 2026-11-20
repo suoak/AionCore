@@ -95,6 +95,48 @@ pub struct CronJobTargetDto {
     pub payload: CronJobPayloadDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<String>,
+    /// 3.0 C6: what each occurrence does. Older clients ignore it.
+    #[serde(default)]
+    pub run_as: CronRunAs,
+    /// Set when `run_as = task`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<CronTaskOptionsDto>,
+}
+
+/// 3.0 C6 (plan B §3): `conversation` sends the message to a conversation
+/// (every job before 3.0); `task` creates a board task (source = cron) that
+/// runs under the task rules and always stops at review.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CronRunAs {
+    #[default]
+    Conversation,
+    Task,
+}
+
+impl CronRunAs {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Task => "task",
+        }
+    }
+}
+
+/// Options of a `run_as = task` job. The task's title is the job name, its
+/// objective the job message, its assistant the job's `agent_config.assistant_id`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CronTaskOptionsDto {
+    /// Start the task right away (E12 run permission and run slots apply;
+    /// it queues when all slots are busy). `false` leaves it in the backlog.
+    #[serde(default)]
+    pub start: bool,
+    /// Absolute path of a git repository: the task works in its own worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -184,6 +226,12 @@ pub struct CreateCronJobRequest {
     /// Channel session (`assistant_sessions.id`) receiving run summaries.
     #[serde(default)]
     pub notify_channel_id: Option<String>,
+    /// 3.0 C6. Defaults to `conversation`.
+    #[serde(default)]
+    pub run_as: Option<CronRunAs>,
+    /// Options for `run_as = task`.
+    #[serde(default)]
+    pub task: Option<CronTaskOptionsDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +292,12 @@ pub struct UpdateCronJobRequest {
     /// Channel session receiving run summaries; empty string clears it.
     #[serde(default)]
     pub notify_channel_id: Option<String>,
+    /// 3.0 C6: switch what each occurrence does.
+    #[serde(default)]
+    pub run_as: Option<CronRunAs>,
+    /// Replace the task options (`run_as = task` only).
+    #[serde(default)]
+    pub task: Option<CronTaskOptionsDto>,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +315,11 @@ pub struct ListCronJobsQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunNowResponse {
+    /// Empty for a `run_as = task` job.
     pub conversation_id: String,
+    /// 3.0 C6: the task a `run_as = task` job created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -284,6 +342,66 @@ pub struct CronJobExecutedEvent {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod run_as_tests {
+    use super::{CreateCronJobRequest, CronJobTargetDto, CronRunAs, CronTaskOptionsDto};
+
+    fn create(extra: serde_json::Value) -> Result<CreateCronJobRequest, serde_json::Error> {
+        let mut body = serde_json::json!({
+            "name": "Nightly",
+            "schedule": { "kind": "every", "every_ms": 60000 },
+            "message": "check",
+            "conversation_id": "conv_1",
+            "created_by": "user",
+        });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body)
+    }
+
+    #[test]
+    fn run_as_defaults_to_conversation_and_parses_task() {
+        let legacy = create(serde_json::json!({})).unwrap();
+        assert_eq!(legacy.run_as, None);
+        assert!(legacy.task.is_none());
+        let task = create(serde_json::json!({
+            "run_as": "task",
+            "task": { "start": true, "repo_path": "/repo", "base_ref": "main" }
+        }))
+        .unwrap();
+        assert_eq!(task.run_as, Some(CronRunAs::Task));
+        assert_eq!(
+            task.task,
+            Some(CronTaskOptionsDto {
+                start: true,
+                repo_path: Some("/repo".into()),
+                base_ref: Some("main".into()),
+            })
+        );
+        assert!(create(serde_json::json!({ "run_as": "pipeline" })).is_err());
+        // Nothing beyond the three options (no merge or mode switches).
+        for field in ["auto_merge", "strategy", "mode", "assistant_id"] {
+            assert!(
+                create(serde_json::json!({ "run_as": "task", "task": { field: true } })).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn older_targets_read_as_conversation_runs() {
+        let target: CronJobTargetDto = serde_json::from_value(serde_json::json!({
+            "payload": { "kind": "message", "text": "hi" },
+            "execution_mode": "existing",
+        }))
+        .unwrap();
+        assert_eq!(target.run_as, CronRunAs::Conversation);
+        assert_eq!(CronRunAs::Task.as_str(), "task");
+        let json = serde_json::to_value(&target).unwrap();
+        assert_eq!(json["run_as"], "conversation");
+        assert!(json.get("task").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -615,6 +733,8 @@ mod tests {
                     text: "Generate report".into(),
                 },
                 execution_mode: Some("new_conversation".into()),
+                run_as: Default::default(),
+                task: None,
             },
             metadata: CronJobMetadataDto {
                 conversation_id: "conv_1".into(),
@@ -698,6 +818,8 @@ mod tests {
             target: CronJobTargetDto {
                 payload: CronJobPayloadDto::Message { text: "ping".into() },
                 execution_mode: None,
+                run_as: Default::default(),
+                task: None,
             },
             metadata: CronJobMetadataDto {
                 conversation_id: "conv_2".into(),
@@ -955,6 +1077,7 @@ mod tests {
     fn run_now_response_serialize() {
         let r = RunNowResponse {
             conversation_id: "conv_new".into(),
+            task_session_id: None,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["conversation_id"], "conv_new");
@@ -964,6 +1087,7 @@ mod tests {
     fn run_now_response_roundtrip() {
         let r = RunNowResponse {
             conversation_id: "conv_1".into(),
+            task_session_id: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let parsed: RunNowResponse = serde_json::from_str(&json).unwrap();
