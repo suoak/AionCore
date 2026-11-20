@@ -49,6 +49,9 @@ pub struct TaskLaunched {
 #[async_trait]
 pub trait TaskLaunchPort: Send + Sync {
     async fn launch(&self, user_id: &str, spec: &TaskLaunchSpec) -> Result<TaskLaunched, ConversationError>;
+
+    /// 3.0 C3: send a follow-up to the task's run conversation.
+    async fn follow_up(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<(), ConversationError>;
 }
 
 fn prompt_text(prompt_json: Option<&str>, objective: &str, title: &str) -> String {
@@ -74,7 +77,7 @@ impl ConversationService {
             .store(limit.clamp(1, MAX_RUNNING_TASKS_LIMIT), Ordering::Relaxed);
     }
 
-    fn task_launch_port(&self) -> Result<Arc<dyn TaskLaunchPort>, ConversationError> {
+    pub(crate) fn task_launch_port(&self) -> Result<Arc<dyn TaskLaunchPort>, ConversationError> {
         self.task_launch
             .read()
             .ok()

@@ -13271,6 +13271,7 @@ async fn task_flow_rejects_core_sources_and_bad_fields_before_creating() {
 #[derive(Default)]
 struct RecordingLaunchPort {
     launched: std::sync::Mutex<Vec<crate::board::start::TaskLaunchSpec>>,
+    follow_ups: std::sync::Mutex<Vec<(String, String)>>,
     fail: std::sync::atomic::AtomicBool,
 }
 
@@ -13286,6 +13287,14 @@ impl crate::board::start::TaskLaunchPort for RecordingLaunchPort {
         }
         self.launched.lock().unwrap().push(spec.clone());
         Ok(crate::board::start::TaskLaunched::default())
+    }
+
+    async fn follow_up(&self, _user_id: &str, conversation_id: &str, text: &str) -> Result<(), ConversationError> {
+        self.follow_ups
+            .lock()
+            .unwrap()
+            .push((conversation_id.to_owned(), text.to_owned()));
+        Ok(())
     }
 }
 
@@ -13539,4 +13548,247 @@ async fn start_is_gated_by_run_permissions_and_the_denial_is_audited() {
     let diff: serde_json::Value = serde_json::from_str(denials[0].diff.as_deref().unwrap()).unwrap();
     assert_eq!(diff["surface"], "task");
     assert_eq!(diff["key"], "agent_run_permission");
+}
+
+// ---------------------------------------------------------------------------
+// 3.0 C3: follow-up, adopt → done, adopt conflict → needs you.
+// ---------------------------------------------------------------------------
+
+async fn task_in_review(db: &aionui_db::Database, service: &ConversationService, conversation: &str) -> String {
+    let id = startable_task(
+        service,
+        json!({ "assistant_id": "codex-helper", "repo_path": "/repo/app" }),
+    )
+    .await;
+    service.start_task("user_1", &id).await.unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, 'user_1', 'Task run', 'acp', 1, 1)",
+    )
+    .bind(conversation)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task_sessions SET conversation_id = ? WHERE id = ?")
+        .bind(conversation)
+        .bind(&id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    service.on_task_turn_settled("user_1", conversation, true).await;
+    id
+}
+
+async fn board_entry(service: &ConversationService, id: &str) -> aionui_api_types::TaskBoardItemResponse {
+    service
+        .task_board("user_1", Default::default())
+        .await
+        .unwrap()
+        .columns
+        .into_iter()
+        .flat_map(|column| column.items)
+        .find(|item| item.id == id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn adopt_approves_the_review_and_a_conflict_needs_you() {
+    use aionui_api_types::{TaskBoardStatus as S, TaskLane, TaskNeedsYouReason};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    let id = task_in_review(&db, &service, "conv-1").await;
+    assert_eq!(board_entry(&service, &id).await.board_status, S::InReview);
+
+    service
+        .on_task_adopt_conflicted("user_1", &id, "fg-1", "CONFLICT (content): Merge conflict in src/a.rs")
+        .await
+        .unwrap();
+    let item = board_entry(&service, &id).await;
+    assert_eq!(
+        (item.lane, item.needs_you_reason),
+        (TaskLane::NeedsYou, Some(TaskNeedsYouReason::MergeConflict))
+    );
+    assert_eq!(item.board_status, S::InReview, "nothing merged, nothing moved");
+    assert_eq!(item.delivery.as_ref().unwrap()["adopt"]["status"], "conflict");
+
+    let adopted = crate::board::delivery::TaskAdopted {
+        group_id: "fg-1".into(),
+        strategy: "squash".into(),
+        branch: "workmate/task-1".into(),
+        target_branch: Some("main".into()),
+        result_commit: Some("0123456789abcdef".into()),
+    };
+    service.on_task_adopted("user_1", &id, &adopted).await.unwrap();
+    let item = board_entry(&service, &id).await;
+    assert_eq!(item.board_status, S::Done);
+    assert_eq!(item.lane, TaskLane::Done);
+    assert_eq!(item.delivery.as_ref().unwrap()["adopt"]["status"], "adopted");
+    assert_eq!(
+        item.delivery.as_ref().unwrap()["adopt"]["result_commit"],
+        "0123456789abcdef"
+    );
+    let comments = service.list_task_comments("user_1", &id).await.unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|comment| comment.body.contains("Adopted (squash) into main as 0123456789ab")),
+        "review record: {comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn follow_up_continues_the_same_conversation_and_reopens_the_card() {
+    use aionui_api_types::{TaskBoardStatus as S, TaskLane, TaskStartState};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+
+    let fresh = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    assert!(matches!(
+        service.follow_up_task("user_1", &fresh, "change it").await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let id = task_in_review(&db, &service, "conv-2").await;
+    assert!(matches!(
+        service.follow_up_task("user_1", &id, "   ").await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    service
+        .on_task_adopt_conflicted("user_1", &id, "fg-2", "CONFLICT")
+        .await
+        .unwrap();
+
+    let response = service
+        .follow_up_task("user_1", &id, "Resolve the conflict in src/a.rs")
+        .await
+        .unwrap();
+    assert_eq!(response.state, TaskStartState::Started);
+    assert_eq!(response.item.board_status, S::InProgress);
+    assert_eq!(response.item.lane, TaskLane::InProgress);
+    assert!(response.item.delivery.is_none(), "conflict superseded");
+    assert_eq!(
+        port.follow_ups.lock().unwrap().clone(),
+        vec![("conv-2".to_owned(), "Resolve the conflict in src/a.rs".to_owned())]
+    );
+    assert_eq!(
+        service.get_task_session("user_1", &id).await.unwrap().status,
+        TaskSessionStatus::Running
+    );
+    // Running: reported, not sent twice.
+    let again = service.follow_up_task("user_1", &id, "more").await.unwrap();
+    assert_eq!(again.state, TaskStartState::AlreadyRunning);
+    assert_eq!(port.follow_ups.lock().unwrap().len(), 1);
+
+    // The next settle goes back to review.
+    service.on_task_turn_settled("user_1", "conv-2", true).await;
+    assert_eq!(board_entry(&service, &id).await.board_status, S::InReview);
+}
+
+#[derive(Default)]
+struct RecordingDeliveryPort {
+    calls: std::sync::Mutex<Vec<crate::board::delivery::TaskPullRequestSpec>>,
+}
+
+#[async_trait::async_trait]
+impl crate::board::delivery::TaskDeliveryPort for RecordingDeliveryPort {
+    async fn pull_request(
+        &self,
+        _user_id: &str,
+        spec: &crate::board::delivery::TaskPullRequestSpec,
+    ) -> Result<crate::board::delivery::TaskPullRequest, ConversationError> {
+        self.calls.lock().unwrap().push(spec.clone());
+        Ok(crate::board::delivery::TaskPullRequest {
+            url: (!spec.update).then(|| "https://github.com/o/r/pull/7".to_owned()),
+            number: (!spec.update).then(|| "7".to_owned()),
+            branch: "workmate/task-1".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn deliver_opens_one_pull_request_then_only_updates_it() {
+    use aionui_api_types::{DeliverTaskRequest, TaskDeliveryKind};
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    let port = Arc::new(RecordingDeliveryPort::default());
+    service.with_task_delivery_port(port.clone());
+    let request = |kind| DeliverTaskRequest {
+        kind,
+        title: None,
+        body: Some("Fixes login".into()),
+        draft: false,
+    };
+
+    let fresh = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    assert!(matches!(
+        service
+            .deliver_task("user_1", &fresh, request(TaskDeliveryKind::Pr))
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let id = task_in_review(&db, &service, "conv-3").await;
+    // In review but no worktree branch yet.
+    assert!(matches!(
+        service.deliver_task("user_1", &id, request(TaskDeliveryKind::Pr)).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    sqlx::query(
+        "INSERT INTO fanout_groups (id, user_id, source_repo_path, repo_common_dir, base_ref, base_commit, prompt, \
+         status, task_session_id, created_at, updated_at) \
+         VALUES ('fg-3', 'user_1', '/repo', '/repo/.git', 'main', 'abc', 'p', 'comparing', ?, 1, 1)",
+    )
+    .bind(&id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task_sessions SET fanout_group_id = 'fg-3' WHERE id = ?")
+        .bind(&id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        service
+            .deliver_task("user_1", &id, request(TaskDeliveryKind::UpdatePr))
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let item = service
+        .deliver_task("user_1", &id, request(TaskDeliveryKind::Pr))
+        .await
+        .unwrap();
+    let pr = &item.delivery.as_ref().unwrap()["pull_request"];
+    assert_eq!(pr["url"], "https://github.com/o/r/pull/7");
+    assert_eq!(pr["branch"], "workmate/task-1");
+    {
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].fanout_group_id, "fg-3");
+        assert_eq!(calls[0].title, "Flow item", "defaults to the task title");
+        assert!(!calls[0].update);
+    }
+    assert!(matches!(
+        service.deliver_task("user_1", &id, request(TaskDeliveryKind::Pr)).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let item = service
+        .deliver_task("user_1", &id, request(TaskDeliveryKind::UpdatePr))
+        .await
+        .unwrap();
+    let pr = &item.delivery.as_ref().unwrap()["pull_request"];
+    assert_eq!(pr["url"], "https://github.com/o/r/pull/7", "update keeps the PR");
+    assert!(pr["updated_at"].is_i64());
+    assert!(port.calls.lock().unwrap()[1].update);
 }

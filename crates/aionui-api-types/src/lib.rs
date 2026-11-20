@@ -301,13 +301,13 @@ pub use system::{
     FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use task_board::{
-    CreateTaskCommentRequest, EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED,
-    EditTaskCommentRequest, ImportGithubIssuesRequest, ImportGithubIssuesResponse, ImportedIssueItem,
-    ImportedIssueOutcome, StartTaskResponse, TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind, TaskBoardChange,
-    TaskBoardColumnResponse, TaskBoardItemResponse, TaskBoardQuery, TaskBoardResponse, TaskBoardReviewDecision,
-    TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus, TaskBoardUpdatedEvent, TaskCommentEvent,
-    TaskCommentKind, TaskCommentResponse, TaskLane, TaskNeedsYouReason, TaskPlanSummary, TaskSource, TaskStartState,
-    UpdateTaskBoardRequest,
+    CreateTaskCommentRequest, DeliverTaskRequest, EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED,
+    EVENT_TASK_COMMENT_UPDATED, EditTaskCommentRequest, ImportGithubIssuesRequest, ImportGithubIssuesResponse,
+    ImportedIssueItem, ImportedIssueOutcome, StartTaskResponse, TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind,
+    TaskBoardChange, TaskBoardColumnResponse, TaskBoardItemResponse, TaskBoardQuery, TaskBoardResponse,
+    TaskBoardReviewDecision, TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus, TaskBoardUpdatedEvent,
+    TaskCommentEvent, TaskCommentKind, TaskCommentResponse, TaskDeliveryKind, TaskLane, TaskNeedsYouReason,
+    TaskPlanSummary, TaskSource, TaskStartState, UpdateTaskBoardRequest,
 };
 pub use task_session::{
     AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,

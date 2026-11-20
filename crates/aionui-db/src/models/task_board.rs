@@ -42,6 +42,8 @@ pub struct TaskBoardItemRow {
     /// 0 / 1.
     pub plan_first: i64,
     pub queued_at: Option<TimestampMs>,
+    /// Adopt / PR outcome (JSON object), see migration 082.
+    pub delivery_json: Option<String>,
 }
 
 /// `task_sessions.source` values (migration 082).
