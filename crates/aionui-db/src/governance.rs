@@ -261,6 +261,8 @@ pub enum LaunchSurface {
     Batch,
     /// A task being started, retried or resumed from the queue (3.0 C2).
     Task,
+    /// A child conversation an agent starts for an `@assistant` (3.0 C7).
+    Delegation,
 }
 
 impl LaunchSurface {
@@ -271,6 +273,7 @@ impl LaunchSurface {
             Self::Cron => "cron",
             Self::Batch => "batch",
             Self::Task => "task",
+            Self::Delegation => "delegation",
         }
     }
 }

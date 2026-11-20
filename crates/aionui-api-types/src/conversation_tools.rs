@@ -115,6 +115,17 @@ pub enum ConversationToolErrorCode {
     SkillNotEnabled,
     SchemaValidationFailed,
     TransportUnavailable,
+    /// 3.0 C7: the user has not picked this `@assistant` in the conversation.
+    DelegationNotGranted,
+    /// A delegated child conversation cannot delegate (depth 1).
+    DelegationDepthExceeded,
+    /// Too many unfinished delegations; read results first.
+    DelegationLimitReached,
+    /// The launch policy (run permissions) refused the delegation.
+    LaunchDenied,
+    NotFound,
+    InvalidRequest,
+    Internal,
 }
 
 impl ConversationToolErrorCode {
@@ -132,6 +143,13 @@ impl ConversationToolErrorCode {
             Self::SkillNotEnabled => "skill_not_enabled",
             Self::SchemaValidationFailed => "schema_validation_failed",
             Self::TransportUnavailable => "transport_unavailable",
+            Self::DelegationNotGranted => "delegation_not_granted",
+            Self::DelegationDepthExceeded => "delegation_depth_exceeded",
+            Self::DelegationLimitReached => "delegation_limit_reached",
+            Self::LaunchDenied => "launch_denied",
+            Self::NotFound => "not_found",
+            Self::InvalidRequest => "invalid_request",
+            Self::Internal => "internal",
         }
     }
 }
@@ -284,6 +302,13 @@ mod tests {
             ConversationToolErrorCode::SkillNotEnabled,
             ConversationToolErrorCode::SchemaValidationFailed,
             ConversationToolErrorCode::TransportUnavailable,
+            ConversationToolErrorCode::DelegationNotGranted,
+            ConversationToolErrorCode::DelegationDepthExceeded,
+            ConversationToolErrorCode::DelegationLimitReached,
+            ConversationToolErrorCode::LaunchDenied,
+            ConversationToolErrorCode::NotFound,
+            ConversationToolErrorCode::InvalidRequest,
+            ConversationToolErrorCode::Internal,
         ];
         let mut wire: Vec<String> = codes
             .iter()

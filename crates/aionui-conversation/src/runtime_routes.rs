@@ -1,4 +1,5 @@
-//! `POST /api/runtime/conversations/create` — the agent-facing create route.
+//! `POST /api/runtime/conversations/create` — the agent-facing create route,
+//! and the 3.0 C7 delegation routes (`/api/runtime/delegations[/{id}]`).
 //!
 //! Authenticates on the three `x-aionui-*` headers itself, exactly like
 //! `aionui-session-message/src/routes.rs`, and is therefore mounted OUTSIDE the
@@ -10,15 +11,16 @@ use std::sync::Arc;
 use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::{
     ConversationCliEnvelope, ConversationCreateRequest, ConversationCreateResponse, ConversationToolErrorCode,
-    ConversationToolErrorPayload,
+    ConversationToolErrorPayload, CreateDelegationRequest, DelegationResponse,
 };
-use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use tracing::warn;
 
+use crate::error::ConversationError;
 use crate::runtime_create::ConversationCreateError;
 use crate::service::ConversationService;
 
@@ -38,6 +40,8 @@ pub struct ConversationRuntimeRouterState {
 pub fn conversation_runtime_routes(state: ConversationRuntimeRouterState) -> Router {
     Router::new()
         .route("/api/runtime/conversations/create", post(create))
+        .route("/api/runtime/delegations", post(delegate).get(list_delegations))
+        .route("/api/runtime/delegations/{id}", get(delegation_result))
         .with_state(state)
 }
 
@@ -183,5 +187,144 @@ fn failure(status: StatusCode, error: ConversationToolErrorPayload) -> Reply {
     (
         status,
         Json(ConversationCliEnvelope::failure(error, Some(COMMAND.to_owned()))),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 3.0 C7: delegation. Any conversation helper token may call these; the real
+// gate is the user's per-conversation `@assistant` grant, checked by the
+// service. The parent is always the token-bound conversation.
+// ---------------------------------------------------------------------------
+
+const DELEGATE_COMMAND: &str = "delegate";
+
+type DelegationReply<T> = (StatusCode, Json<ConversationCliEnvelope<T>>);
+
+fn delegation_failure<T>(status: StatusCode, error: ConversationToolErrorPayload) -> DelegationReply<T> {
+    (
+        status,
+        Json(ConversationCliEnvelope::failure(
+            error,
+            Some(DELEGATE_COMMAND.to_owned()),
+        )),
+    )
+}
+
+fn delegation_unauthenticated<T>() -> DelegationReply<T> {
+    // No header values are logged — the token must never reach the logs.
+    warn!(
+        outcome = "rejected",
+        error_code = "runtime_auth_failed",
+        "agent delegation refused"
+    );
+    delegation_failure(
+        StatusCode::UNAUTHORIZED,
+        ConversationToolErrorPayload::new(ConversationToolErrorCode::RuntimeAuthFailed, "runtime auth failed"),
+    )
+}
+
+pub(crate) fn delegation_error_code(error: &ConversationError) -> (StatusCode, ConversationToolErrorCode) {
+    use ConversationToolErrorCode as Code;
+    match error {
+        ConversationError::Forbidden { reason } if reason.starts_with("delegation_not_granted") => {
+            (StatusCode::FORBIDDEN, Code::DelegationNotGranted)
+        }
+        ConversationError::Forbidden { .. } => (StatusCode::FORBIDDEN, Code::LaunchDenied),
+        ConversationError::Unprocessable { reason } if reason.starts_with("delegation_depth") => {
+            (StatusCode::UNPROCESSABLE_ENTITY, Code::DelegationDepthExceeded)
+        }
+        ConversationError::Busy { .. } => (StatusCode::TOO_MANY_REQUESTS, Code::DelegationLimitReached),
+        ConversationError::NotFound { .. } | ConversationError::NotFoundReason { .. } => {
+            (StatusCode::NOT_FOUND, Code::NotFound)
+        }
+        ConversationError::BadRequest { .. } | ConversationError::Unprocessable { .. } => {
+            (StatusCode::BAD_REQUEST, Code::InvalidRequest)
+        }
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, Code::Internal),
+    }
+}
+
+fn delegation_reply<T>(result: Result<T, ConversationError>) -> DelegationReply<T> {
+    match result {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ConversationCliEnvelope::success(
+                data,
+                Some(DELEGATE_COMMAND.to_owned()),
+            )),
+        ),
+        Err(error) => {
+            let (status, code) = delegation_error_code(&error);
+            warn!(
+                outcome = "rejected",
+                error_code = code.as_str(),
+                "agent delegation refused"
+            );
+            delegation_failure(status, ConversationToolErrorPayload::new(code, error.to_string()))
+        }
+    }
+}
+
+async fn delegate(
+    State(state): State<ConversationRuntimeRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<CreateDelegationRequest>, JsonRejection>,
+) -> DelegationReply<DelegationResponse> {
+    let Some(caller) = authenticated_caller(&state, &headers) else {
+        return delegation_unauthenticated();
+    };
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return delegation_failure(
+                StatusCode::BAD_REQUEST,
+                ConversationToolErrorPayload::new(
+                    ConversationToolErrorCode::SchemaValidationFailed,
+                    format!("request body does not match the schema: {}", rejection.body_text()),
+                ),
+            );
+        }
+    };
+    delegation_reply(
+        state
+            .service
+            .delegate(
+                &caller.user_id,
+                &caller.conversation_id,
+                &request.assistant_id,
+                &request.task_text,
+            )
+            .await,
+    )
+}
+
+async fn delegation_result(
+    State(state): State<ConversationRuntimeRouterState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> DelegationReply<DelegationResponse> {
+    let Some(caller) = authenticated_caller(&state, &headers) else {
+        return delegation_unauthenticated();
+    };
+    delegation_reply(
+        state
+            .service
+            .delegation_result(&caller.user_id, &caller.conversation_id, &id)
+            .await,
+    )
+}
+
+async fn list_delegations(
+    State(state): State<ConversationRuntimeRouterState>,
+    headers: HeaderMap,
+) -> DelegationReply<Vec<DelegationResponse>> {
+    let Some(caller) = authenticated_caller(&state, &headers) else {
+        return delegation_unauthenticated();
+    };
+    delegation_reply(
+        state
+            .service
+            .list_delegations(&caller.user_id, &caller.conversation_id)
+            .await,
     )
 }

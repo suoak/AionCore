@@ -276,7 +276,79 @@ pub(crate) fn build_fanout_state(
                 assistants: assistants.clone(),
             },
         }));
+    services
+        .conversation_service
+        .with_delegation_launch_port(Arc::new(DelegationLaunchAdapter {
+            slots: FanoutConversationsAdapter {
+                conversations: services.conversation_service.clone(),
+                task_manager: services.worker_task_manager.clone(),
+                assistants: assistants.clone(),
+            },
+        }));
     aionui_worktree::FanoutRouterState { service }
+}
+
+/// 3.0 C7: a delegated child is a plain conversation from the assistant, in
+/// the parent's workspace, that receives only the task text (cold start). It
+/// uses the assistant's own permission mode, and creating it goes through the
+/// usual `ConversationCreate` checks.
+pub(crate) struct DelegationLaunchAdapter {
+    slots: FanoutConversationsAdapter,
+}
+
+fn delegation_child_name(assistant_id: &str, task_text: &str) -> String {
+    let first_line = task_text.lines().next().unwrap_or("").trim();
+    let mut short: String = first_line.chars().take(48).collect();
+    if first_line.chars().count() > 48 {
+        short.push('…');
+    }
+    format!("@{assistant_id} · {short}")
+}
+
+#[async_trait]
+impl aionui_conversation::delegation::DelegationLaunchPort for DelegationLaunchAdapter {
+    async fn launch(
+        &self,
+        user_id: &str,
+        spec: &aionui_conversation::delegation::DelegationLaunchSpec,
+    ) -> Result<String, aionui_conversation::ConversationError> {
+        use aionui_worktree::IFanoutConversations;
+        self.slots
+            .check_assistant(user_id, &spec.assistant_id)
+            .await
+            .map_err(|error| launch_error(format!("assistant {}: {error}", spec.assistant_id)))?;
+        let mut extra = serde_json::json!({ "delegation_id": spec.delegation_id });
+        if let Some(workspace) = spec.workspace.as_deref() {
+            extra["workspace"] = serde_json::Value::String(workspace.to_owned());
+        }
+        let req = aionui_api_types::CreateConversationRequest {
+            r#type: None,
+            name: Some(delegation_child_name(&spec.assistant_id, &spec.task_text)),
+            model: None,
+            assistant: Some(aionui_api_types::AssistantConversationRequest {
+                id: spec.assistant_id.clone(),
+                locale: None,
+                conversation_overrides: None,
+            }),
+            source: None,
+            channel_chat_id: None,
+            extra,
+            worktree_id: None,
+        };
+        let conversation_id = self.slots.conversations.create(user_id, req).await?.id;
+        self.slots
+            .send_prompt(
+                user_id,
+                &conversation_id,
+                &aionui_worktree::FanoutPrompt {
+                    content: spec.task_text.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(launch_error)?;
+        Ok(conversation_id)
+    }
 }
 
 /// 3.0 C2: a task with a repository runs in a one-slot fan-out (own

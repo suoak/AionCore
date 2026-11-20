@@ -407,6 +407,12 @@ pub async fn build_module_states(
     }
     // 3.0 C2: tasks queued before the restart take free run slots again
     // (running ones were paused by task-session recovery → needs you).
+    // 3.0 C7: delegated children of the previous run cannot report back.
+    match services.conversation_service.fail_interrupted_delegations().await {
+        Ok(0) => {}
+        Ok(failed) => tracing::info!(failed, "delegation: interrupted children marked failed"),
+        Err(error) => tracing::warn!(error = %error, "delegation: startup recovery failed"),
+    }
     {
         let conversations = services.conversation_service.clone();
         tokio::spawn(async move {

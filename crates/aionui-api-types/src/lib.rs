@@ -23,6 +23,7 @@ mod conversation;
 mod conversation_tools;
 mod cron;
 mod custom_agent;
+mod delegation;
 mod extension;
 mod file;
 mod inbox;
@@ -179,6 +180,10 @@ pub use cron::{
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,
+};
+pub use delegation::{
+    CreateDelegationRequest, DelegationResponse, DelegationStatus, GrantDelegationRequest, MAX_CONCURRENT_DELEGATIONS,
+    MAX_DELEGATION_TASK_CHARS,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,

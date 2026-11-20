@@ -510,10 +510,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware));
     // Agent-facing `conversation create`. Same runtime-token self-authentication
     // as the two groups above, so it is also mounted after the CSRF layer.
+    // The audit layer records 3.0 C7 delegation starts (agent caller).
     let conversation_runtime = conversation_runtime_routes(ConversationRuntimeRouterState {
         service: services.conversation_service.clone(),
         runtime_token_service: services.runtime_token_service.clone(),
-    });
+    })
+    .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware));
     // Channel A. Same runtime-token self-authentication: the caller is an agent
     // process holding a conversation-scoped token, not a browser session.
     let skill_runtime = skill_runtime_routes(states.skill_runtime);

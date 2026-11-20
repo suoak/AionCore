@@ -8,6 +8,7 @@ mod background_stream;
 pub mod board;
 mod context_breakdown;
 mod convert;
+pub mod delegation;
 pub mod error;
 mod inbox;
 mod journal_compaction;

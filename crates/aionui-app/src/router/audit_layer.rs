@@ -550,6 +550,21 @@ const AUDIT_RULES: &[AuditRule] = &[
         "conversation",
         NONE,
     ),
+    // 3.0 C7: `@assistant` delegation — the user's grant, the agent's start.
+    rule(
+        "POST",
+        "/api/conversations/{id}/delegation-grants",
+        "delegation.grant",
+        "conversation",
+        ID,
+    ),
+    rule(
+        "POST",
+        "/api/runtime/delegations",
+        "delegation.start",
+        "conversation",
+        NONE,
+    ),
     // Phone follow-ups (desktop sends are ordinary chat, not audited)
     AuditRule {
         method: "POST",
