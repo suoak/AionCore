@@ -863,6 +863,13 @@ impl FanoutService {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{} (fan-out slot {label})", group.title));
 
+        // 3.0 C8: the task may refuse adopts outright (review-only).
+        if let (Some(hooks), Some(task)) = (self.inner.task_hooks.get(), group.task_session_id.as_deref())
+            && let Err(reason) = hooks.adopt_allowed(user_id, task).await
+        {
+            return Err(WorktreeError::AdoptNotAllowed(reason));
+        }
+
         // Target checks come first: a rejected adopt changes nothing.
         let target_branch = if req.strategy == AdoptStrategy::BranchOnly {
             None

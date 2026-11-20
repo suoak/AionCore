@@ -452,6 +452,14 @@ const AUDIT_RULES: &[AuditRule] = &[
         "task_session",
         ID,
     ),
+    // 3.0 C8: the one GitHub write of an Issue task, after confirmation.
+    rule(
+        "POST",
+        "/api/task-sessions/{id}/issue-comment",
+        "task.issue_comment",
+        "task_session",
+        ID,
+    ),
     rule("POST", "/api/cron/jobs", "config.cron.create", "cron_job", NONE),
     rule("PUT", "/api/cron/jobs/{id}", "config.cron.update", "cron_job", ID),
     rule("DELETE", "/api/cron/jobs/{id}", "config.cron.delete", "cron_job", ID),

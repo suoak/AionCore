@@ -1,6 +1,8 @@
 //! M8 E6-7: [`GithubIssueSource`] over the user's own `gh` CLI login.
 //!
-//! Only `gh issue list` is ever run (read-only). The runner scrubs the
+//! The import only runs `gh issue list` (read-only). The one write, 3.0 C8's
+//! [`GhCliIssueComments`], runs `gh issue comment` and only after the user
+//! confirmed the exact text (see `board::issue_flow`). The runner scrubs the
 //! environment of WorkMate secrets and disables prompts; no token is read or
 //! stored here. Errors are redacted before they reach the caller.
 
@@ -126,9 +128,121 @@ impl GithubIssueSource for GhCliIssueSource {
     }
 }
 
+/// 3.0 C8: posts a confirmed comment (`gh issue comment N --repo R --body-file -`).
+pub(crate) struct GhCliIssueComments {
+    cli: HostCli,
+    cwd: PathBuf,
+}
+
+impl GhCliIssueComments {
+    pub(crate) fn new() -> Self {
+        Self::with_cli(HostCli::new("gh"))
+    }
+
+    pub(crate) fn with_cli(cli: HostCli) -> Self {
+        Self {
+            cli,
+            cwd: std::env::temp_dir(),
+        }
+    }
+}
+
+/// The body goes through stdin, never argv.
+pub(crate) fn issue_comment_argv(repo: &str, number: u64) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "comment".into(),
+        number.to_string(),
+        "--repo".into(),
+        repo.to_owned(),
+        "--body-file".into(),
+        "-".into(),
+    ]
+}
+
+fn comment_error(repo: &str, error: GithubIssueSourceError) -> aionui_conversation::ConversationError {
+    use aionui_conversation::ConversationError;
+    match error {
+        GithubIssueSourceError::Failed(message) => ConversationError::BadGateway {
+            reason: format!("github_comment_failed: {message}"),
+        },
+        GithubIssueSourceError::Timeout => ConversationError::Timeout {
+            reason: "github_comment_timeout: gh issue comment timed out".into(),
+        },
+        GithubIssueSourceError::RepoNotFound(_) => ConversationError::NotFoundReason {
+            reason: format!("github_repo_not_found: {repo}"),
+        },
+        other => other.into(),
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_conversation::board::issue_flow::IssueCommentPort for GhCliIssueComments {
+    async fn post_issue_comment(
+        &self,
+        _user_id: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<Option<String>, aionui_conversation::ConversationError> {
+        let argv = issue_comment_argv(repo, number);
+        let output = self
+            .cli
+            .run(&argv, &self.cwd, Some(body.as_bytes().to_vec()), GH_TIMEOUT)
+            .await
+            .map_err(|error| {
+                comment_error(
+                    repo,
+                    match error {
+                        CliRunError::NotInstalled(_) => GithubIssueSourceError::CliMissing,
+                        CliRunError::Timeout(_) => GithubIssueSourceError::Timeout,
+                        CliRunError::Io { message, .. } => GithubIssueSourceError::Failed(redact_output(&message)),
+                    },
+                )
+            })?;
+        if !output.success() {
+            return Err(comment_error(repo, classify_failure(repo, &output.combined())));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("https://"))
+            .map(str::to_owned))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn issue_comments_send_the_body_on_stdin() {
+        use aionui_conversation::board::issue_flow::IssueCommentPort;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let env = vec![("PATH".into(), path)];
+        let fake = dir.path().join("gh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/argv\"\ncat > \"$(dirname \"$0\")/stdin\"\necho https://github.com/a/b/issues/7#issuecomment-1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let comments = GhCliIssueComments::with_cli(HostCli::new(&fake).with_base_env(env.clone()));
+        let body = "Fixed in #8; $(rm -rf /) `x` --repo other/repo";
+        let url = comments.post_issue_comment("u", "a/b", 7, body).await.unwrap();
+        assert_eq!(url.as_deref(), Some("https://github.com/a/b/issues/7#issuecomment-1"));
+        let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+        assert_eq!(argv.trim(), "issue comment 7 --repo a/b --body-file -");
+        assert_eq!(std::fs::read_to_string(dir.path().join("stdin")).unwrap(), body);
+
+        let missing = GhCliIssueComments::with_cli(HostCli::new(dir.path().join("no-gh")).with_base_env(env));
+        let err = missing.post_issue_comment("u", "a/b", 7, "x").await.unwrap_err();
+        assert!(err.to_string().contains("github_cli_missing"), "{err}");
+    }
 
     #[test]
     fn argv_is_read_only_issue_list() {

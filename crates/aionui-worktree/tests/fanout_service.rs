@@ -675,6 +675,8 @@ async fn a_task_may_run_in_a_single_slot_group() {
 #[derive(Default)]
 struct RecordingTaskHooks {
     events: Mutex<Vec<String>>,
+    /// 3.0 C8: refuse adopts with this reason.
+    refuse: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -700,6 +702,67 @@ impl aionui_worktree::IFanoutTaskHooks for RecordingTaskHooks {
             .unwrap()
             .push(format!("slot_started {task_session_id} {conversation_id}"));
     }
+
+    async fn adopt_allowed(&self, _user_id: &str, _task_session_id: &str) -> Result<(), String> {
+        match self.refuse.lock().unwrap().clone() {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 3.0 C8: a task can refuse adopts (review-only Issue tasks); a refused
+/// adopt changes nothing, not even the slot's branch.
+#[tokio::test]
+async fn a_task_that_refuses_adopts_changes_nothing() {
+    require_git!();
+    let fx = fixture(&[("a1", Script::Write(vec![("review.txt", "notes\n")]))]).await;
+    let hooks = Arc::new(RecordingTaskHooks::default());
+    *hooks.refuse.lock().unwrap() = Some("review_only".into());
+    fx.fanout.set_task_hooks(hooks.clone());
+    let repo = &fx.h.repo;
+    sqlx::query(
+        "INSERT INTO task_sessions (id, user_id, title, mode, objective, acceptance_criteria, status, agent_type, \
+         created_at, updated_at) VALUES ('task-r', ?, 't', 'agent', 'o', '[]', 'ready', 'codex', 1, 1)",
+    )
+    .bind(USER)
+    .execute(fx.h.db.pool())
+    .await
+    .unwrap();
+    let mut req = group_req(repo, &["a1"]);
+    req.task_session_id = Some("task-r".into());
+    let g = fx.fanout.create(USER, req).await.unwrap();
+    fx.fanout.wait_settled(&g.id).await;
+    let g = wait_group(&fx, &g.id, "comparing").await;
+    let head = |dir: &Path, rev: &str| {
+        String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+    };
+    let main_before = head(repo, "HEAD");
+    let branch_before = head(repo, &g.slots[0].branch);
+
+    for strategy in [AdoptStrategy::Squash, AdoptStrategy::BranchOnly] {
+        let err = fx.fanout.adopt(USER, &g.id, adopt("A", strategy)).await.unwrap_err();
+        assert!(matches!(err, WorktreeError::AdoptNotAllowed(_)), "{err:?}");
+        assert_eq!(err.code(), "ADOPT_NOT_ALLOWED");
+    }
+    assert_eq!(head(repo, "HEAD"), main_before);
+    assert_eq!(head(repo, &g.slots[0].branch), branch_before, "no snapshot commit");
+    assert!(hooks.events.lock().unwrap().is_empty());
+    assert_eq!(fx.fanout.get(USER, &g.id).await.unwrap().status, "comparing");
+
+    *hooks.refuse.lock().unwrap() = None;
+    fx.fanout
+        .adopt(USER, &g.id, adopt("A", AdoptStrategy::Squash))
+        .await
+        .unwrap();
 }
 
 /// 3.0 C4: a plan-first task's slot gets its conversation but not the prompt;

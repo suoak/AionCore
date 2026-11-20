@@ -242,6 +242,23 @@ mod tests {
     }
 
     #[test]
+    fn issue_comment_write_back_is_desktop_only() {
+        // 3.0 C8: the phone may read the suggested draft, never post it.
+        assert_eq!(get("/api/task-sessions/t1/issue-comment/draft"), Allow);
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert_eq!(
+                classify_device_request(&method, "/api/task-sessions/t1/issue-comment"),
+                Deny,
+                "{method}"
+            );
+        }
+        assert_eq!(
+            classify_device_request(&Method::POST, "/api/task-sessions/t1/start"),
+            Deny
+        );
+    }
+
+    #[test]
     fn audit_routes_are_denied() {
         // M8 E12-2: the audit ledger is desktop-user only.
         for method in [Method::GET, Method::POST, Method::DELETE] {

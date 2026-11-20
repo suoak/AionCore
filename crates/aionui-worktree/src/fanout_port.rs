@@ -68,4 +68,9 @@ pub trait IFanoutTaskHooks: Send + Sync {
     /// 3.0 C4: a held (plan-first) task slot has its conversation; the prompt
     /// was not sent.
     async fn slot_started(&self, _user_id: &str, _task_session_id: &str, _group_id: &str, _conversation_id: &str) {}
+    /// 3.0 C8: asked before any adopt of the task's group changes anything.
+    /// `Err(reason)` refuses the adopt (e.g. a review-only Issue task).
+    async fn adopt_allowed(&self, _user_id: &str, _task_session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }

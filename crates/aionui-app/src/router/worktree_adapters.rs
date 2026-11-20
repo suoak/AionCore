@@ -581,6 +581,13 @@ impl aionui_worktree::IFanoutTaskHooks for TaskAdoptHooks {
             tracing::warn!(%error, task_session_id, "task adopt conflict → board failed");
         }
     }
+    async fn adopt_allowed(&self, user_id: &str, task_session_id: &str) -> Result<(), String> {
+        self.conversations
+            .ensure_task_deliverable(user_id, task_session_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn slot_started(&self, user_id: &str, task_session_id: &str, _group_id: &str, conversation_id: &str) {
         if let Err(error) = self
             .conversations

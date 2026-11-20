@@ -533,6 +533,10 @@ pub async fn build_module_states(
     services
         .conversation_service
         .with_github_issue_source(Arc::new(crate::github_issue_source::GhCliIssueSource::new()));
+    // 3.0 C8: confirmed Issue comments through the same `gh` login.
+    services
+        .conversation_service
+        .with_issue_comment_port(Arc::new(crate::github_issue_source::GhCliIssueComments::new()));
     // M8 E7-5: Leader eval comments on the linked work-item timeline.
     states
         .team

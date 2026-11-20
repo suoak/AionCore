@@ -420,6 +420,8 @@ impl ConversationService {
                         "unknown adopt strategy '{strategy}'"
                     )));
                 }
+                // 3.0 C8: review-only tasks are never adopted.
+                self.ensure_task_deliverable(user_id, task_session_id).await?;
                 let flow = self
                     .task_board_repo()?
                     .get_task_flow(user_id, task_session_id)

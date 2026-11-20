@@ -14966,3 +14966,330 @@ async fn the_request_lifetime_setting_is_bounded() {
     let request = t.pending(&task).await;
     assert_eq!(request.expires_at - request.requested_at, 45 * 60_000);
 }
+
+// ---------------------------------------------------------------------------
+// 3.0 C8: Issue start options and the confirmed Issue comment.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct FakeIssueComments {
+    posts: std::sync::Mutex<Vec<(String, u64, String)>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::board::issue_flow::IssueCommentPort for FakeIssueComments {
+    async fn post_issue_comment(
+        &self,
+        _user_id: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConversationError::BadGateway {
+                reason: "github_comment_failed: boom".into(),
+            });
+        }
+        self.posts
+            .lock()
+            .unwrap()
+            .push((repo.to_owned(), number, body.to_owned()));
+        Ok(Some(format!(
+            "https://github.com/{repo}/issues/{number}#issuecomment-1"
+        )))
+    }
+}
+
+async fn issue_task(db: &aionui_db::Database, service: &ConversationService, number: u64) -> String {
+    let id = startable_task(service, json!({ "assistant_id": "codex-helper" })).await;
+    sqlx::query("UPDATE task_sessions SET source = 'github', external_ref = ? WHERE id = ?")
+        .bind(format!("github:o/r#{number}"))
+        .bind(&id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    id
+}
+
+fn approach(approach: aionui_api_types::IssueApproach) -> aionui_api_types::StartTaskRequest {
+    aionui_api_types::StartTaskRequest {
+        approach: Some(approach),
+        assistant_id: None,
+    }
+}
+
+async fn task_mode(db: &aionui_db::Database, id: &str) -> String {
+    sqlx::query_scalar("SELECT mode FROM task_sessions WHERE id = ?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn c8_issue_start_options_set_the_approach_once() {
+    use aionui_api_types::IssueApproach as A;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+
+    // Fix: an ordinary agent run.
+    let fix = issue_task(&db, &service, 1).await;
+    service.start_task_with("user_1", &fix, approach(A::Fix)).await.unwrap();
+    assert_eq!(service.task_approach("user_1", &fix).await.unwrap(), Some(A::Fix));
+    assert_eq!(task_mode(&db, &fix).await, "agent");
+    {
+        let launched = port.launched.lock().unwrap();
+        assert_eq!(launched.len(), 1);
+        assert!(!launched[0].plan_first);
+        assert!(!launched[0].prompt.contains("Review only"));
+    }
+    service.ensure_task_deliverable("user_1", &fix).await.unwrap();
+    // Options only before the first run.
+    assert!(matches!(
+        service.start_task_with("user_1", &fix, approach(A::ReviewOnly)).await,
+        Err(ConversationError::BadRequest { .. }) | Err(ConversationError::Busy { .. })
+    ));
+    assert_eq!(service.task_approach("user_1", &fix).await.unwrap(), Some(A::Fix));
+
+    // Review only: the instruction leads the prompt.
+    let review = issue_task(&db, &service, 2).await;
+    service
+        .start_task_with("user_1", &review, approach(A::ReviewOnly))
+        .await
+        .unwrap();
+    assert_eq!(
+        service.task_approach("user_1", &review).await.unwrap(),
+        Some(A::ReviewOnly)
+    );
+    assert_eq!(task_mode(&db, &review).await, "agent");
+    assert!(
+        port.launched.lock().unwrap()[1]
+            .prompt
+            .starts_with(crate::board::issue_flow::REVIEW_ONLY_INSTRUCTION)
+    );
+    let err = service.ensure_task_deliverable("user_1", &review).await.unwrap_err();
+    assert!(err.to_string().contains("review_only_task"), "{err}");
+
+    // Plan first: a plan task that plans before it acts.
+    let plan = issue_task(&db, &service, 3).await;
+    *port.conversation_id.lock().unwrap() = Some("conv-plan".into());
+    let _ = service.start_task_with("user_1", &plan, approach(A::PlanFirst)).await;
+    assert_eq!(
+        service.task_approach("user_1", &plan).await.unwrap(),
+        Some(A::PlanFirst)
+    );
+    assert_eq!(task_mode(&db, &plan).await, "plan");
+    let flow: String = sqlx::query_scalar("SELECT prompt_json FROM task_sessions WHERE id = ?")
+        .bind(&plan)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let flow: serde_json::Value = serde_json::from_str(&flow).unwrap();
+    assert_eq!(flow["approach"], "plan_first");
+    let plan_first: i64 = sqlx::query_scalar("SELECT plan_first FROM task_sessions WHERE id = ?")
+        .bind(&plan)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(plan_first, 1);
+
+    // An approach is for Issue tasks only; a bare start is unchanged.
+    let manual = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    assert!(matches!(
+        service.start_task_with("user_1", &manual, approach(A::Fix)).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    assert_eq!(service.task_approach("user_1", &manual).await.unwrap(), None);
+    service
+        .start_task_with("user_1", &manual, aionui_api_types::StartTaskRequest::default())
+        .await
+        .unwrap();
+    service.ensure_task_deliverable("user_1", &manual).await.unwrap();
+}
+
+#[tokio::test]
+async fn c8_start_options_refuse_an_unknown_assistant_and_change_nothing() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let port = Arc::new(RecordingLaunchPort::default());
+    service.with_task_launch_port(port.clone());
+    let id = issue_task(&db, &service, 4).await;
+    let request = aionui_api_types::StartTaskRequest {
+        approach: Some(aionui_api_types::IssueApproach::ReviewOnly),
+        assistant_id: Some("   ".into()),
+    };
+    assert!(matches!(
+        service.start_task_with("user_1", &id, request).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    assert_eq!(service.task_approach("user_1", &id).await.unwrap(), None);
+    assert!(port.launched.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn c8_review_only_tasks_cannot_be_delivered_or_adopted_remotely() {
+    use aionui_api_types::{DeliverTaskRequest, TaskDeliveryKind};
+
+    let t = c9().await;
+    t.service
+        .with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    let delivery = Arc::new(RecordingDeliveryPort::default());
+    t.service.with_task_delivery_port(delivery.clone());
+    let task = t.in_review_task().await;
+    sqlx::query(
+        "UPDATE task_sessions SET source = 'github', external_ref = 'github:o/r#9', \
+         prompt_json = json_set(COALESCE(prompt_json, '{}'), '$.approach', 'review_only') WHERE id = ?",
+    )
+    .bind(&task)
+    .execute(t.db.pool())
+    .await
+    .unwrap();
+
+    let err = t
+        .service
+        .deliver_task(
+            "user_1",
+            &task,
+            DeliverTaskRequest {
+                kind: TaskDeliveryKind::Pr,
+                title: None,
+                body: None,
+                draft: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("review_only_task"), "{err}");
+    assert!(delivery.calls.lock().unwrap().is_empty());
+
+    let err = t
+        .service
+        .issue_approval_request(
+            "user_1",
+            &task,
+            aionui_api_types::IssueApprovalRequest {
+                kind: aionui_api_types::ApprovalRequestKind::Adopt,
+                strategy: None,
+                target_branch: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("review_only_task"), "{err}");
+    assert!(
+        t.service
+            .list_approval_requests("user_1", Some(&task))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(t.adopt.adopts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn c8_issue_comment_posts_only_the_confirmed_text_once() {
+    use aionui_api_types::PostIssueCommentRequest;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    service.with_task_launch_port(Arc::new(RecordingLaunchPort::default()));
+    let port = Arc::new(FakeIssueComments::default());
+    service.with_issue_comment_port(port.clone());
+    let id = issue_task(&db, &service, 12).await;
+    sqlx::query("UPDATE task_sessions SET delivery_json = ? WHERE id = ?")
+        .bind(r#"{"pull_request":{"url":"https://github.com/o/r/pull/13","branch":"b"}}"#)
+        .bind(&id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // The draft suggests text and posts nothing.
+    let draft = service.issue_comment_draft("user_1", &id).await.unwrap();
+    assert_eq!((draft.repo.as_str(), draft.number), ("o/r", 12));
+    assert!(draft.body.contains("https://github.com/o/r/pull/13"), "{}", draft.body);
+    assert!(draft.posted_url.is_none());
+    assert!(port.posts.lock().unwrap().is_empty());
+
+    let post = |body: &str, confirm| PostIssueCommentRequest {
+        body: body.into(),
+        confirm,
+    };
+    // No confirmation, an empty or overlong body: nothing is posted.
+    for (body, confirm) in [
+        ("Looks good", false),
+        ("   ", true),
+        (
+            &"x".repeat(crate::board::issue_flow::ISSUE_COMMENT_MAX_CHARS + 1)[..],
+            true,
+        ),
+    ] {
+        assert!(matches!(
+            service.post_issue_comment("user_1", &id, post(body, confirm)).await,
+            Err(ConversationError::BadRequest { .. })
+        ));
+    }
+    assert!(port.posts.lock().unwrap().is_empty());
+
+    // A failed post records nothing and can be retried.
+    port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        service
+            .post_issue_comment("user_1", &id, post("Edited by me", true))
+            .await
+            .is_err()
+    );
+    port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let edited = "  My own words.\n\nFixed in o/r#13 — thanks!  ";
+    let item = service
+        .post_issue_comment("user_1", &id, post(edited, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        port.posts.lock().unwrap().clone(),
+        vec![("o/r".to_owned(), 12, edited.trim().to_owned())]
+    );
+    let comment = &item.delivery.as_ref().unwrap()["issue_comment"];
+    assert_eq!(comment["url"], "https://github.com/o/r/issues/12#issuecomment-1");
+    assert_eq!(comment["number"], 12);
+    assert_eq!(
+        item.delivery.as_ref().unwrap()["pull_request"]["url"],
+        "https://github.com/o/r/pull/13",
+        "the PR record is kept"
+    );
+    assert_eq!(
+        service
+            .issue_comment_draft("user_1", &id)
+            .await
+            .unwrap()
+            .posted_url
+            .as_deref(),
+        Some("https://github.com/o/r/issues/12#issuecomment-1")
+    );
+
+    // Once per task.
+    assert!(matches!(
+        service.post_issue_comment("user_1", &id, post("again", true)).await,
+        Err(ConversationError::Busy { .. })
+    ));
+    assert_eq!(port.posts.lock().unwrap().len(), 1);
+
+    // A task without an Issue never posts.
+    let manual = startable_task(&service, json!({ "assistant_id": "codex-helper" })).await;
+    assert!(matches!(
+        service.issue_comment_draft("user_1", &manual).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    assert!(matches!(
+        service.post_issue_comment("user_1", &manual, post("hi", true)).await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+    assert_eq!(port.posts.lock().unwrap().len(), 1);
+}

@@ -38,6 +38,7 @@
 
 pub mod delivery;
 pub mod github_import;
+pub mod issue_flow;
 pub(crate) mod plan_first;
 pub mod start;
 
